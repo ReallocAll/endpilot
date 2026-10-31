@@ -166,6 +166,7 @@ class FrontierPlan:
     elapsed_ms: float
     max_batch_ms: float
     progressed: bool
+    search_truncated: bool = False
 
 
 async def plan_frontier(world, start: Cell, goal: GoalNear, *, max_expansions: int = 4096,
@@ -174,9 +175,10 @@ async def plan_frontier(world, start: Cell, goal: GoalNear, *, max_expansions: i
 
     A frontier has at least one orthogonal neighbor whose standability is
     unconfirmed (None), *not* necessarily an unloaded subchunk. The search
-    exhausts the reachable observed graph before selecting a frontier; a
-    budget-limited search reports budget_exhausted instead of claiming that
-    the best frontier was found. No movement or world requests are issued.
+    selects the best confirmed frontier in the observed candidate set. If a
+    budget limit stops unfinished search, it may still return a safe frontier
+    marked as truncated; that result is not globally optimal exploration.
+    No movement or world requests are issued.
     """
     if len(start) != 3 or any(type(v) is not int for v in start):
         raise ValueError("start must be a three-integer cell")
@@ -187,6 +189,7 @@ async def plan_frontier(world, start: Cell, goal: GoalNear, *, max_expansions: i
     t0 = perf_counter()
     stand_cache: dict[Cell, bool | None] = {}
     queries, expanded, max_batch = 0, 0, 0.0
+    search_truncated = False
 
     def check_cancelled() -> None:
         if cancelled is not None and cancelled():
@@ -204,7 +207,8 @@ async def plan_frontier(world, start: Cell, goal: GoalNear, *, max_expansions: i
                cost: float = math.inf) -> FrontierPlan:
         return FrontierPlan(status, path, frontier, cost, expanded, queries,
                             (perf_counter() - t0) * 1000, max_batch,
-                            status == "frontier" and len(path) > 1)
+                            status == "frontier" and len(path) > 1,
+                            search_truncated if status in ("frontier", "budget_exhausted") else False)
 
     def build_path(node: Cell, parents: dict[Cell, Cell]) -> tuple[Cell, ...]:
         path = [node]
@@ -225,9 +229,11 @@ async def plan_frontier(world, start: Cell, goal: GoalNear, *, max_expansions: i
         if not path or path[0] != start:
             return False
         for cell in path:
+            check_cancelled()
             if fresh(*cell) is not True:
                 return False
         for a, b in zip(path, path[1:]):
+            check_cancelled()
             dx, dz = b[0] - a[0], b[2] - a[2]
             if a[1] != b[1] or max(abs(dx), abs(dz)) != 1:
                 return False
@@ -235,6 +241,7 @@ async def plan_frontier(world, start: Cell, goal: GoalNear, *, max_expansions: i
                               or fresh(a[0], a[1], a[2] + dz) is not True):
                 return False
         if is_frontier:
+            check_cancelled()
             x, y, z = path[-1]
             return any(fresh(x + dx, y, z + dz) is None
                        for dx, dz, _ in _OFFSETS[:4])
@@ -268,11 +275,14 @@ async def plan_frontier(world, start: Cell, goal: GoalNear, *, max_expansions: i
             if math.hypot(node[0] - goal.x, node[2] - goal.z) <= goal.radius:
                 path = build_path(node, parents)
                 valid = fresh_path_safe(path, is_frontier=False)
+                check_cancelled()
                 max_batch = max(max_batch, (perf_counter() - batch_start) * 1000)
                 return result("complete", path, cost=g) if valid else result("need_world")
             if expanded >= max_expansions:
-                max_batch = max(max_batch, (perf_counter() - batch_start) * 1000)
-                return result("budget_exhausted")
+                # This valid node still needs expansion. Already expanded
+                # frontiers remain eligible for a safe partial result.
+                search_truncated = True
+                break
             expanded += 1
             x, y, z = node
             if any(stand((x + dx, y, z + dz)) is None for dx, dz, _ in _OFFSETS[:4]):
@@ -292,6 +302,8 @@ async def plan_frontier(world, start: Cell, goal: GoalNear, *, max_expansions: i
                 sequence += 1
                 heapq.heappush(queue, (candidate + _distance(neighbor, goal), sequence, neighbor))
         max_batch = max(max_batch, (perf_counter() - batch_start) * 1000)
+        if search_truncated:
+            break
         await asyncio.sleep(0)
 
     check_cancelled()
@@ -315,11 +327,13 @@ async def plan_frontier(world, start: Cell, goal: GoalNear, *, max_expansions: i
         node = chosen  # Nonempty frontier_nodes guarantees a selected node.
         max_batch = max(max_batch, (perf_counter() - batch_start) * 1000)
         path = build_path(node, parents)
-        if fresh_path_safe(path, is_frontier=True):
+        valid = fresh_path_safe(path, is_frontier=True)
+        check_cancelled()
+        if valid:
             return result("frontier", path, node, best[node])
         # An observed cell or frontier boundary changed while planning.
         return result("need_world")
-    return result("unreachable")
+    return result("budget_exhausted" if search_truncated else "unreachable")
 
 
 def _segment_end(path: tuple[Cell, ...], start: int) -> int:
