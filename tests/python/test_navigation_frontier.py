@@ -245,8 +245,9 @@ async def test_large_observed_graph_is_bounded():
     world = Flat(known=rectangle(-100, 100, -100, 100))
     plan = await plan_frontier(world, (0, 100, 0), GoalNear(300, 100, 0),
                                max_expansions=512, batch_size=8)
-    assert plan.status == "budget_exhausted" and plan.expanded == 512
-    assert plan.stand_queries < 10000 and not plan.path
+    assert plan.status == "frontier" and plan.search_truncated is True
+    assert plan.expanded == 512 and plan.stand_queries < 10000
+    check_route(world, plan, (0, 100, 0))
 
 
 @pytest.mark.asyncio
