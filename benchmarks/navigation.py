@@ -118,8 +118,8 @@ async def main() -> None:
             GoalNear(300, 100, 0)),
         await measure_frontier(
             "interior_without_frontier",
-            SyntheticFlat({(x, z) for x in range(-100, 101)
-                           for z in range(-100, 101)}, set()),
+            SyntheticFlat({(x, z) for x in range(-160, 161)
+                           for z in range(-160, 161)}, set()),
             GoalNear(300, 100, 0), budget=128),
     ]
     assert [(r["status"], r["search_truncated"]) for r in budget_rows] == [
