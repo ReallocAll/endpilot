@@ -19,6 +19,7 @@ from .types import BotState, Vec3
 
 Cell = tuple[int, int, int]
 _ROOT2 = math.sqrt(2.0)
+_MAX_SEGMENT_EDGES = 8  # A bounded orthogonal run; diagonals retain waypoint stops.
 _OFFSETS = ((1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
             (1, 1, _ROOT2), (1, -1, _ROOT2), (-1, 1, _ROOT2), (-1, -1, _ROOT2))
 
@@ -147,6 +148,30 @@ async def plan_flat(world, start: Cell, goal: GoalNear, *, max_expansions: int =
     return result("need_world" if unknown else "unreachable")
 
 
+
+def _segment_end(path: tuple[Cell, ...], start: int) -> int:
+    """Last waypoint of a bounded, axis-aligned run starting at *start*.
+
+    Only original adjacent orthogonal edges are eligible. Retain every raw
+    waypoint for world-mutation validation; never make geometric shortcuts.
+    A center-to-center orthogonal run stays in the original block columns:
+    even 0.15 block initial offset + the 0.3 half-width is below 0.5.
+    """
+    if start >= len(path) - 1:
+        return start
+    a, b = path[start], path[start + 1]
+    step = (b[0] - a[0], b[2] - a[2])
+    if a[1] != b[1] or abs(step[0]) + abs(step[1]) != 1:
+        return start + 1  # Turn/diagonal/unsupported step: original behavior.
+    end = start + 1
+    while end < len(path) - 1 and end - start < _MAX_SEGMENT_EDGES:
+        a, b = path[end], path[end + 1]
+        if a[1] != b[1] or (b[0] - a[0], b[2] - a[2]) != step:
+            break
+        end += 1
+    return end
+
+
 class Navigator:
     """Intent-only navigator: never calls Bot.set_input() or owns a connection.
 
@@ -187,13 +212,15 @@ class Navigator:
         path = self._path
         if not path:
             return True
-        begin = max(0, self._next - 2)
+        # _next advances by execution segments, not adjacent raw nodes.
+        # On observed mutation re-check *all* original cells and corner guards.
+        begin = 0
         for cell in path[begin:]:
             if self.world.can_stand(*cell) is not True:
                 return False
         for a, b in zip(path[begin:], path[begin + 1:]):
             dx, dz = b[0] - a[0], b[2] - a[2]
-            if abs(dx) > 1 or abs(dz) > 1:
+            if a[1] != b[1] or abs(dx) > 1 or abs(dz) > 1:
                 return False
             if dx and dz and (self.world.can_stand(a[0] + dx, a[1], a[2]) is not True
                               or self.world.can_stand(a[0], a[1], a[2] + dz) is not True):
@@ -231,8 +258,9 @@ class Navigator:
                 if predicted is None:
                     self._fail("missing predicted position")
                     return None
-                cell = self._path[self._next]
-                self._next += 1
+                end = _segment_end(self._path, self._next - 1)
+                cell = self._path[end]
+                self._next = end + 1
                 # After a settled waypoint PR #10 resets momentum. Initialize
                 # at the previous prediction, not a potentially stale status.
                 self.controller.start(replace(status, position=predicted),
@@ -282,8 +310,9 @@ class Navigator:
             if len(self._path) == 1:
                 return
             self._future = asyncio.get_running_loop().create_future()
-            cell = self._path[self._next]
-            self._next += 1
+            end = _segment_end(self._path, 0)
+            cell = self._path[end]
+            self._next = end + 1
             self.controller.start(status, Vec3(cell[0] + .5, status.position.y, cell[2] + .5),
                                   max_ticks=160)
             await self._future
