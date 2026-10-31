@@ -96,11 +96,11 @@ async def main() -> None:
     frontier_rows.append(await measure_frontier(
         "long_corridor", SyntheticFlat({(x, z) for x in range(-1, 2) for z in range(260)},
                                         {(x, z) for x in (-1, 1) for z in range(260)}),
-        GoalNear(300, 100, 0)))
+        GoalNear(0, 100, 300)))
     frontier_rows.append(await measure_frontier(
         "sparse_unknown_boundary",
         SyntheticFlat({(x, z) for x in range(-12, 13) for z in range(-12, 13)
-                       if (x * 7 + z * 11) % 17 not in (0, 1)}, set()),
+                       if (x * 7 + z * 11) % 17 not in (0, 1) or (x, z) == (0, 0)}, set()),
         GoalNear(40, 100, 40)))
     assert [r["status"] for r in frontier_rows] == [
         "frontier", "frontier", "unreachable", "frontier", "frontier"
