@@ -213,6 +213,11 @@ async def plan_frontier(world, start: Cell, goal: GoalNear, *, max_expansions: i
         path.reverse()
         return tuple(path)
 
+    def fresh(x: int, y: int, z: int) -> bool | None:
+        nonlocal queries
+        queries += 1
+        return world.can_stand(x, y, z)
+
     def fresh_path_safe(path: tuple[Cell, ...], *, is_frontier: bool) -> bool:
         # Fresh queries deliberately bypass the search-local stand_cache.
         # There are no awaits between validation and returning the snapshot.
@@ -220,18 +225,18 @@ async def plan_frontier(world, start: Cell, goal: GoalNear, *, max_expansions: i
         if not path or path[0] != start:
             return False
         for cell in path:
-            if world.can_stand(*cell) is not True:
+            if fresh(*cell) is not True:
                 return False
         for a, b in zip(path, path[1:]):
             dx, dz = b[0] - a[0], b[2] - a[2]
             if a[1] != b[1] or max(abs(dx), abs(dz)) != 1:
                 return False
-            if dx and dz and (world.can_stand(a[0] + dx, a[1], a[2]) is not True
-                              or world.can_stand(a[0], a[1], a[2] + dz) is not True):
+            if dx and dz and (fresh(a[0] + dx, a[1], a[2]) is not True
+                              or fresh(a[0], a[1], a[2] + dz) is not True):
                 return False
         if is_frontier:
             x, y, z = path[-1]
-            return any(world.can_stand(x + dx, y, z + dz) is None
+            return any(fresh(x + dx, y, z + dz) is None
                        for dx, dz, _ in _OFFSETS[:4])
         end = path[-1]
         return math.hypot(end[0] - goal.x, end[2] - goal.z) <= goal.radius
@@ -291,7 +296,24 @@ async def plan_frontier(world, start: Cell, goal: GoalNear, *, max_expansions: i
 
     check_cancelled()
     if frontier_nodes:
-        node = min(frontier_nodes, key=lambda c: (_distance(c, goal), best[c], c))
+        # Select in bounded batches: a large frontier set must not block the
+        # Runtime event loop for an unbroken scan.
+        chosen: Cell | None = None
+        chosen_key: tuple[float, float, Cell] | None = None
+        batch_start = perf_counter()
+        for index, cell in enumerate(frontier_nodes):
+            if index % batch_size == 0:
+                check_cancelled()
+                if index:
+                    max_batch = max(max_batch, (perf_counter() - batch_start) * 1000)
+                    await asyncio.sleep(0)
+                    batch_start = perf_counter()
+            key = (_distance(cell, goal), best[cell], cell)
+            if chosen_key is None or key < chosen_key:
+                chosen, chosen_key = cell, key
+        check_cancelled()
+        node = chosen  # Nonempty frontier_nodes guarantees a selected node.
+        max_batch = max(max_batch, (perf_counter() - batch_start) * 1000)
         path = build_path(node, parents)
         if fresh_path_safe(path, is_frontier=True):
             return result("frontier", path, node, best[node])
