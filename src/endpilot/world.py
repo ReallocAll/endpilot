@@ -293,4 +293,21 @@ class WorldQuery:
             return False
         if any(b is None or b.solid is None for b in (foot, head, ground)):
             return None
-        return foot.air and head.air and ground.solid is True
+        if not (foot.air and head.air and ground.solid is True):
+            return False
+        # Extra Bedrock storage can contain fluid/unsupported blocks; the
+        # ordinary-ground motion model must not assume that it is safe.
+        for y in (feet_y - 1, feet_y, feet_y + 1):
+            key = (x // 16, y // 16, z // 16)
+            slice_ = self._slices.get(key)
+            if slice_ is None:
+                return None
+            index = ((x & 15) << 8) | ((z & 15) << 4) | (y & 15)
+            try:
+                secondary = slice_.block(index, 1)
+            except ValueError:
+                self._slices.pop(key, None)
+                return None
+            if secondary != _AIR:
+                return None
+        return True
