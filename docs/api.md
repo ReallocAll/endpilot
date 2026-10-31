@@ -247,6 +247,48 @@ totals and keeps successful decoded packets available. Later Python validation
 failure does not undo already counted headers. Both play histograms are immutable
 1024-entry sequences.
 
+## Safe frontier planning
+
+`endpilot.navigation.plan_frontier(world, start, goal, *, max_expansions=4096,
+batch_size=64, cancelled=None)` is an independent, **planning-only** API
+that accepts the existing `GoalNear` and any WorldQuery-compatible
+`can_stand(x, feet_y, z)` oracle. It does not move the bot, request chunks,
+subscribe to events, or modify `Navigator.goto()`.
+
+`FrontierPlan` is a frozen snapshot containing `status`, `path`,
+`frontier`, `cost`, `expanded`, `stand_queries`, `elapsed_ms`,
+`max_batch_ms`, and `progressed`. The statuses are:
+
+- `complete`: the returned known-safe route reaches the original `GoalNear`.
+- `frontier`: the returned known-safe route ends at a reachable, known-safe
+  cell with a **cardinal** neighbor whose standability cannot be confirmed.
+  This does **not** complete the original goal or prove that a SubChunk is
+  unloaded or requestable. `progressed=False` marks a one-cell path whose
+  frontier is the start itself.
+- `need_world`: the start is unconfirmed, or a candidate route or frontier
+  failed fresh validation after a world change.
+- `unreachable`: the start is known blocked, the exact-radius-zero goal is
+  known blocked, or the exhausted observed reachable graph has no goal and no
+  safe frontier. This is not permanent global-world unreachability.
+- `budget_exhausted`: the limited search cannot establish a complete route
+  or select a frontier after exhausting the reachable observed graph.
+
+Only `True` from `can_stand` permits movement through a cell. `False`
+is known non-traversability; `None` means *unconfirmed safety*, including
+unsupported collisions, secondary layers, missing or invalidated world data.
+Eight-direction A* retains orthogonal corner guards for diagonal edges.
+Candidate frontiers are ranked by octile goal distance, known route cost,
+then coordinate order. Frontier ranking is heuristic, not a guarantee of
+future reachability or globally optimal exploration.
+
+The search is bounded, yields via `asyncio.sleep(0)` once per batch, and
+propagates the optional cancellation callback as `CancelledError`.
+Successful paths are rechecked against the current oracle (including diagonal
+side cells and the frontier boundary) before returning; stale results are
+not durable permissions to move. An application should provide a cancellation
+predicate covering its Session and Dimension and revalidate before any later
+execution. Loading and long-distance segmented navigation remain unsupported.
+
 ## Transport and limits
 
 NetherNet is the default transport. It uses HTTP signaling and DTLS encryption,
