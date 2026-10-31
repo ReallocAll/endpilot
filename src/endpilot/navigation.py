@@ -187,20 +187,17 @@ async def plan_frontier(world, start: Cell, goal: GoalNear, *, max_expansions: i
     t0 = perf_counter()
     stand_cache: dict[Cell, bool | None] = {}
     queries, expanded, max_batch = 0, 0, 0.0
-    unknown_seen = False
 
     def check_cancelled() -> None:
         if cancelled is not None and cancelled():
             raise asyncio.CancelledError
 
     def stand(cell: Cell) -> bool | None:
-        nonlocal queries, unknown_seen
+        nonlocal queries
         if cell not in stand_cache:
             queries += 1
             stand_cache[cell] = world.can_stand(*cell)
         value = stand_cache[cell]
-        if value is None:
-            unknown_seen = True
         return value
 
     def result(status: str, path: tuple[Cell, ...] = (), frontier: Cell | None = None,
@@ -300,7 +297,7 @@ async def plan_frontier(world, start: Cell, goal: GoalNear, *, max_expansions: i
             return result("frontier", path, node, best[node])
         # An observed cell or frontier boundary changed while planning.
         return result("need_world")
-    return result("need_world" if unknown_seen else "unreachable")
+    return result("unreachable")
 
 
 def _segment_end(path: tuple[Cell, ...], start: int) -> int:
