@@ -6,7 +6,7 @@ from dataclasses import replace
 import pytest
 
 from endpilot import BotState, BotStatus, PositionEvent, TickEvent, Vec3
-from endpilot.navigation import GoalNear, NavigationError, Navigator, plan_flat
+from endpilot.navigation import GoalNear, NavigationError, Navigator, _segment_end, plan_flat
 
 
 class KnownFlat:
@@ -206,3 +206,97 @@ async def test_goal_near_radius_uses_euclidean_acceptance():
     assert plan.status == "complete"
     assert math.hypot(plan.path[-1][0] - 1, plan.path[-1][2] - 1) <= 1
     assert math.isclose(plan.cost, 1.0)
+
+
+def test_bounded_orthogonal_segments_preserve_raw_path():
+    straight = tuple((0, 100, z) for z in range(17))
+    assert _segment_end(straight, 0) == 8
+    assert _segment_end(straight, 8) == 16
+    turns = ((0, 100, 0), (0, 100, 1), (0, 100, 2),
+             (1, 100, 2), (2, 100, 2))
+    assert _segment_end(turns, 0) == 2
+    assert _segment_end(turns, 2) == 4
+    diagonals = tuple((z, 100, z) for z in range(5))
+    assert _segment_end(diagonals, 0) == 1
+    assert _segment_end(diagonals, 1) == 2
+    # No merging through a height change or a non-adjacent edge.
+    assert _segment_end(((0, 100, 0), (0, 101, 1)), 0) == 1
+    assert _segment_end(((0, 100, 0), (0, 100, 2)), 0) == 1
+
+
+@pytest.mark.asyncio
+async def test_continuous_straight_16_blocks_uses_only_two_stops():
+    bot = FakeBot()
+    world = KnownFlat(obstacles={(x, z) for x in (-1, 1) for z in range(-1, 18)})
+    world.bot = bot
+    nav = Navigator(bot, world)
+    targets = []
+    start = nav.controller.start
+
+    def count_start(status, target, **kwargs):
+        targets.append(target)
+        return start(status, target, **kwargs)
+
+    nav.controller.start = count_start
+    task = asyncio.create_task(nav.goto(GoalNear(0, 100, 16)))
+    for i in range(600):
+        await asyncio.sleep(0)
+        frame = nav.on_event(TickEvent(i, 0))
+        if frame is not None:
+            # Centerline never intersects either occupied corridor wall.
+            assert abs(frame.position.x - .5) < .2
+        if task.done():
+            break
+    await task
+    assert nav.last_plan.path == tuple((0, 100, z) for z in range(17))
+    assert [round(p.z, 3) for p in targets] == [8.5, 16.5]
+    assert nav.controller.predicted_position is not None
+    assert abs(nav.controller.predicted_position.z - 16.5) <= .1
+    assert nav.on_event(TickEvent(1000, 0)) is None
+
+
+@pytest.mark.asyncio
+async def test_active_segment_intermediate_cell_mutation_fails_closed():
+    from types import SimpleNamespace
+
+    from endpilot import PacketDecodedEvent
+
+    bot = FakeBot()
+    world = KnownFlat()
+    world.bot = bot
+    nav = Navigator(bot, world)
+    task = asyncio.create_task(nav.goto(GoalNear(0, 100, 8)))
+    await asyncio.sleep(0)
+    assert nav._next == 9  # First active segment runs over all eight raw edges.
+    for i in range(6):
+        nav.on_event(TickEvent(i, 0))
+    assert nav.controller.state == "moving"
+    world.obstacles.add((0, 4))
+    packet = SimpleNamespace(header=SimpleNamespace(packet_id=21))
+    nav.on_event(PacketDecodedEvent(packet))
+    assert nav.on_event(TickEvent(7, 0)) is None
+    with pytest.raises(NavigationError, match="path invalidated"):
+        await task
+    assert not nav._path
+    assert nav.controller.state == "coasting"
+
+
+@pytest.mark.asyncio
+async def test_unknown_in_active_segment_cannot_be_treated_as_air():
+    from types import SimpleNamespace
+
+    from endpilot import PacketDecodedEvent
+
+    bot = FakeBot()
+    known = {(0, z) for z in range(9)}
+    world = KnownFlat(known=known)
+    world.bot = bot
+    nav = Navigator(bot, world)
+    task = asyncio.create_task(nav.goto(GoalNear(0, 100, 8)))
+    await asyncio.sleep(0)
+    assert nav.controller.state == "moving"
+    known.remove((0, 5))
+    nav.on_event(PacketDecodedEvent(SimpleNamespace(header=SimpleNamespace(packet_id=174))))
+    assert nav.on_event(TickEvent(1, 0)) is None
+    with pytest.raises(NavigationError, match="path invalidated"):
+        await task
