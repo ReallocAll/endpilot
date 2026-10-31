@@ -257,7 +257,8 @@ subscribe to events, or modify `Navigator.goto()`.
 
 `FrontierPlan` is a frozen snapshot containing `status`, `path`,
 `frontier`, `cost`, `expanded`, `stand_queries`, `elapsed_ms`,
-`max_batch_ms`, and `progressed`. The statuses are:
+`max_batch_ms`, `progressed`, and `search_truncated: bool = False`.
+The last field is appended for positional compatibility. The statuses are:
 
 - `complete`: the returned known-safe route reaches the original `GoalNear`.
 - `frontier`: the returned known-safe route ends at a reachable, known-safe
@@ -270,16 +271,29 @@ subscribe to events, or modify `Navigator.goto()`.
 - `unreachable`: the start is known blocked, the exact-radius-zero goal is
   known blocked, or the exhausted observed reachable graph has no goal and no
   safe frontier. This is not permanent global-world unreachability.
-- `budget_exhausted`: the limited search cannot establish a complete route
-  or select a frontier after exhausting the reachable observed graph.
+- `budget_exhausted`: the search has unfinished work but reaches its
+  expansion budget without confirming a goal or expanding any safe frontier.
+  It returns no path or frontier, infinite cost and `progressed=False`.
 
 Only `True` from `can_stand` permits movement through a cell. `False`
 is known non-traversability; `None` means *unconfirmed safety*, including
 unsupported collisions, secondary layers, missing or invalidated world data.
 Eight-direction A* retains orthogonal corner guards for diagonal edges.
+A confirmed `complete` takes priority over a safe `frontier`, which
+in turn takes priority over `budget_exhausted`. A frontier may be returned
+when the budget interrupts remaining search, but only if its own cell was
+actually expanded and its known-safe path and unknown cardinal boundary pass
+fresh validation. Such a result has `search_truncated=True`; an exhaustive
+frontier has `search_truncated=False`. An exhausted budget without any usable
+frontier has `search_truncated=True`. All `complete`, `unreachable` and
+`need_world` results have `search_truncated=False`. A search using its last
+permitted expansion without leaving unfinished work is **not** truncated.
+
 Candidate frontiers are ranked by octile goal distance, known route cost,
-then coordinate order. Frontier ranking is heuristic, not a guarantee of
-future reachability or globally optimal exploration.
+then coordinate order, considering only **expanded** candidates when truncated.
+The partial result does not establish that the original goal is unreachable or
+that the selected frontier is globally best. Even an exhaustive selection is
+heuristic, not a guarantee of future reachability through unknown space.
 
 The search is bounded, yields via `asyncio.sleep(0)` once per batch, and
 propagates the optional cancellation callback as `CancelledError`.
