@@ -1,8 +1,10 @@
 # First-generation known-flat navigation (experimental)
 
-This API is available only on the stacked navigation branch. It requires the
-unmerged WorldQuery and flat Movement Controller PRs. Do **not** treat the
-temporary integration branch or its code as part of released `main`.
+The first-generation `WorldQuery`, flat-ground `MovementController`, and
+`Navigator` are integrated into `main` (development version 0.1.0). Navigation
+remains experimental and restricted to fully observed, known-flat terrain.
+`Navigator.goto()` uses `plan_flat()`; `plan_frontier()` is an independent,
+planning-only API and does not move the bot or load chunks.
 
 ## Single-writer usage
 
@@ -78,9 +80,10 @@ The planner returns `PlanResult.status`: `complete`, `need_world`,
 route. The default search budget is 4096 expanded nodes; the event loop is
 yielded after each 64-node batch.
 
-After each waypoint has settled, the next block-center target is given to the
-existing Movement Controller. On observed block updates the remaining path is
-revalidated. `stop()` invalidates the pending path and requests friction-only
+The Navigator uses the existing Movement Controller. A bounded straight
+cardinal run of up to eight cell edges may be traversed continuously; diagonal
+waypoints still require settling. On observed block updates the remaining path
+is revalidated. `stop()` invalidates the pending path and requests friction-only
 coasting, while cancellation and session changes invalidate old intentions.
 
 **Arrival is a prediction, not BDS authority.** The session's local status
@@ -89,9 +92,25 @@ is available in the SDK. Real integration tests must obtain server-owned
 coordinates using BDS `querytarget` and check both final error and post-stop
 drift. A mismatch is a navigation failure even if `goto()` returned.
 
+## Safe-frontier planning (no movement)
+
+`plan_frontier(world, start, goal, *, max_expansions=4096, batch_size=64,
+cancelled=None)` returns a frozen `FrontierPlan`. It shares the known-safe
+full-cube and diagonal-corner rules but does not affect `Navigator.goto()`.
+A `frontier` is a reachable, confirmed-safe cell with at least one *cardinal*
+neighbor whose `can_stand()` result is `None`. This does not prove that the
+neighbor is an unloaded or requestable chunk. `progressed=False` means the
+frontier is the starting cell. `search_truncated=True` marks a partial search
+stopped at its expansion limit; that candidate is not globally optimal.
+
+Possible statuses are `complete`, `frontier`, `need_world`, `unreachable`, and
+`budget_exhausted`. Successful paths and frontier boundaries undergo fresh
+oracle revalidation before return, but are not durable movement permissions.
+Neither automatic frontier traversal nor chunk requests are implemented.
+
 ## Deferred work
 
-No frontier/partial-path execution, chunk streaming, waypoint smoothing,
-variable-height actions, replanning, entity collision, native heap, JPS, HPA*,
-or long-distance guarantees are implemented. Do not add these optimizations
-without matching real BDS evidence.
+No automatic frontier/partial-path execution, chunk streaming, general
+waypoint smoothing, variable-height actions, jumping, full dynamic replanning,
+entity collision, native heap, JPS, HPA*, or long-distance guarantees are
+implemented. Do not add these optimizations without matching real BDS evidence.

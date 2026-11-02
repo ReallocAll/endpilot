@@ -108,7 +108,9 @@ shared-peer support.
   limits do not bound transport backlog or reassembly memory.
 
 The [API guide](docs/api.md) covers observations, operations, events,
-statistics and error handling. The runnable examples demonstrate a
+statistics and error handling. The [navigation guide](docs/navigation.md)
+documents experimental known-flat navigation and planning-only safe frontiers.
+The runnable examples demonstrate a
 [RakNet connection](examples/raknet_connect.py),
 [behavior composition](examples/behavior_composition.py), an
 [observed trade](examples/first_trade.py) and a
