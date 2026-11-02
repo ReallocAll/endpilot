@@ -1179,8 +1179,10 @@ class Session:
         self.require_interaction()
         if self.pending is not None:
             raise RuntimeError("an item request is pending")
-        if window is not None:
-            self.validate_window(window)
+        if window is not None and (
+            window != self.window or window.session_id != self.bot._generation
+        ):
+            raise RuntimeError("stale or foreign container window")
         if self.next_request_id < -2147483647:
             raise RuntimeError("item request IDs exhausted")
         key = ItemRequestKey(self.bot._token, self.id, self.next_request_id, window)

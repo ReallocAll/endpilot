@@ -84,6 +84,30 @@ async def test_server_packet_fixtures_round_trip_and_reach_observations(monkeypa
 
 
 @pytest.mark.parametrize("version", [1001, 2193])
+async def test_move_during_player_inventory_window(monkeypatch, version):
+    async with scene(monkeypatch, version) as (bot, peer, _):
+        p = peer.p
+        await deliver(
+            bot, peer,
+            p.ContainerOpenPacket(
+                container_id=p.ContainerID(2),
+                type=p.ContainerType(-1),
+                pos=p.BlockPos(x=0, y=0, z=0),
+                entity_unique_id=-1,
+            ),
+        )
+        source, destination = bot.player_slot(9), bot.player_slot(0)
+        operation = bot.begin_move_item(source, destination, 3)
+        request = await sent(peer)
+        place = action(request.actions[0])
+        assert wire_slot(side(place, "source")) == (29, 9, 101)
+        peer.send(response_packet(p, rows=[(29, 9, 7, 101), (28, 0, 3, 201)]))
+        result = await operation.wait(2)
+        assert result.outcome == api.ItemRequestOutcome.completed and result.server_result == 0
+        assert bot.get_item(source).count == 7 and bot.get_item(destination).count == 3
+
+
+@pytest.mark.parametrize("version", [1001, 2193])
 @pytest.mark.parametrize("entrypoint", ["request", "begin"])
 async def test_move_exact_actions_no_optimism_and_odd_request_ids(monkeypatch, version, entrypoint):
     async with scene(monkeypatch, version) as (bot, peer, events):
