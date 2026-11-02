@@ -1,5 +1,5 @@
 """Conservative two-layer Bedrock standability regression."""
-from endpilot.world import _AIR, _Slice, _Storage, _block_hash, WorldQuery
+from endpilot.world import _AIR, WorldQuery, _block_hash, _Slice, _Storage
 
 
 def test_secondary_storage_is_not_assumed_safe():

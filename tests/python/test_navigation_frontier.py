@@ -8,7 +8,6 @@ import pytest
 from endpilot.navigation import GoalNear, NavigationError, plan_flat, plan_frontier
 
 
-
 @pytest.mark.asyncio
 async def test_flat_and_frontier_share_stable_complete_routes_and_search_budget():
     # A common known-world graph must produce identical A* paths, costs and expansion counts.

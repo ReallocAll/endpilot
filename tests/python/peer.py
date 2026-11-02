@@ -40,7 +40,8 @@ def offer(public):
     salt = b"controlled peer salt"
     header = {"alg": "ES384", "x5u": base64.b64encode(der).decode()}
     body = {"salt": base64.b64encode(salt).decode()}
-    encode = lambda x: base64.urlsafe_b64encode(x).rstrip(b"=")
+    def encode(x):
+        return base64.urlsafe_b64encode(x).rstrip(b"=")
     data = encode(json.dumps(header).encode()) + b"." + encode(json.dumps(body).encode())
     r, s = utils.decode_dss_signature(key.sign(data, ec.ECDSA(hashes.SHA384())))
     jwt = (data + b"." + encode(r.to_bytes(48, "big") + s.to_bytes(48, "big"))).decode()

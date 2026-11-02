@@ -1,12 +1,18 @@
 """Deterministic walking contracts; real BDS arrival is checked by Testbed."""
-from dataclasses import replace
 import math
+from dataclasses import replace
 
-from endpilot._movement import FlatMotion, MovementController, integrate_flat
 from endpilot import (
-    BotState, BotStatus, DimensionEvent, PositionEvent, StateEvent, TickEvent,
-    Vec2, Vec3,
+    BotState,
+    BotStatus,
+    DimensionEvent,
+    PositionEvent,
+    StateEvent,
+    TickEvent,
+    Vec2,
+    Vec3,
 )
+from endpilot._movement import FlatMotion, MovementController, integrate_flat
 
 
 def _status(position=Vec3(0.5, 101.62001, 0.5), session=1):
