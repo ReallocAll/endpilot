@@ -156,6 +156,7 @@ async def test_correction_and_task_cancellation_release_intent():
 @pytest.mark.asyncio
 async def test_route_block_update_invalidates_before_first_frame():
     from types import SimpleNamespace
+
     from endpilot import PacketDecodedEvent
 
     bot = FakeBot()

@@ -21,7 +21,7 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.2
         with:
           enable-cache: false
-      - run: uvx ruff==0.16.2 check --config pyproject.toml src examples/raknet_connect.py
+      - run: uvx ruff==0.16.2 check --config pyproject.toml src examples tests
 
   test:
     name: Test (${{ matrix.os }})

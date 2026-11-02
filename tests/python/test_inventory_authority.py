@@ -1,7 +1,17 @@
 import bedrock_protocol as bp
 import pytest
 from peer import empty_item
-from trade_peer import deliver, inventory_packet, requests, response_packet, scene, sent, slot_events, slot_packet, stack
+from trade_peer import (
+    deliver,
+    inventory_packet,
+    requests,
+    response_packet,
+    scene,
+    sent,
+    slot_events,
+    slot_packet,
+    stack,
+)
 
 import endpilot as api
 
