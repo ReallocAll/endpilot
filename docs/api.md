@@ -98,6 +98,25 @@ See [a standalone extension example](../examples/typed_packet.py).
 
 ## Movement, spawning and respawn
 
+`bot.set_input(Input(...))` submits exactly one frame to the Session-owned tick
+sender. The `move` vector and look angle control ordinary directional input;
+`jumping`, `sneaking` and `sprinting` enable their corresponding native
+PlayerAuthInput flags. For protocol-specific edge actions, `flags` accepts native
+flag *names*, such as `("START_JUMPING", "START_SPRINTING")`. Every submission
+is one-shot: hold an input by submitting it again on successive ticks. A frame
+can also request stop/release edge flags where the configured protocol supports
+them. Callers remain responsible for valid position/delta prediction; setting
+a flag does not promise server acceptance of a physical action.
+
+The sender preserves exclusive ownership of client ticks, position corrections
+and teleport acknowledgements. Input validation rejects unknown flags and
+state-owned flags (`HANDLED_TELEPORT`, `VERTICAL_COLLISION`) as well as flags
+whose required packet payload EndPilot does not yet expose. Invalid
+`set_input()` arguments do not replace the pending frame or close the Session.
+Use `Bot.send_packet` only with an explicit understanding that a manually
+submitted PlayerAuthInputPacket is not coordinated with the high-level tick
+sender.
+
 Player observations retain velocity, rotation and links. Remote player movement
 updates position and rotation and emits `actor_motion`; retained captures do not
 change.

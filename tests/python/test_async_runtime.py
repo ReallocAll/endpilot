@@ -1192,3 +1192,48 @@ async def test_subscription_validation_and_async_return_isolation(monkeypatch):
             assert bot.get_status().state == api.BotState.ready
     finally:
         loop.set_exception_handler(old_handler)
+
+
+@pytest.mark.parametrize("version", [1001, 2193])
+async def test_public_input_controls_and_native_flags(monkeypatch, version):
+    peers = Peers(monkeypatch)
+    async with api.Runtime() as runtime:
+        bot = runtime.add_bot(api.BotOptions(server_url="http://peer", protocol=version))
+        await bot.wait_ready(2)
+        peer = peers.connections[-1]
+        enum = peer.p.PlayerAuthInputPacket.InputData
+
+        def enabled(packet, name):
+            flag = getattr(enum, name)
+            return (
+                bool(packet.input_data & (1 << int(flag)))
+                if version == 1001 else flag in packet.input_data
+            )
+
+        start = len(peer.received)
+        bot.set_input(api.Input(
+            position=bot.get_status().position, move=api.Vec2(0.25, 0.5),
+            jumping=True, sneaking=True, sprinting=True,
+            flags=("START_JUMPING", "START_SNEAKING", "START_SPRINTING"),
+        ))
+        await until(lambda: any(packet.packet_id == 144 for packet in peer.received[start:]))
+        packet = next(packet for packet in peer.received[start:] if packet.packet_id == 144)
+        assert (packet.move.x, packet.move.y) == (0.25, 0.5)
+        assert all(enabled(packet, name) for name in (
+            "JUMPING", "SNEAKING", "SPRINTING",
+            "START_JUMPING", "START_SNEAKING", "START_SPRINTING", "UP", "RIGHT",
+        ))
+        with pytest.raises(ValueError, match="state-owned"):
+            bot.set_input(api.Input(flags=("HANDLED_TELEPORT",)))
+        with pytest.raises(ValueError, match="state-owned"):
+            bot.set_input(api.Input(flags=("PERFORM_ITEM_STACK_REQUEST",)))
+        with pytest.raises(ValueError, match="this protocol"):
+            bot.set_input(api.Input(flags=("NOT_AN_INPUT_FLAG",)))
+        assert bot.get_status().state == api.BotState.ready
+
+        # Player input is one-shot. A later frame must not inherit stale control flags.
+        await until(lambda: sum(p.packet_id == 144 for p in peer.received[start:]) >= 2)
+        later = [p for p in peer.received[start:] if p.packet_id == 144][1]
+        assert not any(enabled(later, name) for name in (
+            "JUMPING", "SNEAKING", "SPRINTING", "START_JUMPING", "START_SPRINTING",
+        ))

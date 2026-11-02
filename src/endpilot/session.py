@@ -996,10 +996,17 @@ class Session:
             (frame.move.x > 0, "RIGHT"),
             (frame.move.x < 0, "LEFT"),
             (frame.vertical_collision, "VERTICAL_COLLISION"),
+            (frame.jumping, "JUMPING"),
+            (frame.sneaking, "SNEAKING"),
+            (frame.sprinting, "SPRINTING"),
             (self.handled_teleport, "HANDLED_TELEPORT"),
         ):
             if enabled:
                 flags.append(getattr(p.PlayerAuthInputPacket.InputData, flag))
+        for flag in frame.flags:
+            value = getattr(p.PlayerAuthInputPacket.InputData, flag)
+            if value not in flags:
+                flags.append(value)
         if self.options.protocol == 1001:
             flags = sum(1 << int(flag) for flag in flags)
         tick = self.status.tick + 1
@@ -1053,10 +1060,29 @@ class Session:
         self.require_ready()
         if not finite(frame.position, frame.delta, frame.move, frame.pitch, frame.yaw):
             raise ValueError("input values must be finite")
+        try:
+            flags = tuple(frame.flags)
+        except TypeError:
+            raise ValueError("input flags must be a sequence of native flag names") from None
+        enum = self.p.PlayerAuthInputPacket.InputData
+        reserved = {
+            "INPUT_NUM", "HANDLED_TELEPORT", "VERTICAL_COLLISION",
+            "PERFORM_ITEM_INTERACTION", "PERFORM_BLOCK_ACTIONS",
+            "PERFORM_ITEM_STACK_REQUEST", "IS_IN_CLIENT_PREDICTED_VEHICLE",
+            "INTERNAL_UPDATE",
+        }
+        if any(
+            type(flag) is not str or not flag.isupper() or flag in reserved or not hasattr(enum, flag)
+            for flag in flags
+        ):
+            raise ValueError("invalid or state-owned PlayerAuthInput flag for this protocol")
         if type(frame) is Input:
-            self.input = Input(frame.position, frame.delta, frame.move, frame.pitch, frame.yaw, frame.vertical_collision)
+            self.input = Input(
+                frame.position, frame.delta, frame.move, frame.pitch, frame.yaw,
+                frame.vertical_collision, frame.jumping, frame.sneaking, frame.sprinting, flags,
+            )
         else:
-            self.input = replace(frame)
+            self.input = replace(frame, flags=flags)
 
     def set_look(self, pitch, yaw):
         if not finite(pitch, yaw):

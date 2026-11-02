@@ -131,6 +131,10 @@ class Input:
     pitch: float = 0
     yaw: float = 0
     vertical_collision: bool = True
+    jumping: bool = False
+    sneaking: bool = False
+    sprinting: bool = False
+    flags: tuple[str, ...] = ()
 
 
 class BotToken:
