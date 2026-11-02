@@ -13,7 +13,7 @@ from . import _inventory, transport
 from . import events as ev
 from ._projection import unwrap
 from .auth import build_login, create_identity, derive_session_key
-from .observations import ActorSnapshot, ContainerSnapshot, InventorySnapshot, SlotObservation, Statistics
+from .observations import ActorSnapshot, ContainerSnapshot, SlotObservation, Statistics
 from .operations import ItemCancellation, ItemOperation, ItemOperationPhase, ItemOperationResult, ItemRequestOutcome
 from .types import (
     BotState,
