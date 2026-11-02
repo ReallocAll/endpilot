@@ -111,6 +111,24 @@ ends the session.
 
 ## Events and decode errors
 
+`runtime.subscribe(callback, events=mask)` registers independent synchronous
+observers and returns an idempotent unsubscribe function. Each observer receives
+`(bot, event)`, is filtered by its own mask, and does not need to share the
+legacy `Runtime(callback=...)` handler. A failing observer reports its exception
+to the owner loop's `call_exception_handler` and does not stop the Bot or prevent
+other observers receiving the event. This deliberately differs from the legacy
+callback's fail-fast behavior. Exceptions inheriting directly from `BaseException`
+retain fail-fast semantics.
+
+Registration, unsubscription and event delivery run on the Runtime owner loop.
+Unsubscribing during a dispatch prevents subsequent delivery to that observer.
+Only synchronous observers are supported: a returned awaitable is rejected and
+reported as an observer error. For asynchronous processing, an observer may
+place immutable events into an application-owned bounded `asyncio.Queue` and
+manage its own consumer task and overflow policy; EndPilot does not create a
+background Task per packet or own that consumer's lifecycle.
+
+
 `StateEvent.disconnect` is `ServerDisconnectReason | None`. A server Disconnect
 packet supplies its numeric `reason_code`, optional `message` and optional
 `filtered_message`, retained through closing and failed events.

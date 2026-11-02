@@ -1112,3 +1112,83 @@ async def test_wait_ready_interrupted_waiter_preserves_later_result(monkeypatch,
         assert not contexts, contexts
     finally:
         loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.parametrize("version", [1001, 2193])
+async def test_independent_event_observers_and_failure_isolation(monkeypatch, version):
+    peers = Peers(monkeypatch)
+    loop = asyncio.get_running_loop()
+    errors = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: errors.append(context))
+    try:
+        events = []
+        after_unsubscribe = []
+        mask = api.event_mask(api.EventKind.health)
+
+        def observe(_bot, event):
+            events.append(event.health)
+
+        def fail(_bot, _event):
+            raise ValueError("observer sentinel")
+
+        async with api.Runtime() as runtime:
+            first = runtime.subscribe(observe, events=mask)
+            second = runtime.subscribe(observe, events=mask)
+            runtime.subscribe(fail, events=mask)
+            runtime.subscribe(lambda _bot, e: after_unsubscribe.append(e.health), events=mask)
+            bot = runtime.add_bot(api.BotOptions(server_url="http://peer", protocol=version))
+            await bot.wait_ready(2)
+            peer = peers.connections[-1]
+
+            peer.send(peer.p.SetHealthPacket(health=19))
+            await until(lambda: events.count(19) == 2 and len(errors) == 1)
+            assert errors[0]["message"] == "EndPilot event observer failed"
+            assert isinstance(errors[0]["exception"], ValueError)
+            assert bot.get_status().state == api.BotState.ready
+
+            first()
+            first()  # Unsubscribing twice is harmless, even with duplicate callbacks.
+            peer.send(peer.p.SetHealthPacket(health=18))
+            await until(lambda: events.count(18) == 1 and after_unsubscribe[-1:] == [18])
+            assert errors[-1]["exception"].args == ("observer sentinel",)
+            second()
+            peer.send(peer.p.SetHealthPacket(health=17))
+            await until(lambda: bot.get_status().health == 17 and after_unsubscribe[-1:] == [17])
+            assert events == [19, 19, 18]
+            assert len(errors) == 3
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+
+async def test_subscription_validation_and_async_return_isolation(monkeypatch):
+    peers = Peers(monkeypatch)
+    errors = []
+    loop = asyncio.get_running_loop()
+    old_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: errors.append(context))
+    try:
+        async with api.Runtime() as runtime:
+            async def coroutine_observer(_bot, _event):
+                pass
+
+            with pytest.raises(TypeError):
+                runtime.subscribe(coroutine_observer)
+            with pytest.raises(ValueError):
+                runtime.subscribe(lambda *_: None, events=-1)
+
+            def returns_coroutine(_bot, _event):
+                return coroutine_observer(_bot, _event)
+
+            runtime.subscribe(returns_coroutine, events=api.event_mask(api.EventKind.health))
+            healthy = []
+            runtime.subscribe(lambda _bot, event: healthy.append(event.health),
+                              events=api.event_mask(api.EventKind.health))
+            bot = runtime.add_bot(api.BotOptions(server_url="http://peer"))
+            await bot.wait_ready(2)
+            peers.connections[-1].send(peers.connections[-1].p.SetHealthPacket(health=19))
+            await until(lambda: healthy == [19] and bool(errors))
+            assert isinstance(errors[0]["exception"], TypeError)
+            assert bot.get_status().state == api.BotState.ready
+    finally:
+        loop.set_exception_handler(old_handler)

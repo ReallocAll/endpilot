@@ -14,6 +14,7 @@ class Runtime:
         if callback is not None and (not callable(callback) or inspect.iscoroutinefunction(callback)):
             raise TypeError("callback must be a synchronous callable")
         self._callback = callback
+        self._subscribers = {}
         self._interests = validate_mask(events)
         self._loop = None
         self._bots = []
@@ -149,23 +150,62 @@ class Runtime:
         self._guard()
         self._interests = validate_mask(mask)
 
+    def subscribe(self, callback: Callable, *, events: int = DEFAULT_EVENTS) -> Callable[[], None]:
+        """Register an independent synchronous observer; return its unsubscribe function."""
+        self._guard()
+        if not callable(callback) or inspect.iscoroutinefunction(callback):
+            raise TypeError("observer must be a synchronous callable")
+        mask = validate_mask(events)
+        key = object()
+        self._subscribers[key] = (callback, mask)
+
+        def unsubscribe() -> None:
+            self._guard(deliver=False, allow_exited=True)
+            self._subscribers.pop(key, None)
+
+        return unsubscribe
+
     def _wants(self, bot, kind) -> bool:
+        if self._suppressed:
+            return False
+        bit = event_mask(kind)
         return (
-            not self._suppressed
-            and self._callback is not None
-            and bool((self._interests | bot._interests) & event_mask(kind))
+            (self._callback is not None and bool((self._interests | bot._interests) & bit))
+            or any(mask & bit for _, mask in self._subscribers.values())
         )
 
     def _emit(self, bot, kind, make_event):
         if not self._wants(bot, kind):
             return
+        bit = event_mask(kind)
+        legacy = self._callback is not None and bool((self._interests | bot._interests) & bit)
+        observers = tuple(
+            (key, callback) for key, (callback, mask) in self._subscribers.items() if mask & bit
+        )
         self._callback_depth += 1
         try:
-            result = self._callback(bot, make_event())
-            if inspect.isawaitable(result):
-                if inspect.iscoroutine(result):
-                    result.close()
-                raise TypeError("event callbacks must not return an awaitable")
+            event = make_event()
+            if legacy:
+                result = self._callback(bot, event)
+                if inspect.isawaitable(result):
+                    if inspect.iscoroutine(result):
+                        result.close()
+                    raise TypeError("event callbacks must not return an awaitable")
+            for key, callback in observers:
+                if key not in self._subscribers or self._suppressed:
+                    continue
+                try:
+                    result = callback(bot, event)
+                    if inspect.isawaitable(result):
+                        if inspect.iscoroutine(result):
+                            result.close()
+                        raise TypeError("event observers must not return an awaitable")
+                except Exception as error:
+                    self._loop.call_exception_handler({
+                        "message": "EndPilot event observer failed",
+                        "exception": error,
+                        "callback": callback,
+                    })
         except BaseException:
             self._suppressed = True
             self._request_stop()
