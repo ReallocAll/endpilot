@@ -5,7 +5,34 @@ from collections import Counter
 
 import pytest
 
-from endpilot.navigation import GoalNear, NavigationError, plan_frontier
+from endpilot.navigation import GoalNear, NavigationError, plan_flat, plan_frontier
+
+
+
+@pytest.mark.asyncio
+async def test_flat_and_frontier_share_stable_complete_routes_and_search_budget():
+    # A common known-world graph must produce identical A* paths, costs and expansion counts.
+    known = rectangle(-2, 8, -3, 5)
+    blocked = {(2, z) for z in range(-2, 4)} | {(3, 3)}
+    for goal in (GoalNear(7, 100, 4), GoalNear(7, 100, 4, radius=1)):
+        for batch_size in (1, 3, 64):
+            flat = await plan_flat(Flat(known=known, blocked=blocked), (0, 100, 0), goal,
+                                   batch_size=batch_size)
+            frontier = await plan_frontier(Flat(known=known, blocked=blocked), (0, 100, 0), goal,
+                                           batch_size=batch_size)
+            assert flat.status == frontier.status == "complete"
+            assert flat.path == frontier.path
+            assert flat.cost == frontier.cost
+            assert flat.expanded == frontier.expanded
+
+    for batch_size in (1, 3, 64):
+        flat = await plan_flat(Flat(), (0, 100, 0), GoalNear(50, 100, 0),
+                               max_expansions=3, batch_size=batch_size)
+        frontier = await plan_frontier(Flat(), (0, 100, 0), GoalNear(50, 100, 0),
+                                       max_expansions=3, batch_size=batch_size)
+        assert flat.status == frontier.status == "budget_exhausted"
+        assert flat.expanded == frontier.expanded == 3
+        assert not frontier.search_truncated or not frontier.path
 
 
 class Flat:
