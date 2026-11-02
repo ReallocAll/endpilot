@@ -149,6 +149,193 @@ async def plan_flat(world, start: Cell, goal: GoalNear, *, max_expansions: int =
 
 
 
+@dataclass(frozen=True, slots=True)
+class FrontierPlan:
+    """Planning snapshot; a frontier is not completion or permission to move.
+
+    ``progressed`` is false when the safe frontier is the start cell itself.
+    Callers must revalidate before executing any returned route.
+    """
+
+    status: str  # complete, frontier, need_world, unreachable, budget_exhausted
+    path: tuple[Cell, ...]
+    frontier: Cell | None
+    cost: float
+    expanded: int
+    stand_queries: int
+    elapsed_ms: float
+    max_batch_ms: float
+    progressed: bool
+    search_truncated: bool = False
+
+
+async def plan_frontier(world, start: Cell, goal: GoalNear, *, max_expansions: int = 4096,
+                        batch_size: int = 64, cancelled: Callable[[], bool] | None = None) -> FrontierPlan:
+    """Find a known-safe route to the goal, or a reachable known-safe frontier.
+
+    A frontier has at least one orthogonal neighbor whose standability is
+    unconfirmed (None), *not* necessarily an unloaded subchunk. The search
+    selects the best confirmed frontier in the observed candidate set. If a
+    budget limit stops unfinished search, it may still return a safe frontier
+    marked as truncated; that result is not globally optimal exploration.
+    No movement or world requests are issued.
+    """
+    if len(start) != 3 or any(type(v) is not int for v in start):
+        raise ValueError("start must be a three-integer cell")
+    if not 1 <= max_expansions <= 100000 or not 1 <= batch_size <= 1024:
+        raise ValueError("invalid search budget")
+    if start[1] != goal.feet_y:
+        raise NavigationError("non-flat goal")
+    t0 = perf_counter()
+    stand_cache: dict[Cell, bool | None] = {}
+    queries, expanded, max_batch = 0, 0, 0.0
+    search_truncated = False
+
+    def check_cancelled() -> None:
+        if cancelled is not None and cancelled():
+            raise asyncio.CancelledError
+
+    def stand(cell: Cell) -> bool | None:
+        nonlocal queries
+        if cell not in stand_cache:
+            queries += 1
+            stand_cache[cell] = world.can_stand(*cell)
+        value = stand_cache[cell]
+        return value
+
+    def result(status: str, path: tuple[Cell, ...] = (), frontier: Cell | None = None,
+               cost: float = math.inf) -> FrontierPlan:
+        return FrontierPlan(status, path, frontier, cost, expanded, queries,
+                            (perf_counter() - t0) * 1000, max_batch,
+                            status == "frontier" and len(path) > 1,
+                            search_truncated if status in ("frontier", "budget_exhausted") else False)
+
+    def build_path(node: Cell, parents: dict[Cell, Cell]) -> tuple[Cell, ...]:
+        path = [node]
+        while path[-1] != start:
+            path.append(parents[path[-1]])
+        path.reverse()
+        return tuple(path)
+
+    def fresh(x: int, y: int, z: int) -> bool | None:
+        nonlocal queries
+        queries += 1
+        return world.can_stand(x, y, z)
+
+    def fresh_path_safe(path: tuple[Cell, ...], *, is_frontier: bool) -> bool:
+        # Fresh queries deliberately bypass the search-local stand_cache.
+        # There are no awaits between validation and returning the snapshot.
+        check_cancelled()
+        if not path or path[0] != start:
+            return False
+        for cell in path:
+            check_cancelled()
+            if fresh(*cell) is not True:
+                return False
+        for a, b in zip(path, path[1:]):
+            check_cancelled()
+            dx, dz = b[0] - a[0], b[2] - a[2]
+            if a[1] != b[1] or max(abs(dx), abs(dz)) != 1:
+                return False
+            if dx and dz and (fresh(a[0] + dx, a[1], a[2]) is not True
+                              or fresh(a[0], a[1], a[2] + dz) is not True):
+                return False
+        if is_frontier:
+            check_cancelled()
+            x, y, z = path[-1]
+            return any(fresh(x + dx, y, z + dz) is None
+                       for dx, dz, _ in _OFFSETS[:4])
+        end = path[-1]
+        return math.hypot(end[0] - goal.x, end[2] - goal.z) <= goal.radius
+
+    check_cancelled()
+    initial = stand(start)
+    if initial is not True:
+        return result("need_world" if initial is None else "unreachable")
+    if goal.radius == 0:
+        goal_stand = stand((goal.x, goal.feet_y, goal.z))
+        if goal_stand is False:
+            return result("unreachable")
+
+    best: dict[Cell, float] = {start: 0.0}
+    parents: dict[Cell, Cell] = {}
+    queue = [(_distance(start, goal), 0, start)]
+    frontier_nodes: set[Cell] = set()
+    sequence = 0
+    while queue:
+        batch_start = perf_counter()
+        for _ in range(batch_size):
+            check_cancelled()
+            if not queue:
+                break
+            f, _, node = heapq.heappop(queue)
+            g = best[node]
+            if f > g + _distance(node, goal) + 1e-8:
+                continue
+            if math.hypot(node[0] - goal.x, node[2] - goal.z) <= goal.radius:
+                path = build_path(node, parents)
+                valid = fresh_path_safe(path, is_frontier=False)
+                check_cancelled()
+                max_batch = max(max_batch, (perf_counter() - batch_start) * 1000)
+                return result("complete", path, cost=g) if valid else result("need_world")
+            if expanded >= max_expansions:
+                # This valid node still needs expansion. Already expanded
+                # frontiers remain eligible for a safe partial result.
+                search_truncated = True
+                break
+            expanded += 1
+            x, y, z = node
+            if any(stand((x + dx, y, z + dz)) is None for dx, dz, _ in _OFFSETS[:4]):
+                frontier_nodes.add(node)
+            for dx, dz, step in _OFFSETS:
+                neighbor = (x + dx, y, z + dz)
+                if stand(neighbor) is not True:
+                    continue
+                if dx and dz and (stand((x + dx, y, z)) is not True
+                                  or stand((x, y, z + dz)) is not True):
+                    continue
+                candidate = g + step
+                if candidate >= best.get(neighbor, math.inf) - 1e-10:
+                    continue
+                best[neighbor] = candidate
+                parents[neighbor] = node
+                sequence += 1
+                heapq.heappush(queue, (candidate + _distance(neighbor, goal), sequence, neighbor))
+        max_batch = max(max_batch, (perf_counter() - batch_start) * 1000)
+        if search_truncated:
+            break
+        await asyncio.sleep(0)
+
+    check_cancelled()
+    if frontier_nodes:
+        # Select in bounded batches: a large frontier set must not block the
+        # Runtime event loop for an unbroken scan.
+        chosen: Cell | None = None
+        chosen_key: tuple[float, float, Cell] | None = None
+        batch_start = perf_counter()
+        for index, cell in enumerate(frontier_nodes):
+            if index % batch_size == 0:
+                check_cancelled()
+                if index:
+                    max_batch = max(max_batch, (perf_counter() - batch_start) * 1000)
+                    await asyncio.sleep(0)
+                    batch_start = perf_counter()
+            key = (_distance(cell, goal), best[cell], cell)
+            if chosen_key is None or key < chosen_key:
+                chosen, chosen_key = cell, key
+        check_cancelled()
+        node = chosen  # Nonempty frontier_nodes guarantees a selected node.
+        max_batch = max(max_batch, (perf_counter() - batch_start) * 1000)
+        path = build_path(node, parents)
+        valid = fresh_path_safe(path, is_frontier=True)
+        check_cancelled()
+        if valid:
+            return result("frontier", path, node, best[node])
+        # An observed cell or frontier boundary changed while planning.
+        return result("need_world")
+    return result("budget_exhausted" if search_truncated else "unreachable")
+
+
 def _segment_end(path: tuple[Cell, ...], start: int) -> int:
     """Last waypoint of a bounded, axis-aligned run starting at *start*.
 

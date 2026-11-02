@@ -13,7 +13,7 @@ import asyncio
 import json
 import platform
 
-from endpilot.navigation import GoalNear, plan_flat
+from endpilot.navigation import GoalNear, plan_flat, plan_frontier
 
 
 class SyntheticFlat:
@@ -35,6 +35,22 @@ async def measure(name: str, world: SyntheticFlat, goal: GoalNear) -> dict:
         "map": name, "status": result.status,
         "expanded": result.expanded, "peak_open": result.peak_open,
         "stand_queries": result.stand_queries, "path_nodes": len(result.path),
+        "path_cost": result.cost if result.path else None,
+        "search_ms": round(result.elapsed_ms, 3),
+        "max_batch_ms": round(result.max_batch_ms, 3),
+    }
+
+
+
+async def measure_frontier(name: str, world: SyntheticFlat, goal: GoalNear,
+                           budget: int = 4096) -> dict:
+    result = await plan_frontier(world, (0, 100, 0), goal, max_expansions=budget)
+    return {
+        "map": name, "status": result.status,
+        "budget": budget, "search_truncated": result.search_truncated,
+        "progressed": result.progressed,
+        "expanded": result.expanded, "stand_queries": result.stand_queries,
+        "path_nodes": len(result.path), "frontier": result.frontier,
         "path_cost": result.cost if result.path else None,
         "search_ms": round(result.elapsed_ms, 3),
         "max_batch_ms": round(result.max_batch_ms, 3),
@@ -65,10 +81,60 @@ async def main() -> None:
     rows.append(await measure("unreachable", SyntheticFlat(enclosed_known, enclosed_blocked),
                               GoalNear(50, 100, 50)))
 
+
+    # Five bounded frontier workloads; these are synthetic standability
+    # oracles, not real SubChunk observations or BDS movement benchmarks.
+    frontier_rows = []
+    frontier_rows.append(await measure_frontier(
+        "small_local", SyntheticFlat({(x, z) for x in range(5) for z in range(-1, 2)}, set()),
+        GoalNear(10, 100, 0)))
+    frontier_rows.append(await measure_frontier(
+        "multiple_frontiers", SyntheticFlat({(x, z) for x in range(-8, 9) for z in range(-8, 9)}, set()),
+        GoalNear(20, 100, 10)))
+    frontier_rows.append(await measure_frontier(
+        "sealed", SyntheticFlat({(x, z) for x in range(-4, 5) for z in range(-4, 5)},
+                                {(x, z) for x in range(-1, 2) for z in range(-1, 2)
+                                 if (x, z) != (0, 0)}),
+        GoalNear(20, 100, 0)))
+    frontier_rows.append(await measure_frontier(
+        "long_corridor", SyntheticFlat({(x, z) for x in range(-1, 2) for z in range(260)},
+                                        {(x, z) for x in (-1, 1) for z in range(260)}),
+        GoalNear(0, 100, 300)))
+    frontier_rows.append(await measure_frontier(
+        "sparse_unknown_boundary",
+        SyntheticFlat({(x, z) for x in range(-12, 13) for z in range(-12, 13)
+                       if (x * 7 + z * 11) % 17 not in (0, 1) or (x, z) == (0, 0)}, set()),
+        GoalNear(40, 100, 40)))
+    # Budget-boundary runs: finite known partial frontiers versus no
+    # frontier within an equally strict expansion cap.
+    budget_rows = [
+        await measure_frontier(
+            "bounded_1000",
+            SyntheticFlat({(x, z) for x in range(40) for z in range(25)}, set()),
+            GoalNear(300, 100, 0), budget=128),
+        await measure_frontier(
+            "bounded_gt_4096",
+            SyntheticFlat({(x, z) for x in range(130) for z in range(60)}, set()),
+            GoalNear(300, 100, 0)),
+        await measure_frontier(
+            "interior_without_frontier",
+            SyntheticFlat({(x, z) for x in range(-160, 161)
+                           for z in range(-160, 161)}, set()),
+            GoalNear(300, 100, 0), budget=128),
+    ]
+    assert [(r["status"], r["search_truncated"]) for r in budget_rows] == [
+        ("frontier", True), ("frontier", True), ("budget_exhausted", True)
+    ]
+
+    assert [r["status"] for r in frontier_rows] == [
+        "frontier", "frontier", "unreachable", "frontier", "frontier"
+    ]
+
     assert [r["status"] for r in rows] == ["complete"] * 5 + ["unreachable"]
     print(json.dumps({"python": platform.python_version(),
                       "environment": "synthetic in-memory known-flat oracle",
-                      "results": rows}, indent=2))
+                      "results": rows, "frontier_results": frontier_rows,
+                      "budget_results": budget_rows}, indent=2))
 
 
 if __name__ == "__main__":

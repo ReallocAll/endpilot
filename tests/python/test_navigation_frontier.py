@@ -1,0 +1,401 @@
+"""Deterministic safety contracts for bounded planning at an observed-world frontier."""
+import asyncio
+import math
+from collections import Counter
+
+import pytest
+
+from endpilot.navigation import GoalNear, NavigationError, plan_frontier
+
+
+class Flat:
+    def __init__(self, known=None, blocked=(), unknown=()):
+        self.known = None if known is None else set(known)
+        self.blocked = set(blocked)
+        self.unknown = set(unknown)
+        self.calls = Counter()
+
+    def can_stand(self, x, y, z):
+        self.calls[x, y, z] += 1
+        if y != 100:
+            return False
+        if (x, z) in self.unknown or (self.known is not None and (x, z) not in self.known):
+            return None
+        return (x, z) not in self.blocked
+
+
+def rectangle(xmin, xmax, zmin, zmax):
+    return {(x, z) for x in range(xmin, xmax + 1) for z in range(zmin, zmax + 1)}
+
+
+def check_route(world, plan, start):
+    assert plan.path and plan.path[0] == start
+    assert all(world.can_stand(*node) is True for node in plan.path)
+    total = 0.0
+    for a, b in zip(plan.path, plan.path[1:]):
+        dx, dz = b[0] - a[0], b[2] - a[2]
+        assert a[1] == b[1] and max(abs(dx), abs(dz)) == 1
+        if dx and dz:
+            assert world.can_stand(a[0] + dx, a[1], a[2]) is True
+            assert world.can_stand(a[0], a[1], a[2] + dz) is True
+        total += math.hypot(dx, dz)
+    assert math.isclose(plan.cost, total, abs_tol=1e-9)
+
+
+@pytest.mark.asyncio
+async def test_known_route_complete_with_original_goal_radius():
+    world = Flat()
+    start = (0, 100, 0)
+    for goal in (GoalNear(6, 100, 4), GoalNear(6, 100, 4, radius=1), GoalNear(0, 100, 0)):
+        plan = await plan_frontier(world, start, goal)
+        assert plan.status == "complete" and plan.frontier is None and not plan.progressed
+        check_route(world, plan, start)
+        assert math.hypot(plan.path[-1][0] - goal.x, plan.path[-1][2] - goal.z) <= goal.radius
+
+
+@pytest.mark.asyncio
+async def test_safe_frontier_boundary_path_cost_and_progress():
+    world = Flat(known=rectangle(0, 5, -1, 1))
+    plan = await plan_frontier(world, (0, 100, 0), GoalNear(9, 100, 0))
+    assert plan.status == "frontier" and plan.frontier == plan.path[-1]
+    assert plan.frontier == (5, 100, 0) and plan.progressed
+    check_route(world, plan, (0, 100, 0))
+    assert world.can_stand(6, 100, 0) is None
+    assert plan.expanded <= 18 and plan.stand_queries > 0
+
+
+@pytest.mark.asyncio
+async def test_initial_cell_can_be_frontier_without_progress():
+    plan = await plan_frontier(Flat(known={(0, 0)}), (0, 100, 0), GoalNear(8, 100, 8))
+    assert plan.status == "frontier" and plan.path == ((0, 100, 0),)
+    assert plan.frontier == (0, 100, 0) and not plan.progressed and plan.cost == 0
+
+
+@pytest.mark.asyncio
+async def test_ties_are_stable_and_rank_goal_then_cost_then_coordinates():
+    world = Flat(known=rectangle(-2, 2, -2, 2))
+    plans = [await plan_frontier(world, (0, 100, 0), GoalNear(10, 100, 10)) for _ in range(5)]
+    assert all(p.status == "frontier" for p in plans)
+    assert len({(p.path, p.frontier, p.cost, p.expanded) for p in plans}) == 1
+    assert plans[0].frontier == (2, 100, 2)
+    line = Flat(known={(0, 0), (1, 0), (0, 1)})
+    plans = [await plan_frontier(line, (0, 100, 0), GoalNear(2, 100, 2)) for _ in range(3)]
+    assert len({p.frontier for p in plans}) == 1
+
+
+@pytest.mark.asyncio
+async def test_wall_detour_and_no_known_wall_crossing():
+    known = rectangle(-4, 4, -4, 4)
+    wall = {(0, z) for z in range(-3, 4)}
+    world = Flat(known=known, blocked=wall)
+    plan = await plan_frontier(world, (-2, 100, 0), GoalNear(7, 100, 0))
+    assert plan.status == "frontier"
+    check_route(world, plan, (-2, 100, 0))
+    assert not any((x, z) in wall for x, _, z in plan.path)
+    assert plan.frontier[0] >= 0
+
+
+@pytest.mark.asyncio
+async def test_sealed_known_cells_are_unreachable_not_frontier():
+    wall = rectangle(-1, 1, -1, 1) - {(0, 0)}
+    plan = await plan_frontier(Flat(blocked=wall), (0, 100, 0), GoalNear(9, 100, 9))
+    assert plan.status == "unreachable" and not plan.path and plan.frontier is None
+
+
+@pytest.mark.asyncio
+async def test_diagonal_cannot_cut_known_or_unknown_corners():
+    blocked = Flat(blocked={(1, 0), (0, 1)})
+    plan = await plan_frontier(blocked, (0, 100, 0), GoalNear(1, 100, 1))
+    assert plan.status == "complete" and plan.cost > math.sqrt(2)
+    check_route(blocked, plan, (0, 100, 0))
+    unknown = Flat(known={(0, 0), (1, 1)})
+    plan = await plan_frontier(unknown, (0, 100, 0), GoalNear(1, 100, 1))
+    assert plan.status == "frontier" and plan.path == ((0, 100, 0),)
+
+
+@pytest.mark.asyncio
+async def test_unknown_behind_wall_is_not_an_exit():
+    known = rectangle(-1, 1, -1, 1)
+    world = Flat(known=known, blocked=known - {(0, 0)})
+    plan = await plan_frontier(world, (0, 100, 0), GoalNear(9, 100, 0))
+    assert plan.status == "unreachable" and not plan.path
+
+
+@pytest.mark.asyncio
+async def test_blocked_exact_goal_and_radius_do_not_alias():
+    world = Flat(blocked={(5, 0)})
+    plan = await plan_frontier(world, (0, 100, 0), GoalNear(5, 100, 0))
+    assert plan.status == "unreachable"
+    plan = await plan_frontier(world, (0, 100, 0), GoalNear(5, 100, 0, radius=1))
+    assert plan.status == "complete" and plan.path[-1] != (5, 100, 0)
+    assert math.hypot(plan.path[-1][0] - 5, plan.path[-1][2]) <= 1
+
+
+@pytest.mark.asyncio
+async def test_unsafe_and_unknown_start_fail_without_a_path():
+    for world, status in ((Flat(blocked={(0, 0)}), "unreachable"),
+                          (Flat(known={(1, 0)}), "need_world"),
+                          (Flat(known={(0, 0)}, unknown={(0, 0)}), "need_world")):
+        plan = await plan_frontier(world, (0, 100, 0), GoalNear(3, 100, 0))
+        assert plan.status == status and not plan.path
+
+
+@pytest.mark.asyncio
+async def test_budget_caps_expansions_and_no_partial_route_is_executable():
+    plan = await plan_frontier(Flat(), (0, 100, 0), GoalNear(40, 100, 0),
+                               max_expansions=5, batch_size=2)
+    assert plan.status == "budget_exhausted" and plan.expanded == 5
+    assert not plan.path and plan.frontier is None and not plan.progressed
+    assert plan.stand_queries < 100
+    for kwargs in ({"max_expansions": 0}, {"max_expansions": 100001},
+                   {"batch_size": 0}, {"batch_size": 1025}):
+        with pytest.raises(ValueError):
+            await plan_frontier(Flat(), (0, 100, 0), GoalNear(3, 100, 0), **kwargs)
+    with pytest.raises(NavigationError, match="non-flat"):
+        await plan_frontier(Flat(), (0, 100, 0), GoalNear(3, 101, 0))
+
+
+@pytest.mark.asyncio
+async def test_cancellation_callback_and_cooperative_yield():
+    calls = 0
+
+    def cancel():
+        nonlocal calls
+        calls += 1
+        return calls >= 6
+
+    with pytest.raises(asyncio.CancelledError):
+        await plan_frontier(Flat(), (0, 100, 0), GoalNear(30, 100, 0),
+                            batch_size=1, cancelled=cancel)
+    observed = []
+
+    async def observer():
+        await asyncio.sleep(0)
+        observed.append(True)
+
+    watch = asyncio.create_task(observer())
+    plan = await plan_frontier(Flat(), (0, 100, 0), GoalNear(30, 100, 0),
+                               batch_size=1, max_expansions=64)
+    await watch
+    assert observed and plan.status == "complete"
+
+
+@pytest.mark.asyncio
+async def test_revalidation_detects_stale_complete_path():
+    class Flip(Flat):
+        def can_stand(self, x, y, z):
+            result = super().can_stand(x, y, z)
+            if (x, y, z) == (0, 100, 0) and self.calls[x, y, z] >= 2:
+                return False
+            return result
+
+    plan = await plan_frontier(Flip(), (0, 100, 0), GoalNear(1, 100, 0))
+    assert plan.status == "need_world" and not plan.path
+
+
+@pytest.mark.asyncio
+async def test_revalidation_detects_stale_frontier_and_diagonal_guard():
+    class FlipFrontier(Flat):
+        def can_stand(self, x, y, z):
+            result = super().can_stand(x, y, z)
+            if (x, y, z) == (0, 100, 0) and self.calls[x, y, z] >= 2:
+                return None
+            return result
+
+    plan = await plan_frontier(FlipFrontier(known={(0, 0)}), (0, 100, 0), GoalNear(3, 100, 3))
+    assert plan.status == "need_world" and not plan.path
+
+    class FlipGuard(Flat):
+        def can_stand(self, x, y, z):
+            result = super().can_stand(x, y, z)
+            if (x, y, z) == (1, 100, 0) and self.calls[x, y, z] >= 2:
+                return False
+            return result
+
+    plan = await plan_frontier(FlipGuard(), (0, 100, 0), GoalNear(1, 100, 1))
+    assert plan.status == "need_world" and not plan.path
+
+
+@pytest.mark.asyncio
+async def test_concurrent_observed_world_mutation_or_clear_is_safe():
+    for clear in (False, True):
+        world = Flat(known=rectangle(-2, 12, -2, 2))
+
+        async def mutate():
+            await asyncio.sleep(0)
+            if clear:
+                world.known.clear()
+            else:
+                world.blocked.add((2, 0))
+
+        task = asyncio.create_task(mutate())
+        plan = await plan_frontier(world, (0, 100, 0), GoalNear(10, 100, 0), batch_size=1)
+        await task
+        if plan.status in ("frontier", "complete"):
+            check_route(world, plan, (0, 100, 0))
+        if clear:
+            assert plan.status not in ("complete", "frontier")
+        next_plan = await plan_frontier(world, (0, 100, 0), GoalNear(10, 100, 0))
+        if clear:
+            assert next_plan.status == "need_world"
+
+
+@pytest.mark.asyncio
+async def test_large_observed_graph_is_bounded():
+    world = Flat(known=rectangle(-100, 100, -100, 100))
+    plan = await plan_frontier(world, (0, 100, 0), GoalNear(300, 100, 0),
+                               max_expansions=512, batch_size=8)
+    assert plan.status == "frontier" and plan.search_truncated is True
+    assert plan.expanded == 512 and plan.stand_queries < 10000
+    check_route(world, plan, (0, 100, 0))
+
+
+@pytest.mark.asyncio
+async def test_budget_truncation_keeps_already_expanded_safe_frontier():
+    # The old implementation discarded this candidate as budget_exhausted.
+    world = Flat(known=rectangle(0, 30, 0, 30))
+    start = (0, 100, 0)
+    goal = GoalNear(100, 100, 100)
+    plan = await plan_frontier(world, start, goal, max_expansions=16, batch_size=3)
+    assert plan.status == "frontier" and plan.search_truncated is True
+    assert plan.expanded == 16 and plan.frontier == plan.path[-1]
+    assert plan.frontier != (goal.x, goal.feet_y, goal.z)
+    check_route(world, plan, start)
+    assert any(world.can_stand(plan.frontier[0] + dx, 100, plan.frontier[2] + dz)
+               is None for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)))
+
+
+@pytest.mark.asyncio
+async def test_budget_without_expanded_frontier_has_no_executable_route():
+    plan = await plan_frontier(Flat(), (0, 100, 0), GoalNear(40, 100, 0),
+                               max_expansions=16, batch_size=4)
+    assert plan.status == "budget_exhausted" and plan.search_truncated is True
+    assert plan.expanded == 16 and plan.path == () and plan.frontier is None
+    assert math.isinf(plan.cost) and plan.progressed is False
+
+
+@pytest.mark.asyncio
+async def test_confirmed_goal_overrides_earlier_frontier():
+    world = Flat(known=rectangle(0, 4, 0, 1))
+    goal = GoalNear(3, 100, 0)
+    plan = await plan_frontier(world, (0, 100, 0), goal, max_expansions=16)
+    assert plan.status == "complete" and plan.search_truncated is False
+    assert plan.frontier is None and plan.path[-1] == (3, 100, 0)
+    check_route(world, plan, (0, 100, 0))
+
+
+@pytest.mark.asyncio
+async def test_exhaustive_frontier_and_exact_budget_exhaustion_are_not_truncated():
+    start = (0, 100, 0)
+    world = Flat(known=rectangle(0, 2, -1, 1))
+    result = await plan_frontier(world, start, GoalNear(10, 100, 0),
+                                 max_expansions=100)
+    assert result.status == "frontier" and result.search_truncated is False
+    assert result.frontier == (2, 100, 0)
+    check_route(world, result, start)
+
+    single = await plan_frontier(Flat(known={(0, 0)}), start,
+                                 GoalNear(10, 100, 0), max_expansions=1)
+    assert single.expanded == 1 and single.status == "frontier"
+    assert single.search_truncated is False and single.path == (start,)
+
+    # A goal already in OPEN may be popped without a second node expansion.
+    last_goal = await plan_frontier(Flat(known={(0, 0), (1, 0)}), start,
+                                    GoalNear(1, 100, 0), max_expansions=1)
+    assert last_goal.status == "complete" and last_goal.expanded == 1
+    assert last_goal.search_truncated is False
+
+
+@pytest.mark.asyncio
+async def test_known_full_goal_beyond_budget_does_not_preempt_partial_frontier():
+    world = Flat(known={(x, 0) for x in range(50)})
+    plan = await plan_frontier(world, (0, 100, 0), GoalNear(49, 100, 0),
+                               max_expansions=4, batch_size=2)
+    assert plan.status == "frontier" and plan.search_truncated is True
+    assert plan.expanded == 4 and plan.frontier[0] < 49
+    check_route(world, plan, (0, 100, 0))
+
+
+@pytest.mark.asyncio
+async def test_partial_frontier_repeated_runs_are_stable():
+    start = (0, 100, 0)
+    cells = list(rectangle(0, 30, 0, 30))
+    records = set()
+    for ordered in (cells, list(reversed(cells)), sorted(cells)):
+        for _ in range(3):
+            plan = await plan_frontier(
+                Flat(known=ordered), start, GoalNear(100, 100, 100),
+                max_expansions=16, batch_size=2)
+            records.add((plan.status, plan.frontier, plan.path, plan.cost,
+                         plan.expanded, plan.search_truncated))
+    assert len(records) == 1
+
+
+@pytest.mark.asyncio
+async def test_start_frontier_zero_progress_on_complete_and_truncated_search():
+    # All other cells lie farther from the goal than the start.
+    known = {(x, 0) for x in range(20)}
+    start = (0, 100, 0)
+    for budget, truncated in ((3, True), (30, False)):
+        plan = await plan_frontier(Flat(known=known), start,
+                                   GoalNear(-100, 100, 0),
+                                   max_expansions=budget, batch_size=1)
+        assert plan.status == "frontier" and plan.search_truncated is truncated
+        assert plan.frontier == start and plan.path == (start,)
+        assert plan.cost == 0 and plan.progressed is False
+
+
+@pytest.mark.asyncio
+async def test_cancellation_preempts_budget_frontier_and_selection():
+    world = Flat(known={(x, 0) for x in range(15)})
+    for threshold in (2, 6, 9):
+        calls = 0
+
+        def cancelled():
+            nonlocal calls
+            calls += 1
+            return calls >= threshold
+
+        with pytest.raises(asyncio.CancelledError):
+            await plan_frontier(world, (0, 100, 0), GoalNear(100, 100, 0),
+                                max_expansions=3, batch_size=1,
+                                cancelled=cancelled)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_final_frontier_validation_propagates():
+    world = Flat(known={(0, 0)})
+
+    def cancelled():
+        return world.calls[0, 100, 0] >= 2
+
+    with pytest.raises(asyncio.CancelledError):
+        await plan_frontier(world, (0, 100, 0), GoalNear(10, 100, 0),
+                            max_expansions=1, cancelled=cancelled)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("changed_cell", "replacement", "goal", "budget", "unknown"),
+    [
+        ((1, 0), False, (40, 0), 4, {(4, 0)}),  # Intermediate path cell.
+        ((3, 0), False, (40, 0), 4, {(4, 0)}),  # Frontier endpoint.
+        ((4, 0), True, (40, 0), 4, {(4, 0)}),   # Sole unknown neighbor.
+        ((1, 0), False, (40, 40), 2, {(2, 1)}),  # Diagonal side guard.
+    ],
+)
+async def test_partial_frontier_fresh_validation_rejects_mutations(
+        changed_cell, replacement, goal, budget, unknown):
+    class Changing(Flat):
+        def can_stand(self, x, y, z):
+            observed = super().can_stand(x, y, z)
+            if (x, z) == changed_cell and self.calls[x, y, z] >= 2:
+                return replacement
+            return observed
+
+    world = Changing(unknown=unknown)
+    plan = await plan_frontier(world, (0, 100, 0),
+                               GoalNear(goal[0], 100, goal[1]),
+                               max_expansions=budget, batch_size=1)
+    assert plan.status == "need_world" and plan.search_truncated is False
+    assert plan.path == () and plan.frontier is None
