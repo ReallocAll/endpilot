@@ -131,6 +131,29 @@ jobs:
             -C host-profile=delivery -C build-profile=delivery -C "build-dir=$RUNNER_TEMP/protocol-native-build"
       - name: Build SDK distributions
         run: python -m build "$GITHUB_WORKSPACE" --outdir "$RUNNER_TEMP/sdk-dist"
+      - name: Verify SDK source distribution includes public guides
+        run: |
+          python - <<'PY'
+          import glob
+          import os
+          import tarfile
+          from pathlib import PurePosixPath
+
+          archives = glob.glob(f"{os.environ['RUNNER_TEMP']}/sdk-dist/*.tar.gz")
+          if len(archives) != 1:
+              raise SystemExit(f"expected one SDK source distribution, got {archives!r}")
+          with tarfile.open(archives[0], "r:gz") as package:
+              members = {
+                  PurePosixPath(member.name).parts[1:]
+                  for member in package.getmembers()
+                  if member.isfile()
+              }
+          expected = {("docs", "api.md"), ("docs", "navigation.md"), ("README.md",)}
+          missing = expected - members
+          if missing:
+              raise SystemExit(f"missing public guides from SDK sdist: {sorted(missing)!r}")
+          print("SDK sdist public documentation verified")
+          PY
       - name: Build benchmark consumer distributions
         run: |
           bench="$GITHUB_WORKSPACE/dependency/bedrock-bench"
