@@ -82,6 +82,15 @@ unsupported encodings, phase errors and full queues raise to the caller without
 failing an otherwise healthy session. Actual asynchronous encoding, transport
 or session failures still close the session.
 
+For a packet ID *unknown to the selected protocol schema*, the same API also
+accepts `bedrock_protocol.UnknownPacket(packet_id=id, body=raw_body)`: this
+supplies an opaque packet **body**, not raw encrypted or compressed transport
+bytes. It follows normal ordered framing, compression, encryption and queue
+limits. IDs already defined by the protocol must use their typed packet class;
+the native codec rejects raw bodies for known IDs. Servers may reject unknown
+packet IDs, so application code remains responsible for compatibility and
+session outcomes. This is not a wire-injection API.
+
 Use the packet namespace matching `BotOptions.protocol`. This low-level API
 does not update high-level movement, inventory, transaction or probe tracking;
 callers must handle the protocol response and state consequences themselves.

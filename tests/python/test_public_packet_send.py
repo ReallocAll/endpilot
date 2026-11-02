@@ -1,3 +1,4 @@
+import bedrock_protocol as bp
 import pytest
 from peer import Peers, until
 
@@ -51,3 +52,26 @@ async def test_external_packet_requires_ready_phase(monkeypatch):
         with pytest.raises(RuntimeError, match="not ready"):
             bot.send_packet(bot._session.p.NetworkStackLatencyPacket(create_time=45, from_server=False))
         assert bot.get_status().state == api.BotState.negotiating
+
+
+@pytest.mark.parametrize("version", [1001, 2193])
+async def test_unknown_packet_uses_typed_send_queue_without_a_new_raw_transmitter(monkeypatch, version):
+    peers = Peers(monkeypatch)
+    async with api.Runtime() as runtime:
+        bot = runtime.add_bot(api.BotOptions(server_url="http://peer", protocol=version))
+        await bot.wait_ready(2)
+        peer = peers.connections[-1]
+        known = set(peer.codec.supported_packet_ids)
+        unknown_id = next(value for value in range(1023, 0, -1) if value not in known)
+        body = b"\x00\xfe\x81\x00"
+        peer.pause_sender(bot)
+        bot.send_packet(bp.UnknownPacket(packet_id=unknown_id, body=body))
+        with pytest.raises(bp.EncodeError, match="known_packet_requires_typed_value"):
+            bot.send_packet(bp.UnknownPacket(packet_id=115, body=body))
+        assert bot.get_status().state == api.BotState.ready
+        peer.resume_sender()
+        await until(lambda: any(packet.packet_id == unknown_id for packet in peer.received))
+        packet = next(packet for packet in peer.received if packet.packet_id == unknown_id)
+        assert isinstance(packet, bp.UnknownPacket)
+        assert packet.body.to_bytes() == body
+        assert bot.get_status().state == api.BotState.ready
