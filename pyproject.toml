@@ -10,7 +10,7 @@ requires-python = ">=3.12"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = [
-    "bedrock-protocol-native==0.5.0.dev0",
+    "bedrock-protocol-native==0.5.0",
     "nethernet[http] @ git+https://github.com/ReallocAll/nethernet-python.git@1fd9b9907e602c3b906ad45abe856ea8e9358861",
     "aiortc==1.15.0",
     "aioice==0.10.2",

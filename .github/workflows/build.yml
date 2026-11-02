@@ -40,7 +40,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           repository: ReallocAll/bedrock-protocol
-          ref: main
+          ref: fd02124c184dec9788b183b3d369e229b7ee0fd1
           path: dependency/bedrock-protocol
           persist-credentials: false
       - uses: actions/checkout@v7.0.1
