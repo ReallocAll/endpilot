@@ -1,7 +1,7 @@
 import bedrock_protocol as bp
 import pytest
 from peer import empty_item
-from trade_peer import deliver, requests, response_packet, scene, sent, slot_events, stack
+from trade_peer import deliver, inventory_packet, requests, response_packet, scene, sent, slot_events, slot_packet, stack
 
 import endpilot as api
 
@@ -58,3 +58,25 @@ async def test_last_negative_odd_request_id_is_admitted_once(monkeypatch, versio
         with pytest.raises(RuntimeError, match="IDs exhausted"):
             bot.begin_move_item(bot.player_slot(9), bot.player_slot(0), 1)
         assert len(requests(peer)) == 1
+
+
+@pytest.mark.parametrize("version", [1001, 2193])
+async def test_slot_event_precedes_inventory_event_and_keeps_earlier_snapshots(monkeypatch, version):
+    async with scene(monkeypatch, version) as (bot, peer, events):
+        before = bot.capture_inventory(0)
+        events.clear()
+        await deliver(bot, peer, slot_packet(peer.p, 9, stack(peer.p, count=7)))
+        updates = [event for event in events if isinstance(event, (api.InventorySlotEvent, api.InventoryEvent))]
+        assert [type(event) for event in updates] == [api.InventorySlotEvent, api.InventoryEvent]
+        assert updates[0].item.stack_size == updates[1].inventory.slots[9].stack_size == 7
+        assert before.slots[9].stack_size == 10
+        after_slot = updates[1].inventory
+        assert after_slot.complete and after_slot.full_container_name is not None
+
+        events.clear()
+        await deliver(bot, peer, inventory_packet(peer.p, {9: stack(peer.p, count=5)}))
+        full_updates = [event for event in events if isinstance(event, (api.InventorySlotEvent, api.InventoryEvent))]
+        assert [type(event) for event in full_updates] == [api.InventoryEvent]
+        assert full_updates[0].inventory.slots[9].stack_size == 5
+        assert after_slot.slots[9].stack_size == 7
+        assert before.slots[9].stack_size == 10

@@ -301,6 +301,61 @@ def trade(s, ref, destination):
     return operation
 
 
+def _owned(value):
+    return None if value is None else value.copy()
+
+
+def apply_content(s, packet):
+    inventory_id = int(packet.inventory_id)
+    if packet.packet_id == 49:
+        inventory = InventorySnapshot(
+            {i: item.copy() for i, item in enumerate(packet.slots)},
+            True,
+            _owned(packet.full_container_name),
+            _owned(packet.storage_item),
+        )
+    else:
+        previous = s.inventories.get(inventory_id)
+        if previous is None:
+            previous = InventorySnapshot({})
+        slots = dict(previous.slots)
+        slots[packet.slot] = packet.item.copy()
+        inventory = InventorySnapshot(
+            slots,
+            previous.complete,
+            _owned(packet.full_container_name)
+            if packet.full_container_name is not None
+            else previous.full_container_name,
+            _owned(packet.storage_item) if packet.storage_item is not None else previous.storage_item,
+        )
+    s.inventories[inventory_id] = inventory
+    s.note_item_update(inventory_id, None if packet.packet_id == 49 else packet.slot)
+    return inventory_id, inventory
+
+
+def apply_transaction(s, packet):
+    if packet.transaction.index != 0:
+        return ()
+    changed = []
+    for action in packet.transaction.value.transaction.actions:
+        if (
+            action.source.type != s.p.InventorySourceType.CONTAINER_INVENTORY
+            or action.source.container_id is None
+        ):
+            continue
+        inventory_id = int(action.source.container_id)
+        previous = s.inventories.get(inventory_id)
+        if previous is None:
+            previous = InventorySnapshot({})
+        slots = dict(previous.slots)
+        slots[action.slot] = action.to_item_descriptor.copy()
+        s.inventories[inventory_id] = replace(previous, slots=slots)
+        s.note_item_update(inventory_id, action.slot)
+        if inventory_id not in changed:
+            changed.append(inventory_id)
+    return tuple(changed)
+
+
 def known(s, physical):
     inventory = s.inventories.get(physical[0])
     return None if inventory is None else inventory.slots.get(physical[1])
