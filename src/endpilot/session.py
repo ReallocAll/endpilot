@@ -108,10 +108,6 @@ def finite(*values):
     return True
 
 
-def owned(value):
-    return None if value is None else value.copy()
-
-
 @dataclass(slots=True)
 class _Command:
     token: bp.EncodedPacket
@@ -815,30 +811,7 @@ class Session:
                 self.actors[packet.id] = actor
                 self.emit(ev.EventKind.actor, lambda: ev.ActorEvent(ev.ActorEvent.Kind.metadata, actor))
         elif id in (49, 50):
-            inventory_id = int(packet.inventory_id)
-            if id == 49:
-                inventory = InventorySnapshot(
-                    {i: item.copy() for i, item in enumerate(packet.slots)},
-                    True,
-                    owned(packet.full_container_name),
-                    owned(packet.storage_item),
-                )
-            else:
-                previous = self.inventories.get(inventory_id)
-                if previous is None:
-                    previous = InventorySnapshot({})
-                slots = dict(previous.slots)
-                slots[packet.slot] = packet.item.copy()
-                inventory = InventorySnapshot(
-                    slots,
-                    previous.complete,
-                    owned(packet.full_container_name)
-                    if packet.full_container_name is not None
-                    else previous.full_container_name,
-                    owned(packet.storage_item) if packet.storage_item is not None else previous.storage_item,
-                )
-            self.inventories[inventory_id] = inventory
-            self.note_item_update(inventory_id, None if id == 49 else packet.slot)
+            inventory_id, inventory = _inventory.apply_content(self, packet)
             if id == 50:
                 self.emit(
                     ev.EventKind.inventory_slot,
@@ -846,26 +819,7 @@ class Session:
                 )
             self.emit(ev.EventKind.inventory, lambda: ev.InventoryEvent(inventory_id, inventory))
         elif id == 30:
-            if packet.transaction.index != 0:
-                return
-            changed = []
-            for action in packet.transaction.value.transaction.actions:
-                if (
-                    action.source.type != p.InventorySourceType.CONTAINER_INVENTORY
-                    or action.source.container_id is None
-                ):
-                    continue
-                inventory_id = int(action.source.container_id)
-                previous = self.inventories.get(inventory_id)
-                if previous is None:
-                    previous = InventorySnapshot({})
-                slots = dict(previous.slots)
-                slots[action.slot] = action.to_item_descriptor.copy()
-                self.inventories[inventory_id] = replace(previous, slots=slots)
-                self.note_item_update(inventory_id, action.slot)
-                if inventory_id not in changed:
-                    changed.append(inventory_id)
-            for inventory_id in changed:
+            for inventory_id in _inventory.apply_transaction(self, packet):
                 self.emit(
                     ev.EventKind.inventory, lambda: ev.InventoryEvent(inventory_id, self.inventories[inventory_id])
                 )
@@ -880,20 +834,7 @@ class Session:
                 self.invalidate_operation("container closed")
                 self.emit(ev.EventKind.container, lambda: ev.ContainerEvent(None, ref, True))
         elif id == 148:
-            operation = self.pending
-            if operation is not None and operation.phase == ItemOperationPhase.submitted:
-                for response in packet.responses:
-                    if self.pending is operation and response.client_request_id.raw_id == operation.key.request_id:
-                        outcome, reason = ItemRequestOutcome.rejected, "server rejected item request"
-                        if int(response.result) == 0:
-                            try:
-                                _inventory.reconcile(self, response)
-                                outcome, reason = ItemRequestOutcome.completed, ""
-                            except RuntimeError as error:
-                                outcome, reason = ItemRequestOutcome.indeterminate, str(error)
-                        self.finish_operation(outcome, reason, response.copy())
-                    if not self.usable():
-                        return
+            self._handle_item_responses(packet)
         elif id == 27:
             actor = self.actors.get(packet.runtime_id)
             if actor:
@@ -1213,6 +1154,22 @@ class Session:
 
     def get_trade_offers(self, window):
         return _inventory.offers(self, window)
+
+    def _handle_item_responses(self, packet):
+        operation = self.pending
+        if operation is not None and operation.phase == ItemOperationPhase.submitted:
+            for response in packet.responses:
+                if self.pending is operation and response.client_request_id.raw_id == operation.key.request_id:
+                    outcome, reason = ItemRequestOutcome.rejected, "server rejected item request"
+                    if int(response.result) == 0:
+                        try:
+                            _inventory.reconcile(self, response)
+                            outcome, reason = ItemRequestOutcome.completed, ""
+                        except RuntimeError as error:
+                            outcome, reason = ItemRequestOutcome.indeterminate, str(error)
+                    self.finish_operation(outcome, reason, response.copy())
+                if not self.usable():
+                    return
 
     def finish_operation(self, outcome, reason, response=None):
         operation = self.pending
