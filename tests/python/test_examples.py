@@ -127,3 +127,75 @@ async def test_cycle_callable_validates_before_touching_bot():
         await cycle.villager_cycle(None, None, trader_unique_id=1, attack_target_unique_id=1)
     with pytest.raises(ValueError, match="positive"):
         await cycle.villager_cycle(None, None, trader_unique_id=1, attack_target_unique_id=2, restock_timeout=-1)
+
+
+async def test_behavior_example_combines_and_stops_independent_intents(monkeypatch):
+    """Exercise the example against the existing decoded-packet peer, not a second harness."""
+    from types import SimpleNamespace
+
+    from peer import Peers
+
+    example = load_example("behavior_composition")
+    peers = Peers(monkeypatch)
+    navigation, avoidance, posture = example.Navigation(), example.ActorAvoidance(), example.Posture()
+    async with api.Runtime() as runtime:
+        bot = runtime.add_bot(api.BotOptions(server_url="http://peer", protocol=2193))
+        unsubscribe = example.subscribe_behaviors(runtime, bot, navigation, avoidance, posture)
+        try:
+            await bot.wait_ready(2)
+            peer = peers.connections[-1]
+            flags = peer.p.PlayerAuthInputPacket.InputData
+
+            def frames():
+                return [packet for packet in peer.received if packet.packet_id == 144]
+
+            def has(packet, name):
+                return getattr(flags, name) in packet.input_data
+
+            navigation.start()
+            avoidance.start()
+            posture.start("sprint")
+            start = len(frames())
+            await until(lambda: any(p.move.y == 1 and has(p, "SPRINTING") for p in frames()[start:]))
+
+            # Nearby actors suppress forward/sprint but preserve the independent jump intent.
+            monkeypatch.setattr(
+                bot, "get_observed_entities",
+                lambda: [SimpleNamespace(position=bot.get_status().position)],
+            )
+            start = len(frames())
+            await until(lambda: any(
+                p.move.y == 0 and has(p, "JUMPING") and not has(p, "SPRINTING")
+                for p in frames()[start:]
+            ))
+
+            posture.start("sneak")
+            avoidance.stop()
+            start = len(frames())
+            await until(lambda: any(
+                p.move.y == 1 and has(p, "SNEAKING") and has(p, "START_SNEAKING")
+                and has(p, "SNEAK_DOWN") and not has(p, "SPRINTING")
+                for p in frames()[start:]
+            ))
+
+            navigation.stop()
+            posture.stop()
+            start = len(frames())
+            await until(lambda: any(
+                p.move.y == 0 and not has(p, "JUMPING")
+                and not has(p, "SPRINTING") and not has(p, "SNEAKING")
+                and has(p, "STOP_SNEAKING") and has(p, "SNEAK_RELEASED_RAW")
+                for p in frames()[start:]
+            ))
+
+            navigation.start()
+            posture.start("sprint")
+            await bot.reconnect()
+            await bot.wait_ready(2)
+            assert not navigation.enabled and not avoidance.enabled and posture.mode is None
+            assert peers.connections[-1] is not peer and peer.closed
+        finally:
+            navigation.stop()
+            avoidance.stop()
+            posture.stop()
+            unsubscribe()

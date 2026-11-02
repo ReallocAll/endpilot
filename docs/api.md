@@ -139,6 +139,30 @@ Early health events may therefore accompany `StartGame`. Remote actor events
 still arrive normally; packet observations and counts are not replayed. Overflow
 ends the session.
 
+## Composing independent behaviors
+
+The existing `Runtime.subscribe()` API supports third-party behavior observers and
+an unsubscribe function. Keep behavior activation and cancellation under application
+ownership; only a single synchronous `TickEvent` callback should call
+`bot.set_input()`. Each behavior contributes an intent, and that callback submits
+one **complete** `Input` frame before the Session-owned tick sender runs. Separate
+calls to `set_input()` replace rather than merge frames. A persistent `set_look()`
+override must be cleared when its owner stops.
+
+See [the runnable three-behavior example](../examples/behavior_composition.py):
+forward intent, a nearby-actor pause/jump heuristic, and independent Sneak/Sprint
+selection. It uses existing `StateEvent` and `wait_ready()` to reset intent when
+the Session closes and only reactivates after a new Ready. Stopping an individual
+behavior affects the next composed tick; it does not retract an already-queued
+packet. Event callbacks are synchronous; applications running asynchronous
+behavior tasks must cancel and await those tasks before releasing their Runtime.
+Unsubscribe observers and release other application-owned resources in `finally`.
+
+The example is intentionally **not** a pathfinder, block collision detector, or
+client physics predictor: submitting the observed position with directional flags
+does not prove physical movement or server acceptance. Validate movement and
+Sneak/Sprint state against a real BDS before depending on game-world effects.
+
 ## Events and decode errors
 
 `runtime.subscribe(callback, events=mask)` registers independent synchronous
@@ -251,7 +275,7 @@ configured connection timeout.
 
 ## Examples
 
-[RakNet connection](../examples/raknet_connect.py) waits for readiness and prints
+[Behavior composition](../examples/behavior_composition.py) demonstrates a single input writer with independent start/stop controls. [RakNet connection](../examples/raknet_connect.py) waits for readiness and prints
 the player's position. [First trade](../examples/first_trade.py) demonstrates
 observed inventory, a single exchange and returning residual input. [Villager cycle](../examples/villager_cycle.py)
 adds exhaustion, natural restock, another trade, an attack and reconnect. They
