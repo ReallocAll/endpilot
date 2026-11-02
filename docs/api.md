@@ -27,7 +27,9 @@ Player slots are `bot.player_slot(0..35)`; trade inputs are
 `bot.trade_input(window, 0..1)`. `get_item()` distinguishes an unknown slot, a known
 empty slot and an occupied item with an unresolved registry identity. Missing
 counts and stack IDs remain `None`. Complete inventory totals require all 36
-player slots and unambiguous item identities.
+player slots and unambiguous item identities. Trade recipe item names are
+resolved through the observed server Item Registry rather than a built-in
+item-name allowlist; unique non-component-based identifiers remain required.
 
 `get_trade_offers(window)` returns `None` until trade data arrives, an empty
 collection for an empty Recipes list, and rows with reasons for unsupported or

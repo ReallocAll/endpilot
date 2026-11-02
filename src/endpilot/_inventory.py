@@ -159,8 +159,6 @@ def trade_item(value, registry, output):
     name = tag(value, "Name", bp.NbtType.STRING).value
     count = tag(value, "Count", bp.NbtType.BYTE).value
     damage = tag(value, "Damage", bp.NbtType.SHORT).value
-    if name not in ("minecraft:wheat", "minecraft:emerald") and (output or name != "minecraft:potato"):
-        raise RuntimeError("unsupported trade item name")
     if not 1 <= count <= 64 or damage not in ((0,) if output else (0, 32767)):
         raise RuntimeError("unsupported trade item Count or Damage")
     if "WasPickedUp" in value and tag(value, "WasPickedUp", bp.NbtType.BYTE).value != 0:

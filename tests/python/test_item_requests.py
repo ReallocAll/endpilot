@@ -407,8 +407,20 @@ async def test_trade_offers_none_empty_malformed_unsupported_and_duplicate_are_d
         assert (offer.input.identifier, offer.input.network_id, offer.input.count) == ("minecraft:wheat", 43, 3)
         assert (offer.output.identifier, offer.output.network_id, offer.output.count) == ("minecraft:emerald", 42, 1)
         assert (offer.uses, offer.max_uses, offer.tier, offer.second_input) == (1, 8, 0, None)
+        # The registry, not a narrow hard-coded whitelist, determines support.
+        potato = compound({
+            "Name": tag("STRING", "minecraft:potato"),
+            "Count": tag("BYTE", 1),
+            "Damage": tag("SHORT", 0),
+        })
+        await deliver(bot, peer, trade_packet(peer.p, [recipe(sell=potato)]))
+        observed = bot.get_trade_offers(window).offers[0]
+        assert observed.supported and observed.ref is not None
+        assert (observed.output.identifier, observed.output.network_id, observed.output.count) == (
+            "minecraft:potato", 44, 1,
+        )
         await deliver(bot, peer, open_packet(peer.p))
-        assert bot.get_trade_window().offer_revision == 4 and bot.get_trade_window().ref == window
+        assert bot.get_trade_window().offer_revision == 5 and bot.get_trade_window().ref == window
         await deliver(bot, peer, close_packet(peer.p))
         assert bot.get_trade_window() is None
         with pytest.raises((ValueError, RuntimeError)):
