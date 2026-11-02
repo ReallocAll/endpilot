@@ -60,6 +60,104 @@ def _distance(a: Cell, b: GoalNear) -> float:
     return max(0.0, max(dx, dz) + (_ROOT2 - 1.0) * min(dx, dz) - b.radius * _ROOT2)
 
 
+
+def _validate_search(start: Cell, goal: GoalNear, max_expansions: int, batch_size: int) -> None:
+    if len(start) != 3 or any(type(v) is not int for v in start):
+        raise ValueError("start must be a three-integer cell")
+    if not 1 <= max_expansions <= 100000 or not 1 <= batch_size <= 1024:
+        raise ValueError("invalid search budget")
+    if start[1] != goal.feet_y:
+        raise NavigationError("non-flat goal")
+
+
+class _AStarSearch:
+    """Search-local cache, stable heap and expansion rules shared by both planners."""
+
+    def __init__(self, world, start: Cell, goal: GoalNear,
+                 cancelled: Callable[[], bool] | None) -> None:
+        self.world = world
+        self.start = start
+        self.goal = goal
+        self.cancelled = cancelled
+        self.cache: dict[Cell, bool | None] = {}
+        self.queries = 0
+        self.unknown = False
+        self.expanded = 0
+        self.peak = 0
+        self.max_batch = 0.0
+        self.best: dict[Cell, float] = {start: 0.0}
+        self.parents: dict[Cell, Cell] = {}
+        self._batch_start = 0.0
+
+    def check_cancelled(self) -> None:
+        if self.cancelled is not None and self.cancelled():
+            raise asyncio.CancelledError
+
+    def stand(self, cell: Cell) -> bool | None:
+        if cell not in self.cache:
+            self.queries += 1
+            self.cache[cell] = self.world.can_stand(*cell)
+        value = self.cache[cell]
+        if value is None:
+            self.unknown = True
+        return value
+
+    def build_path(self, node: Cell) -> tuple[Cell, ...]:
+        path = [node]
+        while path[-1] != self.start:
+            path.append(self.parents[path[-1]])
+        path.reverse()
+        return tuple(path)
+
+    def close_batch(self) -> None:
+        self.max_batch = max(self.max_batch, (perf_counter() - self._batch_start) * 1000)
+
+    async def run(self, max_expansions: int, batch_size: int,
+                  frontier_nodes: set[Cell] | None = None) -> tuple[str, Cell | None]:
+        queue = [(_distance(self.start, self.goal), 0, self.start)]
+        self.peak = 1
+        sequence = 0
+        while queue:
+            self._batch_start = perf_counter()
+            for _ in range(batch_size):
+                self.check_cancelled()
+                if not queue:
+                    break
+                f, _, node = heapq.heappop(queue)
+                g = self.best[node]
+                if f > g + _distance(node, self.goal) + 1e-8:
+                    continue
+                if math.hypot(node[0] - self.goal.x, node[2] - self.goal.z) <= self.goal.radius:
+                    # Caller finishes the same batch after constructing/revalidating the path.
+                    return "complete", node
+                if self.expanded >= max_expansions:
+                    self.close_batch()
+                    return "budget_exhausted", None
+                self.expanded += 1
+                x, y, z = node
+                if frontier_nodes is not None and any(
+                        self.stand((x + dx, y, z + dz)) is None for dx, dz, _ in _OFFSETS[:4]):
+                    frontier_nodes.add(node)
+                for dx, dz, step in _OFFSETS:
+                    neighbor = (x + dx, y, z + dz)
+                    if self.stand(neighbor) is not True:
+                        continue
+                    if dx and dz and (self.stand((x + dx, y, z)) is not True
+                                      or self.stand((x, y, z + dz)) is not True):
+                        continue
+                    candidate = g + step
+                    if candidate >= self.best.get(neighbor, math.inf) - 1e-10:
+                        continue
+                    self.best[neighbor] = candidate
+                    self.parents[neighbor] = node
+                    sequence += 1
+                    heapq.heappush(queue, (candidate + _distance(neighbor, self.goal), sequence, neighbor))
+                    self.peak = max(self.peak, len(queue))
+            self.close_batch()
+            await asyncio.sleep(0)
+        return "unreachable", None
+
+
 async def plan_flat(world, start: Cell, goal: GoalNear, *, max_expansions: int = 4096,
                     batch_size: int = 64, cancelled: Callable[[], bool] | None = None) -> PlanResult:
     """Incremental A* over observed flat full-cube cells only.
@@ -68,84 +166,27 @@ async def plan_flat(world, start: Cell, goal: GoalNear, *, max_expansions: int =
     0.6-block-wide player's swept AABB cannot cut across an occupied corner.
     Unknown support, headroom and block shape never become traversable.
     """
-    if len(start) != 3 or any(type(v) is not int for v in start):
-        raise ValueError("start must be a three-integer cell")
-    if not 1 <= max_expansions <= 100000 or not 1 <= batch_size <= 1024:
-        raise ValueError("invalid search budget")
-    if start[1] != goal.feet_y:
-        raise NavigationError("non-flat goal")
+    _validate_search(start, goal, max_expansions, batch_size)
     t0 = perf_counter()
-    stand_cache: dict[Cell, bool | None] = {}
-    stand_queries = 0
-    unknown = False
-
-    def stand(cell: Cell) -> bool | None:
-        nonlocal stand_queries, unknown
-        if cell not in stand_cache:
-            stand_queries += 1
-            stand_cache[cell] = world.can_stand(*cell)
-        value = stand_cache[cell]
-        if value is None:
-            unknown = True
-        return value
-
-    expanded, peak, max_batch = 0, 0, 0.0
+    search = _AStarSearch(world, start, goal, cancelled)
 
     def result(status: str, path: tuple[Cell, ...] = (), cost: float = math.inf) -> PlanResult:
-        return PlanResult(status, path, cost, expanded, peak, stand_queries,
-                          (perf_counter() - t0) * 1000, max_batch)
+        return PlanResult(status, path, cost, search.expanded, search.peak, search.queries,
+                          (perf_counter() - t0) * 1000, search.max_batch)
 
-    if stand(start) is not True:
-        return result("need_world" if unknown else "unreachable")
-    if goal.radius == 0 and stand((goal.x, goal.feet_y, goal.z)) is not True:
-        return result("need_world" if unknown else "unreachable")
+    if search.stand(start) is not True:
+        return result("need_world" if search.unknown else "unreachable")
+    if goal.radius == 0 and search.stand((goal.x, goal.feet_y, goal.z)) is not True:
+        return result("need_world" if search.unknown else "unreachable")
 
-    best: dict[Cell, float] = {start: 0.0}
-    parents: dict[Cell, Cell] = {}
-    queue = [(_distance(start, goal), 0, start)]
-    peak = 1
-    seq = 0
-    while queue:
-        batch_start = perf_counter()
-        for _ in range(batch_size):
-            if cancelled is not None and cancelled():
-                raise asyncio.CancelledError
-            if not queue:
-                break
-            f, _, node = heapq.heappop(queue)
-            g = best[node]
-            if f > g + _distance(node, goal) + 1e-8:
-                continue
-            if math.hypot(node[0] - goal.x, node[2] - goal.z) <= goal.radius:
-                path = [node]
-                while path[-1] != start:
-                    path.append(parents[path[-1]])
-                path.reverse()
-                max_batch = max(max_batch, (perf_counter() - batch_start) * 1000)
-                return result("complete", tuple(path), g)
-            if expanded >= max_expansions:
-                max_batch = max(max_batch, (perf_counter() - batch_start) * 1000)
-                return result("budget_exhausted")
-            expanded += 1
-            x, y, z = node
-            for dx, dz, step in _OFFSETS:
-                neighbor = (x + dx, y, z + dz)
-                if stand(neighbor) is not True:
-                    continue
-                if dx and dz and (stand((x + dx, y, z)) is not True
-                                  or stand((x, y, z + dz)) is not True):
-                    continue
-                candidate = g + step
-                if candidate >= best.get(neighbor, math.inf) - 1e-10:
-                    continue
-                best[neighbor] = candidate
-                parents[neighbor] = node
-                seq += 1
-                heapq.heappush(queue, (candidate + _distance(neighbor, goal), seq, neighbor))
-                peak = max(peak, len(queue))
-        max_batch = max(max_batch, (perf_counter() - batch_start) * 1000)
-        await asyncio.sleep(0)
-    return result("need_world" if unknown else "unreachable")
+    status, node = await search.run(max_expansions, batch_size)
+    if status == "complete":
+        path = search.build_path(node)
+        search.close_batch()
+        return result("complete", path, search.best[node])
+    if status == "unreachable" and search.unknown:
+        return result("need_world")
+    return result(status)
 
 
 
@@ -169,6 +210,7 @@ class FrontierPlan:
     search_truncated: bool = False
 
 
+
 async def plan_frontier(world, start: Cell, goal: GoalNear, *, max_expansions: int = 4096,
                         batch_size: int = 64, cancelled: Callable[[], bool] | None = None) -> FrontierPlan:
     """Find a known-safe route to the goal, or a reachable known-safe frontier.
@@ -180,60 +222,34 @@ async def plan_frontier(world, start: Cell, goal: GoalNear, *, max_expansions: i
     marked as truncated; that result is not globally optimal exploration.
     No movement or world requests are issued.
     """
-    if len(start) != 3 or any(type(v) is not int for v in start):
-        raise ValueError("start must be a three-integer cell")
-    if not 1 <= max_expansions <= 100000 or not 1 <= batch_size <= 1024:
-        raise ValueError("invalid search budget")
-    if start[1] != goal.feet_y:
-        raise NavigationError("non-flat goal")
+    _validate_search(start, goal, max_expansions, batch_size)
     t0 = perf_counter()
-    stand_cache: dict[Cell, bool | None] = {}
-    queries, expanded, max_batch = 0, 0, 0.0
+    search = _AStarSearch(world, start, goal, cancelled)
     search_truncated = False
-
-    def check_cancelled() -> None:
-        if cancelled is not None and cancelled():
-            raise asyncio.CancelledError
-
-    def stand(cell: Cell) -> bool | None:
-        nonlocal queries
-        if cell not in stand_cache:
-            queries += 1
-            stand_cache[cell] = world.can_stand(*cell)
-        value = stand_cache[cell]
-        return value
 
     def result(status: str, path: tuple[Cell, ...] = (), frontier: Cell | None = None,
                cost: float = math.inf) -> FrontierPlan:
-        return FrontierPlan(status, path, frontier, cost, expanded, queries,
-                            (perf_counter() - t0) * 1000, max_batch,
+        return FrontierPlan(status, path, frontier, cost, search.expanded, search.queries,
+                            (perf_counter() - t0) * 1000, search.max_batch,
                             status == "frontier" and len(path) > 1,
                             search_truncated if status in ("frontier", "budget_exhausted") else False)
 
-    def build_path(node: Cell, parents: dict[Cell, Cell]) -> tuple[Cell, ...]:
-        path = [node]
-        while path[-1] != start:
-            path.append(parents[path[-1]])
-        path.reverse()
-        return tuple(path)
-
     def fresh(x: int, y: int, z: int) -> bool | None:
-        nonlocal queries
-        queries += 1
+        # Intentionally bypass the search-local cache for authoritative revalidation.
+        search.queries += 1
         return world.can_stand(x, y, z)
 
     def fresh_path_safe(path: tuple[Cell, ...], *, is_frontier: bool) -> bool:
-        # Fresh queries deliberately bypass the search-local stand_cache.
-        # There are no awaits between validation and returning the snapshot.
-        check_cancelled()
+        # No awaits between revalidation and returning the planning snapshot.
+        search.check_cancelled()
         if not path or path[0] != start:
             return False
         for cell in path:
-            check_cancelled()
+            search.check_cancelled()
             if fresh(*cell) is not True:
                 return False
         for a, b in zip(path, path[1:]):
-            check_cancelled()
+            search.check_cancelled()
             dx, dz = b[0] - a[0], b[2] - a[2]
             if a[1] != b[1] or max(abs(dx), abs(dz)) != 1:
                 return False
@@ -241,72 +257,33 @@ async def plan_frontier(world, start: Cell, goal: GoalNear, *, max_expansions: i
                               or fresh(a[0], a[1], a[2] + dz) is not True):
                 return False
         if is_frontier:
-            check_cancelled()
+            search.check_cancelled()
             x, y, z = path[-1]
             return any(fresh(x + dx, y, z + dz) is None
                        for dx, dz, _ in _OFFSETS[:4])
         end = path[-1]
         return math.hypot(end[0] - goal.x, end[2] - goal.z) <= goal.radius
 
-    check_cancelled()
-    initial = stand(start)
+    search.check_cancelled()
+    initial = search.stand(start)
     if initial is not True:
         return result("need_world" if initial is None else "unreachable")
     if goal.radius == 0:
-        goal_stand = stand((goal.x, goal.feet_y, goal.z))
+        goal_stand = search.stand((goal.x, goal.feet_y, goal.z))
         if goal_stand is False:
             return result("unreachable")
 
-    best: dict[Cell, float] = {start: 0.0}
-    parents: dict[Cell, Cell] = {}
-    queue = [(_distance(start, goal), 0, start)]
     frontier_nodes: set[Cell] = set()
-    sequence = 0
-    while queue:
-        batch_start = perf_counter()
-        for _ in range(batch_size):
-            check_cancelled()
-            if not queue:
-                break
-            f, _, node = heapq.heappop(queue)
-            g = best[node]
-            if f > g + _distance(node, goal) + 1e-8:
-                continue
-            if math.hypot(node[0] - goal.x, node[2] - goal.z) <= goal.radius:
-                path = build_path(node, parents)
-                valid = fresh_path_safe(path, is_frontier=False)
-                check_cancelled()
-                max_batch = max(max_batch, (perf_counter() - batch_start) * 1000)
-                return result("complete", path, cost=g) if valid else result("need_world")
-            if expanded >= max_expansions:
-                # This valid node still needs expansion. Already expanded
-                # frontiers remain eligible for a safe partial result.
-                search_truncated = True
-                break
-            expanded += 1
-            x, y, z = node
-            if any(stand((x + dx, y, z + dz)) is None for dx, dz, _ in _OFFSETS[:4]):
-                frontier_nodes.add(node)
-            for dx, dz, step in _OFFSETS:
-                neighbor = (x + dx, y, z + dz)
-                if stand(neighbor) is not True:
-                    continue
-                if dx and dz and (stand((x + dx, y, z)) is not True
-                                  or stand((x, y, z + dz)) is not True):
-                    continue
-                candidate = g + step
-                if candidate >= best.get(neighbor, math.inf) - 1e-10:
-                    continue
-                best[neighbor] = candidate
-                parents[neighbor] = node
-                sequence += 1
-                heapq.heappush(queue, (candidate + _distance(neighbor, goal), sequence, neighbor))
-        max_batch = max(max_batch, (perf_counter() - batch_start) * 1000)
-        if search_truncated:
-            break
-        await asyncio.sleep(0)
+    status, node = await search.run(max_expansions, batch_size, frontier_nodes)
+    if status == "complete":
+        path = search.build_path(node)
+        valid = fresh_path_safe(path, is_frontier=False)
+        search.check_cancelled()
+        search.close_batch()
+        return result("complete", path, cost=search.best[node]) if valid else result("need_world")
 
-    check_cancelled()
+    search_truncated = status == "budget_exhausted"
+    search.check_cancelled()
     if frontier_nodes:
         # Select in bounded batches: a large frontier set must not block the
         # Runtime event loop for an unbroken scan.
@@ -315,23 +292,22 @@ async def plan_frontier(world, start: Cell, goal: GoalNear, *, max_expansions: i
         batch_start = perf_counter()
         for index, cell in enumerate(frontier_nodes):
             if index % batch_size == 0:
-                check_cancelled()
+                search.check_cancelled()
                 if index:
-                    max_batch = max(max_batch, (perf_counter() - batch_start) * 1000)
+                    search.max_batch = max(search.max_batch, (perf_counter() - batch_start) * 1000)
                     await asyncio.sleep(0)
                     batch_start = perf_counter()
-            key = (_distance(cell, goal), best[cell], cell)
+            key = (_distance(cell, goal), search.best[cell], cell)
             if chosen_key is None or key < chosen_key:
                 chosen, chosen_key = cell, key
-        check_cancelled()
+        search.check_cancelled()
         node = chosen  # Nonempty frontier_nodes guarantees a selected node.
-        max_batch = max(max_batch, (perf_counter() - batch_start) * 1000)
-        path = build_path(node, parents)
+        search.max_batch = max(search.max_batch, (perf_counter() - batch_start) * 1000)
+        path = search.build_path(node)
         valid = fresh_path_safe(path, is_frontier=True)
-        check_cancelled()
+        search.check_cancelled()
         if valid:
-            return result("frontier", path, node, best[node])
-        # An observed cell or frontier boundary changed while planning.
+            return result("frontier", path, node, search.best[node])
         return result("need_world")
     return result("budget_exhausted" if search_truncated else "unreachable")
 
