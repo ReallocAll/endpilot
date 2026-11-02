@@ -227,6 +227,11 @@ class Bot:
             for a in s.actors.values()
         ]
 
+    def send_packet(self, packet):
+        session = self._current(mutable=True)
+        session.require_ready()
+        session.enqueue(packet, fail_session=False)
+
     def set_input(self, input):
         self._current(mutable=True).set_input(input)
 

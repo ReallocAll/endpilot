@@ -60,6 +60,31 @@ session. Failure or cancellation after submission leaves the outcome indetermina
 Queued hotbar selections survive position corrections and precede subsequent
 interactions. Death, dimension changes and disconnect invalidate queued selections.
 
+## Typed packet sending
+
+`bot.send_packet(packet)` accepts a native typed packet from the configured
+`bedrock_protocol.v1001` or `v2193` namespace after the bot is Ready.
+For example, a third-party extension can submit a packet without accessing
+private Session methods:
+
+```python
+from bedrock_protocol import v2193
+
+bot.send_packet(v2193.NetworkStackLatencyPacket(create_time=42, from_server=False))
+```
+
+The packet is encoded on admission and uses the same bounded, ordered Session
+queue, compression and encryption as built-in operations. Successful return
+means **queued**, not delivered or acknowledged. Invalid packet objects,
+unsupported encodings, phase errors and full queues raise to the caller without
+failing an otherwise healthy session. Actual asynchronous encoding, transport
+or session failures still close the session.
+
+Use the packet namespace matching `BotOptions.protocol`. This low-level API
+does not update high-level movement, inventory, transaction or probe tracking;
+callers must handle the protocol response and state consequences themselves.
+See [a standalone extension example](../examples/typed_packet.py).
+
 ## Movement, spawning and respawn
 
 Player observations retain velocity, rotation and links. Remote player movement

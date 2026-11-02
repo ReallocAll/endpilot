@@ -331,18 +331,20 @@ class Session:
                 self.runtime._background_failure(error)
             raise
 
-    def enqueue(self, packet, *, operation=None, valid=None):
+    def enqueue(self, packet, *, operation=None, valid=None, fail_session=True):
         if not self.usable():
             raise RuntimeError("session is closing")
         try:
             token = self.codec.prepare_packet(packet)
             size = len(token) + 5
         except BaseException as error:
-            self.fail(error)
+            if fail_session:
+                self.fail(error)
             raise
         if self.queue_packets >= transport.COMMAND_PACKETS or size > transport.COMMAND_BYTES - self.queue_bytes:
             error = RuntimeError("outbound queue limit exceeded")
-            self.fail(error)
+            if fail_session:
+                self.fail(error)
             raise error
         self.queue.append(_Command(token, size, self.initialized, operation, valid))
         self.queue_bytes += size
