@@ -282,8 +282,7 @@ class Session:
             self.queue_bytes = self.queue_packets = 0
             self.actors.clear()
             self.unique_ids.clear()
-            self.inventory.inventories.clear()
-            self.inventory.container = self.inventory.window = None
+            self.inventory.discard()
             if self.connection is not None:
                 try:
                     await self.connection.close()
@@ -523,9 +522,7 @@ class Session:
             self.apply_initial_self_state()
             await self.try_ready()
         elif id == 162:
-            self.inventory.registry = packet.items.copy()
-            if not self.inventory.registry_observed:
-                self.inventory.registry_observed = True
+            if self.inventory.observe_registry(packet.items):
                 self.enqueue(p.RequestChunkRadiusPacket(chunk_radius=16, max_chunk_radius=16))
             self.emit(ev.EventKind.item_registry, lambda: ev.ItemRegistryEvent(self.inventory.registry))
         elif id == 70:
@@ -800,7 +797,7 @@ class Session:
         elif id == 30:
             for inventory_id in _inventory.apply_transaction(self.inventory, packet):
                 self.emit(
-                    ev.EventKind.inventory, lambda: ev.InventoryEvent(inventory_id, self.inventory.inventories[inventory_id])
+                    ev.EventKind.inventory, lambda: ev.InventoryEvent(inventory_id, self.inventory.capture_inventory(inventory_id))
                 )
         elif id == 46:
             self.open_container(packet)
@@ -1037,7 +1034,7 @@ class Session:
             self.input_epoch += 1
             self.equipment_epoch += 1
             self.invalidate_container()
-            self.inventory.inventories.clear()
+            self.inventory.clear_inventories()
             self.respawn_phase = 0
             self.stats["deaths"] += 1
             self.invalidate_operation("player died")
@@ -1159,7 +1156,7 @@ class Session:
 
     def held_item(self):
         slot = self.status.selected_hotbar
-        inventory = self.inventory.inventories.get(0)
+        inventory = self.inventory.capture_inventory(0)
         if slot is None or inventory is None or slot not in inventory.slots:
             raise RuntimeError("hotbar item or selection is unknown")
         item = unwrap(inventory.slots[slot])
@@ -1173,7 +1170,7 @@ class Session:
             raise RuntimeError("an item request is pending")
         if type(slot) is not int or not 0 <= slot <= 8:
             raise ValueError("hotbar slot must be in 0..8")
-        inventory = self.inventory.inventories.get(0)
+        inventory = self.inventory.capture_inventory(0)
         item = None if inventory is None else unwrap(inventory.slots.get(slot))
         if not isinstance(item, self.p.SerializedNetworkItemStackDescriptor):
             raise RuntimeError("hotbar item is unknown or descriptor version mismatch")
@@ -1230,7 +1227,7 @@ class Session:
             ),
         )
         if not attack:
-            self.inventory.interacting = entity.unique_id
+            self.inventory.record_interaction(entity.unique_id)
 
     def open_container(self, packet):
         if (
@@ -1283,8 +1280,7 @@ class Session:
             ),
             valid=lambda: self.inventory.window == window,
         )
-        self.inventory.container = replace(self.inventory.container, closing=True)
-        self.inventory.interacting = None
+        self.inventory.mark_container_closing()
         self.invalidate_operation("container closing")
 
     def request_chunk_radius(self, radius):
