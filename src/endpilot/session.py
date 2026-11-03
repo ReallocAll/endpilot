@@ -14,7 +14,6 @@ from . import events as ev
 from ._projection import unwrap
 from .auth import build_login, create_identity, derive_session_key
 from .observations import ActorSnapshot, Statistics
-from .operations import ItemOperationPhase, ItemRequestOutcome
 from .types import (
     BotState,
     BotStatus,
@@ -881,8 +880,7 @@ class Session:
         while self.usable():
             await asyncio.sleep(0.05 if self.next_tick is None else max(0, self.next_tick - self.runtime._loop.time()))
             now = self.runtime._loop.time()
-            if self.inventory.pending is not None and self.inventory.operation_deadline is not None and now >= self.inventory.operation_deadline:
-                self.finish_operation(ItemRequestOutcome.indeterminate, "item request timed out")
+            self._emit_item_result(self.inventory.expire_operation(now))
             if not self.usable():
                 return
             if self.status.state != BotState.ready:
@@ -1110,18 +1108,10 @@ class Session:
         return self.inventory.get_trade_offers(window)
 
     def _handle_item_responses(self, packet):
-        operation = self.inventory.pending
-        if operation is not None and operation.phase == ItemOperationPhase.submitted:
+        operation = self.inventory.submitted_operation()
+        if operation is not None:
             for response in packet.responses:
-                if self.inventory.pending is operation and response.client_request_id.raw_id == operation.key.request_id:
-                    outcome, reason = ItemRequestOutcome.rejected, "server rejected item request"
-                    if int(response.result) == 0:
-                        try:
-                            _inventory.reconcile(self.inventory, response)
-                            outcome, reason = ItemRequestOutcome.completed, ""
-                        except RuntimeError as error:
-                            outcome, reason = ItemRequestOutcome.indeterminate, str(error)
-                    self.finish_operation(outcome, reason, response.copy())
+                self._emit_item_result(self.inventory.apply_response(operation, response))
                 if not self.usable():
                     return
 
@@ -1131,9 +1121,6 @@ class Session:
                 ev.EventKind.item_request,
                 lambda: ev.ItemRequestEvent(result.key, result.outcome, result.response, result.reason),
             )
-
-    def finish_operation(self, outcome, reason, response=None):
-        self._emit_item_result(self.inventory.finish_operation(outcome, reason, response))
 
     def invalidate_operation(self, reason):
         self._emit_item_result(self.inventory.invalidate_operation(reason))

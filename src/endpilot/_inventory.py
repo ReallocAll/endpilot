@@ -631,6 +631,29 @@ class _InventoryState:
         operation._submit()
         self.operation_deadline = self.loop.time() + self.timeout_ms / 1000
 
+    def submitted_operation(self):
+        operation = self.pending
+        return operation if operation is not None and operation.phase == ItemOperationPhase.submitted else None
+
+    def apply_response(self, operation, response):
+        # Keep the originally submitted operation pinned across event callbacks.
+        # A callback-created request cannot be matched by this packet.
+        if self.pending is not operation or response.client_request_id.raw_id != operation.key.request_id:
+            return None
+        outcome, reason = ItemRequestOutcome.rejected, "server rejected item request"
+        if int(response.result) == 0:
+            try:
+                reconcile(self, response)
+                outcome, reason = ItemRequestOutcome.completed, ""
+            except RuntimeError as error:
+                outcome, reason = ItemRequestOutcome.indeterminate, str(error)
+        return self.finish_operation(outcome, reason, response.copy())
+
+    def expire_operation(self, now):
+        if self.pending is None or self.operation_deadline is None or now < self.operation_deadline:
+            return None
+        return self.finish_operation(ItemRequestOutcome.indeterminate, "item request timed out")
+
     def finish_operation(self, outcome, reason, response=None):
         operation = self.pending
         if operation is None:
