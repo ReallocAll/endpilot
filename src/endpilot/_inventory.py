@@ -5,7 +5,14 @@ from types import MappingProxyType
 import bedrock_protocol as bp
 
 from ._projection import unwrap
-from .observations import ContainerSnapshot, InventorySnapshot, ItemRegistrySnapshot, SlotObservation, TradeOffers, _stack_id
+from .observations import (
+    ContainerSnapshot,
+    InventorySnapshot,
+    ItemRegistrySnapshot,
+    SlotObservation,
+    TradeOffers,
+    _stack_id,
+)
 from .operations import ItemCancellation, ItemOperation, ItemOperationPhase, ItemOperationResult, ItemRequestOutcome
 from .types import (
     InventoryArea,
