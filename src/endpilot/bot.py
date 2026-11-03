@@ -5,7 +5,7 @@ from dataclasses import fields, replace
 
 from ._projection import ReadonlyMap
 from .events import validate_mask
-from .observations import ItemRegistrySnapshot, Snapshot, Statistics, TradeOffers
+from .observations import Snapshot, Statistics, TradeOffers
 from .operations import ItemOperation
 from .types import (
     BotOptions,
@@ -199,9 +199,7 @@ class Bot:
         return Snapshot(
             **{f.name: getattr(s.status, f.name) for f in fields(s.status)},
             actors=self.capture_actors(),
-            inventories=s.inventory.inventories,
-            item_registry=s.inventory.registry,
-            container=s.inventory.container,
+            **s.inventory.snapshot_fields(),
         )
 
     def capture_actor(self, runtime_id):
@@ -211,14 +209,13 @@ class Bot:
         return ReadonlyMap(self._current().actors)
 
     def capture_inventory(self, inventory_id):
-        return self._current().inventory.inventories.get(inventory_id)
+        return self._current().inventory.capture_inventory(inventory_id)
 
     def capture_container(self):
-        return self._current().inventory.container
+        return self._current().inventory.capture_container()
 
     def capture_item_registry(self):
-        s = self._current()
-        return ItemRegistrySnapshot(s.inventory.registry_observed, s.inventory.registry)
+        return self._current().inventory.capture_item_registry()
 
     def get_observed_entities(self):
         s = self._current()
