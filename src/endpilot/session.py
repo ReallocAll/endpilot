@@ -9,7 +9,8 @@ from dataclasses import dataclass, fields, replace
 import bedrock_protocol as bp
 from bedrock_protocol.wire import BatchCodec, Compression
 
-from . import _actors, _inventory, transport
+from . import _actors, _inventory, _player_control, transport
+from ._player_control import finite
 from . import events as ev
 from ._projection import unwrap
 from .auth import build_login, create_identity, derive_session_key
@@ -17,9 +18,7 @@ from .observations import ActorSnapshot, Statistics
 from .types import (
     BotState,
     BotStatus,
-    Input,
     ServerDisconnectReason,
-    Vec2,
     Vec3,
 )
 
@@ -81,23 +80,6 @@ def bounded_ints(values, low, high, limit):
 
 def vec(value):
     return Vec3(value.x, value.y, value.z)
-
-
-def finite(*values):
-    for value in values:
-        value_type = type(value)
-        if value_type is Vec3:
-            if not (math.isfinite(value.x) and math.isfinite(value.y) and math.isfinite(value.z)):
-                return False
-        elif value_type is Vec2:
-            if not (math.isfinite(value.x) and math.isfinite(value.y)):
-                return False
-        elif isinstance(value, (Vec3, Vec2)):
-            if not all(math.isfinite(getattr(value, f.name)) for f in fields(value)):
-                return False
-        elif not math.isfinite(value):
-            return False
-    return True
 
 
 @dataclass(slots=True)
@@ -162,11 +144,8 @@ class Session:
         self.inventory = _inventory._InventoryState(
             self.p, self.bot._token, self.id, self.runtime._loop, self.options.item_request_timeout_ms
         )
-        self.input = None
-        self.look = None
-        self.input_epoch = 0
+        self.control = _player_control._PlayerControl(self.p, self.options.protocol)
         self.equipment_epoch = 0
-        self.handled_teleport = False
         self.dimension_deadline = None
         self.loading_screen_id = None
         self.respawn_phase = 0
@@ -201,8 +180,7 @@ class Session:
     def invalidate(self, reason):
         self.active = False
         self.reason = reason
-        self.input = self.look = None
-        self.input_epoch += 1
+        self.control.invalidate(clear_look=True)
         self.equipment_epoch += 1
         self.send_event.set()
         if self.id != self.bot._generation:
@@ -515,8 +493,7 @@ class Session:
                 position=position,
                 dimension=packet.settings.spawn_settings.dimension,
             )
-            self.input = self.look = None
-            self.input_epoch += 1
+            self.control.invalidate(clear_look=True)
             self.start_game = True
             self.apply_initial_self_state()
             await self.try_ready()
@@ -792,8 +769,7 @@ class Session:
             position = vec(packet.pos)
             if not finite(position):
                 raise _MalformedPacket("non-finite dimension position")
-            self.input = self.look = None
-            self.input_epoch += 1
+            self.control.invalidate(clear_look=True)
             self.equipment_epoch += 1
             self.invalidate_container()
             self.actor_state.clear()
@@ -824,7 +800,7 @@ class Session:
                         )
                     )
                 self.action(False)
-                self.handled_teleport = True
+                self.control.acknowledge_teleport()
         elif id == 115:
             if packet.from_server:
                 self.enqueue(p.NetworkStackLatencyPacket(create_time=packet.create_time, from_server=False))
@@ -860,59 +836,10 @@ class Session:
     def tick(self):
         if self.dimension_deadline is not None:
             return
-        frame = self.input or Input(position=self.status.position)
-        self.input = None
-        if self.look is not None:
-            frame = replace(frame, pitch=self.look.x, yaw=self.look.y)
-        p = self.p
-        flags = []
-        for enabled, flag in (
-            (frame.move.y > 0, "UP"),
-            (frame.move.y < 0, "DOWN"),
-            (frame.move.x > 0, "RIGHT"),
-            (frame.move.x < 0, "LEFT"),
-            (frame.vertical_collision, "VERTICAL_COLLISION"),
-            (frame.jumping, "JUMPING"),
-            (frame.sneaking, "SNEAKING"),
-            (frame.sprinting, "SPRINTING"),
-            (self.handled_teleport, "HANDLED_TELEPORT"),
-        ):
-            if enabled:
-                flags.append(getattr(p.PlayerAuthInputPacket.InputData, flag))
-        for flag in frame.flags:
-            value = getattr(p.PlayerAuthInputPacket.InputData, flag)
-            if value not in flags:
-                flags.append(value)
-        if self.options.protocol == 1001:
-            flags = sum(1 << int(flag) for flag in flags)
-        tick = self.status.tick + 1
-        rot = p.Vec2(x=frame.pitch, y=frame.yaw)
-        move = p.Vec2(x=frame.move.x, y=frame.move.y)
-        packet = p.PlayerAuthInputPacket(
-            rot=rot,
-            pos=self.wire_vec(frame.position),
-            move=move,
-            y_head_rot=frame.yaw,
-            input_data=flags,
-            input_mode=p.InputMode.MOUSE,
-            play_mode=p.ClientPlayMode.SCREEN,
-            new_interaction_model=p.NewInteractionModel.CROSSHAIR,
-            interact_rotation=rot,
-            client_tick=tick,
-            pos_delta=self.wire_vec(frame.delta),
-            item_use_transaction=None,
-            item_stack_request=None,
-            player_block_actions=None,
-            vehicle_rot=None,
-            client_predicted_vehicle=None,
-            analog_move_vector=move,
-            camera_orientation=p.Vec3(x=0, y=0, z=0),
-            raw_move_vector=move,
-        )
-        epoch = self.input_epoch
-        self.enqueue(packet, valid=lambda: epoch == self.input_epoch)
-        self.handled_teleport = False
-        self.status = replace(self.status, tick=tick, position=frame.position)
+        packet, position, epoch = self.control.tick_packet(self.status)
+        self.enqueue(packet, valid=lambda: epoch == self.control.epoch)
+        self.control.tick_enqueued()
+        self.status = replace(self.status, tick=packet.client_tick, position=position)
 
     def wire_vec(self, value):
         return self.p.Vec3(x=value.x, y=value.y, z=value.z)
@@ -934,45 +861,18 @@ class Session:
 
     def set_input(self, frame):
         self.require_ready()
-        if not finite(frame.position, frame.delta, frame.move, frame.pitch, frame.yaw):
-            raise ValueError("input values must be finite")
-        try:
-            flags = tuple(frame.flags)
-        except TypeError:
-            raise ValueError("input flags must be a sequence of native flag names") from None
-        enum = self.p.PlayerAuthInputPacket.InputData
-        reserved = {
-            "INPUT_NUM", "HANDLED_TELEPORT", "VERTICAL_COLLISION",
-            "PERFORM_ITEM_INTERACTION", "PERFORM_BLOCK_ACTIONS",
-            "PERFORM_ITEM_STACK_REQUEST", "IS_IN_CLIENT_PREDICTED_VEHICLE",
-            "INTERNAL_UPDATE",
-        }
-        if any(
-            type(flag) is not str or not flag.isupper() or flag in reserved or not hasattr(enum, flag)
-            for flag in flags
-        ):
-            raise ValueError("invalid or state-owned PlayerAuthInput flag for this protocol")
-        if type(frame) is Input:
-            self.input = Input(
-                frame.position, frame.delta, frame.move, frame.pitch, frame.yaw,
-                frame.vertical_collision, frame.jumping, frame.sneaking, frame.sprinting, flags,
-            )
-        else:
-            self.input = replace(frame, flags=flags)
+        self.control.set_input(frame)
 
     def set_look(self, pitch, yaw):
-        if not finite(pitch, yaw):
-            raise ValueError("look values must be finite")
-        self.look = Vec2(pitch, yaw)
+        self.control.set_look(pitch, yaw)
 
     def position(self, position, teleport, correction, acknowledge):
         if not finite(position):
             raise _MalformedPacket("non-finite own position")
         self.status = replace(self.status, position=position)
-        self.input = None
-        self.input_epoch += 1
+        self.control.invalidate(clear_look=False)
         if acknowledge:
-            self.handled_teleport = True
+            self.control.acknowledge_teleport()
         if correction:
             self.stats["corrections"] += 1
         self.emit(ev.EventKind.position, lambda: ev.PositionEvent(position, teleport, correction))
@@ -989,8 +889,7 @@ class Session:
         else:
             self.status = replace(self.status, health=value)
         if died:
-            self.look = self.input = None
-            self.input_epoch += 1
+            self.control.invalidate(clear_look=True)
             self.equipment_epoch += 1
             self.invalidate_container()
             self.inventory.clear_inventories()
@@ -1160,11 +1059,11 @@ class Session:
         packet = p.InventoryTransactionPacket(
             legacy_request_id=0, legacy_set_item_slots=None, transaction=bp.Variant(3, transaction)
         )
-        epoch = self.input_epoch
+        epoch = self.control.epoch
         self.enqueue(
             packet,
             valid=lambda: (
-                epoch == self.input_epoch
+                epoch == self.control.epoch
                 and self.actor_state.matches(entity.runtime_id, entity.unique_id)
             ),
         )

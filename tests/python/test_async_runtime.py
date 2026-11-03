@@ -437,7 +437,7 @@ async def test_window_identity_death_respawn_dimension_and_correction(monkeypatc
         peer.send(dimension_ack(p, bot.get_status().actor_runtime_id))
         await until(lambda: bot._session.dimension_deadline is None)
         assert bot.get_observed_entities() == [] and bot.get_status().selected_hotbar is None
-        assert bot._session.look is None
+        assert bot._session.control.look is None
 
 
 @pytest.mark.parametrize("version", [1001, 2193])
