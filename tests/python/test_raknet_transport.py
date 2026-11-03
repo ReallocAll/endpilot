@@ -291,7 +291,7 @@ async def test_pinned_session_rejects_pre_handshake_state_and_spawn_bypass(monke
         assert not any(packet.packet_id == 4 for packet in peer.received)
         assert bot.get_status().state != api.BotState.ready
         assert bot.get_status().health is None
-        assert not bot._session.start_game
+        assert not bot._session.negotiation.start_game
 
 
 @pytest.mark.parametrize("failure", ["signature", "pin", "pinned_without_handshake"])

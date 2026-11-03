@@ -22,10 +22,10 @@ async def test_login_success_last_gates_ready_and_initializes_in_order(monkeypat
     peers = Peers(monkeypatch)
     async with api.Runtime() as runtime:
         bot = runtime.add_bot(api.BotOptions(server_url="http://peer", protocol=version))
-        await until(lambda: bot._session is not None and bot._session.spawn)
+        await until(lambda: bot._session is not None and bot._session.negotiation.spawn)
         peer = peers.connections[-1]
-        assert not bot._session.login
-        assert not bot._session.initialized
+        assert not bot._session.negotiation.login
+        assert not bot._session.negotiation.initialized
         assert not bot._session.ready.done()
         assert bot.get_status().state != api.BotState.ready
         assert not any(packet.packet_id in (113, 312) for packet in peer.received)
@@ -139,3 +139,28 @@ async def test_bad_server_handshake_signature_closes_without_packet4(monkeypatch
         assert len(peer.received_wire) == 2
         assert bot.get_status().state == api.BotState.failed
         assert bot.capture_statistics().decode_errors == 1
+
+
+@pytest.mark.parametrize("version", [1001, 2193])
+@pytest.mark.parametrize("incoming_id", [6, 7])
+async def test_resource_pack_response_preserves_native_protocol_variant(version, incoming_id):
+    from types import SimpleNamespace
+
+    from test_respawn_retry import queued_packets, ready_bot
+
+    _, session, _ = ready_bot(version)
+    await session.handle(SimpleNamespace(packet_id=incoming_id))
+    packets = queued_packets(session)
+    assert len(packets) == 1
+    response = packets[0]
+    assert isinstance(response, session.p.ResourcePackClientResponsePacket)
+    if version == 2193:
+        assert response.response.index == (3 if incoming_id == 7 else 2)
+    else:
+        expected = (
+            session.p.ResourcePackResponse.RESOURCE_PACK_STACK_FINISHED
+            if incoming_id == 7
+            else session.p.ResourcePackResponse.DOWNLOADING_FINISHED
+        )
+        assert response.response == expected
+        assert not response.downloading_packs

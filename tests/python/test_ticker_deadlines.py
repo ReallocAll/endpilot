@@ -43,7 +43,7 @@ def ticker_session(monkeypatch, clock, *, count, work=0, protocol=2193):
                           _token=api.BotToken())
     session = session_module.Session(bot, 1, asyncio.get_running_loop().create_future())
     session.status = dataclasses.replace(session.status, state=api.BotState.ready)
-    session.login = True
+    session.negotiation.login = True
     session.next_tick = clock.time() + 0.05
     session.enqueue = lambda packet, **_kwargs: packets.append(packet)
     original_tick = session.tick
@@ -122,8 +122,8 @@ async def test_ready_retains_first_deadline_50ms_after_ready_and_pre_ready_wait(
     session, events, packets, serviced = ticker_session(monkeypatch, clock, count=1)
     session.next_tick = None
     session.status = dataclasses.replace(session.status, state=api.BotState.spawning, chunk_radius=1)
-    session.spawn_deadline = clock.now + 10
-    session.start_game = session.spawn = True
+    session.negotiation.spawn_deadline = clock.now + 10
+    session.negotiation.start_game = session.negotiation.spawn = True
     ready_at = []
 
     async def flush():
