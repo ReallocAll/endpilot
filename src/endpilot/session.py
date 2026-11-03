@@ -10,8 +10,8 @@ import bedrock_protocol as bp
 from bedrock_protocol.wire import BatchCodec, Compression
 
 from . import _actors, _inventory, _player_control, transport
-from ._player_control import finite
 from . import events as ev
+from ._player_control import finite
 from ._projection import unwrap
 from .auth import build_login, create_identity, derive_session_key
 from .observations import ActorSnapshot, Statistics
