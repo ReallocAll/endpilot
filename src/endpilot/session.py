@@ -187,7 +187,7 @@ class Session:
                 self.connection = await transport._open_connection(self.options, self.identity)
             if not self.usable():
                 return
-            self.negotiation.spawn_deadline = self.runtime._loop.time() + self.options.spawn_timeout_ms / 1000
+            self.spawn_deadline = self.runtime._loop.time() + self.options.spawn_timeout_ms / 1000
             self.state(BotState.negotiating)
             if not self.usable():
                 return
@@ -667,7 +667,7 @@ class Session:
             if not self.usable():
                 return
             if self.status.state != BotState.ready:
-                if now >= self.negotiation.spawn_deadline:
+                if now >= self.spawn_deadline:
                     raise TimeoutError("login/spawn deadline expired")
                 continue
             if self.dimension_deadline is not None and now >= self.dimension_deadline:

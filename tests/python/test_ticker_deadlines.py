@@ -122,7 +122,7 @@ async def test_ready_retains_first_deadline_50ms_after_ready_and_pre_ready_wait(
     session, events, packets, serviced = ticker_session(monkeypatch, clock, count=1)
     session.next_tick = None
     session.status = dataclasses.replace(session.status, state=api.BotState.spawning, chunk_radius=1)
-    session.negotiation.spawn_deadline = clock.now + 10
+    session.spawn_deadline = clock.now + 10
     session.negotiation.start_game = session.negotiation.spawn = True
     ready_at = []
 
