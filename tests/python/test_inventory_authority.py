@@ -59,7 +59,7 @@ async def test_normal_transaction_authority_precedes_callback_and_missing_respon
 @pytest.mark.parametrize("version", [1001, 2193])
 async def test_last_negative_odd_request_id_is_admitted_once(monkeypatch, version):
     async with scene(monkeypatch, version) as (bot, peer, _):
-        bot._session.next_request_id = -2147483647
+        bot._session.inventory.next_request_id = -2147483647
         operation = bot.begin_move_item(bot.player_slot(9), bot.player_slot(0), 1)
         assert operation.key.request_id == -2147483647
         await sent(peer)
