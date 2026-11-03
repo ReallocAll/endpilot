@@ -335,7 +335,7 @@ async def test_encrypted_item_send_failure_is_indeterminate(monkeypatch):
         assert operation.phase == api.ItemOperationPhase.terminal
         assert bot.get_status().state == api.BotState.failed
         assert not any(packet.packet_id == 147 for packet in peer.received)
-        assert bot._session.queue_packets == bot._session.queue_bytes == 0
+        assert bot._session.outbound.packets == bot._session.outbound.bytes == 0
 
 
 @pytest.mark.parametrize("reason", ["timeout", "disconnect"])

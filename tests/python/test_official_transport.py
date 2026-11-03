@@ -36,7 +36,7 @@ async def test_encoding_failure_invalidates_session(monkeypatch, protocol, stage
         await until(lambda: peer.closed)
         assert bot.get_status().state == api.BotState.failed
         assert bot.capture_statistics().packets_out == before.packets_out
-        assert session.queue_packets == session.queue_bytes == 0
+        assert session.outbound.packets == session.outbound.bytes == 0
 
 
 @pytest.mark.parametrize("failure", [OSError("send failed"), asyncio.CancelledError()])
@@ -51,8 +51,8 @@ async def test_send_failure_is_indeterminate_and_keeps_batch_accounted(monkeypat
 
         def at_send():
             assert operation.phase == api.ItemOperationPhase.submitted
-            assert bot._session.queue_packets >= 1
-            assert bot._session.queue_bytes > 0
+            assert bot._session.outbound.packets >= 1
+            assert bot._session.outbound.bytes > 0
 
         peer.before_send = at_send
         peer.send_error = failure
@@ -69,7 +69,7 @@ async def test_send_failure_is_indeterminate_and_keeps_batch_accounted(monkeypat
         assert after.batch_bytes_out == before.batch_bytes_out
         assert after.packet_counts_out.to_list() == before.packet_counts_out.to_list()
         assert after.play_packet_counts_out.to_list() == before.play_packet_counts_out.to_list()
-        assert bot._session.queue_packets == bot._session.queue_bytes == 0
+        assert bot._session.outbound.packets == bot._session.outbound.bytes == 0
 
 
 @pytest.mark.parametrize("direction", ["send", "receive"])
@@ -136,14 +136,14 @@ async def test_prepared_tokens_keep_exact_queue_byte_charges_until_cleanup(monke
         monkeypatch.setattr(transport, "COMMAND_BYTES", size * 2)
         session.enqueue(packet)
         session.enqueue(packet)
-        assert session.queue_bytes == size * 2 and session.queue_packets == 2
+        assert session.outbound.bytes == size * 2 and session.outbound.packets == 2
         assert all(command.token.protocol == protocol and command.token.packet_id == 69
-                   and command.size == len(command.token) + 5 for command in session.queue)
+                   and command.size == len(command.token) + 5 for command in session.outbound.queue)
         with pytest.raises(RuntimeError, match="queue limit"):
             session.enqueue(packet)
-        assert session.queue_bytes == size * 2 and session.queue_packets == 2
+        assert session.outbound.bytes == size * 2 and session.outbound.packets == 2
         await until(lambda: peer.closed)
-        assert session.queue_bytes == session.queue_packets == 0
+        assert session.outbound.bytes == session.outbound.packets == 0
 
 
 async def test_prepared_packets_follow_fifo_compression_boundary(monkeypatch):

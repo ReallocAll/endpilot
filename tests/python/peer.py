@@ -73,7 +73,7 @@ class Peer:
         self._sender_event = None
 
     def pause_sender(self, bot):
-        event = bot._session.send_event
+        event = bot._session.outbound.event
         event.clear()
         self._sender_event = event
         self._wake_sender = event.set
