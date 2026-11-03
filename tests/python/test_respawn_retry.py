@@ -75,10 +75,10 @@ async def test_respawn_retries_preserve_server_order_and_require_health(protocol
     server_ready(session)
     assert len(session.outbound.queue) == 4
     assert not any(isinstance(event, api.RespawnEvent) for event in events)
-    assert session.stats["respawns"] == 0
+    assert bot.capture_statistics().respawns == 0
     deliver(session, p.SetHealthPacket(health=20))
     assert bot.get_status().alive and session.respawn_phase == 0
-    assert sum(isinstance(event, api.RespawnEvent) for event in events) == session.stats["respawns"] == 1
+    assert sum(isinstance(event, api.RespawnEvent) for event in events) == bot.capture_statistics().respawns == 1
 
 
 @pytest.mark.parametrize("phase,retry", [(0, None), (1, 1), (2, "true")])

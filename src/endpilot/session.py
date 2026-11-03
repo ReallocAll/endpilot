@@ -4,17 +4,16 @@ import asyncio
 import math
 import time
 from collections import deque
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 
 import bedrock_protocol as bp
 from bedrock_protocol.wire import BatchCodec, Compression
 
-from . import _actors, _inventory, _outbound, _player_control, transport
+from . import _actors, _inventory, _outbound, _player_control, _statistics, transport
 from . import events as ev
 from ._player_control import finite
 from ._projection import unwrap
 from .auth import build_login, create_identity, derive_session_key
-from .observations import Statistics
 from .types import (
     BotState,
     BotStatus,
@@ -110,12 +109,7 @@ class Session:
         self.batch = BatchCodec(self.codec)
         self.identity = None
         self.status = BotStatus(session_id=generation)
-        self.stats = {f.name: 0 for f in fields(Statistics)
-                      if not f.name.startswith(("connected_bytes_", "packet_counts_", "play_packet_counts_"))}
-        self.packet_counts_in = [0] * 1024
-        self.packet_counts_out = [0] * 1024
-        self.play_packet_counts_in = [0] * 1024
-        self.play_packet_counts_out = [0] * 1024
+        self.metrics = _statistics._StatisticsState()
         self.connection = None
         self.active = True
         self.finished = False
@@ -302,18 +296,13 @@ class Session:
                         if command.operation is not None:
                             self.inventory.mark_submitted(command.operation)
                     await self.connection.send(wire)
-                    self.stats["batch_bytes_out"] += len(wire)
-                    self.stats["packets_out"] += len(valid)
-                    for command in valid:
-                        self.packet_counts_out[command.token.packet_id] += 1
-                        if command.play:
-                            self.play_packet_counts_out[command.token.packet_id] += 1
+                    self.metrics.outgoing_batch(len(wire), valid)
                 self.outbound.consume(commands)
 
     async def reader(self):
         while self.usable():
             data = await self.connection.recv()
-            self.stats["batch_bytes_in"] += len(data)
+            self.metrics.incoming_wire(len(data))
             if len(data) > transport.MAX_WIRE_MESSAGE:
                 raise ValueError("inbound wire message limit exceeded")
             if not self.usable():
@@ -328,10 +317,8 @@ class Session:
                 packet_id = getattr(error, "packet_id", None)
                 self.decode_error(-1 if packet_id is None else packet_id, str(error), recoverable=False)
                 raise
-            self.stats["packets_in"] += batch.packet_count
             headers = batch.headers
-            for header in headers:
-                self.packet_counts_in[header.packet_id] += 1
+            self.metrics.incoming_batch(batch.packet_count, headers)
             decoded_packets = iter(batch)
             decode_errors = batch.errors
             errors = {error.packet_index: error for error in decode_errors} if decode_errors else None
@@ -346,7 +333,7 @@ class Session:
                     continue
                 decoded = next(decoded_packets)
                 if self.initialized:
-                    self.play_packet_counts_in[decoded.header.packet_id] += 1
+                    self.metrics.incoming_play_packet(decoded.header.packet_id)
                 self.emit(ev.EventKind.packet_decoded, lambda: ev.PacketDecodedEvent(decoded))
                 if not self.usable():
                     return
@@ -365,7 +352,7 @@ class Session:
                     raise
 
     def decode_error(self, packet_id, reason, *, recoverable):
-        self.stats["decode_errors"] += 1
+        self.metrics.increment("decode_errors")
         self.emit(ev.EventKind.decode_error, lambda: ev.DecodeErrorEvent(packet_id, reason, recoverable))
 
     async def handle(self, packet):
@@ -520,7 +507,7 @@ class Session:
             else:
                 self.health(float(packet.health))
         elif id == 58:
-            self.stats["column_packets"] += 1
+            self.metrics.increment("column_packets")
             if self.runtime._wants(self.bot, ev.EventKind.chunk):
                 limit = packet.client_request_sub_chunk_limit
                 if self.options.protocol == 1001 and packet.sub_chunks_count == 0xFFFFFFFF:
@@ -543,7 +530,7 @@ class Session:
             entries = packet.sub_chunk_data
             if self.options.protocol == 1001 and not packet.cache_enabled:
                 entries = packet.uncached_sub_chunk_data
-            self.stats["subchunks"] += len(entries)
+            self.metrics.increment("subchunks", len(entries))
             if self.runtime._wants(self.bot, ev.EventKind.chunk):
                 blobs = tuple(entry.blob_id for entry in entries if getattr(entry, "blob_id", None) is not None)
                 self.emit(
@@ -764,7 +751,7 @@ class Session:
         if acknowledge:
             self.control.acknowledge_teleport()
         if correction:
-            self.stats["corrections"] += 1
+            self.metrics.increment("corrections")
         self.emit(ev.EventKind.position, lambda: ev.PositionEvent(position, teleport, correction))
 
     def health(self, value):
@@ -784,12 +771,12 @@ class Session:
             self.invalidate_container()
             self.inventory.clear_inventories()
             self.respawn_phase = 0
-            self.stats["deaths"] += 1
+            self.metrics.increment("deaths")
             self.invalidate_operation("player died")
             self.emit(ev.EventKind.death, ev.DeathEvent)
         elif respawned:
             self.respawn_phase = 0
-            self.stats["respawns"] += 1
+            self.metrics.increment("respawns")
             self.emit(ev.EventKind.respawn, ev.RespawnEvent)
         self.emit(ev.EventKind.health, lambda: ev.HealthEvent(value))
 
@@ -1080,7 +1067,7 @@ class Session:
         self.enqueue(self.p.NetworkStackLatencyPacket(create_time=stamp, from_server=False))
         self.last_probe_stamp = stamp
         if self.probe is not None:
-            self.stats["probes_lost"] += 1
+            self.metrics.increment("probes_lost")
         self.probe = (stamp, self.runtime._loop.time())
-        self.stats["probes_sent"] += 1
+        self.metrics.increment("probes_sent")
 
