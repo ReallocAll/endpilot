@@ -5,7 +5,7 @@ from dataclasses import fields, replace
 
 from ._projection import ReadonlyMap
 from .events import validate_mask
-from .observations import ItemRegistrySnapshot, Snapshot, Statistics, TradeOffers
+from .observations import Snapshot, Statistics, TradeOffers
 from .operations import ItemOperation
 from .types import (
     BotOptions,
@@ -199,9 +199,7 @@ class Bot:
         return Snapshot(
             **{f.name: getattr(s.status, f.name) for f in fields(s.status)},
             actors=self.capture_actors(),
-            inventories=s.inventories,
-            item_registry=s.registry,
-            container=s.container,
+            **s.inventory.snapshot_fields(),
         )
 
     def capture_actor(self, runtime_id):
@@ -211,14 +209,13 @@ class Bot:
         return ReadonlyMap(self._current().actors)
 
     def capture_inventory(self, inventory_id):
-        return self._current().inventories.get(inventory_id)
+        return self._current().inventory.capture_inventory(inventory_id)
 
     def capture_container(self):
-        return self._current().container
+        return self._current().inventory.capture_container()
 
     def capture_item_registry(self):
-        s = self._current()
-        return ItemRegistrySnapshot(s.registry_observed, s.registry)
+        return self._current().inventory.capture_item_registry()
 
     def get_observed_entities(self):
         s = self._current()
@@ -242,20 +239,20 @@ class Bot:
         self._current(mutable=True).look = None
 
     def player_slot(self, index):
-        return self._current().player_slot(index)
+        return self._current().inventory.player_slot(index)
 
     def get_item(self, slot):
-        return self._current().get_item(slot)
+        return self._current().inventory.get_item(slot)
 
     def get_player_inventory(self):
         s = self._current()
-        return [s.get_item(s.player_slot(i)) for i in range(36)]
+        return [s.inventory.get_item(s.inventory.player_slot(i)) for i in range(36)]
 
     def count_player_item(self, identifier):
-        return self._current().count_player_item(identifier)
+        return self._current().inventory.count_player_item(identifier)
 
     def get_trade_window(self):
-        return self._current().get_trade_window()
+        return self._current().inventory.get_trade_window()
 
     def get_trade_offers(self, window: WindowRef) -> TradeOffers | None:
         return self._current().get_trade_offers(window)
@@ -273,7 +270,7 @@ class Bot:
         return self.begin_trade(offer, destination).key
 
     def trade_input(self, window, index):
-        return self._current().trade_input(window, index)
+        return self._current().inventory.trade_input(window, index)
 
     def select_hotbar(self, slot):
         self._current(mutable=True).select_hotbar(slot)

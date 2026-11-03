@@ -48,7 +48,7 @@ async def test_native_disconnect_fields_survive_session_cleanup(monkeypatch, pro
                               _background_failure=failures.append)
     options = api.BotOptions(server_url="http://peer", protocol=protocol)
     options._validate()
-    bot = SimpleNamespace(_runtime=runtime, _options=options, _generation=1, _wake=asyncio.Event())
+    bot = SimpleNamespace(_runtime=runtime, _options=options, _generation=1, _wake=asyncio.Event(), _token=api.BotToken())
     ready = loop.create_future()
     session = Session(bot, 1, ready)
     p = session.p

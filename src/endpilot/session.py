@@ -13,22 +13,14 @@ from . import _inventory, transport
 from . import events as ev
 from ._projection import unwrap
 from .auth import build_login, create_identity, derive_session_key
-from .observations import ActorSnapshot, ContainerSnapshot, SlotObservation, Statistics
-from .operations import ItemCancellation, ItemOperation, ItemOperationPhase, ItemOperationResult, ItemRequestOutcome
+from .observations import ActorSnapshot, Statistics
 from .types import (
     BotState,
     BotStatus,
     Input,
-    InventoryArea,
-    InventorySlot,
-    ItemCount,
-    ItemRequestKey,
     ServerDisconnectReason,
-    SlotState,
-    TradeWindowObservation,
     Vec2,
     Vec3,
-    WindowRef,
 )
 
 REQUIRED_IDS = frozenset(
@@ -166,16 +158,11 @@ class Session:
         self.disconnect_reason = None
         self.settings = self.handshake = self.login = self.start_game = self.spawn = self.initialized = False
         self.initial_self_state = deque()
-        self.registry_observed = False
-        self.registry = ()
         self.actors = {}
         self.unique_ids = {}
-        self.inventories = {}
-        self.container = None
-        self.window = None
-        self.window_generation = 0
-        self.offer_revision = 0
-        self.interacting = None
+        self.inventory = _inventory._InventoryState(
+            self.p, self.bot._token, self.id, self.runtime._loop, self.options.item_request_timeout_ms
+        )
         self.input = None
         self.look = None
         self.input_epoch = 0
@@ -186,11 +173,6 @@ class Session:
         self.respawn_phase = 0
         self.probe = None
         self.last_probe_stamp = 0
-        self.pending = None
-        self.item_changes = ()
-        self.item_authority = set()
-        self.next_request_id = -1
-        self.operation_deadline = None
         self.queue = deque()
         self.queue_bytes = 0
         self.queue_packets = 0
@@ -224,7 +206,9 @@ class Session:
         self.input_epoch += 1
         self.equipment_epoch += 1
         self.send_event.set()
-        if self.pending is not None:
+        if self.id != self.bot._generation:
+            self.inventory.retire()
+        if self.inventory.pending is not None:
             self.invalidate_operation(reason)
 
     def fail(self, error):
@@ -299,8 +283,7 @@ class Session:
             self.queue_bytes = self.queue_packets = 0
             self.actors.clear()
             self.unique_ids.clear()
-            self.inventories.clear()
-            self.container = self.window = None
+            self.inventory.discard()
             if self.connection is not None:
                 try:
                     await self.connection.close()
@@ -354,7 +337,7 @@ class Session:
         await asyncio.shield(future)
 
     def command_valid(self, command):
-        return (command.operation is None or command.operation is self.pending) and (
+        return (command.operation is None or command.operation is self.inventory.pending) and (
             command.valid is None or command.valid()
         )
 
@@ -383,11 +366,7 @@ class Session:
                         raise ValueError("outbound wire message limit exceeded")
                     for command in valid:
                         if command.operation is not None:
-                            self.item_authority.clear()
-                            command.operation._submit()
-                            self.operation_deadline = (
-                                self.runtime._loop.time() + self.options.item_request_timeout_ms / 1000
-                            )
+                            self.inventory.mark_submitted(command.operation)
                     await self.connection.send(wire)
                     self.stats["batch_bytes_out"] += len(wire)
                     self.stats["packets_out"] += len(valid)
@@ -544,11 +523,9 @@ class Session:
             self.apply_initial_self_state()
             await self.try_ready()
         elif id == 162:
-            self.registry = packet.items.copy()
-            if not self.registry_observed:
-                self.registry_observed = True
+            if self.inventory.observe_registry(packet.items):
                 self.enqueue(p.RequestChunkRadiusPacket(chunk_radius=16, max_chunk_radius=16))
-            self.emit(ev.EventKind.item_registry, lambda: ev.ItemRegistryEvent(self.registry))
+            self.emit(ev.EventKind.item_registry, lambda: ev.ItemRegistryEvent(self.inventory.registry))
         elif id == 70:
             self.status = replace(self.status, chunk_radius=packet.chunk_radius)
             await self.try_ready()
@@ -811,7 +788,7 @@ class Session:
                 self.actors[packet.id] = actor
                 self.emit(ev.EventKind.actor, lambda: ev.ActorEvent(ev.ActorEvent.Kind.metadata, actor))
         elif id in (49, 50):
-            inventory_id, inventory = _inventory.apply_content(self, packet)
+            inventory_id, inventory = _inventory.apply_content(self.inventory, packet)
             if id == 50:
                 self.emit(
                     ev.EventKind.inventory_slot,
@@ -819,17 +796,17 @@ class Session:
                 )
             self.emit(ev.EventKind.inventory, lambda: ev.InventoryEvent(inventory_id, inventory))
         elif id == 30:
-            for inventory_id in _inventory.apply_transaction(self, packet):
+            for inventory_id in _inventory.apply_transaction(self.inventory, packet):
                 self.emit(
-                    ev.EventKind.inventory, lambda: ev.InventoryEvent(inventory_id, self.inventories[inventory_id])
+                    ev.EventKind.inventory, lambda: ev.InventoryEvent(inventory_id, self.inventory.capture_inventory(inventory_id))
                 )
         elif id == 46:
             self.open_container(packet)
         elif id == 80:
             self.update_trade(packet)
         elif id == 47:
-            if self.window and self.window.window_id == int(packet.container_id):
-                ref = self.window
+            if self.inventory.window and self.inventory.window.window_id == int(packet.container_id):
+                ref = self.inventory.window
                 self.invalidate_container()
                 self.invalidate_operation("container closed")
                 self.emit(ev.EventKind.container, lambda: ev.ContainerEvent(None, ref, True))
@@ -903,8 +880,7 @@ class Session:
         while self.usable():
             await asyncio.sleep(0.05 if self.next_tick is None else max(0, self.next_tick - self.runtime._loop.time()))
             now = self.runtime._loop.time()
-            if self.pending is not None and self.operation_deadline is not None and now >= self.operation_deadline:
-                self.finish_operation(ItemRequestOutcome.indeterminate, "item request timed out")
+            self._emit_item_result(self.inventory.expire_operation(now))
             if not self.usable():
                 return
             if self.status.state != BotState.ready:
@@ -1058,7 +1034,7 @@ class Session:
             self.input_epoch += 1
             self.equipment_epoch += 1
             self.invalidate_container()
-            self.inventories.clear()
+            self.inventory.clear_inventories()
             self.respawn_phase = 0
             self.stats["deaths"] += 1
             self.invalidate_operation("player died")
@@ -1110,7 +1086,7 @@ class Session:
         if actor is None:
             return
         self.unique_ids.pop(actor.unique_id, None)
-        if self.interacting == actor.unique_id or self.window and self.window.trader_unique_id == actor.unique_id:
+        if self.inventory.interacting == actor.unique_id or self.inventory.window and self.inventory.window.trader_unique_id == actor.unique_id:
             self.invalidate_container()
             self.invalidate_operation("trader removed")
         self.emit(ev.EventKind.actor, lambda: ev.ActorEvent(ev.ActorEvent.Kind.removed, actor))
@@ -1118,107 +1094,41 @@ class Session:
     def submit_item_request(self, make_packet, *, window=None):
         self.runtime._guard()
         self.require_interaction()
-        if self.pending is not None:
-            raise RuntimeError("an item request is pending")
-        if window is not None and (
-            window != self.window or window.session_id != self.bot._generation
-        ):
-            raise RuntimeError("stale or foreign container window")
-        if self.next_request_id < -2147483647:
-            raise RuntimeError("item request IDs exhausted")
-        key = ItemRequestKey(self.bot._token, self.id, self.next_request_id, window)
-        packet = make_packet(key.request_id)
-        if (
-            not isinstance(packet, self.p.ItemStackRequestPacket)
-            or len(packet.requests) != 1
-            or packet.requests[0].client_request_id.raw_id != key.request_id
-        ):
-            raise ValueError("typed request must contain the assigned request ID exactly once")
-        operation = ItemOperation(key, self.runtime._loop)
-        self.enqueue(packet, operation=operation)
-        self.pending = operation
-        self.next_request_id -= 2
-        return operation
-
-    def note_item_update(self, inventory_id, index):
-        if self.pending is not None and self.pending.phase == ItemOperationPhase.submitted:
-            self.item_authority.update(change.physical for change in self.item_changes
-                                       if change.physical[0] == inventory_id
-                                       and (index is None or change.physical[1] == index))
+        return self.inventory.submit_item_request(make_packet, window=window, enqueue=self.enqueue)
 
     def begin_move_item(self, source, destination, count):
-        return _inventory.move(self, source, destination, count)
+        self.require_interaction()
+        return _inventory.move(self.inventory, source, destination, count, self.submit_item_request)
 
     def begin_trade(self, offer, destination):
-        return _inventory.trade(self, offer, destination)
+        self.require_interaction()
+        return _inventory.trade(self.inventory, offer, destination, self.submit_item_request)
 
     def get_trade_offers(self, window):
-        return _inventory.offers(self, window)
+        return self.inventory.get_trade_offers(window)
 
     def _handle_item_responses(self, packet):
-        operation = self.pending
-        if operation is not None and operation.phase == ItemOperationPhase.submitted:
+        operation = self.inventory.submitted_operation()
+        if operation is not None:
             for response in packet.responses:
-                if self.pending is operation and response.client_request_id.raw_id == operation.key.request_id:
-                    outcome, reason = ItemRequestOutcome.rejected, "server rejected item request"
-                    if int(response.result) == 0:
-                        try:
-                            _inventory.reconcile(self, response)
-                            outcome, reason = ItemRequestOutcome.completed, ""
-                        except RuntimeError as error:
-                            outcome, reason = ItemRequestOutcome.indeterminate, str(error)
-                    self.finish_operation(outcome, reason, response.copy())
+                self._emit_item_result(self.inventory.apply_response(operation, response))
                 if not self.usable():
                     return
 
-    def finish_operation(self, outcome, reason, response=None):
-        operation = self.pending
-        if operation is None:
-            return
-        if outcome == ItemRequestOutcome.indeterminate:
-            for change in self.item_changes:
-                inventory_id, index = change.physical
-                inventory = self.inventories.get(inventory_id)
-                if inventory is not None:
-                    slots = dict(inventory.slots)
-                    slots.pop(index, None)
-                    self.inventories[inventory_id] = replace(inventory, slots=slots, complete=False)
-        touched = []
-        for change in self.item_changes:
-            try:
-                touched.append(self.get_item(change.slot))
-            except RuntimeError:
-                touched.append(SlotObservation(change.slot))
-        result = ItemOperationResult(
-            operation.key, outcome, None if response is None else int(response.result), tuple(touched), response, reason
-        )
-        self.pending = None
-        self.item_changes = ()
-        self.item_authority.clear()
-        self.operation_deadline = None
-        operation._finish(result)
-        self.emit(ev.EventKind.item_request, lambda: ev.ItemRequestEvent(result.key, outcome, response, reason))
+    def _emit_item_result(self, result):
+        if result is not None:
+            self.emit(
+                ev.EventKind.item_request,
+                lambda: ev.ItemRequestEvent(result.key, result.outcome, result.response, result.reason),
+            )
 
     def invalidate_operation(self, reason):
-        if self.pending is not None:
-            outcome = (
-                ItemRequestOutcome.indeterminate
-                if self.pending.phase == ItemOperationPhase.submitted
-                else ItemRequestOutcome.cancelled
-            )
-            self.finish_operation(outcome, reason)
+        self._emit_item_result(self.inventory.invalidate_operation(reason))
 
     def cancel_operation(self, operation):
-        if operation.key.bot is not self.bot._token or operation.key.session_id != self.bot._generation:
-            raise RuntimeError("stale or foreign item operation")
-        if operation.phase == ItemOperationPhase.terminal:
-            return ItemCancellation.already_terminal
-        if operation is not self.pending:
-            raise RuntimeError("item operation is not pending")
-        if operation.phase == ItemOperationPhase.submitted:
-            return ItemCancellation.already_submitted
-        self.finish_operation(ItemRequestOutcome.cancelled, "item operation cancelled")
-        return ItemCancellation.cancelled
+        status, result = self.inventory.cancel_operation(operation)
+        self._emit_item_result(result)
+        return status
 
     def require_ready(self):
         if not self.usable() or self.status.state != BotState.ready:
@@ -1230,12 +1140,12 @@ class Session:
             raise RuntimeError("bot is dead")
         if self.dimension_deadline is not None:
             raise RuntimeError("dimension is changing")
-        if self.container and self.container.closing:
+        if self.inventory.container and self.inventory.container.closing:
             raise RuntimeError("container is closing")
 
     def held_item(self):
         slot = self.status.selected_hotbar
-        inventory = self.inventories.get(0)
+        inventory = self.inventory.capture_inventory(0)
         if slot is None or inventory is None or slot not in inventory.slots:
             raise RuntimeError("hotbar item or selection is unknown")
         item = unwrap(inventory.slots[slot])
@@ -1245,11 +1155,11 @@ class Session:
 
     def select_hotbar(self, slot):
         self.require_interaction()
-        if self.pending is not None:
+        if self.inventory.pending is not None:
             raise RuntimeError("an item request is pending")
         if type(slot) is not int or not 0 <= slot <= 8:
             raise ValueError("hotbar slot must be in 0..8")
-        inventory = self.inventories.get(0)
+        inventory = self.inventory.capture_inventory(0)
         item = None if inventory is None else unwrap(inventory.slots.get(slot))
         if not isinstance(item, self.p.SerializedNetworkItemStackDescriptor):
             raise RuntimeError("hotbar item is unknown or descriptor version mismatch")
@@ -1276,7 +1186,7 @@ class Session:
         ):
             raise RuntimeError("stale or foreign entity")
         self.require_interaction()
-        if self.pending is not None:
+        if self.inventory.pending is not None:
             raise RuntimeError("an item request is pending")
         if not finite(hit):
             raise ValueError("hit position must be finite")
@@ -1306,25 +1216,23 @@ class Session:
             ),
         )
         if not attack:
-            self.interacting = entity.unique_id
+            self.inventory.record_interaction(entity.unique_id)
 
     def open_container(self, packet):
-        if not self.status.alive or self.dimension_deadline is not None or self.container and self.container.closing:
-            return
-        identity = (int(packet.container_id), int(packet.type), packet.entity_unique_id)
-        if self.window is not None and identity != (
-            self.window.window_id,
-            self.window.container_type,
-            self.window.trader_unique_id,
+        if (
+            not self.status.alive
+            or self.dimension_deadline is not None
+            or self.inventory.container and self.inventory.container.closing
         ):
             return
-        if self.window is None:
-            self.window_generation += 1
-            self.window = WindowRef(self.bot._token, self.id, self.window_generation, *identity)
-        self.container = replace(self.container or ContainerSnapshot(), open=packet.copy())
-        if self.pending is not None and self.pending.key.window != self.window:
+        if not self.inventory.open_container(packet):
+            return
+        if self.inventory.pending is not None and self.inventory.pending.key.window != self.inventory.window:
             self.invalidate_operation("trade window changed")
-        self.emit(ev.EventKind.container, lambda: ev.ContainerEvent(self.container, self.window))
+        self.emit(
+            ev.EventKind.container,
+            lambda: ev.ContainerEvent(self.inventory.container, self.inventory.window),
+        )
 
     def update_trade(self, packet):
         identity = (int(packet.container_id), int(packet.type), packet.entity_unique_id)
@@ -1335,47 +1243,22 @@ class Session:
             or not 1 <= identity[0] <= 100
         ):
             return
-        if self.container and self.container.closing or identity[2] not in self.unique_ids:
+        if self.inventory.container and self.inventory.container.closing or identity[2] not in self.unique_ids:
             return
-        if self.window is not None:
-            if identity != (self.window.window_id, self.window.container_type, self.window.trader_unique_id):
-                return
-        elif self.interacting != identity[2]:
+        if not self.inventory.update_trade(packet):
             return
-        else:
-            self.window_generation += 1
-            self.window = WindowRef(self.bot._token, self.id, self.window_generation, *identity)
-        self.offer_revision += 1
-        self.container = replace(self.container or ContainerSnapshot(), trade=packet.copy())
-        self.interacting = None
-        if self.pending is not None and self.pending.key.window != self.window:
+        if self.inventory.pending is not None and self.inventory.pending.key.window != self.inventory.window:
             self.invalidate_operation("trade window changed")
-        self.emit(ev.EventKind.container, lambda: ev.ContainerEvent(self.container, self.window))
-
-    def validate_window(self, window):
-        if (
-            window is None
-            or window != self.window
-            or window.session_id != self.bot._generation
-            or window.container_type != 15
-        ):
-            raise RuntimeError("stale or foreign trade window")
-
-    def get_trade_window(self):
-        if self.window is None or self.window.container_type != 15 or not 1 <= self.window.window_id <= 100:
-            return None
-        return TradeWindowObservation(self.window, self.container.closing, self.offer_revision)
+        self.emit(
+            ev.EventKind.container,
+            lambda: ev.ContainerEvent(self.inventory.container, self.inventory.window),
+        )
 
     def invalidate_container(self):
-        if self.window is not None:
-            self.inventories.pop(self.window.window_id, None)
-        self.inventories.pop(124, None)
-        self.window = self.container = None
-        self.offer_revision = 0
-        self.interacting = None
+        self.inventory.invalidate_container()
 
     def close_container(self, window):
-        self.validate_window(window)
+        self.inventory.validate_window(window)
         self.require_interaction()
         p = self.p
         self.enqueue(
@@ -1384,17 +1267,10 @@ class Session:
                 container_type=p.ContainerType(window.container_type),
                 server_initiated_close=False,
             ),
-            valid=lambda: self.window == window,
+            valid=lambda: self.inventory.window == window,
         )
-        self.container = replace(self.container, closing=True)
-        self.interacting = None
+        self.inventory.mark_container_closing()
         self.invalidate_operation("container closing")
-
-    def trade_input(self, window, index):
-        self.validate_window(window)
-        if type(index) is not int or not 0 <= index <= 1:
-            raise ValueError("trade input slot must be in 0..1")
-        return InventorySlot(self.bot._token, self.id, InventoryArea.trade_input, index, window)
 
     def request_chunk_radius(self, radius):
         self.require_ready()
@@ -1466,38 +1342,3 @@ class Session:
         self.probe = (stamp, self.runtime._loop.time())
         self.stats["probes_sent"] += 1
 
-    def player_slot(self, index):
-        if type(index) is not int or not 0 <= index <= 35:
-            raise ValueError("player inventory slot must be in 0..35")
-        return InventorySlot(self.bot._token, self.id, InventoryArea.player, index)
-
-    def get_item(self, slot):
-        if slot.bot is not self.bot._token or slot.session_id != self.bot._generation:
-            raise RuntimeError("stale or foreign inventory slot")
-        inventory_id = 0
-        if slot.area == InventoryArea.trade_input:
-            self.validate_window(slot.window)
-            inventory_id = slot.window.window_id
-        inventory = self.inventories.get(inventory_id)
-        item = None if inventory is None else inventory.slots.get(slot.index)
-        name = None
-        if item is not None and item.id:
-            matches = [entry for entry in self.registry if entry.id == item.id]
-            if (
-                len(matches) == 1
-                and matches[0].name
-                and sum(entry.name == matches[0].name for entry in self.registry) == 1
-            ):
-                name = matches[0].name
-        return SlotObservation(slot, item, name)
-
-    def count_player_item(self, identifier):
-        observed = [self.get_item(self.player_slot(i)) for i in range(36)]
-        return ItemCount(
-            self.id,
-            sum(item.count for item in observed if item.identifier == identifier),
-            all(
-                item.state == SlotState.empty or (item.state == SlotState.occupied and item.identifier is not None)
-                for item in observed
-            ),
-        )

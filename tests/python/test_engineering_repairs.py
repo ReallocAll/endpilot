@@ -108,14 +108,14 @@ async def test_inventory_slot_absent_and_present_fallbacks_keep_owned_captures(p
         session.handle_state(session.codec.decode_packet(session.codec.encode_packet(packet)).payload)
 
     deliver_slot(0)
-    first = session.inventories[0]
+    first = session.inventory.inventories[0]
     assert not first.complete and first.full_container_name is None and first.storage_item is None
     assert set(first.slots) == {0}
     name = p.FullContainerName(name=p.ContainerEnumName(7), dynamic_id=42)
     previous = api.InventorySnapshot({0: empty_item(p), 2: empty_item(p)}, True, name, empty_item(p))
-    session.inventories[0] = previous
+    session.inventory.inventories[0] = previous
     deliver_slot(1)
-    current = session.inventories[0]
+    current = session.inventory.inventories[0]
     assert current.complete and set(current.slots) == {0, 1, 2}
     assert current.full_container_name is previous.full_container_name
     assert current.storage_item is previous.storage_item

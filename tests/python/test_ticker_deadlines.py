@@ -39,7 +39,8 @@ def ticker_session(monkeypatch, clock, *, count, work=0, protocol=2193):
     runtime = SimpleNamespace(_loop=clock, _stopping=False)
     runtime._emit = lambda _bot, _kind, factory: events.append(factory())
     bot = SimpleNamespace(_runtime=runtime, _generation=1,
-                          _options=api.BotOptions(server_url="http://unused", protocol=protocol))
+                          _options=api.BotOptions(server_url="http://unused", protocol=protocol),
+                          _token=api.BotToken())
     session = session_module.Session(bot, 1, asyncio.get_running_loop().create_future())
     session.status = dataclasses.replace(session.status, state=api.BotState.ready)
     session.login = True

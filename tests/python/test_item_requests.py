@@ -570,3 +570,27 @@ async def test_trade_prevalidation_and_refresh_do_not_consume_ids_or_cancel_pend
             bot.request_trade(fresh, bot.player_slot(11))
         next_key = bot.request_trade(refreshed.offers[0].ref, bot.player_slot(11))
         assert next_key.request_id == -3
+
+
+@pytest.mark.parametrize("version", [1001, 2193])
+async def test_reconnect_retires_inventory_before_new_session_and_queued_result(monkeypatch, version):
+    async with scene(monkeypatch, version) as (bot, peer, _):
+        peer.pause_sender(bot)
+        source, destination = bot.player_slot(9), bot.player_slot(0)
+        operation = bot.begin_move_item(source, destination, 3)
+        assert operation.phase == api.ItemOperationPhase.queued
+
+        reconnect = bot.reconnect()
+        # Bot's generation advances synchronously, before its old Session is joined.
+        with pytest.raises(RuntimeError, match="stale or foreign inventory slot"):
+            bot.get_item(source)
+        with pytest.raises(RuntimeError, match="stale or foreign item operation"):
+            bot.cancel_item_operation(operation)
+        result = await operation.wait(2)
+        assert result.outcome == api.ItemRequestOutcome.cancelled
+        assert all(slot.state == api.SlotState.unknown for slot in result.touched_slots)
+        await reconnect
+        await bot.wait_ready(2)
+        with pytest.raises(RuntimeError, match="stale or foreign inventory slot"):
+            bot.get_item(source)
+        assert not requests(peer)
