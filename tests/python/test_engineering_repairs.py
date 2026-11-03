@@ -149,9 +149,9 @@ async def test_prepared_input_epoch_is_invalidated_before_transmission(monkeypat
                                              respawn=False, loading_screen_id=42)
         else:
             packet = p.SetHealthPacket(health=0)
-        epoch = bot._session.control.input_epoch
+        epoch = bot._session.control.epoch
         peer.send(packet)
-        await until(lambda: bot._session.control.input_epoch != epoch)
+        await until(lambda: bot._session.control.epoch != epoch)
         if invalidation == "death":
             bot.respawn()
             peer.send(
