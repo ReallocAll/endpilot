@@ -9,7 +9,7 @@ from dataclasses import dataclass, fields, replace
 import bedrock_protocol as bp
 from bedrock_protocol.wire import BatchCodec, Compression
 
-from . import _actors, _inventory, _player_control, transport
+from . import _actors, _inventory, _outbound, _player_control, transport
 from . import events as ev
 from ._player_control import finite
 from ._projection import unwrap
@@ -82,21 +82,6 @@ def vec(value):
     return Vec3(value.x, value.y, value.z)
 
 
-@dataclass(slots=True)
-class _Command:
-    token: bp.EncodedPacket
-    size: int
-    play: bool
-    operation: object = None
-    valid: object = None
-
-
-@dataclass(slots=True)
-class _Boundary:
-    future: asyncio.Future
-    change: object = None
-
-
 @dataclass(frozen=True, slots=True)
 class _InitialPosition:
     runtime_id: int
@@ -151,10 +136,7 @@ class Session:
         self.respawn_phase = 0
         self.probe = None
         self.last_probe_stamp = 0
-        self.queue = deque()
-        self.queue_bytes = 0
-        self.queue_packets = 0
-        self.send_event = asyncio.Event()
+        self.outbound = _outbound._OutboundQueue()
         self.next_tick = None
 
     def usable(self):
@@ -182,7 +164,7 @@ class Session:
         self.reason = reason
         self.control.invalidate(clear_look=True)
         self.equipment_epoch += 1
-        self.send_event.set()
+        self.outbound.wake()
         if self.id != self.bot._generation:
             self.inventory.retire()
         if self.inventory.pending is not None:
@@ -252,12 +234,8 @@ class Session:
                     if self.runtime._suppressed:
                         self.runtime._background_failure(error)
                     self.error = error
-            for command in self.queue:
-                if isinstance(command, _Boundary) and not command.future.done():
-                    command.future.cancel()
-            self.queue.clear()
+            self.outbound.discard()
             self.initial_self_state.clear()
-            self.queue_bytes = self.queue_packets = 0
             self.actor_state.clear()
             self.inventory.discard()
             if self.connection is not None:
@@ -291,25 +269,15 @@ class Session:
             raise RuntimeError("session is closing")
         try:
             token = self.codec.prepare_packet(packet)
-            size = len(token) + 5
+            self.outbound.admit(token, play=self.initialized, operation=operation, valid=valid)
         except BaseException as error:
             if fail_session:
                 self.fail(error)
             raise
-        if self.queue_packets >= transport.COMMAND_PACKETS or size > transport.COMMAND_BYTES - self.queue_bytes:
-            error = RuntimeError("outbound queue limit exceeded")
-            if fail_session:
-                self.fail(error)
-            raise error
-        self.queue.append(_Command(token, size, self.initialized, operation, valid))
-        self.queue_bytes += size
-        self.queue_packets += 1
-        self.send_event.set()
 
     async def flush(self, change=None):
         future = self.runtime._loop.create_future()
-        self.queue.append(_Boundary(future, change))
-        self.send_event.set()
+        self.outbound.add_boundary(future, change)
         await asyncio.shield(future)
 
     def command_valid(self, command):
@@ -319,22 +287,12 @@ class Session:
 
     async def sender(self):
         while self.usable():
-            await self.send_event.wait()
-            self.send_event.clear()
-            while self.queue and self.usable():
-                first = self.queue[0]
-                if isinstance(first, _Boundary):
-                    self.queue.popleft()
-                    if first.change:
-                        first.change()
-                    if not first.future.done():
-                        first.future.set_result(None)
+            await self.outbound.wait()
+            while self.outbound.queue and self.usable():
+                if isinstance(self.outbound.queue[0], _outbound._Boundary):
+                    self.outbound.advance_boundary()
                     continue
-                commands = []
-                for command in self.queue:
-                    if isinstance(command, _Boundary):
-                        break
-                    commands.append(command)
+                commands = self.outbound.batch()
                 valid = [command for command in commands if self.command_valid(command)]
                 if valid:
                     wire = self.batch.encode_prepared([command.token for command in valid])
@@ -350,10 +308,7 @@ class Session:
                         self.packet_counts_out[command.token.packet_id] += 1
                         if command.play:
                             self.play_packet_counts_out[command.token.packet_id] += 1
-                for command in commands:
-                    assert self.queue.popleft() is command
-                    self.queue_bytes -= command.size
-                    self.queue_packets -= 1
+                self.outbound.consume(commands)
 
     async def reader(self):
         while self.usable():

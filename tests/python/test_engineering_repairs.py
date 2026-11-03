@@ -542,7 +542,7 @@ async def test_player_control_frame_consumption_look_override_and_epoch_invalida
     bot.set_look(12, 34)
     session.control.acknowledge_teleport()
     session.tick()
-    queued = session.queue[-1]
+    queued = session.outbound.queue[-1]
     assert session.command_valid(queued)
     session.tick()
     first, second = queued_packets(session)
