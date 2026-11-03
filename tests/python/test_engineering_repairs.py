@@ -24,7 +24,7 @@ async def test_input_copy_is_independent_and_keeps_all_fields_and_subclass_layou
     frame = input_type(position=api.Vec3(1, 2, 3), delta=api.Vec3(4, 5, 6), move=api.Vec2(-1, 1),
                        pitch=-0.0, yaw=75, vertical_collision=False)
     bot.set_input(frame)
-    captured = session.input
+    captured = session.control.input
     assert captured is not frame and type(captured) is input_type
     frame.position = frame.delta = api.Vec3(99, 99, 99)
     frame.move = api.Vec2()
@@ -38,7 +38,7 @@ async def test_input_copy_is_independent_and_keeps_all_fields_and_subclass_layou
     assert captured.yaw == 75 and captured.vertical_collision is False
     with pytest.raises(ValueError, match="finite"):
         bot.set_input(api.Input(position=api.Vec3(x=float("inf"))))
-    assert session.input is captured
+    assert session.control.input is captured
 
 
 @pytest.mark.parametrize("protocol", [1001, 2193])
@@ -149,9 +149,9 @@ async def test_prepared_input_epoch_is_invalidated_before_transmission(monkeypat
                                              respawn=False, loading_screen_id=42)
         else:
             packet = p.SetHealthPacket(health=0)
-        epoch = bot._session.input_epoch
+        epoch = bot._session.control.epoch
         peer.send(packet)
-        await until(lambda: bot._session.input_epoch != epoch)
+        await until(lambda: bot._session.control.epoch != epoch)
         if invalidation == "death":
             bot.respawn()
             peer.send(
@@ -531,3 +531,35 @@ async def test_actor_replacement_does_not_resurrect_after_removed_callback_inval
     assert not session.usable()
     assert bot.capture_actor(91) is None and bot.capture_actor(92) is None
     assert [event.kind for event in events] == [api.ActorEvent.Kind.removed]
+
+
+@pytest.mark.parametrize("protocol", [1001, 2193])
+async def test_player_control_frame_consumption_look_override_and_epoch_invalidation(protocol):
+    from test_respawn_retry import queued_packets
+
+    bot, session, _ = ready_bot(protocol)
+    bot.set_input(api.Input(position=api.Vec3(7, 8, 9), jumping=True))
+    bot.set_look(12, 34)
+    session.control.acknowledge_teleport()
+    session.tick()
+    queued = session.queue[-1]
+    assert session.command_valid(queued)
+    session.tick()
+    first, second = queued_packets(session)
+    assert (first.client_tick, second.client_tick) == (1, 2)
+    assert (first.rot.x, first.rot.y) == (12, 34)
+    assert (second.rot.x, second.rot.y) == (12, 34)
+    assert first.pos.x == second.pos.x == 7
+    data = session.p.PlayerAuthInputPacket.InputData
+    has_flag = (
+        (lambda packet, flag: bool(packet.input_data & (1 << int(flag))))
+        if protocol == 1001 else (lambda packet, flag: flag in packet.input_data)
+    )
+    assert has_flag(first, data.JUMPING) and not has_flag(second, data.JUMPING)
+    assert has_flag(first, data.HANDLED_TELEPORT) and not has_flag(second, data.HANDLED_TELEPORT)
+
+    epoch = session.control.epoch
+    session.position(api.Vec3(10, 11, 12), True, True, False)
+    assert session.control.epoch == epoch + 1
+    assert not session.command_valid(queued)
+    assert session.control.look == api.Vec2(12, 34)
