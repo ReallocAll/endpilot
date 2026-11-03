@@ -594,3 +594,28 @@ async def test_reconnect_retires_inventory_before_new_session_and_queued_result(
         with pytest.raises(RuntimeError, match="stale or foreign inventory slot"):
             bot.get_item(source)
         assert not requests(peer)
+
+
+@pytest.mark.parametrize("version", [1001, 2193])
+@pytest.mark.parametrize("phase", ["queued", "submitted"])
+async def test_trader_removal_settles_item_request_before_actor_event(monkeypatch, version, phase):
+    async with scene(monkeypatch, version) as (bot, peer, events):
+        await open_trade(bot, peer, second=True)
+        if phase == "queued":
+            peer.pause_sender(bot)
+        operation = bot.begin_move_item(bot.player_slot(9), bot.player_slot(0), 3)
+        if phase == "submitted":
+            await sent(peer)
+        events.clear()
+
+        bot._session.remove_actor(91)
+        result = await operation.wait(2)
+        expected = api.ItemRequestOutcome.cancelled if phase == "queued" else api.ItemRequestOutcome.indeterminate
+        assert result.outcome == expected
+        assert bot.get_trade_window() is None
+        relevant = [event for event in events if isinstance(event, (api.ItemRequestEvent, api.ActorEvent))]
+        assert [type(event) for event in relevant] == [api.ItemRequestEvent, api.ActorEvent]
+        assert relevant[0].reason == "trader removed"
+        assert relevant[1].kind == api.ActorEvent.Kind.removed
+        assert bot.capture_actor(91) is None
+        peer.resume_sender()
