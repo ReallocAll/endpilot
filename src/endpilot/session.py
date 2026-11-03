@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 import bedrock_protocol as bp
 from bedrock_protocol.wire import BatchCodec, Compression
 
-from . import _actors, _inventory, _outbound, _player_control, _statistics, transport
+from . import _actors, _inventory, _negotiation, _outbound, _player_control, _statistics, transport
 from . import events as ev
 from ._player_control import finite
 from ._projection import unwrap
@@ -117,7 +117,7 @@ class Session:
         self.error = None
         self.reason = ""
         self.disconnect_reason = None
-        self.settings = self.handshake = self.login = self.start_game = self.spawn = self.initialized = False
+        self.negotiation = _negotiation._Negotiation(self.p, self.options)
         self.initial_self_state = deque()
         self.actor_state = _actors._ActorState(self.p)
         self.inventory = _inventory._InventoryState(
@@ -263,7 +263,7 @@ class Session:
             raise RuntimeError("session is closing")
         try:
             token = self.codec.prepare_packet(packet)
-            self.outbound.admit(token, play=self.initialized, operation=operation, valid=valid)
+            self.outbound.admit(token, play=self.negotiation.initialized, operation=operation, valid=valid)
         except BaseException as error:
             if fail_session:
                 self.fail(error)
@@ -332,7 +332,7 @@ class Session:
                 if not self.options.validate_all_packets and header.packet_id not in REQUIRED_IDS:
                     continue
                 decoded = next(decoded_packets)
-                if self.initialized:
+                if self.negotiation.initialized:
                     self.metrics.incoming_play_packet(decoded.header.packet_id)
                 self.emit(ev.EventKind.packet_decoded, lambda: ev.PacketDecodedEvent(decoded))
                 if not self.usable():
@@ -358,25 +358,22 @@ class Session:
     async def handle(self, packet):
         p = self.p
         id = packet.packet_id
-        pinned_raknet = self.options.transport == "raknet" and bool(self.options.server_key_sha256)
-        if pinned_raknet and not self.login and id not in (143, 3, 2, 5):
+        if self.negotiation.blocks_gameplay(id):
             raise _MalformedPacket("gameplay packet received before pinned login success")
         if id == 143:
-            if self.settings or self.status.state != BotState.negotiating:
-                raise RuntimeError("unexpected NetworkSettings")
+            self.negotiation.require_settings(self.status.state)
             await self.flush(
                 lambda: self.batch.set_compression(
                     Compression(int(packet.compression_algorithm)), packet.compression_threshold
                 )
             )
-            self.settings = True
+            self.negotiation.settings = True
             login = build_login(self.identity, self.options)
             self.state(BotState.logging_in)
             if self.usable():
                 self.enqueue(p.LoginPacket(client_network_version=self.options.protocol, connection_request=login))
         elif id == 3:
-            if not self.settings or self.handshake or self.login:
-                raise RuntimeError("unexpected server handshake")
+            self.negotiation.require_handshake()
             try:
                 if self.options.transport == "raknet":
                     key = derive_session_key(
@@ -391,40 +388,22 @@ class Session:
                 await self.flush(lambda: self.batch.enable_encryption(key))
             else:
                 await self.flush()
-            self.handshake = True
+            self.negotiation.handshake = True
             self.enqueue(p.ClientToServerHandshakePacket())
         elif id == 2:
             if packet.status == p.PlayStatus.LOGIN_SUCCESS:
-                if not self.settings:
-                    raise RuntimeError("LoginSuccess before settings")
-                if self.options.transport == "raknet" and self.options.server_key_sha256 and not self.handshake:
-                    raise RuntimeError("LoginSuccess before pinned server handshake")
-                if not self.login:
-                    self.login = True
+                if self.negotiation.accept_login_success():
                     self.enqueue(p.ClientCacheStatusPacket(enabled=self.options.client_cache))
                     self.state(BotState.spawning)
                     await self.try_ready()
             elif packet.status == p.PlayStatus.PLAYER_SPAWN:
-                if pinned_raknet and not self.login:
+                if not self.negotiation.accept_spawn():
                     raise _MalformedPacket("PlayerSpawn before pinned LoginSuccess")
-                self.spawn = True
                 await self.try_ready()
             else:
                 raise RuntimeError("server rejected login")
         elif id in (6, 7):
-            if self.options.protocol == 2193:
-                cls = p.ResourcePackClientResponsePacket
-                response = bp.Variant(
-                    3 if id == 7 else 2, cls.ResourcePackStackFinished() if id == 7 else cls.DownloadingFinished()
-                )
-                self.enqueue(cls(response=response))
-            else:
-                response = (
-                    p.ResourcePackResponse.RESOURCE_PACK_STACK_FINISHED
-                    if id == 7
-                    else p.ResourcePackResponse.DOWNLOADING_FINISHED
-                )
-                self.enqueue(p.ResourcePackClientResponsePacket(response=response, downloading_packs=[]))
+            self.enqueue(self.negotiation.resource_pack_response(id))
         elif id == 11:
             position = vec(packet.pos)
             if not finite(position):
@@ -436,7 +415,7 @@ class Session:
                 dimension=packet.settings.spawn_settings.dimension,
             )
             self.control.invalidate(clear_look=True)
-            self.start_game = True
+            self.negotiation.start_game = True
             self.apply_initial_self_state()
             await self.try_ready()
         elif id == 162:
@@ -463,15 +442,7 @@ class Session:
             self.handle_state(packet)
 
     async def try_ready(self):
-        if (
-            not self.usable()
-            or self.initialized
-            or not self.login
-            or (self.options.transport == "raknet" and self.options.server_key_sha256 and not self.handshake)
-            or not self.start_game
-            or not self.spawn
-            or self.status.chunk_radius <= 0
-        ):
+        if not self.usable() or not self.negotiation.can_initialize(self.status.chunk_radius):
             return
         p = self.p
         if self.options.load_screen:
@@ -484,7 +455,7 @@ class Session:
         await self.flush()
         if not self.usable():
             return
-        self.initialized = True
+        self.negotiation.initialized = True
         if self.options.chunk_radius != 16:
             self.enqueue(
                 p.RequestChunkRadiusPacket(
@@ -502,7 +473,7 @@ class Session:
         p = self.p
         id = packet.packet_id
         if id == 42:
-            if not self.start_game:
+            if not self.negotiation.start_game:
                 self.defer_self_state(_InitialHealth(None, float(packet.health)))
             else:
                 self.health(float(packet.health))
@@ -545,11 +516,11 @@ class Session:
                     ),
                 )
         elif id == 29:
-            if not self.start_game:
+            if not self.negotiation.start_game:
                 for attribute in packet.attribute_data:
                     if attribute.name == "minecraft:health":
                         self.defer_self_state(_InitialHealth(packet.runtime_id, attribute.current_value))
-            if self.start_game and packet.runtime_id == self.status.actor_runtime_id:
+            if self.negotiation.start_game and packet.runtime_id == self.status.actor_runtime_id:
                 for attribute in packet.attribute_data:
                     if attribute.name == "minecraft:health":
                         self.health(attribute.current_value)
@@ -561,7 +532,7 @@ class Session:
                     return
                 self.emit(ev.EventKind.actor, lambda: ev.ActorEvent(ev.ActorEvent.Kind.metadata, actor))
         elif id == 19:
-            if not self.start_game:
+            if not self.negotiation.start_game:
                 mode = packet.reset_position
                 self.defer_self_state(_InitialPosition(
                     packet.player_id, vec(packet.pos),
@@ -569,7 +540,7 @@ class Session:
                     mode in (p.PlayerPositionModeComponent.PositionMode.TELEPORT,
                              p.PlayerPositionModeComponent.PositionMode.RESPAWN),
                 ))
-            if self.start_game and packet.player_id == self.status.actor_runtime_id:
+            if self.negotiation.start_game and packet.player_id == self.status.actor_runtime_id:
                 mode = packet.reset_position
                 self.position(
                     vec(packet.pos),
@@ -631,7 +602,7 @@ class Session:
         elif id == 27:
             self.actor_state.record_signal(packet)
             if packet.event_id == p.ActorEvent.DEATH:
-                if not self.start_game:
+                if not self.negotiation.start_game:
                     self.defer_self_state(_InitialHealth(packet.runtime_id, 0))
                 elif packet.runtime_id == self.status.actor_runtime_id:
                     self.health(0)

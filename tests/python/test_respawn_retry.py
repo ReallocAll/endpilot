@@ -19,7 +19,7 @@ def ready_bot(protocol):
     bot._generation = 1
     bot._token = api.BotToken()
     bot._session = session = Session(bot, 1, loop.create_future())
-    session.start_game = True
+    session.negotiation.start_game = True
     session.status = replace(session.status, state=api.BotState.ready, actor_runtime_id=2,
                              position=api.Vec3(4, 5, 6), health=20)
     return bot, session, events
