@@ -8,8 +8,16 @@ from ._projection import unwrap
 from .observations import ContainerSnapshot, InventorySnapshot, SlotObservation, TradeOffers, _stack_id
 from .operations import ItemCancellation, ItemOperation, ItemOperationPhase, ItemOperationResult, ItemRequestOutcome
 from .types import (
-    InventoryArea, InventorySlot, ItemCount, ItemRequestKey, SlotState,
-    TradeItem, TradeOffer, TradeOfferRef, TradeWindowObservation, WindowRef,
+    InventoryArea,
+    InventorySlot,
+    ItemCount,
+    ItemRequestKey,
+    SlotState,
+    TradeItem,
+    TradeOffer,
+    TradeOfferRef,
+    TradeWindowObservation,
+    WindowRef,
 )
 
 PLAIN_DATA = b"\0" * 10
