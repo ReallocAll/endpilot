@@ -3,13 +3,12 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import replace
 
 import bedrock_protocol as bp
 from bedrock_protocol.wire import BatchCodec, Compression
 
-from . import _actors, _inventory, _negotiation, _outbound, _player_control, _statistics, transport
+from . import _actors, _inventory, _negotiation, _outbound, _player_control, _player_lifecycle, _statistics, transport
 from . import events as ev
 from ._player_control import finite
 from ._projection import unwrap
@@ -81,20 +80,6 @@ def vec(value):
     return Vec3(value.x, value.y, value.z)
 
 
-@dataclass(frozen=True, slots=True)
-class _InitialPosition:
-    runtime_id: int
-    position: Vec3
-    teleport: bool
-    acknowledge: bool
-
-
-@dataclass(frozen=True, slots=True)
-class _InitialHealth:
-    runtime_id: int | None
-    value: float
-
-
 class Session:
     def __init__(self, bot, generation, ready):
         self.bot = bot
@@ -118,7 +103,7 @@ class Session:
         self.reason = ""
         self.disconnect_reason = None
         self.negotiation = _negotiation._Negotiation(self.p, self.options)
-        self.initial_self_state = deque()
+        self.player = _player_lifecycle._PlayerLifecycle(self.p)
         self.actor_state = _actors._ActorState(self.p)
         self.inventory = _inventory._InventoryState(
             self.p, self.bot._token, self.id, self.runtime._loop, self.options.item_request_timeout_ms
@@ -127,7 +112,6 @@ class Session:
         self.equipment_epoch = 0
         self.dimension_deadline = None
         self.loading_screen_id = None
-        self.respawn_phase = 0
         self.probe = None
         self.last_probe_stamp = 0
         self.outbound = _outbound._OutboundQueue()
@@ -229,7 +213,7 @@ class Session:
                         self.runtime._background_failure(error)
                     self.error = error
             self.outbound.discard()
-            self.initial_self_state.clear()
+            self.player.clear_pending()
             self.actor_state.clear()
             self.inventory.discard()
             if self.connection is not None:
@@ -474,7 +458,7 @@ class Session:
         id = packet.packet_id
         if id == 42:
             if not self.negotiation.start_game:
-                self.defer_self_state(_InitialHealth(None, float(packet.health)))
+                self.defer_self_state(_player_lifecycle._InitialHealth(None, float(packet.health)))
             else:
                 self.health(float(packet.health))
         elif id == 58:
@@ -519,7 +503,7 @@ class Session:
             if not self.negotiation.start_game:
                 for attribute in packet.attribute_data:
                     if attribute.name == "minecraft:health":
-                        self.defer_self_state(_InitialHealth(packet.runtime_id, attribute.current_value))
+                        self.defer_self_state(_player_lifecycle._InitialHealth(packet.runtime_id, attribute.current_value))
             if self.negotiation.start_game and packet.runtime_id == self.status.actor_runtime_id:
                 for attribute in packet.attribute_data:
                     if attribute.name == "minecraft:health":
@@ -533,13 +517,7 @@ class Session:
                 self.emit(ev.EventKind.actor, lambda: ev.ActorEvent(ev.ActorEvent.Kind.metadata, actor))
         elif id == 19:
             if not self.negotiation.start_game:
-                mode = packet.reset_position
-                self.defer_self_state(_InitialPosition(
-                    packet.player_id, vec(packet.pos),
-                    mode == p.PlayerPositionModeComponent.PositionMode.TELEPORT,
-                    mode in (p.PlayerPositionModeComponent.PositionMode.TELEPORT,
-                             p.PlayerPositionModeComponent.PositionMode.RESPAWN),
-                ))
+                self.defer_self_state(self.player.position_effect(packet))
             if self.negotiation.start_game and packet.player_id == self.status.actor_runtime_id:
                 mode = packet.reset_position
                 self.position(
@@ -603,16 +581,16 @@ class Session:
             self.actor_state.record_signal(packet)
             if packet.event_id == p.ActorEvent.DEATH:
                 if not self.negotiation.start_game:
-                    self.defer_self_state(_InitialHealth(packet.runtime_id, 0))
+                    self.defer_self_state(_player_lifecycle._InitialHealth(packet.runtime_id, 0))
                 elif packet.runtime_id == self.status.actor_runtime_id:
                     self.health(0)
             self.emit(ev.EventKind.actor_signal, lambda: ev.ActorSignalEvent(packet.copy()))
         elif id == 45:
-            if packet.state == p.PlayerRespawnState.READY_TO_SPAWN and self.respawn_phase == 1:
+            if packet.state == p.PlayerRespawnState.READY_TO_SPAWN and self.player.respawn_phase == 1:
                 self.position(vec(packet.pos), False, False, False)
                 if self.usable():
                     self.action(True)
-                    self.respawn_phase = 2
+                    self.player.respawn_phase = 2
         elif id == 61:
             position = vec(packet.pos)
             if not finite(position):
@@ -693,16 +671,15 @@ class Session:
         return self.p.Vec3(x=value.x, y=value.y, z=value.z)
 
     def defer_self_state(self, effect):
-        if len(self.initial_self_state) >= 4096:
+        if not self.player.defer(effect):
             raise _MalformedPacket("pre-StartGame self-state limit exceeded")
-        self.initial_self_state.append(effect)
 
     def apply_initial_self_state(self):
-        while self.initial_self_state and self.usable():
-            effect = self.initial_self_state.popleft()
-            if effect.runtime_id is not None and effect.runtime_id != self.status.actor_runtime_id:
-                continue
-            if isinstance(effect, _InitialPosition):
+        while self.usable():
+            effect = self.player.take(self.status.actor_runtime_id)
+            if effect is None:
+                break
+            if isinstance(effect, _player_lifecycle._InitialPosition):
                 self.position(effect.position, effect.teleport, False, effect.acknowledge)
             else:
                 self.health(effect.value)
@@ -728,25 +705,18 @@ class Session:
     def health(self, value):
         if not finite(value):
             raise _MalformedPacket("non-finite health")
-        died = value <= 0 and self.status.alive
-        respawned = value > 0 and not self.status.alive and self.respawn_phase == 2
-        if died:
-            self.status = replace(self.status, health=value, alive=False, selected_hotbar=None)
-        elif respawned:
-            self.status = replace(self.status, health=value, alive=True)
-        else:
-            self.status = replace(self.status, health=value)
+        self.status, died, respawned = self.player.health_transition(self.status, value)
         if died:
             self.control.invalidate(clear_look=True)
             self.equipment_epoch += 1
             self.invalidate_container()
             self.inventory.clear_inventories()
-            self.respawn_phase = 0
+            self.player.respawn_phase = 0
             self.metrics.increment("deaths")
             self.invalidate_operation("player died")
             self.emit(ev.EventKind.death, ev.DeathEvent)
         elif respawned:
-            self.respawn_phase = 0
+            self.player.respawn_phase = 0
             self.metrics.increment("respawns")
             self.emit(ev.EventKind.respawn, ev.RespawnEvent)
         self.emit(ev.EventKind.health, lambda: ev.HealthEvent(value))
@@ -1014,11 +984,10 @@ class Session:
         if type(retry) is not bool:
             raise ValueError("retry must be a boolean")
         self.require_ready()
-        if self.status.alive:
-            raise RuntimeError("bot is alive")
-        if self.respawn_phase and not retry:
+        intent = self.player.respawn_intent(self.status.alive, retry)
+        if intent == 0:
             return
-        if self.respawn_phase == 2:
+        if intent == 2:
             self.action(True)
             return
         self.enqueue(
@@ -1028,7 +997,7 @@ class Session:
                 runtime_id=self.status.actor_runtime_id,
             )
         )
-        self.respawn_phase = 1
+        self.player.respawn_phase = 1
 
     def probe_latency(self):
         self.require_ready()

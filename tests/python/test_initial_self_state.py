@@ -67,7 +67,7 @@ async def test_early_moves_preserve_own_teleport_and_do_not_replay_remote_actor_
 
     async with api.Runtime(callback, events=api.ALL_EVENTS) as runtime:
         bot = runtime.add_bot(api.BotOptions(server_url="http://peer", protocol=protocol))
-        await until(lambda: bot._session is not None and len(bot._session.initial_self_state) == 1 + own_move)
+        await until(lambda: bot._session is not None and len(bot._session.player.pending) == 1 + own_move)
         peer = peers.connections[-1]
         assert bot.capture_actor(91).position == api.Vec3(70, 8, 9)
         assert not any(isinstance(event, api.PositionEvent) for event in events)
@@ -81,7 +81,7 @@ async def test_early_moves_preserve_own_teleport_and_do_not_replay_remote_actor_
             peer.start_game.pos.x, peer.start_game.pos.y, peer.start_game.pos.z
         )
         assert bot.get_status().position == expected_position
-        assert not bot._session.initial_self_state
+        assert not bot._session.player.pending
         assert sum(isinstance(event, api.PositionEvent) for event in events) == own_move
         assert sum(isinstance(event, api.ActorMotionEvent) for event in events) == 1
         assert sum(isinstance(event, api.ActorEvent) and event.kind == api.ActorEvent.Kind.moved
@@ -116,7 +116,7 @@ async def test_early_health_and_death_fifo_emit_once_and_respawn_after_ready(mon
     interests = api.ALL_EVENTS & ~api.event_mask(api.EventKind.packet_decoded)
     async with api.Runtime(lambda _bot, event: events.append(event), events=interests) as runtime:
         bot = runtime.add_bot(api.BotOptions(server_url="http://peer", protocol=protocol))
-        await until(lambda: bot._session is not None and len(bot._session.initial_self_state) == 1 + len(expected))
+        await until(lambda: bot._session is not None and len(bot._session.player.pending) == 1 + len(expected))
         peer = peers.connections[-1]
         assert not any(isinstance(event, (api.DeathEvent, api.HealthEvent)) for event in events)
         assert sum(isinstance(event, api.ActorSignalEvent) for event in events) == (ordering != "attribute_health")
@@ -130,7 +130,7 @@ async def test_early_health_and_death_fifo_emit_once_and_respawn_after_ready(mon
         assert sum(isinstance(event, api.ActorSignalEvent) for event in events) == (ordering != "attribute_health")
         assert sum(isinstance(event, api.ActorEvent) and event.kind == api.ActorEvent.Kind.metadata
                    for event in events) == 1
-        assert not bot._session.initial_self_state
+        assert not bot._session.player.pending
         bot.respawn()
         p = peer.p
         peer.send(p.RespawnPacket(pos=p.Vec3(x=1, y=2, z=3), state=p.PlayerRespawnState.READY_TO_SPAWN,
@@ -145,9 +145,9 @@ async def test_close_before_start_game_releases_pending_effects(monkeypatch):
     events = []
     async with api.Runtime(lambda _bot, event: events.append(event), events=api.ALL_EVENTS) as runtime:
         bot = runtime.add_bot(api.BotOptions(server_url="http://peer"))
-        await until(lambda: bot._session is not None and len(bot._session.initial_self_state) == 2)
+        await until(lambda: bot._session is not None and len(bot._session.player.pending) == 2)
         await bot.disconnect()
-        assert peers.connections[-1].closed and not bot._session.initial_self_state
+        assert peers.connections[-1].closed and not bot._session.player.pending
         assert not any(isinstance(event, (api.DeathEvent, api.HealthEvent)) for event in events)
 
 
@@ -159,7 +159,7 @@ async def test_pending_bound_is_checked_for_each_health_attribute_and_fails_visi
         with pytest.raises(RuntimeError, match="self-state limit"):
             await bot.wait_ready(2)
         await until(lambda: bot._session.finished)
-        assert bot.get_status().state == api.BotState.failed and not bot._session.initial_self_state
+        assert bot.get_status().state == api.BotState.failed and not bot._session.player.pending
         assert not any(isinstance(event, api.HealthEvent) for event in events)
         errors = [event for event in events if isinstance(event, api.DecodeErrorEvent)]
         assert len(errors) == 1 and errors[0].packet_id == 29 and not errors[0].recoverable
@@ -177,8 +177,8 @@ async def test_start_game_drain_stops_after_callback_disconnect(monkeypatch):
 
     async with api.Runtime(callback, events=api.event_mask(api.EventKind.health)) as runtime:
         bot = runtime.add_bot(api.BotOptions(server_url="http://peer"))
-        await until(lambda: bot._session is not None and len(bot._session.initial_self_state) == 2)
+        await until(lambda: bot._session is not None and len(bot._session.player.pending) == 2)
         finish_spawn(peers.connections[-1])
         await until(lambda: peers.connections[-1].closed)
-        assert health == [0] and not bot._session.initial_self_state
+        assert health == [0] and not bot._session.player.pending
         assert not bot.get_status().alive and bot.get_status().health == 0

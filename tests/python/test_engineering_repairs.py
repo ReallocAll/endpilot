@@ -91,7 +91,7 @@ async def test_health_callbacks_observe_final_status_and_keep_death_respawn_even
     retained = session.status
     events.clear()
     observations.clear()
-    session.respawn_phase = 2
+    session.player.respawn_phase = 2
     session.health(20)
     assert [type(event) for event in events] == [api.RespawnEvent, api.HealthEvent]
     assert all(status.alive and status.health == 20 for _, status in observations)
