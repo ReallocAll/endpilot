@@ -670,7 +670,7 @@ class _InventoryState:
         return self.finish_operation(outcome, reason)
 
     def cancel_operation(self, operation):
-        if operation.key.bot is not self.bot_token or operation.key.session_id != self.session_id:
+        if self.retired or operation.key.bot is not self.bot_token or operation.key.session_id != self.session_id:
             raise RuntimeError("stale or foreign item operation")
         if operation.phase == ItemOperationPhase.terminal:
             return ItemCancellation.already_terminal, None

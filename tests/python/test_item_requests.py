@@ -584,6 +584,8 @@ async def test_reconnect_retires_inventory_before_new_session_and_queued_result(
         # Bot's generation advances synchronously, before its old Session is joined.
         with pytest.raises(RuntimeError, match="stale or foreign inventory slot"):
             bot.get_item(source)
+        with pytest.raises(RuntimeError, match="stale or foreign item operation"):
+            bot.cancel_item_operation(operation)
         result = await operation.wait(2)
         assert result.outcome == api.ItemRequestOutcome.cancelled
         assert all(slot.state == api.SlotState.unknown for slot in result.touched_slots)
