@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from dataclasses import fields, replace
 
-from ._projection import ReadonlyMap
 from .events import validate_mask
 from .observations import Snapshot, Statistics, TradeOffers
 from .operations import ItemOperation
@@ -203,10 +202,10 @@ class Bot:
         )
 
     def capture_actor(self, runtime_id):
-        return self._current().actors.get(runtime_id)
+        return self._current().actor_state.get(runtime_id)
 
     def capture_actors(self):
-        return ReadonlyMap(self._current().actors)
+        return self._current().actor_state.capture()
 
     def capture_inventory(self, inventory_id):
         return self._current().inventory.capture_inventory(inventory_id)
@@ -221,7 +220,7 @@ class Bot:
         s = self._current()
         return [
             ObservedEntity(EntityRef(self._token, s.id, a.runtime_id, a.unique_id), a.type, a.position)
-            for a in s.actors.values()
+            for a in s.actor_state.values()
         ]
 
     def send_packet(self, packet):
