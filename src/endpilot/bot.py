@@ -185,13 +185,7 @@ class Bot:
         session = self._session
         if session is None:
             return Statistics()
-        return Statistics(
-            **session.stats,
-            packet_counts_in=session.packet_counts_in,
-            packet_counts_out=session.packet_counts_out,
-            play_packet_counts_in=session.play_packet_counts_in,
-            play_packet_counts_out=session.play_packet_counts_out,
-        )
+        return session.metrics.capture()
 
     def capture_snapshot(self):
         s = self._current()
