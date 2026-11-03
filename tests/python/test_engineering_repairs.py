@@ -60,7 +60,7 @@ async def test_delta_actor_motion_preserves_axis_values_identity_and_retained_sn
     p = session.p
     packet = p.MoveActorDeltaPacket(move_data=p.MoveActorDeltaData(**values))
     session.handle_state(session.codec.decode_packet(session.codec.encode_packet(packet)).payload)
-    current = session.actors[91]
+    current = session.actor_state.get(91)
     if coordinates is None:
         assert current.position is actor.position
     else:
@@ -487,3 +487,47 @@ def test_public_collection_copy_detaches_ordinary_nested_containers(collection):
     token = api.BotToken()
     ref = api.InventorySlot(token, 1, api.InventoryArea.player, 0)
     assert ref.copy().bot is token and ref.copy().area is api.InventoryArea.player
+
+@pytest.mark.parametrize("protocol", [1001, 2193])
+async def test_actor_id_collisions_remove_previous_snapshot_before_replacement(protocol):
+    bot, session, events = ready_bot(protocol)
+    first = api.ActorSnapshot(91, -92, "minecraft:player", api.Vec3(1, 2, 3))
+    changed_runtime = api.ActorSnapshot(92, -92, "minecraft:player", api.Vec3(4, 5, 6))
+    changed_unique = api.ActorSnapshot(92, -93, "minecraft:player", api.Vec3(7, 8, 9))
+
+    session.add_actor(first)
+    retained = bot.capture_actor(91)
+    events.clear()
+    session.add_actor(changed_runtime)
+    assert bot.capture_actor(91) is None and bot.capture_actor(92) is changed_runtime
+    assert [event.kind for event in events] == [api.ActorEvent.Kind.removed, api.ActorEvent.Kind.added]
+    assert events[0].actor is retained
+    assert [(entry.ref.runtime_id, entry.ref.unique_id) for entry in bot.get_observed_entities()] == [(92, -92)]
+
+    events.clear()
+    session.add_actor(changed_unique)
+    assert bot.capture_actor(92) is changed_unique
+    assert [event.kind for event in events] == [api.ActorEvent.Kind.removed, api.ActorEvent.Kind.added]
+    assert [(entry.ref.runtime_id, entry.ref.unique_id) for entry in bot.get_observed_entities()] == [(92, -93)]
+    assert retained.position == api.Vec3(1, 2, 3)
+
+
+@pytest.mark.parametrize("protocol", [1001, 2193])
+async def test_actor_replacement_does_not_resurrect_after_removed_callback_invalidation(protocol):
+    bot, session, events = ready_bot(protocol)
+    first = api.ActorSnapshot(91, -92, "minecraft:player", api.Vec3(1, 2, 3))
+    next_actor = api.ActorSnapshot(92, -92, "minecraft:player", api.Vec3(4, 5, 6))
+    session.add_actor(first)
+    events.clear()
+
+    def callback(_bot, _kind, factory):
+        event = factory()
+        events.append(event)
+        if isinstance(event, api.ActorEvent) and event.kind == api.ActorEvent.Kind.removed:
+            session.invalidate("actor removed callback")
+
+    session.runtime._emit = callback
+    session.add_actor(next_actor)
+    assert not session.usable()
+    assert bot.capture_actor(91) is None and bot.capture_actor(92) is None
+    assert [event.kind for event in events] == [api.ActorEvent.Kind.removed]

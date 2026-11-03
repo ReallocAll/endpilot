@@ -9,7 +9,7 @@ from dataclasses import dataclass, fields, replace
 import bedrock_protocol as bp
 from bedrock_protocol.wire import BatchCodec, Compression
 
-from . import _inventory, transport
+from . import _actors, _inventory, transport
 from . import events as ev
 from ._projection import unwrap
 from .auth import build_login, create_identity, derive_session_key
@@ -158,8 +158,7 @@ class Session:
         self.disconnect_reason = None
         self.settings = self.handshake = self.login = self.start_game = self.spawn = self.initialized = False
         self.initial_self_state = deque()
-        self.actors = {}
-        self.unique_ids = {}
+        self.actor_state = _actors._ActorState(self.p)
         self.inventory = _inventory._InventoryState(
             self.p, self.bot._token, self.id, self.runtime._loop, self.options.item_request_timeout_ms
         )
@@ -281,8 +280,7 @@ class Session:
             self.queue.clear()
             self.initial_self_state.clear()
             self.queue_bytes = self.queue_packets = 0
-            self.actors.clear()
-            self.unique_ids.clear()
+            self.actor_state.clear()
             self.inventory.discard()
             if self.connection is not None:
                 try:
@@ -639,25 +637,9 @@ class Session:
                     if not self.usable():
                         return
             else:
-                actor = self.actors.get(packet.runtime_id)
-                if actor is None or not packet.attribute_data:
+                actor = self.actor_state.update_attributes(packet)
+                if actor is None:
                     return
-                attributes = list(actor.attributes)
-                for attribute in packet.attribute_data:
-                    value = p.SyncedAttribute(
-                        name=attribute.name,
-                        min_value=attribute.min_value,
-                        current_value=attribute.current_value,
-                        max_value=attribute.max_value,
-                    )
-                    for index, old in enumerate(attributes):
-                        if old.name == attribute.name:
-                            attributes[index] = value
-                            break
-                    else:
-                        attributes.append(value)
-                actor = replace(actor, attributes=tuple(attributes))
-                self.actors[packet.runtime_id] = actor
                 self.emit(ev.EventKind.actor, lambda: ev.ActorEvent(ev.ActorEvent.Kind.metadata, actor))
         elif id == 19:
             if not self.start_game:
@@ -681,7 +663,7 @@ class Session:
                     ),
                 )
             else:
-                actor = self.actors.get(packet.player_id)
+                actor = self.actor_state.get(packet.player_id)
                 if actor is not None and actor.type == "minecraft:player":
                     self.move_actor(actor, vec(packet.pos), packet.rot.x, packet.rot.y, packet.y_head_rot)
         elif id == 161:
@@ -733,13 +715,13 @@ class Session:
             )
             self.add_actor(actor)
         elif id == 14:
-            self.remove_actor(self.unique_ids.get(packet.entity_id))
+            self.remove_actor(self.actor_state.runtime_id(packet.entity_id))
         elif id == 17:
             self.remove_actor(packet.item_id)
             self.emit(ev.EventKind.take_item, lambda: ev.TakeItemEvent(packet.item_id, packet.actor_id))
         elif id in (18, 111):
             move = packet.move_data
-            actor = self.actors.get(move.runtime_id)
+            actor = self.actor_state.get(move.runtime_id)
             if actor is None:
                 return
             if id == 18:
@@ -764,28 +746,8 @@ class Session:
                 pitch, yaw, head = angles
             self.move_actor(actor, position, pitch, yaw, head)
         elif id == 39:
-            actor = self.actors.get(packet.id)
-            if actor:
-                entries = {entry.id: entry for entry in actor.metadata.data} if actor.metadata is not None else {}
-                entries.update((entry.id, entry.copy()) for entry in packet.packed_items.data)
-                ints = (
-                    {entry.property_index: entry for entry in actor.properties.int_entries}
-                    if actor.properties is not None
-                    else {}
-                )
-                floats = (
-                    {entry.property_index: entry for entry in actor.properties.float_entries}
-                    if actor.properties is not None
-                    else {}
-                )
-                ints.update((entry.property_index, entry.copy()) for entry in packet.synched_properties.int_entries)
-                floats.update((entry.property_index, entry.copy()) for entry in packet.synched_properties.float_entries)
-                actor = replace(
-                    actor,
-                    metadata=p.SynchedActorData.CopyableDataList(data=entries.values()),
-                    properties=p.PropertySyncData(int_entries=ints.values(), float_entries=floats.values()),
-                )
-                self.actors[packet.id] = actor
+            actor = self.actor_state.update_data(packet)
+            if actor is not None:
                 self.emit(ev.EventKind.actor, lambda: ev.ActorEvent(ev.ActorEvent.Kind.metadata, actor))
         elif id in (49, 50):
             inventory_id, inventory = _inventory.apply_content(self.inventory, packet)
@@ -813,9 +775,7 @@ class Session:
         elif id == 148:
             self._handle_item_responses(packet)
         elif id == 27:
-            actor = self.actors.get(packet.runtime_id)
-            if actor:
-                self.actors[packet.runtime_id] = replace(actor, last_event=packet.copy())
+            self.actor_state.record_signal(packet)
             if packet.event_id == p.ActorEvent.DEATH:
                 if not self.start_game:
                     self.defer_self_state(_InitialHealth(packet.runtime_id, 0))
@@ -836,8 +796,7 @@ class Session:
             self.input_epoch += 1
             self.equipment_epoch += 1
             self.invalidate_container()
-            self.actors.clear()
-            self.unique_ids.clear()
+            self.actor_state.clear()
             self.status = replace(self.status, position=position, dimension=packet.dimension_id, selected_hotbar=None)
             self.loading_screen_id = packet.loading_screen_id
             self.dimension_deadline = self.runtime._loop.time() + self.options.spawn_timeout_ms / 1000
@@ -1048,8 +1007,7 @@ class Session:
     def move_actor(self, actor, position, pitch, yaw, head):
         if not finite(position, pitch, yaw, head):
             raise _MalformedPacket("non-finite actor motion")
-        actor = replace(actor, position=position, pitch=pitch, yaw=yaw, head_yaw=head)
-        self.actors[actor.runtime_id] = actor
+        actor = self.actor_state.move(actor, position, pitch, yaw, head)
         self.emit(
             ev.EventKind.actor_motion,
             lambda: ev.ActorMotionEvent(
@@ -1069,24 +1027,20 @@ class Session:
     def add_actor(self, actor):
         if not finite(actor.position):
             raise _MalformedPacket("non-finite actor position")
-        old = self.actors.get(actor.runtime_id)
-        other = self.unique_ids.get(actor.unique_id)
-        if other is not None and other != actor.runtime_id:
-            self.remove_actor(other)
-        if old is not None and old.unique_id != actor.unique_id:
-            self.remove_actor(old.runtime_id)
+        for runtime_id in self.actor_state.conflicts(actor):
+            self.remove_actor(runtime_id)
         if not self.usable():
             return
-        self.actors[actor.runtime_id] = actor
-        self.unique_ids[actor.unique_id] = actor.runtime_id
+        self.actor_state.add(actor)
         self.emit(ev.EventKind.actor, lambda: ev.ActorEvent(ev.ActorEvent.Kind.added, actor))
 
     def remove_actor(self, runtime_id):
-        actor = self.actors.pop(runtime_id, None)
+        actor = self.actor_state.remove(runtime_id)
         if actor is None:
             return
-        self.unique_ids.pop(actor.unique_id, None)
-        if self.inventory.interacting == actor.unique_id or self.inventory.window and self.inventory.window.trader_unique_id == actor.unique_id:
+        if self.inventory.interacting == actor.unique_id or (
+            self.inventory.window and self.inventory.window.trader_unique_id == actor.unique_id
+        ):
             self.invalidate_container()
             self.invalidate_operation("trader removed")
         self.emit(ev.EventKind.actor, lambda: ev.ActorEvent(ev.ActorEvent.Kind.removed, actor))
@@ -1177,7 +1131,7 @@ class Session:
         self.status = replace(self.status, selected_hotbar=slot)
 
     def interact(self, entity, hit, attack):
-        actor = self.actors.get(entity.runtime_id)
+        actor = self.actor_state.get(entity.runtime_id)
         if (
             entity.bot is not self.bot._token
             or entity.session_id != self.bot._generation
@@ -1211,8 +1165,7 @@ class Session:
             packet,
             valid=lambda: (
                 epoch == self.input_epoch
-                and self.actors.get(entity.runtime_id) is not None
-                and self.actors[entity.runtime_id].unique_id == entity.unique_id
+                and self.actor_state.matches(entity.runtime_id, entity.unique_id)
             ),
         )
         if not attack:
@@ -1243,7 +1196,7 @@ class Session:
             or not 1 <= identity[0] <= 100
         ):
             return
-        if self.inventory.container and self.inventory.container.closing or identity[2] not in self.unique_ids:
+        if self.inventory.container and self.inventory.container.closing or not self.actor_state.has_unique_id(identity[2]):
             return
         if not self.inventory.update_trade(packet):
             return
