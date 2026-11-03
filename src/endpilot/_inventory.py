@@ -5,7 +5,7 @@ from types import MappingProxyType
 import bedrock_protocol as bp
 
 from ._projection import unwrap
-from .observations import ContainerSnapshot, InventorySnapshot, SlotObservation, TradeOffers, _stack_id
+from .observations import ContainerSnapshot, InventorySnapshot, ItemRegistrySnapshot, SlotObservation, TradeOffers, _stack_id
 from .operations import ItemCancellation, ItemOperation, ItemOperationPhase, ItemOperationResult, ItemRequestOutcome
 from .types import (
     InventoryArea,
@@ -458,6 +458,38 @@ class _InventoryState:
         self.item_authority = set()
         self.next_request_id = -1
         self.operation_deadline = None
+
+    def observe_registry(self, items):
+        self.registry = items.copy()
+        first = not self.registry_observed
+        self.registry_observed = True
+        return first
+
+    def capture_inventory(self, inventory_id):
+        return self.inventories.get(inventory_id)
+
+    def capture_container(self):
+        return self.container
+
+    def capture_item_registry(self):
+        return ItemRegistrySnapshot(self.registry_observed, self.registry)
+
+    def snapshot_fields(self):
+        return {"inventories": self.inventories, "item_registry": self.registry, "container": self.container}
+
+    def clear_inventories(self):
+        self.inventories.clear()
+
+    def discard(self):
+        self.inventories.clear()
+        self.container = self.window = None
+
+    def record_interaction(self, actor_unique_id):
+        self.interacting = actor_unique_id
+
+    def mark_container_closing(self):
+        self.container = replace(self.container, closing=True)
+        self.interacting = None
 
     def player_slot(self, index):
         if type(index) is not int or not 0 <= index <= 35:
