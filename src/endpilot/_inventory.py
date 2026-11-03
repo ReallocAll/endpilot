@@ -450,6 +450,7 @@ class _InventoryState:
         self.p = p
         self.bot_token = bot_token
         self.session_id = session_id
+        self.retired = False
         self.loop = loop
         self.timeout_ms = timeout_ms
         self.inventories = {}
@@ -465,6 +466,9 @@ class _InventoryState:
         self.item_authority = set()
         self.next_request_id = -1
         self.operation_deadline = None
+
+    def retire(self):
+        self.retired = True
 
     def observe_registry(self, items):
         self.registry = items.copy()
@@ -504,7 +508,7 @@ class _InventoryState:
         return InventorySlot(self.bot_token, self.session_id, InventoryArea.player, index)
 
     def get_item(self, slot):
-        if slot.bot is not self.bot_token or slot.session_id != self.session_id:
+        if self.retired or slot.bot is not self.bot_token or slot.session_id != self.session_id:
             raise RuntimeError("stale or foreign inventory slot")
         inventory_id = 0
         if slot.area == InventoryArea.trade_input:
@@ -536,7 +540,8 @@ class _InventoryState:
 
     def validate_window(self, window):
         if (
-            window is None
+            self.retired
+            or window is None
             or window != self.window
             or window.session_id != self.session_id
             or window.container_type != 15

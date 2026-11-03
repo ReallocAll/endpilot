@@ -207,6 +207,8 @@ class Session:
         self.input_epoch += 1
         self.equipment_epoch += 1
         self.send_event.set()
+        if self.id != self.bot._generation:
+            self.inventory.retire()
         if self.inventory.pending is not None:
             self.invalidate_operation(reason)
 
