@@ -14,7 +14,7 @@ from . import events as ev
 from ._player_control import finite
 from ._projection import unwrap
 from .auth import build_login, create_identity, derive_session_key
-from .observations import ActorSnapshot, Statistics
+from .observations import Statistics
 from .types import (
     BotState,
     BotStatus,
@@ -601,82 +601,17 @@ class Session:
         elif id == 161:
             if packet.prediction_type == p.RewindType.PLAYER:
                 self.position(vec(packet.pos), False, True, False)
-        elif id == 13:
-            actor = ActorSnapshot(
-                packet.runtime_id,
-                packet.entity_id,
-                packet.actor_type,
-                vec(packet.pos),
-                vec(packet.velocity),
-                packet.rot.x,
-                packet.rot.y,
-                packet.y_head_rotation,
-                packet.y_body_rotation,
-                packet.data.copy(),
-                packet.synched_properties.copy(),
-                packet.attributes.copy(),
-                packet.links.copy(),
-            )
-            self.add_actor(actor)
-        elif id == 15:
-            self.add_actor(
-                ActorSnapshot(
-                    packet.runtime_id,
-                    packet.id,
-                    "minecraft:item",
-                    vec(packet.pos),
-                    vec(packet.velocity),
-                    metadata=packet.data.copy(),
-                    item=packet.item.copy(),
-                    from_fishing=packet.is_from_fishing,
-                )
-            )
-        elif id == 12:
-            actor = ActorSnapshot(
-                packet.runtime_id,
-                packet.abilities_data.target_player,
-                "minecraft:player",
-                vec(packet.pos),
-                velocity=vec(packet.velocity),
-                pitch=packet.rot.x,
-                yaw=packet.rot.y,
-                head_yaw=packet.y_head_rot,
-                metadata=packet.unpack.copy(),
-                properties=packet.synched_properties.copy(),
-                links=packet.links.copy(),
-            )
-            self.add_actor(actor)
+        elif id in (13, 15, 12):
+            self.add_actor(self.actor_state.snapshot(packet))
         elif id == 14:
             self.remove_actor(self.actor_state.runtime_id(packet.entity_id))
         elif id == 17:
             self.remove_actor(packet.item_id)
             self.emit(ev.EventKind.take_item, lambda: ev.TakeItemEvent(packet.item_id, packet.actor_id))
         elif id in (18, 111):
-            move = packet.move_data
-            actor = self.actor_state.get(move.runtime_id)
-            if actor is None:
-                return
-            if id == 18:
-                position = vec(move.pos)
-                pitch, yaw, head = (getattr(move, field) * 360 / 256 for field in ("rot_x", "rot_y", "rot_y_head"))
-            else:
-                position = actor.position
-                coordinates = {}
-                angles = [actor.pitch, actor.yaw, actor.head_yaw]
-                for i, field in enumerate(
-                    ("new_position_x", "new_position_y", "new_position_z", "rot_x", "rot_y", "rot_y_head")
-                ):
-                    value = getattr(move, field)
-                    present = value is not None if self.options.protocol == 2193 else bool(move.header & (1 << i))
-                    if present:
-                        if i < 3:
-                            coordinates[("x", "y", "z")[i]] = value
-                        else:
-                            angles[i - 3] = value * 360 / 256
-                if coordinates:
-                    position = replace(position, **coordinates)
-                pitch, yaw, head = angles
-            self.move_actor(actor, position, pitch, yaw, head)
+            motion = self.actor_state.motion(packet, self.options.protocol)
+            if motion is not None:
+                self.move_actor(*motion)
         elif id == 39:
             actor = self.actor_state.update_data(packet)
             if actor is not None:

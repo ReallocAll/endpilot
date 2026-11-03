@@ -5,7 +5,7 @@ from uuid import UUID
 
 import bedrock_protocol as bp
 import pytest
-from peer import Peers, actor_packet, empty_item, slot_packet, until
+from peer import Peers, actor_packet, empty_item, motion_packet, slot_packet, until
 from test_benchmark_hooks import dimension_ack
 from test_respawn_retry import ready_bot
 from trade_peer import deliver, inventory_packet, scene
@@ -563,3 +563,24 @@ async def test_player_control_frame_consumption_look_override_and_epoch_invalida
     assert session.control.epoch == epoch + 1
     assert not session.command_valid(queued)
     assert session.control.look == api.Vec2(12, 34)
+
+@pytest.mark.parametrize("protocol", [1001, 2193])
+async def test_actor_packet_projection_preserves_spawn_attributes_and_absolute_motion(protocol):
+    bot, session, events = ready_bot(protocol)
+    p = session.p
+    for original in (actor_packet(p), motion_packet(p, x=7)):
+        packet = session.codec.decode_packet(session.codec.encode_packet(original)).payload
+        session.handle_state(packet)
+    observed = bot.capture_actor(91)
+    assert (observed.runtime_id, observed.unique_id, observed.type) == (91, -92, "minecraft:villager_v2")
+    assert observed.position == api.Vec3(7, 8, 9)
+    assert observed.velocity == api.Vec3(0, 5, 0)
+    assert (observed.pitch, observed.yaw, observed.head_yaw) == (0, 45, 0)
+    actor_events = [event for event in events if isinstance(event, (api.ActorEvent, api.ActorMotionEvent))]
+    assert [type(e) for e in actor_events] == [api.ActorEvent, api.ActorMotionEvent, api.ActorEvent]
+    assert [e.kind for e in actor_events if isinstance(e, api.ActorEvent)] == [
+        api.ActorEvent.Kind.added, api.ActorEvent.Kind.moved
+    ]
+    assert actor_events[0].actor.position == api.Vec3(1, 2, 3)
+    assert actor_events[2].actor is observed
+
