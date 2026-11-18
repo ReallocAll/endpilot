@@ -1,18 +1,13 @@
 # Contributing
 
-Follow the checkout installation in the [README](README.md), then run:
+[Install the SDK](README.md#try-it-offline), then run:
 
 ```sh
-python -m unittest discover -s tests
-python examples/network_settings.py
+python -m unittest discover -s tests -v
 ```
 
-For a first change, follow the example into `src/endpilot/protocol.py`. The
-native dependency owns packet fields and serialization. EndPilot handles game
-packet headers and batch boundaries. If a change affects actual server behavior,
-include the BDS version and what you observed in the pull request. A small
-reproduction or a correction to an example is also welcome.
+Run `python -m pip install -e ".[nethernet]"` to include the NetherNet loopback check.
 
-The SDK is unreleased. Update affected callers together when an interface changes.
-Keep repeatable examples and focused regression fixtures with the code. Put
-investigation notes in the issue or PR and attach supporting run output there.
+For a first packet change, follow the [offline example](examples/network_settings.py) into [protocol.py](src/endpilot/protocol.py) and run the [framing tests](tests/test_protocol.py). A small reproduction or a correction to an example is welcome.
+
+In your PR, describe what the user can do and how you checked it. For server behavior, include the BDS version, transport and observed result.
