@@ -1,0 +1,28 @@
+name: Check
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  sdk:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the native binding and SDK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          wheel="$RUNNER_TEMP/bedrock_protocol-0.5.0.dev0-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"
+          if gh api repos/EndstoneMC/bedrock-protocol/actions/artifacts/14283466209/zip > "$wheel"; then
+            echo "2dc21ed2b9e6a0de777b64459d9686c4625d010b8f15484b5bbc71adc424c451  $wheel" | sha256sum --check
+            python -m pip install "$wheel"
+          else
+            python -m pip install git+https://github.com/EndstoneMC/bedrock-protocol.git@1aa8ae119ccb0a4e60f693217d6dcdde00238d13
+          fi
+          python -m pip install '.[nethernet]'
+      - name: Test the SDK and run the offline example
+        run: |
+          python -m unittest discover -s tests -v
+          python examples/network_settings.py
