@@ -78,10 +78,12 @@ class Movement:
             camera_orientation=b.Vec3(x=0.0, y=0.0, z=1.0),
             raw_move_vector=movement,
         )
-        await self.packets.send(packet)
+        # A server correction can arrive while send() is suspended.
+        # Commit this frame first so it cannot overwrite that correction.
         self._teleport_pending = False
         self._input_position = next_pos
         self._tick += 1
+        await self.packets.send(packet)
 
     async def _idle_inputs(self):
         await self._updated.wait()

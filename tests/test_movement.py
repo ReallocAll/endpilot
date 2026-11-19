@@ -10,6 +10,7 @@ class PacketSink:
         self.protocol = protocol
         self.observer = None
         self.sent = []
+        self.on_send = None
 
     def subscribe_raw(self, callback):
         self.observer = callback
@@ -17,6 +18,8 @@ class PacketSink:
 
     async def send(self, packet):
         self.sent.append(packet)
+        if self.on_send is not None:
+            self.on_send()
 
     def start_receiving(self):
         pass
@@ -77,3 +80,37 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(movement.position[1], 101.62, places=4)
         self.assertAlmostEqual(movement.position[2], 0.5)
         movement.close()
+
+    async def test_teleport_while_sending_rebases_next_frame(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        stream = PacketSink(protocol)
+        movement = Movement(stream, 1)
+
+        teleport = b.MovePlayerPacket()
+        teleport.player_id = 1
+        teleport.pos = b.Vec3(x=0.5, y=100.0, z=0.5)
+        teleport.rot = b.Vec2(x=0.0, y=0.0)
+        teleport.y_head_rot = 0.0
+        teleport.riding_id = 0
+        teleport.reset_position = 2
+        teleport.teleport_data = None
+        teleport.tick = 0
+        movement._on_packet(protocol.encode(teleport))
+
+        def correct_during_send():
+            if len(stream.sent) == 1:
+                teleport.pos = b.Vec3(x=5.5, y=100.0, z=0.5)
+                movement._on_packet(protocol.encode(teleport))
+
+        stream.on_send = correct_during_send
+        await movement._send_input(True)
+        await movement._send_input(True)
+
+        self.assertEqual(movement.position, (5.5, 100.0, 0.5))
+        self.assertAlmostEqual(stream.sent[1].pos.x, 5.5)
+        self.assertAlmostEqual(stream.sent[1].pos.z, 0.59, places=5)
+        self.assertIn(
+            b.PlayerAuthInputPacket.InputData.HANDLED_TELEPORT,
+            stream.sent[1].input_data,
+        )
