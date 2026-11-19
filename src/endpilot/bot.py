@@ -38,6 +38,11 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._movement.wait_for_position_sync(timeout)
 
+    async def walk_forward(self, ticks: int = 24) -> int:
+        if self._movement is None:
+            raise RuntimeError("player has not joined")
+        return await self._movement.walk_forward(ticks)
+
     @property
     def packets(self):
         """Expose typed and raw packet I/O for external extensions."""
