@@ -10,6 +10,7 @@ class Movement:
         self.position: tuple[float, float, float] | None = None
         self._input_position: tuple[float, float, float] | None = None
         self._tick = 0
+        self._teleport_pending = False
         self._updated = asyncio.Event()
         self._unsubscribe = None
         self._action_lock = asyncio.Lock()
@@ -24,6 +25,8 @@ class Movement:
             packet = self.packets.protocol.decode(raw)
             if int(packet.player_id) != self.player_id:
                 return
+            if int(packet.reset_position) == 2:
+                self._teleport_pending = True
         elif raw.packet_id == b.CorrectPlayerMovePredictionPacket.ID:
             packet = self.packets.protocol.decode(raw)
             if int(packet.prediction_type) != 0:
@@ -49,12 +52,15 @@ class Movement:
         step = 0.09 if forward else 0.0
         next_pos = (x, y, z + step)
         movement = b.Vec2(x=0.0, y=1.0 if forward else 0.0)
+        flags = [b.PlayerAuthInputPacket.InputData.UP] if forward else []
+        if self._teleport_pending:
+            flags.append(b.PlayerAuthInputPacket.InputData.HANDLED_TELEPORT)
         packet = b.PlayerAuthInputPacket(
             rot=b.Vec2(x=0.0, y=0.0),
             pos=b.Vec3(x=next_pos[0], y=next_pos[1], z=next_pos[2]),
             move=movement,
             y_head_rot=0.0,
-            input_data=[b.PlayerAuthInputPacket.InputData.UP] if forward else [],
+            input_data=flags,
             input_mode=b.InputMode.MOUSE,
             play_mode=b.ClientPlayMode.NORMAL,
             new_interaction_model=b.NewInteractionModel.CROSSHAIR,
@@ -71,6 +77,7 @@ class Movement:
             raw_move_vector=movement,
         )
         await self.packets.send(packet)
+        self._teleport_pending = False
         self._input_position = next_pos
         self._tick += 1
 
