@@ -9,7 +9,7 @@ EndPilot is a Python SDK for headless Bedrock players. Scripts and MCP tools sha
 Use Python 3.12+ and install the native wheel in the [quickstart](README.md#try-it-offline). From the repository root:
 
 ```sh
-python -m pip install -e ".[nethernet]"
+python -m pip install -e ".[nethernet,raknet]"
 python -m unittest discover -s tests -v
 python examples/network_settings.py
 ```
