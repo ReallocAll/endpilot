@@ -96,6 +96,7 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
             stream.start_receiving()
             for raw in (RawPacket(5, b"first"), RawPacket(5, b"second")):
                 receiving = asyncio.create_task(stream.recv_raw())
+                await asyncio.sleep(0)  # Register the live waiter before the packet arrives.
                 await fake.received.put(b"\xff" + write_batch([raw]))
                 self.assertEqual(await asyncio.wait_for(receiving, 1), raw)
 
