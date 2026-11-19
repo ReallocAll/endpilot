@@ -17,7 +17,7 @@ class Bot:
         if self._session is not None:
             raise RuntimeError("player is already connected")
         session = await JoinSession.connect_nethernet(url, self.identity, self.protocol, timeout)
-        self._movement = Movement(session.packets, session.player_id)
+        self._movement = Movement(session.packets, session.player_id, session.start_position)
         self._session = session
         self._movement.start()
 
