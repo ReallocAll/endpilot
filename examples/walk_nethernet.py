@@ -17,9 +17,9 @@ async def main(url: str, name: str, frames: int, before: float, after: float):
         while True:
             raw = await bot.packets.recv_raw()
             counts[raw.packet_id] += 1
-            if raw.packet_id in (19, 161, 16):
+            if raw.packet_id in (19, 161, 16) or (raw.packet_id == 111 and len(corrected) < 6):
                 decoded = bot.protocol.decode(raw)
-                corrected.append(repr(decoded)[:220])
+                corrected.append(repr(decoded)[:320])
 
     try:
         await bot.join_nethernet(url)
