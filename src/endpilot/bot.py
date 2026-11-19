@@ -19,6 +19,7 @@ class Bot:
         session = await JoinSession.connect_nethernet(url, self.identity, self.protocol, timeout)
         self._movement = Movement(session.packets, session.start_game)
         self._session = session
+        self._movement.start()
 
     @property
     def player_id(self) -> int:
@@ -40,6 +41,8 @@ class Bot:
 
     async def close(self) -> None:
         session, self._session = self._session, None
-        self._movement = None
+        movement, self._movement = self._movement, None
+        if movement is not None:
+            await movement.close()
         if session is not None:
             await session.close()
