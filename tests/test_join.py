@@ -3,6 +3,7 @@ import base64
 import json
 import struct
 import unittest
+from unittest.mock import patch
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -10,6 +11,7 @@ from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 from endpilot.authentication import OfflineIdentity
 from endpilot.compression import PacketConnection
+from endpilot.login import JoinSession
 from endpilot.protocol import Protocol, RawPacket, read_batch, write_batch
 
 
@@ -40,6 +42,16 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
             ".".join(token[:2]).encode(), ec.ECDSA(hashes.SHA384()),
         )
         self.assertEqual(payload["xname"], "EndPilotTest")
+
+    async def test_join_timeout_includes_signaling_connection(self):
+        async def never_connect(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        with patch("endpilot.transport.nethernet.connect", side_effect=never_connect):
+            with self.assertRaises(TimeoutError):
+                await JoinSession.connect_nethernet(
+                    "http://127.0.0.1:19132", OfflineIdentity("EndPilotTest"), object(), timeout=0.01
+                )
 
     async def test_compressed_typed_raw_roundtrip(self):
         protocol = Protocol(2193)
