@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 dependencies = ["bedrock-protocol==0.5.0.dev0", "cryptography>=43"]
 
 [project.optional-dependencies]
-nethernet = ["nethernet[http] @ git+https://github.com/EndstoneMC/nethernet-python.git@873026ec6b9a9162f90e1721884bc1e262ef5516"]
+nethernet = ["nethernet[http] @ git+https://github.com/EndstoneMC/nethernet-python.git@b51ab0fc095ae2562bcbb3de911a392b86b2b335"]
 raknet = ["raknet>=0.4.0"]
 
 [project.urls]

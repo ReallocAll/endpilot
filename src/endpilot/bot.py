@@ -13,10 +13,12 @@ class Bot:
         self._session: JoinSession | None = None
         self._movement: Movement | None = None
 
-    async def join_nethernet(self, url: str, *, timeout: float = 30) -> None:
+    async def join_nethernet(self, url: str, *, timeout: float = 30, server_key_sha256: str | None = None) -> None:
         if self._session is not None:
             raise RuntimeError("player is already connected")
-        session = await JoinSession.connect_nethernet(url, self.identity, self.protocol, timeout)
+        session = await JoinSession.connect_nethernet(
+            url, self.identity, self.protocol, timeout, server_key_sha256=server_key_sha256
+        )
         self._start_session(session)
 
     async def join_raknet(self, host: str, port: int = 19132, *, timeout: float = 30) -> None:
