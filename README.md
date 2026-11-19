@@ -1,6 +1,6 @@
 # EndPilot
 
-EndPilot is a Python SDK for Minecraft Bedrock bots. The current development build supports NetherNet network negotiation and offline-mode player join/leave on BDS 1.26.52 (protocol 2193). Gameplay actions are still under development.
+EndPilot is a Python SDK for Minecraft Bedrock bots. The current development build supports offline-mode join/leave and forward walking on NetherNet and RakNet against BDS 1.26.52 (protocol 2193). Other gameplay actions are still under development.
 
 ## Try it offline
 
@@ -25,5 +25,17 @@ python examples/join_nethernet.py http://localhost:19132 --name EndPilotTest --h
 ```
 
 The settings probe prints the server's compression algorithm and threshold. The join example reports spawn and closes the connection after the requested hold time. Server-required resource-pack downloads and online authentication are not yet supported.
+
+## Walk on NetherNet or RakNet
+
+The same script uses either transport; press Enter to start walking after joining:
+
+```sh
+python -m pip install -e ".[nethernet,raknet]"
+python examples/walk.py http://localhost:19132
+python examples/walk.py raknet://127.0.0.1:19132
+```
+
+`walk_forward()` returns submitted input frames, not confirmed server displacement. Use BDS `querytarget` to verify actual movement. The example's wait for Enter also supports Testbed world setup.
 
 [Contributing](CONTRIBUTING.md) · [Roadmap](ROADMAP.md) · [Apache-2.0](LICENSE)

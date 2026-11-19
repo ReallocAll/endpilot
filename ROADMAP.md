@@ -1,6 +1,6 @@
 # Road to the first public release
 
-EndPilot targets Bedrock players controlled by Python scripts or AI. Today the SDK handles typed and raw packets, uncompressed batches and the opening NetherNet settings exchange. The milestones below describe planned work.
+EndPilot targets Bedrock players controlled by Python scripts or AI. The development SDK handles typed/raw packets and offline-mode join/leave with forward walking on NetherNet and RakNet. The milestones below describe remaining work.
 
 ## 1. Connect a player
 
