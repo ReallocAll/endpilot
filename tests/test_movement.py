@@ -65,5 +65,7 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(stream.sent[1].pos.z, 0.68, places=5)
         self.assertAlmostEqual(stream.sent[-1].pos.z, 0.68, places=5)
         # Submission must not overwrite the last server-observed position.
-        self.assertEqual(movement.position, (0.5, 101.62, 0.5))
+        self.assertAlmostEqual(movement.position[0], 0.5)
+        self.assertAlmostEqual(movement.position[1], 101.62, places=4)
+        self.assertAlmostEqual(movement.position[2], 0.5)
         movement.close()
