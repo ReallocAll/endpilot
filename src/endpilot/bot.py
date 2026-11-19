@@ -1,6 +1,7 @@
 """Public player entry point; game state delegates to the relevant feature."""
 
 from .authentication import OfflineIdentity
+from .blocks import Blocks, BlockUpdate
 from .login import JoinSession
 from .movement import Movement
 from .protocol import Protocol
@@ -12,6 +13,7 @@ class Bot:
         self.protocol = Protocol(protocol)
         self._session: JoinSession | None = None
         self._movement: Movement | None = None
+        self._blocks: Blocks | None = None
 
     async def join_nethernet(self, url: str, *, timeout: float = 30, server_key_sha256: str | None = None) -> None:
         if self._session is not None:
@@ -29,6 +31,7 @@ class Bot:
 
     def _start_session(self, session: JoinSession) -> None:
         self._movement = Movement(session.packets, session.player_id)
+        self._blocks = Blocks(session.packets)
         self._session = session
         self._movement.start()
 
@@ -54,6 +57,13 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._movement.walk_forward(ticks)
 
+    async def wait_for_block_update(
+        self, position: tuple[int, int, int], *, layer: int = 0, timeout: float = 15
+    ) -> BlockUpdate:
+        if self._blocks is None:
+            raise RuntimeError("player has not joined")
+        return await self._blocks.wait_for_update(position, layer=layer, timeout=timeout)
+
     @property
     def packets(self):
         """Expose typed and raw packet I/O for external extensions."""
@@ -64,6 +74,7 @@ class Bot:
     async def close(self) -> None:
         session, self._session = self._session, None
         movement, self._movement = self._movement, None
+        self._blocks = None
         if movement is not None:
             movement.close()
         if session is not None:
