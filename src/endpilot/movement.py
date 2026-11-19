@@ -4,11 +4,11 @@ import asyncio
 
 
 class Movement:
-    def __init__(self, packets, player_id, initial_input_position=None):
+    def __init__(self, packets, player_id):
         self.packets = packets
         self.player_id = int(player_id)
         self.position: tuple[float, float, float] | None = None
-        self._input_position: tuple[float, float, float] | None = initial_input_position
+        self._input_position: tuple[float, float, float] | None = None
         self._tick = 0
         self._teleport_pending = False
         self._updated = asyncio.Event()
@@ -84,8 +84,7 @@ class Movement:
         self._tick += 1
 
     async def _idle_inputs(self):
-        if self._input_position is None:
-            await self._updated.wait()
+        await self._updated.wait()
         while True:
             async with self._action_lock:
                 await self._send_input(False)

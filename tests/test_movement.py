@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 
 from endpilot.movement import Movement
@@ -49,6 +50,9 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         stream = PacketSink(protocol)
         movement = Movement(stream, 1)
         movement.start()
+        # Do not submit placeholder input before the server reports a position.
+        await asyncio.sleep(0)
+        self.assertEqual(stream.sent, [])
         teleport = b.MovePlayerPacket()
         teleport.player_id = 1
         teleport.pos = b.Vec3(x=0.5, y=101.62, z=0.5)
