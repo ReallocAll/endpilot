@@ -9,7 +9,7 @@ class Movement:
         self.player_id = int(player_id)
         self.position: tuple[float, float, float] | None = None
         self._input_position: tuple[float, float, float] | None = None
-        self._tick = 0
+        self._tick = 1
         self._teleport_pending = False
         self._updated = asyncio.Event()
         self._unsubscribe = None
