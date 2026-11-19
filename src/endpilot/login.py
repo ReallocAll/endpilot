@@ -58,13 +58,16 @@ class JoinSession:
         self.spawned = False
 
     @classmethod
-    async def connect_nethernet(cls, url: str, identity, protocol: Protocol, timeout: float = 30):
+    async def connect_nethernet(
+        cls, url: str, identity, protocol: Protocol, timeout: float = 30,
+        *, server_key_sha256: str | None = None,
+    ):
         from .transport.nethernet import connect
 
         transport = None
         try:
             async with asyncio.timeout(timeout):
-                transport = await connect(url, private_key=identity.key)
+                transport = await connect(url, private_key=identity.key, server_key_sha256=server_key_sha256)
                 settings = await request_network_settings(transport, protocol)
                 session = cls(PacketConnection(transport, protocol, settings), identity, url)
                 await session.join()
