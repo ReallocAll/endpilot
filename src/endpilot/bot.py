@@ -1,4 +1,4 @@
-"""Public player entry point; game actions delegate to their feature."""
+"""Public player entry point; game state delegates to the relevant feature."""
 
 from .authentication import OfflineIdentity
 from .login import JoinSession
@@ -28,21 +28,27 @@ class Bot:
         return self._session.player_id
 
     @property
+    def position(self) -> tuple[float, float, float]:
+        if self._movement is None:
+            raise RuntimeError("player has not joined")
+        return self._movement.position
+
+    async def wait_for_position_update(self, timeout: float = 15) -> tuple[float, float, float]:
+        if self._movement is None:
+            raise RuntimeError("player has not joined")
+        return await self._movement.wait_for_position_update(timeout)
+
+    @property
     def packets(self):
         """Expose typed and raw packet I/O for external extensions."""
         if self._session is None:
             raise RuntimeError("player has not joined")
         return self._session.packets
 
-    async def walk_forward(self, frames: int = 34) -> int:
-        if self._movement is None:
-            raise RuntimeError("player has not joined")
-        return await self._movement.walk_forward(frames)
-
     async def close(self) -> None:
         session, self._session = self._session, None
         movement, self._movement = self._movement, None
         if movement is not None:
-            await movement.close()
+            movement.close()
         if session is not None:
             await session.close()
