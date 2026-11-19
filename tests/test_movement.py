@@ -64,7 +64,7 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         teleport.tick = 0
         stream.observer(protocol.encode(teleport))
         self.assertEqual(await movement.walk_forward(2), 2)
-        self.assertEqual([p.client_tick for p in stream.sent], [0, 1, 2, 3])
+        self.assertEqual([p.client_tick for p in stream.sent], [1, 2, 3, 4])
         self.assertEqual([list(p.input_data) for p in stream.sent], [
             [b.PlayerAuthInputPacket.InputData.UP,
              b.PlayerAuthInputPacket.InputData.HANDLED_TELEPORT],
