@@ -26,6 +26,9 @@ class FakeTransport:
     async def recv(self):
         return await self.received.get()
 
+    async def close(self):
+        self.closed = True
+
 
 class JoinTests(unittest.IsolatedAsyncioTestCase):
     def test_offline_identity_signature(self):
@@ -74,3 +77,46 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
         await fake.received.put(b"\xff" + payload)
         self.assertEqual((await stream.recv_raw()).packet_id, raw.packet_id)
         self.assertEqual((await stream.recv_raw()).packet_id, raw.packet_id)
+
+    async def test_failed_observer_does_not_stop_live_packets(self):
+        protocol = Protocol(2193)
+        settings = protocol.binding.NetworkSettingsPacket()
+        settings.compression_algorithm = protocol.binding.PacketCompressionAlgorithm.ZLIB
+        settings.compression_threshold = 1
+        fake = FakeTransport()
+        stream = PacketConnection(fake, protocol, settings)
+        observed = []
+
+        def broken(_raw):
+            raise ValueError("extension callback failed")
+
+        stream.subscribe_raw(broken)
+        stream.subscribe_raw(observed.append)
+        with patch.object(asyncio.get_running_loop(), "call_exception_handler") as report:
+            stream.start_receiving()
+            for raw in (RawPacket(5, b"first"), RawPacket(5, b"second")):
+                receiving = asyncio.create_task(stream.recv_raw())
+                await asyncio.sleep(0)  # Register the live waiter before the packet arrives.
+                await fake.received.put(b"\xff" + write_batch([raw]))
+                self.assertEqual(await asyncio.wait_for(receiving, 1), raw)
+
+            self.assertEqual([packet.body for packet in observed], [b"first", b"second"])
+            self.assertEqual(report.call_count, 2)
+
+        await stream.close()
+        self.assertTrue(fake.closed)
+
+    async def test_reader_failure_still_closes_transport(self):
+        protocol = Protocol(2193)
+        settings = protocol.binding.NetworkSettingsPacket()
+        settings.compression_algorithm = protocol.binding.PacketCompressionAlgorithm.ZLIB
+        settings.compression_threshold = 1
+        fake = FakeTransport()
+        stream = PacketConnection(fake, protocol, settings)
+        stream.start_receiving()
+        await fake.received.put(b"\x01invalid-compression-header")
+        await asyncio.sleep(0)
+
+        with self.assertRaises(ValueError):
+            await stream.close()
+        self.assertTrue(fake.closed)

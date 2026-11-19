@@ -68,7 +68,14 @@ class PacketConnection:
             while True:
                 raw = await self._read_wire()
                 for callback in tuple(self._subscribers):
-                    callback(raw)
+                    try:
+                        callback(raw)
+                    except Exception as error:
+                        asyncio.get_running_loop().call_exception_handler({
+                            "message": "packet observer failed",
+                            "exception": error,
+                            "callback": callback,
+                        })
                 while self._waiters:
                     waiter = self._waiters.popleft()
                     if not waiter.done():
@@ -102,14 +109,16 @@ class PacketConnection:
         return self.protocol.decode(await self.recv_raw())
 
     async def close(self) -> None:
-        if self._reader_task is not None:
-            self._reader_task.cancel()
-            try:
-                await self._reader_task
-            except asyncio.CancelledError:
-                pass
-        for waiter in self._waiters:
-            if not waiter.done():
-                waiter.set_exception(ConnectionError("connection closed"))
-        self._waiters.clear()
-        await self.transport.close()
+        try:
+            if self._reader_task is not None:
+                self._reader_task.cancel()
+                try:
+                    await self._reader_task
+                except asyncio.CancelledError:
+                    pass
+        finally:
+            for waiter in self._waiters:
+                if not waiter.done():
+                    waiter.set_exception(ConnectionError("connection closed"))
+            self._waiters.clear()
+            await self.transport.close()
