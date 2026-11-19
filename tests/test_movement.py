@@ -8,10 +8,14 @@ class PacketSink:
     def __init__(self, protocol):
         self.protocol = protocol
         self.observer = None
+        self.sent = []
 
     def subscribe_raw(self, callback):
         self.observer = callback
         return lambda: None
+
+    async def send(self, packet):
+        self.sent.append(packet)
 
     def start_receiving(self):
         pass
@@ -37,4 +41,29 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         packet.player_id = 1
         stream.observer(protocol.encode(packet))
         self.assertEqual(await movement.wait_for_position_sync(timeout=0.1), (8.5, 81.0, 9.5))
+        movement.close()
+
+    async def test_forward_frames_release_input_and_advance_ticks(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        stream = PacketSink(protocol)
+        movement = Movement(stream, 1)
+        movement.start()
+        teleport = b.MovePlayerPacket()
+        teleport.player_id = 1
+        teleport.pos = b.Vec3(x=0.5, y=101.62, z=0.5)
+        teleport.rot = b.Vec2(x=0.0, y=0.0)
+        teleport.y_head_rot = 0.0
+        teleport.riding_id = 0
+        teleport.teleport_data = None
+        teleport.tick = 0
+        stream.observer(protocol.encode(teleport))
+        self.assertEqual(await movement.walk_forward(2), 2)
+        self.assertEqual([p.client_tick for p in stream.sent], [0, 1, 2, 3])
+        self.assertEqual([list(p.input_data) for p in stream.sent],
+                         [[b.PlayerAuthInputPacket.InputData.UP]] * 2 + [[], []])
+        self.assertAlmostEqual(stream.sent[1].pos.z, 0.68, places=5)
+        self.assertAlmostEqual(stream.sent[-1].pos.z, 0.68, places=5)
+        # Submission must not overwrite the last server-observed position.
+        self.assertEqual(movement.position, (0.5, 101.62, 0.5))
         movement.close()
