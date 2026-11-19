@@ -41,8 +41,8 @@ class Movement:
         x, y, z = self.position
         frame = b.PlayerAuthInputPacket()
         frame.rot = b.Vec2(x=0.0, y=0.0)
-        frame.pos = b.Vec3(x=x, y=y, z=z + forward)
-        frame.move = b.Vec2(x=0.0, y=1.0 if forward else 0.0)
+        frame.pos = b.Vec3(x=x + forward, y=y, z=z)
+        frame.move = b.Vec2(x=1.0 if forward else 0.0, y=0.0)
         frame.y_head_rot = 0.0
         flags = []
         if forward:
@@ -58,7 +58,7 @@ class Movement:
         frame.new_interaction_model = b.NewInteractionModel.CLASSIC
         frame.interact_rotation = b.Vec2(x=0.0, y=0.0)
         frame.client_tick = self.tick + 1
-        frame.pos_delta = b.Vec3(x=0.0, y=0.0, z=forward)
+        frame.pos_delta = b.Vec3(x=forward, y=0.0, z=0.0)
         frame.item_use_transaction = None
         frame.item_stack_request = None
         frame.player_block_actions = None
