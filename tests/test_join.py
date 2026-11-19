@@ -96,7 +96,7 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
             stream.start_receiving()
             for raw in (RawPacket(5, b"first"), RawPacket(5, b"second")):
                 receiving = asyncio.create_task(stream.recv_raw())
-                await fake.received.put(b"\\xff" + write_batch([raw]))
+                await fake.received.put(b"\xff" + write_batch([raw]))
                 self.assertEqual(await asyncio.wait_for(receiving, 1), raw)
 
             self.assertEqual([packet.body for packet in observed], [b"first", b"second"])
@@ -113,7 +113,7 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
         fake = FakeTransport()
         stream = PacketConnection(fake, protocol, settings)
         stream.start_receiving()
-        await fake.received.put(b"\\x01invalid-compression-header")
+        await fake.received.put(b"\x01invalid-compression-header")
         await asyncio.sleep(0)
 
         with self.assertRaises(ValueError):
