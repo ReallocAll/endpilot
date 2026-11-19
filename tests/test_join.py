@@ -74,12 +74,13 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
 
         packets = SpawnPackets()
         with patch.object(protocol, "decode", return_value=SimpleNamespace(status=3)):
-            session = JoinSession(packets, None, "")
+            session = JoinSession(packets, OfflineIdentity("EndPilotTest"), "")
             await session.join()
 
         self.assertTrue(session.spawned)
+        self.assertIsInstance(packets.sent[0], binding.LoginPacket)
         self.assertEqual(
-            [int(packet.serverbound_loading_screen_packet_type) for packet in packets.sent],
+            [int(packet.serverbound_loading_screen_packet_type) for packet in packets.sent[1:]],
             [int(binding.ServerboundLoadingScreenPacketType.START_LOADING_SCREEN),
              int(binding.ServerboundLoadingScreenPacketType.END_LOADING_SCREEN)],
         )
