@@ -24,7 +24,7 @@ python examples/probe_nethernet.py http://localhost:19132
 python examples/join_nethernet.py http://localhost:19132 --name EndPilotTest --hold 10
 ```
 
-The settings probe prints the server's compression algorithm and threshold. The join example reports spawn and closes the connection after the requested hold time. Server-required resource-pack downloads and online authentication are not yet supported.
+The settings probe prints the server's compression algorithm and threshold. The join example reports spawn and closes the connection after the requested hold time. To require a trusted NetherNet server identity, pass `--server-key-sha256 HEX` or `server_key_sha256=HEX` to `Bot.join_nethernet()`. The pin is the lowercase SHA-256 hex digest of the server operator public key in DER SPKI form; obtain it from a trusted source. A missing, invalid or mismatched identity fails the join. Without a pin, the server identity is not verified. Server-required resource-pack downloads and online authentication are not yet supported.
 
 ## Walk on NetherNet or RakNet
 
