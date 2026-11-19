@@ -40,6 +40,9 @@ async def run(url, name):
                 }), flush=True)
             except TimeoutError:
                 print(f"placement_no_update={x}", flush=True)
+
+        print("placement_checks_ready", flush=True)
+        await asyncio.to_thread(sys.stdin.readline)
     finally:
         await bot.close()
     print(f"disconnected {name}", flush=True)
