@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-dependencies = ["bedrock-protocol==0.5.0.dev0"]
+dependencies = ["bedrock-protocol==0.5.0.dev0", "cryptography>=43"]
 
 [project.optional-dependencies]
 nethernet = ["nethernet[http] @ git+https://github.com/EndstoneMC/nethernet-python.git@873026ec6b9a9162f90e1721884bc1e262ef5516"]
