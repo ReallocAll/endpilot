@@ -4,10 +4,10 @@ import asyncio
 
 
 class Movement:
-    def __init__(self, packets, start_game):
+    def __init__(self, packets, player_id):
         self.packets = packets
-        self.player_id = int(start_game.runtime_id)
-        self.position = (float(start_game.pos.x), float(start_game.pos.y), float(start_game.pos.z))
+        self.player_id = int(player_id)
+        self.position: tuple[float, float, float] | None = None
         self._updated = asyncio.Event()
         self._unsubscribe = None
 
@@ -32,8 +32,8 @@ class Movement:
         self.position = (float(packet.pos.x), float(packet.pos.y), float(packet.pos.z))
         self._updated.set()
 
-    async def wait_for_position_update(self, timeout: float = 15) -> tuple[float, float, float]:
-        """Wait until the server sends a movement correction, not until input is submitted."""
+    async def wait_for_position_sync(self, timeout: float = 15) -> tuple[float, float, float]:
+        """Wait for the first server position; StartGame may contain a placeholder."""
         async with asyncio.timeout(timeout):
             await self._updated.wait()
         return self.position

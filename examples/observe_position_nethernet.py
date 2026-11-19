@@ -12,7 +12,7 @@ async def main(url: str, name: str, hold: float):
     try:
         await bot.join_nethernet(url)
         print(f"spawned {name} runtime_id={bot.player_id}", flush=True)
-        pos = await bot.wait_for_position_update()
+        pos = await bot.wait_for_position_sync()
         print("server_position_update=" + json.dumps(dict(zip(("x", "y", "z"), pos))), flush=True)
         await asyncio.sleep(hold)
     finally:

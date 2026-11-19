@@ -22,9 +22,7 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         protocol = Protocol(2193)
         b = protocol.binding
         stream = PacketSink(protocol)
-        movement = Movement(stream, type("Start", (), {
-            "runtime_id": 1, "pos": b.Vec3(x=11.0, y=32769.0, z=3.0),
-        })())
+        movement = Movement(stream, 1)
         movement.start()
         packet = b.MovePlayerPacket()
         packet.player_id = 2
@@ -35,8 +33,8 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         packet.teleport_data = None
         packet.tick = 0
         stream.observer(protocol.encode(packet))
-        self.assertEqual(movement.position, (11.0, 32769.0, 3.0))
+        self.assertIsNone(movement.position)
         packet.player_id = 1
         stream.observer(protocol.encode(packet))
-        self.assertEqual(await movement.wait_for_position_update(timeout=0.1), (8.5, 81.0, 9.5))
+        self.assertEqual(await movement.wait_for_position_sync(timeout=0.1), (8.5, 81.0, 9.5))
         movement.close()

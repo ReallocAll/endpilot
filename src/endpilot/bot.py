@@ -17,7 +17,7 @@ class Bot:
         if self._session is not None:
             raise RuntimeError("player is already connected")
         session = await JoinSession.connect_nethernet(url, self.identity, self.protocol, timeout)
-        self._movement = Movement(session.packets, session.start_game)
+        self._movement = Movement(session.packets, session.player_id)
         self._session = session
         self._movement.start()
 
@@ -28,15 +28,15 @@ class Bot:
         return self._session.player_id
 
     @property
-    def position(self) -> tuple[float, float, float]:
+    def position(self) -> tuple[float, float, float] | None:
         if self._movement is None:
             raise RuntimeError("player has not joined")
         return self._movement.position
 
-    async def wait_for_position_update(self, timeout: float = 15) -> tuple[float, float, float]:
+    async def wait_for_position_sync(self, timeout: float = 15) -> tuple[float, float, float]:
         if self._movement is None:
             raise RuntimeError("player has not joined")
-        return await self._movement.wait_for_position_update(timeout)
+        return await self._movement.wait_for_position_sync(timeout)
 
     @property
     def packets(self):
