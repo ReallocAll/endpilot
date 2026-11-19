@@ -52,7 +52,7 @@ class NetherNetTests(unittest.IsolatedAsyncioTestCase):
 
         async with asyncio.timeout(30):
             async with serve_http(
-                peer, host="127.0.0.1", identity_signer=IdentitySigner(key, domain="self")
+                peer, host="127.0.0.1", identity_signer=IdentitySigner(key)
             ) as server:
                 url = f"http://127.0.0.1:{server.bound_port}"
                 connection = await connect(url, server_key_sha256=pin)

@@ -1,7 +1,7 @@
 """NetherNet HTTP signaling for a Bedrock server."""
 
 from cryptography.hazmat.primitives.asymmetric import ec
-from nethernet import IdentitySigner, InvalidIdentity, connect_http
+from nethernet import InvalidIdentity, PlayerSigner, connect_http
 
 
 async def connect(
@@ -15,6 +15,6 @@ async def connect(
             raise InvalidIdentity("NetherNet server identity does not match server_key_sha256")
 
     return await connect_http(
-        url, identity_signer=IdentitySigner(key, domain="self"),
+        url, identity_signer=PlayerSigner(key, domain="self"),
         on_server_identity=verify_pin if server_key_sha256 is not None else None,
     )
