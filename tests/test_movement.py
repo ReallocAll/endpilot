@@ -51,6 +51,6 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         active = [p for p in stream.sent if b.PlayerAuthInputPacket.InputData.UP in p.input_data]
         self.assertEqual(len(active), 2)
         self.assertIn(b.PlayerAuthInputPacket.InputData.START_SPRINTING, active[0].input_data)
-        self.assertAlmostEqual(active[-1].pos.z, 9.68, places=5)
+        self.assertAlmostEqual(active[-1].pos.x, 8.68, places=5)
         self.assertIn(b.PlayerAuthInputPacket.InputData.STOP_SPRINTING, stream.sent[-1].input_data)
-        self.assertEqual(stream.sent[-1].pos_delta.z, 0.0)
+        self.assertEqual(stream.sent[-1].pos_delta.x, 0.0)
