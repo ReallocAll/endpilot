@@ -14,10 +14,12 @@ class Movement:
         self._updated = asyncio.Event()
         self._unsubscribe = None
         self._action_lock = asyncio.Lock()
+        self._ticker: asyncio.Task | None = None
 
     def start(self):
         self._unsubscribe = self.packets.subscribe_raw(self._on_packet)
         self.packets.start_receiving()
+        self._ticker = asyncio.create_task(self._idle_inputs())
 
     def _on_packet(self, raw):
         b = self.packets.protocol.binding
@@ -81,6 +83,13 @@ class Movement:
         self._input_position = next_pos
         self._tick += 1
 
+    async def _idle_inputs(self):
+        await self._updated.wait()
+        while True:
+            async with self._action_lock:
+                await self._send_input(False)
+            await asyncio.sleep(0.05)
+
     async def walk_forward(self, ticks: int = 24) -> int:
         """Submit forward input at 20 Hz, then release it. Return submitted moving frames."""
         async with self._action_lock:
@@ -99,6 +108,9 @@ class Movement:
             return ticks
 
     def close(self):
+        if self._ticker is not None:
+            self._ticker.cancel()
+            self._ticker = None
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None
