@@ -55,13 +55,17 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         teleport.rot = b.Vec2(x=0.0, y=0.0)
         teleport.y_head_rot = 0.0
         teleport.riding_id = 0
+        teleport.reset_position = 2
         teleport.teleport_data = None
         teleport.tick = 0
         stream.observer(protocol.encode(teleport))
         self.assertEqual(await movement.walk_forward(2), 2)
         self.assertEqual([p.client_tick for p in stream.sent], [0, 1, 2, 3])
-        self.assertEqual([list(p.input_data) for p in stream.sent],
-                         [[b.PlayerAuthInputPacket.InputData.UP]] * 2 + [[], []])
+        self.assertEqual([list(p.input_data) for p in stream.sent], [
+            [b.PlayerAuthInputPacket.InputData.UP,
+             b.PlayerAuthInputPacket.InputData.HANDLED_TELEPORT],
+            [b.PlayerAuthInputPacket.InputData.UP], [], [],
+        ])
         self.assertAlmostEqual(stream.sent[1].pos.z, 0.68, places=5)
         self.assertAlmostEqual(stream.sent[-1].pos.z, 0.68, places=5)
         # Submission must not overwrite the last server-observed position.
