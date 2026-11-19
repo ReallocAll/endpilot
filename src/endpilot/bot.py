@@ -17,6 +17,15 @@ class Bot:
         if self._session is not None:
             raise RuntimeError("player is already connected")
         session = await JoinSession.connect_nethernet(url, self.identity, self.protocol, timeout)
+        self._start_session(session)
+
+    async def join_raknet(self, host: str, port: int = 19132, *, timeout: float = 30) -> None:
+        if self._session is not None:
+            raise RuntimeError("player is already connected")
+        session = await JoinSession.connect_raknet(host, port, self.identity, self.protocol, timeout)
+        self._start_session(session)
+
+    def _start_session(self, session: JoinSession) -> None:
         self._movement = Movement(session.packets, session.player_id)
         self._session = session
         self._movement.start()
