@@ -1,4 +1,4 @@
-"""Periodic Bedrock player input and the state of the current walk."""
+"""Periodic Bedrock player input with server-origin position synchronization."""
 
 import asyncio
 
@@ -6,15 +6,35 @@ import asyncio
 class Movement:
     def __init__(self, packets, start_game):
         self.packets = packets
+        self.player_id = int(start_game.runtime_id)
         self.position = (float(start_game.pos.x), float(start_game.pos.y), float(start_game.pos.z))
         self.tick = 0
         self._moving = False
         self._remaining = 0
         self._waiter = None
         self._task = None
+        self._unsubscribe = None
 
     def start(self):
+        self._unsubscribe = self.packets.subscribe_raw(self._on_packet)
+        self.packets.start_receiving()
         self._task = asyncio.create_task(self._run())
+
+    def _on_packet(self, raw):
+        b = self.packets.protocol.binding
+        if raw.packet_id == b.MovePlayerPacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            if int(packet.player_id) != self.player_id:
+                return
+        elif raw.packet_id == b.CorrectPlayerMovePredictionPacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            if int(packet.prediction_type) != 0:  # RewindType.PLAYER
+                return
+        elif raw.packet_id == b.ServerPlayerPostMovePositionPacket.ID:
+            packet = self.packets.protocol.decode(raw)
+        else:
+            return
+        self.position = (float(packet.pos.x), float(packet.pos.y), float(packet.pos.z))
 
     def _frame(self, forward: float):
         b = self.packets.protocol.binding
@@ -97,3 +117,6 @@ class Movement:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        if self._unsubscribe is not None:
+            self._unsubscribe()
+            self._unsubscribe = None
