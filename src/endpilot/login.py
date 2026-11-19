@@ -59,15 +59,17 @@ class JoinSession:
     async def connect_nethernet(cls, url: str, identity, protocol: Protocol, timeout: float = 30):
         from .transport.nethernet import connect
 
-        transport = await connect(url, private_key=identity.key)
+        transport = None
         try:
             async with asyncio.timeout(timeout):
+                transport = await connect(url, private_key=identity.key)
                 settings = await request_network_settings(transport, protocol)
                 session = cls(PacketConnection(transport, protocol, settings), identity, url)
                 await session.join()
             return session
         except BaseException:
-            await transport.close()
+            if transport is not None:
+                await transport.close()
             raise
 
     async def join(self) -> None:
