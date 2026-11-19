@@ -2,6 +2,7 @@
 
 from .authentication import OfflineIdentity
 from .blocks import Blocks, BlockUpdate
+from .inventory import Inventory
 from .login import JoinSession
 from .movement import Movement
 from .protocol import Protocol
@@ -13,6 +14,7 @@ class Bot:
         self.protocol = Protocol(protocol)
         self._session: JoinSession | None = None
         self._movement: Movement | None = None
+        self._inventory: Inventory | None = None
         self._blocks: Blocks | None = None
 
     async def join_nethernet(self, url: str, *, timeout: float = 30, server_key_sha256: str | None = None) -> None:
@@ -31,7 +33,8 @@ class Bot:
 
     def _start_session(self, session: JoinSession) -> None:
         self._movement = Movement(session.packets, session.player_id)
-        self._blocks = Blocks(session.packets)
+        self._inventory = Inventory(session.packets, session.player_id)
+        self._blocks = Blocks(session.packets, self._movement, self._inventory)
         self._session = session
         self._movement.start()
 
@@ -64,6 +67,11 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._blocks.wait_for_update(position, layer=layer, timeout=timeout)
 
+    async def place_against(self, against: BlockUpdate, *, face: int = 1, slot: int = 0) -> int:
+        if self._blocks is None:
+            raise RuntimeError("player has not joined")
+        return await self._blocks.place_against(against, face=face, slot=slot)
+
     @property
     def packets(self):
         """Expose typed and raw packet I/O for external extensions."""
@@ -74,8 +82,11 @@ class Bot:
     async def close(self) -> None:
         session, self._session = self._session, None
         movement, self._movement = self._movement, None
+        inventory, self._inventory = self._inventory, None
         self._blocks = None
         if movement is not None:
             movement.close()
+        if inventory is not None:
+            inventory.close()
         if session is not None:
             await session.close()

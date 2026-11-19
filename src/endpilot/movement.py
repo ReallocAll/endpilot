@@ -47,7 +47,7 @@ class Movement:
             await self._updated.wait()
         return self.position
 
-    async def _send_input(self, forward: bool):
+    async def _send_input(self, forward: bool, item_use_transaction=None):
         """Submit one predicted frame; only a later server observation proves acceptance."""
         b = self.packets.protocol.binding
         x, y, z = self._input_position
@@ -55,6 +55,8 @@ class Movement:
         next_pos = (x, y, z + step)
         movement = b.Vec2(x=0.0, y=1.0 if forward else 0.0)
         flags = [b.PlayerAuthInputPacket.InputData.UP] if forward else []
+        if item_use_transaction is not None:
+            flags.append(b.PlayerAuthInputPacket.InputData.PERFORM_ITEM_INTERACTION)
         if self._teleport_pending:
             flags.append(b.PlayerAuthInputPacket.InputData.HANDLED_TELEPORT)
         packet = b.PlayerAuthInputPacket(
@@ -69,7 +71,7 @@ class Movement:
             interact_rotation=b.Vec2(x=0.0, y=0.0),
             client_tick=self._tick,
             pos_delta=b.Vec3(x=0.0, y=0.0, z=step),
-            item_use_transaction=None,
+            item_use_transaction=item_use_transaction,
             item_stack_request=None,
             player_block_actions=None,
             vehicle_rot=None,
@@ -84,6 +86,7 @@ class Movement:
         self._input_position = next_pos
         self._tick += 1
         await self.packets.send(packet)
+        return self._tick - 1
 
     async def _idle_inputs(self):
         await self._updated.wait()
@@ -108,6 +111,13 @@ class Movement:
                     await asyncio.sleep(0.05)
                     await self._send_input(False)
             return ticks
+
+    async def send_item_use(self, transaction) -> int:
+        """Serialize an item action in the same client-tick stream as movement."""
+        async with self._action_lock:
+            if self._input_position is None:
+                await self.wait_for_position_sync()
+            return await self._send_input(False, item_use_transaction=transaction)
 
     def close(self):
         if self._ticker is not None:
