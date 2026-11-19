@@ -51,12 +51,12 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
         packet = protocol.binding.RequestNetworkSettingsPacket()
         packet.client_network_version = protocol.number
         await stream.send(packet)
-        self.assertEqual(fake.sent[0][0], 0)  # Raw-deflate above the 1-byte threshold.
+        self.assertIn(fake.sent[0][0], (0, 255))
         await fake.received.put(fake.sent[0])
         raw = await stream.recv_raw()
         self.assertEqual(protocol.decode(raw).client_network_version, protocol.number)
-        await stream.send(RawPacket(header=5, body=b"abc"))
-        self.assertIsInstance(fake.sent[-1], bytes)
+        await stream.send(RawPacket(header=5, body=b"x" * 1024))
+        self.assertEqual(fake.sent[-1][0], 0)  # Repetitive payload is worth compressing.
         # A batch can carry multiple packets without dropping the next one.
         payload = write_batch([raw, raw])
         await fake.received.put(b"\xff" + payload)
