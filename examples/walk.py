@@ -34,6 +34,9 @@ async def main(url: str, name: str, ticks: int, hold: float):
         unsubscribe = bot.packets.subscribe_raw(on_packet)
         # The testbed creates flat ground and teleports the player before sending GO.
         await asyncio.to_thread(sys.stdin.readline)
+        # Report only corrections observed during the actual walk.
+        observed["movement_modes"].clear()
+        observed["corrections"] = 0
         before = bot.position or await bot.wait_for_position_sync()
         start = time.monotonic()
         submitted = await bot.walk_forward(ticks)
