@@ -89,6 +89,11 @@ class JoinSession:
             elif raw.packet_id == binding.PlayStatusPacket.ID:
                 status = self.packets.protocol.decode(raw).status
                 if int(status) == 3:
+                    screen = binding.ServerboundLoadingScreenPacketType
+                    for phase in (screen.START_LOADING_SCREEN, screen.END_LOADING_SCREEN):
+                        await self.packets.send(binding.ServerboundLoadingScreenPacket(
+                            serverbound_loading_screen_packet_type=phase, loading_screen_id=None
+                        ))
                     self.spawned = True
                 elif int(status) != 0:
                     raise ConnectionError(f"server refused login: {status}")
