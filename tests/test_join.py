@@ -3,6 +3,7 @@ import base64
 import json
 import struct
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -55,6 +56,34 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
                 await JoinSession.connect_nethernet(
                     "http://127.0.0.1:19132", OfflineIdentity("EndPilotTest"), object(), timeout=0.01
                 )
+
+    async def test_player_spawn_finishes_loading_screen(self):
+        protocol = Protocol(2193)
+        binding = protocol.binding
+
+        class SpawnPackets:
+            def __init__(self):
+                self.protocol = protocol
+                self.sent = []
+
+            async def recv_raw(self):
+                return RawPacket(binding.PlayStatusPacket.ID, b"")
+
+            async def send(self, packet):
+                self.sent.append(packet)
+
+        packets = SpawnPackets()
+        with patch.object(protocol, "decode", return_value=SimpleNamespace(status=3)):
+            session = JoinSession(packets, OfflineIdentity("EndPilotTest"), "")
+            await session.join()
+
+        self.assertTrue(session.spawned)
+        self.assertIsInstance(packets.sent[0], binding.LoginPacket)
+        self.assertEqual(
+            [int(packet.serverbound_loading_screen_packet_type) for packet in packets.sent[1:]],
+            [int(binding.ServerboundLoadingScreenPacketType.START_LOADING_SCREEN),
+             int(binding.ServerboundLoadingScreenPacketType.END_LOADING_SCREEN)],
+        )
 
     async def test_compressed_typed_raw_roundtrip(self):
         protocol = Protocol(2193)
