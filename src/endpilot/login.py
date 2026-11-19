@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import hashlib
 import json
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -26,7 +27,7 @@ async def request_network_settings(connection, protocol: Protocol):
                 raise ConnectionError(f"server replied to network settings request: {protocol.decode(raw)!r}")
 
 
-def _verify_handshake(token: str) -> None:
+def _verify_handshake(token: str):
     """The NetherNet transport is already encrypted; verify the server's signed handshake."""
     parts = token.split(".")
     if len(parts) != 3:
@@ -43,6 +44,7 @@ def _verify_handshake(token: str) -> None:
         raise ValueError("invalid handshake signature")
     r, s = int.from_bytes(signature[:48], "big"), int.from_bytes(signature[48:], "big")
     public.verify(encode_dss_signature(r, s), ".".join(parts[:2]).encode(), ec.ECDSA(hashes.SHA384()))
+    return public, base64.b64decode(json.loads(decode(parts[1]))["salt"])
 
 
 class JoinSession:
@@ -72,6 +74,23 @@ class JoinSession:
                 await transport.close()
             raise
 
+    @classmethod
+    async def connect_raknet(cls, host: str, port: int, identity, protocol: Protocol, timeout: float = 30):
+        from .transport.raknet import connect
+
+        transport = None
+        try:
+            async with asyncio.timeout(timeout):
+                transport = await connect(host, port)
+                settings = await request_network_settings(transport, protocol)
+                session = cls(PacketConnection(transport, protocol, settings), identity, f"{host}:{port}")
+                await session.join()
+            return session
+        except BaseException:
+            if transport is not None:
+                await transport.close()
+            raise
+
     async def join(self) -> None:
         binding = self.packets.protocol.binding
         login = binding.LoginPacket()
@@ -82,7 +101,12 @@ class JoinSession:
         while not self.spawned:
             raw = await self.packets.recv_raw()
             if raw.packet_id == binding.ServerToClientHandshakePacket.ID:
-                _verify_handshake(self.packets.protocol.decode(raw).token)
+                server_key, salt = _verify_handshake(self.packets.protocol.decode(raw).token)
+                if hasattr(self.packets.transport, "enable_encryption"):
+                    key = hashlib.sha256(
+                        salt + self.identity.key.exchange(ec.ECDH(), server_key)
+                    ).digest()
+                    self.packets.transport.enable_encryption(key)
                 await self.packets.send(binding.ClientToServerHandshakePacket())
             elif raw.packet_id == binding.DisconnectPacket.ID:
                 raise ConnectionError(f"server disconnected during login: {self.packets.protocol.decode(raw)!r}")

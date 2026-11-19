@@ -1,4 +1,4 @@
-"""Join NetherNet, wait for a server teleport, then submit forward walking input."""
+"""Join a Bedrock server, wait for a teleport, then submit forward walking input."""
 
 import argparse
 import asyncio
@@ -12,7 +12,13 @@ from endpilot import Bot
 async def main(url: str, name: str, ticks: int, hold: float):
     bot = Bot(name)
     try:
-        await bot.join_nethernet(url)
+        if url.startswith("raknet://"):
+            host, sep, port = url.removeprefix("raknet://").rpartition(":")
+            if not sep:
+                host, port = port, "19132"
+            await bot.join_raknet(host, int(port))
+        else:
+            await bot.join_nethernet(url)
         print(f"spawned {name} runtime_id={bot.player_id}", flush=True)
         b = bot.packets.protocol.binding
         observed = {"movement_modes": [], "corrections": 0, "input_locks": []}
@@ -46,7 +52,7 @@ async def main(url: str, name: str, ticks: int, hold: float):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("url", help="NetherNet HTTP signaling URL")
+    parser.add_argument("url", help="NetherNet HTTP URL or raknet://host:port")
     parser.add_argument("--name", default="EndPilotTest")
     parser.add_argument("--ticks", type=int, default=24)
     parser.add_argument("--hold", type=float, default=4)
