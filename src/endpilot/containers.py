@@ -258,25 +258,24 @@ class Containers:
                 reply for reply in packet.responses
                 if int(reply.client_request_id.raw_id) == request_id
             )
-            if response.result == b.ItemStackNetResult.SUCCESS:
-                # Reconcile only the two requested slots actually present in the
-                # server response; a request alone does not establish an effect.
-                for container in response.containers or ():
-                    name = container.full_container_name.name.name
-                    for slot in container.slots:
-                        index = int(slot.slot)
-                        if (name == chest_name and index == chest_slot
-                                and self.window is window and self._slots is not None):
-                            previous = self._slots.get(index) or self.inventory.item_or_empty(-1)
-                            self._slots[index] = _response_item(b, previous, source, slot)
-                            self._slots_updated.set()
-                        elif (name in (
-                                "HOTBAR_CONTAINER", "INVENTORY_CONTAINER", player_name,
-                        ) and index == player_slot):
-                            current = self.inventory.item_or_empty(index)
-                            self.inventory._set_slot(
-                                index, _response_item(b, current, source, slot)
-                            )
+            # Apply server slot corrections even after rejection, as the upstream
+        # client does. A request alone does not establish an effect.
+            for container in response.containers or ():
+                name = container.full_container_name.name.name
+                for slot in container.slots:
+                    index = int(slot.slot)
+                    if (name == chest_name and index == chest_slot
+                            and self.window is window and self._slots is not None):
+                        previous = self._slots.get(index) or self.inventory.item_or_empty(-1)
+                        self._slots[index] = _response_item(b, previous, source, slot)
+                        self._slots_updated.set()
+                    elif (name in (
+                            "HOTBAR_CONTAINER", "INVENTORY_CONTAINER", player_name,
+                    ) and index == player_slot):
+                        current = self.inventory.item_or_empty(index)
+                        self.inventory._set_slot(
+                            index, _response_item(b, current, source, slot)
+                        )
             return response
         finally:
             if not pending.done():
