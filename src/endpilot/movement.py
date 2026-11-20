@@ -2,6 +2,7 @@
 
 import asyncio
 import math
+from collections import deque
 
 
 class Movement:
@@ -193,6 +194,97 @@ class Movement:
                 return submitted
             finally:
                 self._follow_target_id = None
+                try:
+                    if self._input_position is not None:
+                        await self._send_input(False)
+                        await asyncio.sleep(0.05)
+                        await self._send_input(False)
+                finally:
+                    self._active_done = None
+                    done.set()
+
+
+    @staticmethod
+    def _flat_route(blocks, start, goal, feet_y, radius):
+        """Find a route through observed, two-block-high air above known floor."""
+        def clear(cell):
+            x, z = cell
+            body = blocks.observed_block((x, feet_y, z))
+            head = blocks.observed_block((x, feet_y + 1, z))
+            floor = blocks.observed_block((x, feet_y - 1, z))
+            return (body is not None and body.is_air is True
+                    and head is not None and head.is_air is True
+                    and floor is not None and floor.is_air is False)
+
+        if not clear(start):
+            raise RuntimeError("starting terrain is not known walkable")
+        queue = deque([start])
+        previous = {start: None}
+        while queue:
+            current = queue.popleft()
+            if current == goal:
+                route = []
+                while previous[current] is not None:
+                    route.append(current)
+                    current = previous[current]
+                return list(reversed(route))
+            for dx, dz in ((0, 1), (1, 0), (0, -1), (-1, 0)):
+                neighbor = (current[0] + dx, current[1] + dz)
+                if (neighbor in previous
+                        or abs(neighbor[0] - start[0]) > radius
+                        or abs(neighbor[1] - start[1]) > radius
+                        or not clear(neighbor)):
+                    continue
+                previous[neighbor] = current
+                queue.append(neighbor)
+        raise RuntimeError("no route through observed flat terrain")
+
+    async def navigate_to(self, blocks, target: tuple[float, float, float], *,
+                          ticks: int = 160, search_radius: int = 8) -> int:
+        """Walk to a block's center on observed flat ground.
+
+        Unknown cells are impassable. Return submitted moving input frames,
+        not a server-confirmed arrival. Stop/cancellation releases input.
+        """
+        async with self._action_lock:
+            if self._input_position is None:
+                await self.wait_for_position_sync()
+            x, y, z = self._input_position
+            # PlayerAuthInput/MovePlayer positions are eye-high (EndstoneMC/client).
+            feet_y = math.floor(y - 1.62 + 0.001)
+            if math.floor(target[1]) != feet_y:
+                raise ValueError("flat navigation cannot change elevation")
+            start = (math.floor(x), math.floor(z))
+            goal = (math.floor(target[0]), math.floor(target[2]))
+            route = self._flat_route(blocks, start, goal, feet_y, search_radius)
+            self._stop_requested = False
+            done = self._active_done = asyncio.Event()
+            submitted = 0
+            try:
+                for cell_x, cell_z in route:
+                    while submitted < ticks:
+                        if self._stop_requested:
+                            return submitted
+                        px, py, pz = self._input_position
+                        waypoint = (cell_x + 0.5, py, cell_z + 0.5)
+                        if math.hypot(waypoint[0] - px, waypoint[2] - pz) <= 0.12:
+                            break
+                        # Do not enter a cell that changed or became unknown.
+                        body = blocks.observed_block((cell_x, feet_y, cell_z))
+                        head = blocks.observed_block((cell_x, feet_y + 1, cell_z))
+                        floor = blocks.observed_block((cell_x, feet_y - 1, cell_z))
+                        if (body is None or body.is_air is not True
+                                or head is None or head.is_air is not True
+                                or floor is None or floor.is_air is not False):
+                            return submitted
+                        await self.look_at(waypoint)
+                        await self._send_input(True)
+                        submitted += 1
+                        await asyncio.sleep(0.05)
+                    else:
+                        return submitted
+                return submitted
+            finally:
                 try:
                     if self._input_position is not None:
                         await self._send_input(False)
