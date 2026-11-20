@@ -67,6 +67,36 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(tx.hit_pos.y, 102.12, places=2)
         self.assertAlmostEqual(tx.hit_pos.z, -0.5)
 
+    async def test_interact_uses_selected_item_and_observed_actor_in_typed_packet(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        packets = SimpleNamespace(protocol=protocol, send=AsyncMock())
+        entities = Entities(packets)
+        entities._record(EntityState(42, 77, "minecraft:cow", (2.5, 100.0, 0.5)))
+        movement = SimpleNamespace(wait_for_position_sync=AsyncMock(
+            return_value=(0.5, 101.62, 0.5),
+        ))
+        item = b.SerializedNetworkItemStackDescriptor(
+            id=1, stack_size=2, aux_value=0, net_id_variant=17,
+            block_runtime_id=0, user_data_buffer=b"\x00" * 10,
+        )
+        inventory = SimpleNamespace(selected_slot=3, item_or_empty=lambda slot: item)
+        await entities.interact(movement, inventory, 77, hit_height=0.75)
+        packets.send.assert_awaited_once()
+        packet = protocol.decode(protocol.encode(packets.send.await_args.args[0]))
+        self.assertIsInstance(packet, b.InventoryTransactionPacket)
+        tx = packet.variant_transaction
+        self.assertIsInstance(tx, b.ItemUseOnActorInventoryTransaction)
+        self.assertEqual(tx.action_type, b.ItemUseOnActorInventoryTransaction.ActionType.INTERACT)
+        self.assertEqual(int(tx.runtime_id), 77)
+        self.assertEqual(tx.slot, 3)
+        self.assertEqual(int(tx.item.id), 1)
+        self.assertEqual(int(tx.item.net_id_variant), 17)
+        self.assertEqual(tx.transaction.actions, [])
+        self.assertAlmostEqual(tx.from_pos.y, 101.62, places=2)
+        self.assertAlmostEqual(tx.hit_pos.x, 2.5)
+        self.assertAlmostEqual(tx.hit_pos.y, 100.75)
+
     async def test_spawn_filters_type_and_returns_server_ids_and_position(self):
         binding = Protocol(2193).binding
         other = RawPacket(binding.AddActorPacket.ID, b"other")
