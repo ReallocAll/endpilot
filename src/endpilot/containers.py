@@ -90,5 +90,37 @@ class Containers:
                 pending.cancel()
                 await asyncio.gather(pending, return_exceptions=True)
 
+    async def close_window(self, *, timeout: float = 15) -> ContainerWindow | None:
+        """Request close; return after the same window's server close packet."""
+        window = self.window
+        if window is None:
+            return None
+        b = self.packets.protocol.binding
+
+        def matches(raw):
+            return int(self.packets.protocol.decode(raw).container_id) == window.container_id
+
+        pending = asyncio.create_task(self.packets.wait_for_packet(
+            b.ContainerClosePacket.ID, timeout=timeout, match=matches,
+        ))
+        try:
+            # Register the observer before sending; BDS may reply immediately.
+            await asyncio.sleep(0)
+            container_type = (
+                int(window.container_type) if window.container_type.lstrip("-").isdigit()
+                else b.ContainerType[window.container_type]
+            )
+            await self.packets.send(b.ContainerClosePacket(
+                container_id=window.container_id,
+                container_type=container_type,
+                server_initiated_close=False,
+            ))
+            await pending
+            return window
+        finally:
+            if not pending.done():
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+
     def close(self) -> None:
         self._unsubscribe()
