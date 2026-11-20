@@ -4,6 +4,7 @@ from .authentication import OfflineIdentity
 from .blocks import Blocks, BlockObservation, BlockUpdate
 from .chat import Chat, ChatMessage
 from .commands import Commands
+from .containers import Containers, ContainerWindow
 from .entities import Entities, EntityMovement, EntitySpawn, EntityState
 from .inventory import Inventory
 from .login import JoinSession
@@ -19,6 +20,7 @@ class Bot:
         self._session: JoinSession | None = None
         self._movement: Movement | None = None
         self._inventory: Inventory | None = None
+        self._containers: Containers | None = None
         self._blocks: Blocks | None = None
         self._chat: Chat | None = None
         self._commands: Commands | None = None
@@ -42,6 +44,7 @@ class Bot:
     def _start_session(self, session: JoinSession) -> None:
         self._movement = Movement(session.packets, session.player_id)
         self._inventory = Inventory(session.packets, session.player_id)
+        self._containers = Containers(session.packets, self._movement, self._inventory)
         self._blocks = Blocks(
             session.packets, self._movement, self._inventory,
             hashed_runtime_ids=session.block_network_ids_are_hashes,
@@ -161,6 +164,21 @@ class Bot:
         if self._inventory is None or self._movement is None:
             raise RuntimeError("player has not joined")
         await self._inventory.use_item(self._movement)
+
+    @property
+    def open_window(self) -> ContainerWindow | None:
+        """Latest server-opened window, or None if closed or not yet opened."""
+        if self._containers is None:
+            raise RuntimeError("player has not joined")
+        return self._containers.window
+
+    async def open_container(
+        self, position: tuple[int, int, int], *, face: int = 1, timeout: float = 15
+    ) -> ContainerWindow:
+        """Use a block and wait for the server's container-open response."""
+        if self._containers is None or self._blocks is None:
+            raise RuntimeError("player has not joined")
+        return await self._containers.open(position, self._blocks, face=face, timeout=timeout)
 
     async def mine_block(
         self, position: tuple[int, int, int], *, face: int = 1, timeout: float = 15
@@ -296,9 +314,12 @@ class Bot:
         session, self._session = self._session, None
         movement, self._movement = self._movement, None
         inventory, self._inventory = self._inventory, None
+        containers, self._containers = self._containers, None
         blocks, self._blocks = self._blocks, None
         if blocks is not None:
             blocks.close()
+        if containers is not None:
+            containers.close()
         self._chat = None
         self._commands = None
         entities, self._entities = self._entities, None
