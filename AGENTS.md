@@ -35,4 +35,6 @@ The NetherNet test uses a loopback peer. Verify gameplay changes against BDS wit
 
 Use an imperative subject such as `feat(inventory): track item requests by slot` or `fix(login): apply compression after negotiation`. Omit the scope for project-wide changes. Preserve human attribution; omit AI co-author trailers.
 
+Rebase a PR when its commits are independently useful. Squash a single change developed through successive fixes, using an imperative subject. Use one of these two methods for routine PRs.
+
 Keep examples, fixtures and current instructions in Git. Put investigation notes in the issue or PR and attach raw test output there. At release, summarize user-visible changes.
