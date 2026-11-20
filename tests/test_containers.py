@@ -126,6 +126,7 @@ class ContainerTests(unittest.IsolatedAsyncioTestCase):
         callbacks = []
         first = SimpleNamespace(id=3, stack_size=4)
         updated = SimpleNamespace(id=3, stack_size=2)
+        transacted = SimpleNamespace(id=3, stack_size=1)
         messages = {
             b"open": SimpleNamespace(
                 container_id=5, type=SimpleNamespace(name="CONTAINER"),
@@ -134,6 +135,22 @@ class ContainerTests(unittest.IsolatedAsyncioTestCase):
             b"other": SimpleNamespace(inventory_id=0, slots=[first]),
             b"contents": SimpleNamespace(inventory_id=5, slots=[first]),
             b"slot": SimpleNamespace(inventory_id=5, slot=0, item=updated),
+            b"transaction": SimpleNamespace(variant_transaction=SimpleNamespace(
+                transaction=SimpleNamespace(actions=[SimpleNamespace(
+                    source=SimpleNamespace(
+                        type=SimpleNamespace(name="CONTAINER_INVENTORY"), container_id=5,
+                    ),
+                    slot=0, to_item_descriptor=transacted,
+                )]),
+            )),
+            b"other_transaction": SimpleNamespace(variant_transaction=SimpleNamespace(
+                transaction=SimpleNamespace(actions=[SimpleNamespace(
+                    source=SimpleNamespace(
+                        type=SimpleNamespace(name="CONTAINER_INVENTORY"), container_id=0,
+                    ),
+                    slot=0, to_item_descriptor=transacted,
+                )]),
+            )),
             b"close": SimpleNamespace(container_id=5),
         }
         packets = SimpleNamespace(
@@ -151,6 +168,8 @@ class ContainerTests(unittest.IsolatedAsyncioTestCase):
             pending = asyncio.create_task(containers.wait_for_slots(timeout=1))
             await asyncio.sleep(0)
             inbound(b.InventoryContentPacket, b"other")
+            inbound(b.InventoryTransactionPacket, b"transaction")
+            self.assertIsNone(containers.slots)  # Initial contents are not yet complete.
             self.assertFalse(pending.done())
             inbound(b.InventoryContentPacket, b"contents")
             self.assertEqual((await pending)[0].stack_size, 4)
@@ -158,6 +177,10 @@ class ContainerTests(unittest.IsolatedAsyncioTestCase):
             snapshot = containers.slots
             snapshot.clear()
             self.assertEqual(containers.slots[0].stack_size, 4)
+            inbound(b.InventoryTransactionPacket, b"other_transaction")
+            self.assertEqual(containers.slots[0].stack_size, 4)
+            inbound(b.InventoryTransactionPacket, b"transaction")
+            self.assertEqual(containers.slots[0].stack_size, 1)
             inbound(b.InventorySlotPacket, b"slot")
             self.assertEqual(containers.slots[0].stack_size, 2)
 
@@ -171,8 +194,11 @@ class ContainerTests(unittest.IsolatedAsyncioTestCase):
             waiting = asyncio.create_task(containers.wait_for_slots(timeout=1))
             await asyncio.sleep(0)
             inbound(b.ContainerClosePacket, b"close")
+            inbound(b.ContainerOpenPacket, b"open")  # Server reuses numeric window ID.
+            inbound(b.InventoryContentPacket, b"contents")
             with self.assertRaises(RuntimeError):
                 await waiting
+            self.assertEqual(containers.slots[0].stack_size, 4)
         finally:
             containers.close()
         self.assertEqual(callbacks, [])
