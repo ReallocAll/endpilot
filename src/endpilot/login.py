@@ -13,6 +13,10 @@ from .compression import PacketConnection
 from .protocol import Protocol, read_batch, write_batch
 
 
+class LoginRefused(ConnectionError):
+    """The server explicitly rejected a player before spawn."""
+
+
 async def request_network_settings(connection, protocol: Protocol):
     """Exchange the first game message on a newly opened batch transport."""
     request = protocol.binding.RequestNetworkSettingsPacket()
@@ -24,7 +28,7 @@ async def request_network_settings(connection, protocol: Protocol):
             if raw.packet_id == protocol.binding.NetworkSettingsPacket.ID:
                 return protocol.decode(raw)
             if raw.packet_id in (protocol.binding.DisconnectPacket.ID, protocol.binding.PlayStatusPacket.ID):
-                raise ConnectionError(f"server replied to network settings request: {protocol.decode(raw)!r}")
+                raise LoginRefused(f"server refused network settings request: {protocol.decode(raw)!r}")
 
 
 def _verify_handshake(token: str):
@@ -112,7 +116,7 @@ class JoinSession:
                     self.packets.transport.enable_encryption(key)
                 await self.packets.send(binding.ClientToServerHandshakePacket())
             elif raw.packet_id == binding.DisconnectPacket.ID:
-                raise ConnectionError(f"server disconnected during login: {self.packets.protocol.decode(raw)!r}")
+                raise LoginRefused(f"server rejected login: {self.packets.protocol.decode(raw)!r}")
             elif raw.packet_id == binding.PlayStatusPacket.ID:
                 status = self.packets.protocol.decode(raw).status
                 if int(status) == 3:
@@ -123,7 +127,7 @@ class JoinSession:
                         ))
                     self.spawned = True
                 elif int(status) != 0:
-                    raise ConnectionError(f"server refused login: {status}")
+                    raise LoginRefused(f"server refused login: {status}")
             elif raw.packet_id == binding.ResourcePacksInfoPacket.ID:
                 info = self.packets.protocol.decode(raw)
                 if info.resource_pack_required and info.resource_packs:
