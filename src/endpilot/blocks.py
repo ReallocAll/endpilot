@@ -187,22 +187,27 @@ class Blocks:
         waiter = asyncio.create_task(self.packets.wait_for_packet(
             b.UpdateBlockPacket.ID, timeout=timeout, match=matches
         ))
-        # The observation must be registered before the input frame is sent.
-        await asyncio.sleep(0)
         started = False
         try:
+            # Register the observation before sending START; cancellation must
+            # also clean up the waiting task at this suspension point.
+            await asyncio.sleep(0)
             await self.movement.send_block_actions([
                 ("START_DESTROY_BLOCK", position, face),
             ])
             started = True
             raw = await waiter
-        except BaseException:
+        except BaseException as error:
             waiter.cancel()
             if started:
-                await self.movement.send_block_actions([
-                    ("ABORT_DESTROY_BLOCK", position, 0),
-                    ("STOP_DESTROY_BLOCK", (0, 0, 0), 0),
-                ])
+                try:
+                    await self.movement.send_block_actions([
+                        ("ABORT_DESTROY_BLOCK", position, 0),
+                        ("STOP_DESTROY_BLOCK", (0, 0, 0), 0),
+                    ])
+                except Exception as cleanup_error:
+                    # A lost transport may also reject ABORT. Keep the cause.
+                    error.add_note(f"mining abort failed: {cleanup_error!r}")
             raise
         await self.movement.send_block_actions([
             ("STOP_DESTROY_BLOCK", (0, 0, 0), 0),
