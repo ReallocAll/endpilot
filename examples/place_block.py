@@ -27,7 +27,15 @@ async def run(url, name):
         against = await asyncio.gather(*pending)
         print("supports_observed=" + json.dumps([u.runtime_id for u in against]), flush=True)
 
-        for x, update in zip((2, 3), against):
+        # Capture each initially empty target from an actual server update.
+        await asyncio.to_thread(sys.stdin.readline)
+        pending = [asyncio.create_task(bot.wait_for_block_update((x, 100, 0))) for x in (2, 3)]
+        await asyncio.sleep(0)
+        print("target_watchers_ready", flush=True)
+        empty = await asyncio.gather(*pending)
+        print("targets_observed=" + json.dumps([u.runtime_id for u in empty]), flush=True)
+
+        for x, update, baseline in zip((2, 3), against, empty):
             await asyncio.to_thread(sys.stdin.readline)
             watch = asyncio.create_task(bot.wait_for_block_update((x, 100, 0), timeout=3))
             await asyncio.sleep(0)
@@ -35,11 +43,17 @@ async def run(url, name):
             print("placement_submitted=" + json.dumps({"x": x, "tick": tick}), flush=True)
             try:
                 observed = await watch
+                expected = baseline.runtime_id if x == 2 else update.runtime_id
+                if observed.runtime_id != expected:
+                    raise AssertionError(
+                        f"target {x}: expected runtime ID {expected}, received {observed.runtime_id}"
+                    )
                 print("placement_update=" + json.dumps({
                     "x": x, "runtime_id": observed.runtime_id, "layer": observed.layer,
+                    "effect": "unchanged" if x == 2 else "placed",
                 }), flush=True)
-            except TimeoutError:
-                print(f"placement_no_update={x}", flush=True)
+            except TimeoutError as error:
+                raise TimeoutError(f"no target update at {x} after input tick {tick}") from error
 
         print("placement_checks_ready", flush=True)
         await asyncio.to_thread(sys.stdin.readline)
