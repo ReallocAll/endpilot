@@ -25,6 +25,19 @@ class PacketStream:
         for observer in tuple(self.observers):
             observer(raw)
 
+    async def wait_for_packet(self, packet_id, *, timeout, match=None):
+        future = asyncio.get_running_loop().create_future()
+
+        def observe(raw):
+            if not future.done() and raw.packet_id == packet_id and (match is None or match(raw)):
+                future.set_result(raw)
+
+        unsubscribe = self.subscribe_raw(observe)
+        try:
+            return await asyncio.wait_for(future, timeout)
+        finally:
+            unsubscribe()
+
     async def send(self, packet):
         self.sent.append(packet)
 
