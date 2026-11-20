@@ -172,6 +172,19 @@ class Bot:
             raise RuntimeError("player has not joined")
         return self._containers.window
 
+    @property
+    def container_slots(self) -> dict[int, object] | None:
+        """Current window slots from BDS; None until initial contents arrive."""
+        if self._containers is None:
+            raise RuntimeError("player has not joined")
+        return self._containers.slots
+
+    async def wait_for_container_slots(self, *, timeout: float = 15) -> dict[int, object]:
+        """Wait for server-reported slots of the currently open container."""
+        if self._containers is None:
+            raise RuntimeError("player has not joined")
+        return await self._containers.wait_for_slots(timeout=timeout)
+
     async def close_container(self, *, timeout: float = 15) -> ContainerWindow | None:
         """Close the active window; wait for the matching server close packet."""
         if self._containers is None:
