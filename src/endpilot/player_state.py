@@ -2,11 +2,13 @@
 
 import asyncio
 
+
 class PlayerState:
     def __init__(self, packets, runtime_id: int):
         self.packets = packets
         self.runtime_id = int(runtime_id)
         self.health: float | None = None
+        self._respawn_searching = asyncio.Event()
         self._unsubscribe = packets.subscribe_raw(self._on_packet)
 
     def _read_health(self, raw) -> float | None:
@@ -24,6 +26,14 @@ class PlayerState:
         return None
 
     def _on_packet(self, raw) -> None:
+        b = self.packets.protocol.binding
+        if raw.packet_id == b.RespawnPacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            if int(packet.runtime_id) == self.runtime_id:
+                if packet.state == b.PlayerRespawnState.SEARCHING_FOR_SPAWN:
+                    self._respawn_searching.set()
+                elif packet.state == b.PlayerRespawnState.READY_TO_SPAWN:
+                    self._respawn_searching.clear()
         value = self._read_health(raw)
         if value is not None:
             self.health = value
@@ -51,30 +61,34 @@ class PlayerState:
             return (int(packet.runtime_id) == self.runtime_id
                     and packet.state == b.PlayerRespawnState.READY_TO_SPAWN)
 
-        # Register before sending: the server may answer in the very next batch.
-        pending = asyncio.create_task(self.packets.wait_for_packet(
-            b.RespawnPacket.ID, timeout=timeout, match=ready,
-        ))
-        try:
-            await asyncio.sleep(0)
-            await self.packets.send(b.RespawnPacket(
-                pos=b.Vec3(x=0.0, y=0.0, z=0.0),
-                state=b.PlayerRespawnState.CLIENT_READY_TO_SPAWN,
-                runtime_id=self.runtime_id,
+        # BDS ignores CLIENT_READY_TO_SPAWN until it has announced the
+        # death's SEARCHING_FOR_SPAWN. Keep a single end-to-end timeout.
+        async with asyncio.timeout(timeout):
+            await self._respawn_searching.wait()
+            # Register before sending: the server may answer in the next batch.
+            pending = asyncio.create_task(self.packets.wait_for_packet(
+                b.RespawnPacket.ID, timeout=timeout, match=ready,
             ))
-            response = self.packets.protocol.decode(await pending)
-            await self.packets.send(b.PlayerActionPacket(
-                runtime_id=self.runtime_id,
-                action=b.PlayerActionType.RESPAWN,
-                pos=b.BlockPos(x=0, y=0, z=0),
-                result_pos=b.BlockPos(x=0, y=0, z=0),
-                face=0,
-            ))
-            return (float(response.pos.x), float(response.pos.y), float(response.pos.z))
-        finally:
-            if not pending.done():
-                pending.cancel()
-                await asyncio.gather(pending, return_exceptions=True)
+            try:
+                await asyncio.sleep(0)
+                await self.packets.send(b.RespawnPacket(
+                    pos=b.Vec3(x=0.0, y=0.0, z=0.0),
+                    state=b.PlayerRespawnState.CLIENT_READY_TO_SPAWN,
+                    runtime_id=self.runtime_id,
+                ))
+                response = self.packets.protocol.decode(await pending)
+                await self.packets.send(b.PlayerActionPacket(
+                    runtime_id=self.runtime_id,
+                    action=b.PlayerActionType.RESPAWN,
+                    pos=b.BlockPos(x=0, y=0, z=0),
+                    result_pos=b.BlockPos(x=0, y=0, z=0),
+                    face=0,
+                ))
+                return (float(response.pos.x), float(response.pos.y), float(response.pos.z))
+            finally:
+                if not pending.done():
+                    pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
 
     def close(self) -> None:
         self._unsubscribe()

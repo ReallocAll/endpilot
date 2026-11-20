@@ -91,6 +91,14 @@ class PlayerStateTests(unittest.IsolatedAsyncioTestCase):
         movement = Movement(packets, 7)
         observer.append(movement._on_packet)
         pending = asyncio.create_task(state.respawn(timeout=3))
+        await asyncio.sleep(0)
+        self.assertFalse(sent, "cannot send client-ready before BDS death state 0")
+        searching = protocol.encode(b.RespawnPacket(
+            pos=b.Vec3(x=0, y=100, z=0),
+            state=b.PlayerRespawnState.SEARCHING_FOR_SPAWN, runtime_id=7,
+        ))
+        for callback in tuple(observer):
+            callback(searching)
         await waiting.wait()
         await asyncio.sleep(0)
         self.assertEqual(len(sent), 1)
@@ -135,9 +143,31 @@ class PlayerStateTests(unittest.IsolatedAsyncioTestCase):
                 sent.append(packet)
 
         state = PlayerState(FakePackets(), 7)
+        state._on_packet(protocol.encode(b.RespawnPacket(
+            pos=b.Vec3(x=0, y=100, z=0),
+            state=b.PlayerRespawnState.SEARCHING_FOR_SPAWN, runtime_id=7,
+        )))
         with self.assertRaises(TimeoutError):
             await state.respawn(timeout=0.1)
         self.assertTrue(registered.is_set())
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0].state, b.PlayerRespawnState.CLIENT_READY_TO_SPAWN)
 
+
+    async def test_respawn_waits_for_searching_state_from_own_player(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        sent = []
+        state = PlayerState(SimpleNamespace(
+            protocol=protocol,
+            subscribe_raw=lambda callback: lambda: None,
+            send=AsyncMock(side_effect=lambda packet: sent.append(packet)),
+        ), 7)
+        state._on_packet(protocol.encode(b.RespawnPacket(
+            pos=b.Vec3(x=0, y=100, z=0),
+            state=b.PlayerRespawnState.SEARCHING_FOR_SPAWN, runtime_id=99,
+        )))
+        with self.assertRaises(TimeoutError):
+            await state.respawn(timeout=0.01)
+        self.assertEqual(sent, [])
+        state.close()
