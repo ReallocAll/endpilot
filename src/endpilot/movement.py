@@ -41,6 +41,11 @@ class Movement:
                 return
         elif raw.packet_id == b.ServerPlayerPostMovePositionPacket.ID:
             packet = self.packets.protocol.decode(raw)
+        elif raw.packet_id == b.RespawnPacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            if (int(packet.runtime_id) != self.player_id
+                    or packet.state != b.PlayerRespawnState.READY_TO_SPAWN):
+                return
         else:
             return
         self.position = (float(packet.pos.x), float(packet.pos.y), float(packet.pos.z))
