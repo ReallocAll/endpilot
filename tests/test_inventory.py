@@ -39,6 +39,30 @@ class InventoryTests(unittest.IsolatedAsyncioTestCase):
             inventory.close()
         self.assertEqual(callbacks, [])
 
+    async def test_empty_inventory_slot_needs_no_server_content_for_attack(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        callbacks = []
+        packets = SimpleNamespace(
+            protocol=protocol,
+            subscribe_raw=lambda cb: callbacks.append(cb) or (lambda: callbacks.remove(cb)),
+        )
+        inventory = Inventory(packets, 7)
+        try:
+            empty = inventory.item_or_empty(0)
+            self.assertEqual(int(empty.id), 0)
+            self.assertEqual(int(empty.stack_size), 0)
+            self.assertIsNone(empty.net_id_variant)
+            self.assertEqual(empty.user_data_buffer, b"")
+            item = b.SerializedNetworkItemStackDescriptor(
+                id=42, stack_size=1, aux_value=0, net_id_variant=None,
+                block_runtime_id=0, user_data_buffer=b"",
+            )
+            inventory._set_slot(0, item)
+            self.assertIs(inventory.item_or_empty(0), item)
+        finally:
+            inventory.close()
+
     async def test_server_inventory_transaction_updates_only_player_slots(self):
         protocol = Protocol(2193)
         b = protocol.binding

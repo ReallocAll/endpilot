@@ -137,7 +137,7 @@ class Entities:
         actor = self.get(runtime_id)
         if actor is None:
             raise ValueError("actor is not currently observed")
-        item = await inventory.wait_for_slot(slot)
+        item = inventory.item_or_empty(slot)
         x, y, z = await movement.wait_for_position_sync()
         b = self.packets.protocol.binding
         action = b.ItemUseOnActorInventoryTransaction(

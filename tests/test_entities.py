@@ -19,10 +19,9 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
         entities = Entities(packets)
         entities._record(EntityState(42, 77, "minecraft:cow", (2.5, 100.0, 0.5)))
         movement = SimpleNamespace(wait_for_position_sync=AsyncMock(return_value=(0.5, 101.62, 0.5)))
-        inventory = SimpleNamespace(wait_for_slot=AsyncMock(return_value=item))
+        inventory = SimpleNamespace(item_or_empty=lambda slot: item)
 
         await entities.attack(movement, inventory, 77, slot=2, hit_height=0.75)
-        inventory.wait_for_slot.assert_awaited_once_with(2)
         packets.send.assert_awaited_once()
         packet = protocol.decode(protocol.encode(packets.send.await_args.args[0]))
         self.assertIsInstance(packet, b.InventoryTransactionPacket)

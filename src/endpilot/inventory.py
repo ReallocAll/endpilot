@@ -62,14 +62,18 @@ class Inventory:
                 self._changed.clear()
                 await self._changed.wait()
 
-    async def wait_for_slot(self, slot: int, timeout: float = 15):
-        """Return a server-reported slot descriptor, including an empty hand."""
-        event = self._events.setdefault(slot, asyncio.Event())
-        async with asyncio.timeout(timeout):
-            while slot not in self._slots:
-                event.clear()
-                await event.wait()
-        return self._slots[slot]
+    def item_or_empty(self, slot: int):
+        """Return an observed item or the client's initial empty-hand descriptor.
+
+        A fresh BDS connection need not send InventoryContent for empty slots.
+        Match EndstoneMC/client's initially empty inventory instead of waiting
+        for inventory state that an unarmed attack does not require.
+        """
+        b = self.packets.protocol.binding
+        return self._slots.get(slot) or b.SerializedNetworkItemStackDescriptor(
+            id=0, stack_size=0, aux_value=0, net_id_variant=None,
+            block_runtime_id=0, user_data_buffer=b"",
+        )
 
     async def wait_for_item(self, slot: int, timeout: float = 15):
         """Return the current server-reported nonempty inventory slot."""
