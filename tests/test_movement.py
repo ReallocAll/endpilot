@@ -218,3 +218,63 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         movement._on_packet(protocol.encode(packet))
         self.assertEqual(await movement.follow_entity(Entities(stream), 123, ticks=10), 0)
         self.assertEqual([list(p.input_data) for p in stream.sent], [[], []])
+
+    async def test_explicit_stop_releases_follow_then_allows_another_walk(self):
+        from endpilot.entities import Entities, EntityState
+
+        protocol = Protocol(2193)
+        b = protocol.binding
+        stream = PacketSink(protocol)
+        movement = Movement(stream, 1)
+        packet = b.MovePlayerPacket()
+        packet.player_id = 1
+        packet.pos = b.Vec3(x=0.5, y=101.62, z=0.5)
+        packet.rot = b.Vec2(x=0.0, y=0.0)
+        packet.y_head_rot = 0.0
+        packet.riding_id = 0
+        packet.teleport_data = None
+        packet.tick = 0
+        movement._on_packet(protocol.encode(packet))
+        entities = Entities(stream)
+        entities._record(EntityState(4, 7, "minecraft:cow", (-6.0, 100.0, 0.5)))
+
+        follow = asyncio.create_task(movement.follow_entity(entities, 7, ticks=100))
+        await asyncio.sleep(0.13)
+        await movement.stop_moving()
+        submitted = await follow
+        self.assertGreater(submitted, 0)
+        self.assertLess(submitted, 100)
+        self.assertEqual(
+            sum(b.PlayerAuthInputPacket.InputData.UP in p.input_data for p in stream.sent),
+            submitted,
+        )
+        self.assertEqual([list(p.input_data) for p in stream.sent[-2:]], [[], []])
+
+        before = len(stream.sent)
+        walk = asyncio.create_task(movement.walk_forward(100))
+        await asyncio.sleep(0.13)
+        await movement.stop_moving()
+        walked = await walk
+        self.assertGreater(walked, 0)
+        self.assertLess(walked, 100)
+        self.assertEqual(
+            sum(b.PlayerAuthInputPacket.InputData.UP in p.input_data for p in stream.sent[before:]),
+            walked,
+        )
+        self.assertEqual([list(p.input_data) for p in stream.sent[-2:]], [[], []])
+        self.assertEqual([p.client_tick for p in stream.sent], list(range(1, len(stream.sent) + 1)))
+
+
+        # A queued new action must not extend stop_moving()'s wait for
+        # the action that was active when stop was requested.
+        following = asyncio.create_task(movement.follow_entity(entities, 7, ticks=100))
+        await asyncio.sleep(0.13)
+        queued_walk = asyncio.create_task(movement.walk_forward(100))
+        await asyncio.sleep(0)
+        await asyncio.wait_for(movement.stop_moving(), timeout=0.8)
+        self.assertLess(await following, 100)
+        self.assertFalse(queued_walk.done())
+        queued_walk.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await queued_walk
+        self.assertEqual([list(p.input_data) for p in stream.sent[-2:]], [[], []])
