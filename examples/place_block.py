@@ -8,7 +8,7 @@ import sys
 from endpilot import Bot
 
 
-async def run(url, name):
+async def run(url, name, expect_kick=False):
     bot = Bot(name)
     try:
         if url.startswith("raknet://"):
@@ -56,7 +56,11 @@ async def run(url, name):
                 raise TimeoutError(f"no target update at {x} after input tick {tick}") from error
 
         print("placement_checks_ready", flush=True)
-        await asyncio.to_thread(sys.stdin.readline)
+        if expect_kick:
+            packet = await bot.wait_for_server_disconnect(timeout=10)
+            print("server_disconnect=" + type(packet).__name__, flush=True)
+        else:
+            await asyncio.to_thread(sys.stdin.readline)
     finally:
         await bot.close()
     print(f"disconnected {name}", flush=True)
@@ -66,5 +70,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("url", help="NetherNet HTTP URL or raknet://host:port")
     parser.add_argument("--name", default="EndPilotTest")
+    parser.add_argument("--expect-kick", action="store_true", help="Wait for a BDS kick after placements")
     args = parser.parse_args()
-    asyncio.run(run(args.url, args.name))
+    asyncio.run(run(args.url, args.name, args.expect_kick))

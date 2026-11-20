@@ -149,5 +149,12 @@ class JoinSession:
                 initialized.player_id = game.runtime_id
                 await self.packets.send(initialized)
 
+    async def wait_for_server_disconnect(self, timeout: float = 15):
+        """Return an upstream DisconnectPacket, not a timeout or transport failure."""
+        raw = await self.packets.wait_for_packet(
+            self.packets.protocol.binding.DisconnectPacket.ID, timeout=timeout
+        )
+        return self.packets.protocol.decode(raw)
+
     async def close(self) -> None:
         await self.packets.close()
