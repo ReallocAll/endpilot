@@ -134,3 +134,87 @@ class TakeContainerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             containers.close()
             inventory.close()
+
+    async def test_put_back_uses_place_and_applies_server_slots_only(self):
+        codec = Protocol(2193)
+        b = codec.binding
+
+        def response(request_id, accepted=True):
+            def container(name, index, count, net):
+                return SimpleNamespace(
+                    full_container_name=SimpleNamespace(name=SimpleNamespace(name=name)),
+                    slots=[SimpleNamespace(
+                        slot=index, amount=count,
+                        item_stack_net_id=SimpleNamespace(raw_id=net),
+                    )],
+                )
+
+            return SimpleNamespace(
+                client_request_id=SimpleNamespace(raw_id=request_id),
+                result=b.ItemStackNetResult.SUCCESS if accepted else b.ItemStackNetResult.ERROR,
+                containers=[
+                    container("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 2, 1, 21),
+                    container("LEVEL_ENTITY_CONTAINER", 0, 3, 17),
+                    container("LEVEL_ENTITY_CONTAINER", 4, 99, 33),
+                ] if accepted else None,
+            )
+
+        replies = {
+            b"ok": SimpleNamespace(responses=[response(-1)]),
+            b"reject": SimpleNamespace(responses=[response(-3, False)]),
+            b"other": SimpleNamespace(responses=[response(-7)]),
+        }
+        sent = []
+        attempts = 0
+
+        async def wait(packet_id, *, timeout, match):
+            nonlocal attempts
+            self.assertEqual(packet_id, b.ItemStackResponsePacket.ID)
+            self.assertEqual(timeout, 3)
+            self.assertFalse(match(RawPacket(packet_id, b"other")))
+            raw = RawPacket(packet_id, b"ok" if attempts == 0 else b"reject")
+            attempts += 1
+            self.assertTrue(match(raw))
+            return raw
+
+        packets = SimpleNamespace(
+            protocol=SimpleNamespace(binding=b, decode=lambda raw: replies[raw.body]),
+            subscribe_raw=lambda callback: (lambda: None),
+            send=AsyncMock(side_effect=lambda packet: sent.append(packet)),
+            wait_for_packet=wait,
+        )
+        inventory = Inventory(packets, 11)
+        containers = Containers(packets, None, inventory)
+        containers.window = ContainerWindow(2, "CONTAINER", (1, 100, 0), -1)
+        containers._slots = {0: item(b, 3, 2, 17), 4: item(b)}
+        inventory._set_slot(2, item(b, 3, 2, 21))
+        inventory._set_slot(7, item(b, 5, 8, 99))
+        try:
+            first = await containers.put_into_container(2, 0, 1, timeout=3)
+            self.assertEqual(first.result.name, "SUCCESS")
+            outgoing = codec.decode(codec.encode(sent[0])).requests[0]
+            self.assertEqual(int(outgoing.client_request_id.raw_id), -1)
+            self.assertIsInstance(outgoing.actions[0], b.ItemStackRequestCereal.PlaceActionData)
+            action = outgoing.actions[0]
+            self.assertEqual(int(action.amount), 1)
+            self.assertEqual(action.source.full_container_name.name,
+                             b.ContainerEnumName.COMBINED_HOTBAR_AND_INVENTORY_CONTAINER)
+            self.assertEqual(int(action.source.slot), 2)
+            self.assertEqual(int(action.source.net_id_variant), 21)
+            self.assertEqual(action.destination.full_container_name.name,
+                             b.ContainerEnumName.LEVEL_ENTITY_CONTAINER)
+            self.assertEqual(int(action.destination.slot), 0)
+            self.assertEqual(int(action.destination.net_id_variant), 17)
+            self.assertEqual((int(containers.slots[0].id), int(containers.slots[0].stack_size)), (3, 3))
+            self.assertEqual((int(inventory.item_or_empty(2).id), int(inventory.item_or_empty(2).stack_size)), (3, 1))
+            self.assertEqual(int(containers.slots[4].id), 0)
+            self.assertEqual(int(inventory.item_or_empty(7).stack_size), 8)
+
+            rejected = await containers.put_into_container(2, 0, 1, timeout=3)
+            self.assertEqual(rejected.result.name, "ERROR")
+            self.assertEqual(int(codec.decode(codec.encode(sent[1])).requests[0].client_request_id.raw_id), -3)
+            self.assertEqual(int(containers.slots[0].stack_size), 3)
+            self.assertEqual(int(inventory.item_or_empty(2).stack_size), 1)
+        finally:
+            containers.close()
+            inventory.close()

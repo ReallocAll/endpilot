@@ -174,11 +174,23 @@ class Containers:
     async def take_from_container(
         self, source_slot: int, destination_slot: int, amount: int = 1, *, timeout: float = 15
     ):
-        """Take from the open block container into player inventory.
+        """Take chest items into inventory; return the matching server verdict."""
+        return await self._transfer(
+            source_slot, destination_slot, amount, into_container=False, timeout=timeout
+        )
 
-        Return the matching server ItemStackResponseInfo (including rejection).
-        Only response-listed slots are reconciled; a request alone is not an effect.
-        """
+    async def put_into_container(
+        self, source_slot: int, destination_slot: int, amount: int = 1, *, timeout: float = 15
+    ):
+        """Place inventory items into the open chest; return the matching server verdict."""
+        return await self._transfer(
+            source_slot, destination_slot, amount, into_container=True, timeout=timeout
+        )
+
+    async def _transfer(
+        self, source_slot: int, destination_slot: int, amount: int,
+        *, into_container: bool, timeout: float,
+    ):
         window = self.window
         if window is None or self._slots is None:
             raise RuntimeError("container window or its server-reported slots are unavailable")
@@ -186,13 +198,25 @@ class Containers:
             raise ValueError("item-stack request slots must fit in a byte")
         if not 1 <= amount <= 255:
             raise ValueError("item-stack request amount must be between 1 and 255")
-        source = self._slots.get(source_slot)
-        if source is None or int(source.id) == 0:
-            raise ValueError("source container slot has no observed item")
 
         b = self.packets.protocol.binding
         cereal = b.ItemStackRequestCereal
-        destination = self.inventory.item_or_empty(destination_slot)
+        player_name = "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER"
+        chest_name = "LEVEL_ENTITY_CONTAINER"
+        if into_container:
+            source = self.inventory.item_or_empty(source_slot)
+            destination = self._slots.get(destination_slot) or self.inventory.item_or_empty(-1)
+            source_name, destination_name = player_name, chest_name
+            action_type = cereal.PlaceActionData
+            chest_slot, player_slot = destination_slot, source_slot
+        else:
+            source = self._slots.get(source_slot)
+            destination = self.inventory.item_or_empty(destination_slot)
+            source_name, destination_name = chest_name, player_name
+            action_type = cereal.TakeActionData
+            chest_slot, player_slot = source_slot, destination_slot
+        if source is None or int(source.id) == 0:
+            raise ValueError("source slot has no observed item")
 
         def slot_info(name, slot, item):
             return cereal.SlotInfoData(
@@ -207,12 +231,10 @@ class Containers:
         self._next_request_id -= 2
         request = b.ItemStackRequestPacketData.RequestData(
             client_request_id=b.ItemStackRequestId(raw_id=request_id),
-            actions=[cereal.TakeActionData(
+            actions=[action_type(
                 amount=amount,
-                source=slot_info("LEVEL_ENTITY_CONTAINER", source_slot, source),
-                destination=slot_info(
-                    "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", destination_slot, destination
-                ),
+                source=slot_info(source_name, source_slot, source),
+                destination=slot_info(destination_name, destination_slot, destination),
             )],
             strings_to_filter=[],
             strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
@@ -229,7 +251,6 @@ class Containers:
             b.ItemStackResponsePacket.ID, timeout=timeout, match=matches,
         ))
         try:
-            # Arm before sending; a server response can arrive in the same tick.
             await asyncio.sleep(0)
             await self.packets.send(b.ItemStackRequestPacket(requests=[request]))
             packet = self.packets.protocol.decode(await pending)
@@ -238,19 +259,20 @@ class Containers:
                 if int(reply.client_request_id.raw_id) == request_id
             )
             if response.result == b.ItemStackNetResult.SUCCESS:
+                # Reconcile only the two requested slots actually present in the
+                # server response; a request alone does not establish an effect.
                 for container in response.containers or ():
                     name = container.full_container_name.name.name
                     for slot in container.slots:
                         index = int(slot.slot)
-                        if (name == "LEVEL_ENTITY_CONTAINER" and index == source_slot
+                        if (name == chest_name and index == chest_slot
                                 and self.window is window and self._slots is not None):
-                            previous = self._slots[source_slot]
-                            self._slots[source_slot] = _response_item(b, previous, source, slot)
+                            previous = self._slots.get(index) or self.inventory.item_or_empty(-1)
+                            self._slots[index] = _response_item(b, previous, source, slot)
                             self._slots_updated.set()
                         elif (name in (
-                                "HOTBAR_CONTAINER", "INVENTORY_CONTAINER",
-                                "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER",
-                        ) and index == destination_slot):
+                                "HOTBAR_CONTAINER", "INVENTORY_CONTAINER", player_name,
+                        ) and index == player_slot):
                             current = self.inventory.item_or_empty(index)
                             self.inventory._set_slot(
                                 index, _response_item(b, current, source, slot)
