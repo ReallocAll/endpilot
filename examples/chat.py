@@ -27,11 +27,6 @@ async def run(url, message):
         print("both_spawned", flush=True)
         await asyncio.to_thread(sys.stdin.readline)
 
-        def inspect_text(raw):
-            if raw.packet_id == 9:
-                print("diagnostic_incoming_text=" + repr(observer.protocol.decode(raw)), flush=True)
-
-        observer.packets.subscribe_raw(inspect_text)
         observed = asyncio.create_task(observer.wait_for_chat(author="EndPilotTest", timeout=15))
         await asyncio.sleep(0)
         await sender.send_chat(message)

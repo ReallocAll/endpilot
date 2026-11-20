@@ -5,6 +5,11 @@ from dataclasses import dataclass
 from bedrock_protocol import TextPacketType
 
 
+def _author_without_reset(author: str) -> str:
+    # BDS appends a formatting reset to relayed player chat author names.
+    return author.removesuffix("\u00a7r")
+
+
 @dataclass(frozen=True, slots=True)
 class ChatMessage:
     author: str
@@ -38,9 +43,9 @@ class Chat:
             return (
                 isinstance(body, text.AuthorAndMessage)
                 and body.type == TextPacketType.CHAT
-                and (author is None or body.author == author)
+                and (author is None or _author_without_reset(body.author) == author)
             )
 
         raw = await self.packets.wait_for_packet(text.ID, match=matches, timeout=timeout)
         body = self.packets.protocol.decode(raw).body
-        return ChatMessage(body.author, body.message)
+        return ChatMessage(_author_without_reset(body.author), body.message)

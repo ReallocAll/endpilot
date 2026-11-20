@@ -36,8 +36,8 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(packet_id, 9)
             self.assertEqual(timeout, 5)
             self.assertFalse(match(incoming("AnotherPlayer", "not this player")))
-            self.assertTrue(match(incoming("EndPilotTest", "relay confirmed")))
-            return incoming("EndPilotTest", "relay confirmed")
+            self.assertTrue(match(incoming("EndPilotTest\u00a7r", "relay confirmed")))
+            return incoming("EndPilotTest\u00a7r", "relay confirmed")
 
         stream.wait_for_packet.side_effect = wait
         observed = await chat.wait_for_message(author="EndPilotTest", timeout=5)
