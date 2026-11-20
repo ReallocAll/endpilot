@@ -201,6 +201,12 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._player_state.wait_for_health_update(timeout)
 
+    async def respawn(self, *, timeout: float = 15) -> tuple[float, float, float]:
+        """Request respawn and acknowledge the server-provided spawn position."""
+        if self._player_state is None:
+            raise RuntimeError("player has not joined")
+        return await self._player_state.respawn(timeout=timeout)
+
     @property
     def observed_entities(self) -> tuple[EntityState, ...]:
         """Last observed AddActor states, not a complete scan of loaded entities."""
