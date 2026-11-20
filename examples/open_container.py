@@ -32,6 +32,14 @@ async def run(url: str) -> None:
             "id": window.container_id, "type": window.container_type,
             "position": window.position, "entity_unique_id": window.entity_unique_id,
         }), flush=True)
+        slots = await bot.wait_for_container_slots()
+        print("container_slots=" + json.dumps({
+            "count": len(slots),
+            "nonempty": [
+                {"slot": slot, "item_id": int(item.id), "stack_size": int(item.stack_size)}
+                for slot, item in sorted(slots.items()) if int(item.id) != 0
+            ],
+        }), flush=True)
         await asyncio.to_thread(sys.stdin.readline)
         closed = await bot.close_container()
         print("container_closed=" + json.dumps({

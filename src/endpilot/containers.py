@@ -24,6 +24,8 @@ class Containers:
         self.movement = movement
         self.inventory = inventory
         self.window: ContainerWindow | None = None
+        self._slots: dict[int, object] | None = None
+        self._slots_updated = asyncio.Event()
         self._unsubscribe = packets.subscribe_raw(self._on_packet)
 
     def _decode_open(self, raw) -> ContainerWindow:
@@ -39,10 +41,54 @@ class Containers:
         b = self.packets.protocol.binding
         if raw.packet_id == b.ContainerOpenPacket.ID:
             self.window = self._decode_open(raw)
+            self._slots = None
+            self._slots_updated.set()
+        elif raw.packet_id == b.InventoryContentPacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            if self.window is not None and int(packet.inventory_id) == self.window.container_id:
+                self._slots = dict(enumerate(packet.slots))
+                self._slots_updated.set()
+        elif raw.packet_id == b.InventorySlotPacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            if (self.window is not None and self._slots is not None
+                    and int(packet.inventory_id) == self.window.container_id):
+                self._slots[int(packet.slot)] = packet.item
+                self._slots_updated.set()
+        elif raw.packet_id == b.InventoryTransactionPacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            transaction = getattr(packet.variant_transaction, "transaction", None)
+            for action in getattr(transaction, "actions", ()):
+                source = action.source
+                if (self.window is not None and self._slots is not None
+                        and source.type.name == "CONTAINER_INVENTORY"
+                        and source.container_id is not None
+                        and int(source.container_id) == self.window.container_id):
+                    self._slots[int(action.slot)] = action.to_item_descriptor
+                    self._slots_updated.set()
         elif raw.packet_id == b.ContainerClosePacket.ID:
             packet = self.packets.protocol.decode(raw)
             if self.window is not None and int(packet.container_id) == self.window.container_id:
                 self.window = None
+                self._slots = None
+                self._slots_updated.set()
+
+    @property
+    def slots(self) -> dict[int, object] | None:
+        """Last server-supplied slots for the active window, or None before its content."""
+        return None if self._slots is None else dict(self._slots)
+
+    async def wait_for_slots(self, *, timeout: float = 15) -> dict[int, object]:
+        """Wait for an initial InventoryContent for this window, not a client prediction."""
+        window = self.window
+        if window is None:
+            raise RuntimeError("no container window is open")
+        async with asyncio.timeout(timeout):
+            while self.window is window:
+                if self._slots is not None:
+                    return dict(self._slots)
+                self._slots_updated.clear()
+                await self._slots_updated.wait()
+        raise RuntimeError("container window closed or changed before its contents arrived")
 
     async def open(self, position: tuple[int, int, int], blocks, *, face: int = 1,
                    timeout: float = 15) -> ContainerWindow:

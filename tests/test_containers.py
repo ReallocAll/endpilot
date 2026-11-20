@@ -120,6 +120,89 @@ class ContainerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             containers.close()
 
+    async def test_window_slots_are_server_reported_and_scoped_to_window(self):
+        codec = Protocol(2193)
+        b = codec.binding
+        callbacks = []
+        first = SimpleNamespace(id=3, stack_size=4)
+        updated = SimpleNamespace(id=3, stack_size=2)
+        transacted = SimpleNamespace(id=3, stack_size=1)
+        messages = {
+            b"open": SimpleNamespace(
+                container_id=5, type=SimpleNamespace(name="CONTAINER"),
+                pos=b.BlockPos(x=1, y=100, z=0), entity_unique_id=-1,
+            ),
+            b"other": SimpleNamespace(inventory_id=0, slots=[first]),
+            b"contents": SimpleNamespace(inventory_id=5, slots=[first]),
+            b"slot": SimpleNamespace(inventory_id=5, slot=0, item=updated),
+            b"transaction": SimpleNamespace(variant_transaction=SimpleNamespace(
+                transaction=SimpleNamespace(actions=[SimpleNamespace(
+                    source=SimpleNamespace(
+                        type=SimpleNamespace(name="CONTAINER_INVENTORY"), container_id=5,
+                    ),
+                    slot=0, to_item_descriptor=transacted,
+                )]),
+            )),
+            b"other_transaction": SimpleNamespace(variant_transaction=SimpleNamespace(
+                transaction=SimpleNamespace(actions=[SimpleNamespace(
+                    source=SimpleNamespace(
+                        type=SimpleNamespace(name="CONTAINER_INVENTORY"), container_id=0,
+                    ),
+                    slot=0, to_item_descriptor=transacted,
+                )]),
+            )),
+            b"close": SimpleNamespace(container_id=5),
+        }
+        packets = SimpleNamespace(
+            protocol=SimpleNamespace(binding=b, decode=lambda raw: messages[raw.body]),
+            subscribe_raw=lambda cb: callbacks.append(cb) or (lambda: callbacks.remove(cb)),
+        )
+        containers = Containers(packets, None, None)
+
+        def inbound(packet_type, body):
+            callbacks[0](RawPacket(packet_type.ID, body))
+
+        try:
+            inbound(b.ContainerOpenPacket, b"open")
+            self.assertIsNone(containers.slots)
+            pending = asyncio.create_task(containers.wait_for_slots(timeout=1))
+            await asyncio.sleep(0)
+            inbound(b.InventoryContentPacket, b"other")
+            inbound(b.InventoryTransactionPacket, b"transaction")
+            self.assertIsNone(containers.slots)  # Initial contents are not yet complete.
+            self.assertFalse(pending.done())
+            inbound(b.InventoryContentPacket, b"contents")
+            self.assertEqual((await pending)[0].stack_size, 4)
+
+            snapshot = containers.slots
+            snapshot.clear()
+            self.assertEqual(containers.slots[0].stack_size, 4)
+            inbound(b.InventoryTransactionPacket, b"other_transaction")
+            self.assertEqual(containers.slots[0].stack_size, 4)
+            inbound(b.InventoryTransactionPacket, b"transaction")
+            self.assertEqual(containers.slots[0].stack_size, 1)
+            inbound(b.InventorySlotPacket, b"slot")
+            self.assertEqual(containers.slots[0].stack_size, 2)
+
+            inbound(b.ContainerClosePacket, b"close")
+            self.assertIsNone(containers.window)
+            self.assertIsNone(containers.slots)
+            with self.assertRaises(RuntimeError):
+                await containers.wait_for_slots(timeout=1)
+
+            inbound(b.ContainerOpenPacket, b"open")
+            waiting = asyncio.create_task(containers.wait_for_slots(timeout=1))
+            await asyncio.sleep(0)
+            inbound(b.ContainerClosePacket, b"close")
+            inbound(b.ContainerOpenPacket, b"open")  # Server reuses numeric window ID.
+            inbound(b.InventoryContentPacket, b"contents")
+            with self.assertRaises(RuntimeError):
+                await waiting
+            self.assertEqual(containers.slots[0].stack_size, 4)
+        finally:
+            containers.close()
+        self.assertEqual(callbacks, [])
+
     async def test_close_timeout_keeps_last_observed_window(self):
         codec = Protocol(2193)
         b = codec.binding
