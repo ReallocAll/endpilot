@@ -20,7 +20,18 @@ async def run(url: str, command: str):
             await bot.join_nethernet(url)
         print("spawned EndPilotTest", flush=True)
         await asyncio.to_thread(sys.stdin.readline)
-        packet = await bot.execute_command(command)
+        def observe(raw):
+            if raw.packet_id in (9, 79):
+                try:
+                    print("command_packet=" + repr(bot.protocol.decode(raw)), flush=True)
+                except Exception as error:
+                    print("command_packet_error=" + repr(error), flush=True)
+
+        unsubscribe = bot.packets.subscribe_raw(observe)
+        try:
+            packet = await bot.execute_command(command)
+        finally:
+            unsubscribe()
         output = packet.output
         print("command_result=" + json.dumps({
             "success_count": int(output.success_count),
