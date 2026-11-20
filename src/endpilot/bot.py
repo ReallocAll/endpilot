@@ -215,6 +215,13 @@ class Bot:
             raise RuntimeError("player has not joined")
         return self._entities.drops()
 
+    async def attack_entity(self, runtime_id: int, *, hit_height: float = 0.5) -> None:
+        """Submit a held-item attack; server damage or removal must be observed separately."""
+        if self._entities is None or self._movement is None or self._inventory is None:
+            raise RuntimeError("player has not joined")
+        await self._entities.attack(self._movement, self._inventory, runtime_id,
+                                    hit_height=hit_height)
+
     async def collect_drop(
         self, runtime_id: int, *, ticks: int = 120, timeout: float = 15
     ) -> EntityState:

@@ -4,10 +4,69 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from endpilot.entities import Entities, EntityMovement, EntitySpawn, EntityState
+from endpilot.inventory import Inventory
 from endpilot.protocol import Protocol, RawPacket
 
 
 class EntityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_attack_uses_observed_actor_and_selected_item_in_typed_packet(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        item = b.SerializedNetworkItemStackDescriptor(
+            id=1, stack_size=1, aux_value=0, net_id_variant=9,
+            block_runtime_id=123, user_data_buffer=b"\x00" * 10,
+        )
+        callbacks = []
+        packets = SimpleNamespace(
+            protocol=protocol, send=AsyncMock(),
+            subscribe_raw=lambda cb: callbacks.append(cb) or (lambda: callbacks.remove(cb)),
+        )
+        entities = Entities(packets)
+        entities._record(EntityState(42, 77, "minecraft:cow", (2.5, 100.0, 0.5)))
+        movement = SimpleNamespace(wait_for_position_sync=AsyncMock(return_value=(0.5, 101.62, 0.5)))
+        inventory = Inventory(packets, 7)
+        inventory._set_slot(2, item)
+        await inventory.select_hotbar(2)
+        packets.send.reset_mock()
+
+        await entities.attack(movement, inventory, 77, hit_height=0.75)
+        packets.send.assert_awaited_once()
+        packet = protocol.decode(protocol.encode(packets.send.await_args.args[0]))
+        self.assertIsInstance(packet, b.InventoryTransactionPacket)
+        tx = packet.variant_transaction
+        self.assertIsInstance(tx, b.ItemUseOnActorInventoryTransaction)
+        self.assertEqual(int(tx.runtime_id), 77)
+        self.assertEqual(tx.action_type, b.ItemUseOnActorInventoryTransaction.ActionType.ATTACK)
+        self.assertEqual(tx.slot, 2)
+        self.assertEqual(int(tx.item.id), 1)
+        self.assertEqual(int(tx.item.net_id_variant), 9)
+        self.assertAlmostEqual(tx.from_pos.y, 101.62, places=2)
+        self.assertAlmostEqual(tx.hit_pos.x, 2.5)
+        self.assertAlmostEqual(tx.hit_pos.y, 100.75)
+        self.assertEqual(tx.transaction.actions, [])
+        inventory.close()
+        self.assertEqual(callbacks, [])
+
+    async def test_attack_unobserved_actor_uses_upstream_player_position_fallback(self):
+        protocol = Protocol(2193)
+        packets = SimpleNamespace(protocol=protocol, send=AsyncMock())
+        entities = Entities(packets)
+        movement = SimpleNamespace(wait_for_position_sync=AsyncMock(
+            return_value=(3.5, 101.62, -0.5),
+        ))
+        item = protocol.binding.SerializedNetworkItemStackDescriptor(
+            id=0, stack_size=0, aux_value=0, net_id_variant=None,
+            block_runtime_id=0, user_data_buffer=b"",
+        )
+        inventory = SimpleNamespace(item_or_empty=lambda slot: item, selected_slot=0)
+        await entities.attack(movement, inventory, 999)
+        packet = protocol.decode(protocol.encode(packets.send.await_args.args[0]))
+        tx = packet.variant_transaction
+        self.assertEqual(int(tx.runtime_id), 999)
+        self.assertAlmostEqual(tx.hit_pos.x, 3.5)
+        self.assertAlmostEqual(tx.hit_pos.y, 102.12, places=2)
+        self.assertAlmostEqual(tx.hit_pos.z, -0.5)
+
     async def test_spawn_filters_type_and_returns_server_ids_and_position(self):
         binding = Protocol(2193).binding
         other = RawPacket(binding.AddActorPacket.ID, b"other")

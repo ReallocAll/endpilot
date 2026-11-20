@@ -19,9 +19,12 @@ class InventoryTests(unittest.IsolatedAsyncioTestCase):
         )
         inventory = Inventory(packets, 7)
         try:
+            self.assertEqual(inventory.selected_slot, 0)
             # Empty or not-yet-observed slots remain valid player selections.
             await inventory.select_hotbar(2)
+            self.assertEqual(inventory.selected_slot, 2)
             await inventory.select_hotbar(8)
+            self.assertEqual(inventory.selected_slot, 8)
             self.assertEqual(packets.send.await_count, 2)
             for index, call in zip((2, 8), packets.send.await_args_list):
                 encoded = protocol.encode(call.args[0])
@@ -35,9 +38,58 @@ class InventoryTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(ValueError):
                     await inventory.select_hotbar(invalid)
             self.assertEqual(packets.send.await_count, 2)
+            self.assertEqual(inventory.selected_slot, 8)
         finally:
             inventory.close()
         self.assertEqual(callbacks, [])
+
+    async def test_equipment_announcement_updates_locally_selected_slot(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        callbacks = []
+        packets = SimpleNamespace(
+            protocol=protocol, send=AsyncMock(),
+            subscribe_raw=lambda cb: callbacks.append(cb) or (lambda: callbacks.remove(cb)),
+        )
+        inventory = Inventory(packets, 7)
+        try:
+            item = b.SerializedNetworkItemStackDescriptor(
+                id=1, stack_size=1, aux_value=0, net_id_variant=None,
+                block_runtime_id=0, user_data_buffer=b"",
+            )
+            await inventory.announce_equipment(3, item)
+            self.assertEqual(inventory.selected_slot, 3)
+            sent = protocol.decode(protocol.encode(packets.send.await_args.args[0]))
+            self.assertIsInstance(sent, b.MobEquipmentPacket)
+            self.assertEqual(int(sent.selected_slot), 3)
+            self.assertEqual(int(sent.slot), 3)
+        finally:
+            inventory.close()
+        self.assertEqual(callbacks, [])
+
+    async def test_empty_inventory_slot_needs_no_server_content_for_attack(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        callbacks = []
+        packets = SimpleNamespace(
+            protocol=protocol,
+            subscribe_raw=lambda cb: callbacks.append(cb) or (lambda: callbacks.remove(cb)),
+        )
+        inventory = Inventory(packets, 7)
+        try:
+            empty = inventory.item_or_empty(0)
+            self.assertEqual(int(empty.id), 0)
+            self.assertEqual(int(empty.stack_size), 0)
+            self.assertIsNone(empty.net_id_variant)
+            self.assertEqual(empty.user_data_buffer, b"")
+            item = b.SerializedNetworkItemStackDescriptor(
+                id=42, stack_size=1, aux_value=0, net_id_variant=None,
+                block_runtime_id=0, user_data_buffer=b"",
+            )
+            inventory._set_slot(0, item)
+            self.assertIs(inventory.item_or_empty(0), item)
+        finally:
+            inventory.close()
 
     async def test_server_inventory_transaction_updates_only_player_slots(self):
         protocol = Protocol(2193)

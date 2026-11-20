@@ -8,6 +8,7 @@ class Inventory:
         self.packets = packets
         self.player_id = int(player_id)
         self._slots = {}
+        self._selected_slot = 0
         self._events = {}
         self._changed = asyncio.Event()
         self._unsubscribe = packets.subscribe_raw(self._on_packet)
@@ -62,6 +63,24 @@ class Inventory:
                 self._changed.clear()
                 await self._changed.wait()
 
+    @property
+    def selected_slot(self) -> int:
+        """Last locally selected hotbar slot, not a BDS acceptance receipt."""
+        return self._selected_slot
+
+    def item_or_empty(self, slot: int):
+        """Return an observed item or the client's initial empty-hand descriptor.
+
+        A fresh BDS connection need not send InventoryContent for empty slots.
+        Match EndstoneMC/client's initially empty inventory instead of waiting
+        for inventory state that an unarmed attack does not require.
+        """
+        b = self.packets.protocol.binding
+        return self._slots.get(slot) or b.SerializedNetworkItemStackDescriptor(
+            id=0, stack_size=0, aux_value=0, net_id_variant=None,
+            block_runtime_id=0, user_data_buffer=b"",
+        )
+
     async def wait_for_item(self, slot: int, timeout: float = 15):
         """Return the current server-reported nonempty inventory slot."""
         event = self._events.setdefault(slot, asyncio.Event())
@@ -85,6 +104,7 @@ class Inventory:
             container_id=b.ContainerID.INVENTORY,
             should_select_slot=True,
         ))
+        self._selected_slot = slot
 
     async def announce_equipment(self, slot: int, item) -> None:
         """Carry the server-observed item descriptor for a use transaction."""
@@ -96,6 +116,7 @@ class Inventory:
             selected_slot=slot,
             container_id=b.ContainerID.INVENTORY,
         ))
+        self._selected_slot = slot
 
     def close(self):
         self._unsubscribe()
