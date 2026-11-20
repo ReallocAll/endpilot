@@ -54,6 +54,9 @@ class Entities:
         """Snapshot actors observed since subscription; not a world entity scan."""
         return tuple(self._by_runtime.values())
 
+    def get(self, runtime_id: int) -> EntityState | None:
+        return self._by_runtime.get(runtime_id)
+
     def drops(self) -> tuple[EntityState, ...]:
         return tuple(state for state in self._by_runtime.values()
                      if state.actor_type == "minecraft:item")

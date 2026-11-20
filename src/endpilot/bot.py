@@ -83,6 +83,15 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._movement.walk_forward(ticks)
 
+    async def follow_entity(self, runtime_id: int, *, ticks: int = 80,
+                            stop_distance: float = 1.5) -> int:
+        """Follow the latest server-observed actor position for a bounded time."""
+        if self._movement is None or self._entities is None:
+            raise RuntimeError("player has not joined")
+        return await self._movement.follow_entity(
+            self._entities, runtime_id, ticks=ticks, stop_distance=stop_distance
+        )
+
     async def wait_for_block_update(
         self, position: tuple[int, int, int], *, layer: int = 0, timeout: float = 15
     ) -> BlockUpdate:
