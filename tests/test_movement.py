@@ -147,7 +147,7 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(west.pos.z, 0.5, places=5)
         self.assertAlmostEqual(west.pos_delta.x, -0.09, places=5)
         self.assertEqual(list(west.input_data), [b.PlayerAuthInputPacket.InputData.UP])
-        self.assertEqual(movement.position, (0.5, 101.62, 0.5))
+        self.assertEqual(movement.position, eye)
 
         await movement.look_at((0.41, 91.62, 0.5))
         await movement._send_input(False)
