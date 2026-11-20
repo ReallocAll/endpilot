@@ -8,7 +8,7 @@ from endpilot import Bot
 
 
 async def run(url: str, take_count: int = 0, destination_slot: int = 0,
-              put_back_count: int = 0) -> None:
+              put_back_count: int = 0, equip_armor_slot: int | None = None) -> None:
     bot = Bot("EndPilotTest")
     target = (1, 100, 0)
     try:
@@ -65,6 +65,16 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
             "id": None if closed is None else closed.container_id,
             "open_window": bot.open_window is not None,
         }), flush=True)
+        if equip_armor_slot is not None:
+            response = await bot.equip_armor(destination_slot, equip_armor_slot)
+            armor = bot.armor_slots.get(equip_armor_slot)
+            print("armor_equip_response=" + json.dumps({
+                "request_id": int(response.client_request_id.raw_id),
+                "result": response.result.name,
+                "armor_item_id": None if armor is None else int(armor.id),
+                "armor_count": None if armor is None else int(armor.stack_size),
+                "inventory_count": bot.inventory_count(int(slots[0].id)),
+            }), flush=True)
         await asyncio.to_thread(sys.stdin.readline)
     finally:
         await bot.close()
@@ -79,5 +89,8 @@ if __name__ == "__main__":
     parser.add_argument("--destination-slot", type=int, default=0)
     parser.add_argument("--put-back-count", type=int, default=0,
                         help="return this many items from destination slot to chest slot 0")
+    parser.add_argument("--equip-armor-slot", type=int, default=None,
+                        help="after closing the chest, equip the taken item into armor slot 0-3")
     args = parser.parse_args()
-    asyncio.run(run(args.url, args.take_count, args.destination_slot, args.put_back_count))
+    asyncio.run(run(args.url, args.take_count, args.destination_slot,
+                    args.put_back_count, args.equip_armor_slot))
