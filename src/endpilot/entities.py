@@ -66,6 +66,10 @@ class Entities:
                 (float(actor.pos.x), float(actor.pos.y), float(actor.pos.z)),
             )
             self._runtime_by_id[entity_id] = runtime_id
+        elif raw.packet_id == b.ChangeDimensionPacket.ID:
+            # Actors from the previous dimension are no longer observable.
+            self._by_runtime.clear()
+            self._runtime_by_id.clear()
         elif raw.packet_id == b.RemoveActorPacket.ID:
             entity_id = int(self.packets.protocol.decode(raw).entity_id)
             runtime_id = self._runtime_by_id.pop(entity_id, None)
