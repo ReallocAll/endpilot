@@ -20,7 +20,7 @@ async def run(url: str):
         for slot in (0, 2):
             await asyncio.to_thread(sys.stdin.readline)
             await bot.select_hotbar(slot)
-            print(f"selected_hotbar_slot={slot}", flush=True)
+            print(f"hotbar_selection_submitted={slot}", flush=True)
         await asyncio.to_thread(sys.stdin.readline)
     finally:
         await bot.close()

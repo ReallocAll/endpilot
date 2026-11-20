@@ -135,7 +135,7 @@ class Bot:
         await self._blocks.request_sub_chunk(position)
 
     async def select_hotbar(self, slot: int) -> None:
-        """Submit a selection using BDS's current slot item, including air."""
+        """Request a hotbar slot; observe BDS to confirm the equipped item."""
         if self._inventory is None:
             raise RuntimeError("player has not joined")
         await self._inventory.select_hotbar(slot)
