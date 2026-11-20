@@ -37,12 +37,25 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(tx.hit_pos.y, 100.75)
         self.assertEqual(tx.transaction.actions, [])
 
-    async def test_attack_requires_observed_actor_not_arbitrary_runtime_id(self):
-        packets = SimpleNamespace(protocol=Protocol(2193), send=AsyncMock())
+    async def test_attack_unobserved_actor_uses_upstream_player_position_fallback(self):
+        protocol = Protocol(2193)
+        packets = SimpleNamespace(protocol=protocol, send=AsyncMock())
         entities = Entities(packets)
-        with self.assertRaisesRegex(ValueError, "not currently observed"):
-            await entities.attack(None, None, 999)
-        packets.send.assert_not_awaited()
+        movement = SimpleNamespace(wait_for_position_sync=AsyncMock(
+            return_value=(3.5, 101.62, -0.5),
+        ))
+        item = protocol.binding.SerializedNetworkItemStackDescriptor(
+            id=0, stack_size=0, aux_value=0, net_id_variant=None,
+            block_runtime_id=0, user_data_buffer=b"",
+        )
+        inventory = SimpleNamespace(item_or_empty=lambda slot: item)
+        await entities.attack(movement, inventory, 999)
+        packet = protocol.decode(protocol.encode(packets.send.await_args.args[0]))
+        tx = packet.variant_transaction
+        self.assertEqual(int(tx.runtime_id), 999)
+        self.assertAlmostEqual(tx.hit_pos.x, 3.5)
+        self.assertAlmostEqual(tx.hit_pos.y, 102.12, places=2)
+        self.assertAlmostEqual(tx.hit_pos.z, -0.5)
 
     async def test_spawn_filters_type_and_returns_server_ids_and_position(self):
         binding = Protocol(2193).binding

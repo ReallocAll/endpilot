@@ -129,16 +129,16 @@ class Entities:
 
     async def attack(self, movement, inventory, runtime_id: int, *,
                      slot: int = 0, hit_height: float = 0.5) -> None:
-        """Submit one attack using the latest observed actor position.
+        """Submit one attack using the observed actor position when available.
 
         Uses the same ItemUseOnActor inventory transaction as EndstoneMC/client.
         Completion means only that the packet was submitted, not server damage.
         """
         actor = self.get(runtime_id)
-        if actor is None:
-            raise ValueError("actor is not currently observed")
         item = inventory.item_or_empty(slot)
         x, y, z = await movement.wait_for_position_sync()
+        # EndstoneMC/client uses player position when this actor is not tracked.
+        target = actor.position if actor is not None else (x, y, z)
         b = self.packets.protocol.binding
         action = b.ItemUseOnActorInventoryTransaction(
             transaction=b.InventoryTransaction(actions=[]),
@@ -148,9 +148,9 @@ class Entities:
             item=item,
             from_pos=b.Vec3(x=x, y=y, z=z),
             hit_pos=b.Vec3(
-                x=actor.position[0],
-                y=actor.position[1] + hit_height,
-                z=actor.position[2],
+                x=target[0],
+                y=target[1] + hit_height,
+                z=target[2],
             ),
         )
         await self.packets.send(b.InventoryTransactionPacket(
