@@ -1,4 +1,4 @@
-"""Observe server actor spawn and removal packets on the active player stream."""
+"""Observe server actors and retain the latest state seen on this player stream."""
 
 from dataclasses import dataclass
 
@@ -21,9 +21,75 @@ class EntityMovement:
     z: float | None
 
 
+@dataclass(frozen=True, slots=True)
+class EntityState:
+    """Last observed AddActor position plus subsequent server movement."""
+
+    entity_id: int
+    runtime_id: int
+    actor_type: str
+    position: tuple[float, float, float]
+
+
 class Entities:
     def __init__(self, packets):
         self.packets = packets
+        self._by_runtime: dict[int, EntityState] = {}
+        self._runtime_by_id: dict[int, int] = {}
+        self._unsubscribe = None
+
+    def start(self) -> None:
+        self._unsubscribe = self.packets.subscribe_raw(self._on_packet)
+
+    def close(self) -> None:
+        if self._unsubscribe is not None:
+            self._unsubscribe()
+            self._unsubscribe = None
+
+    def snapshot(self) -> tuple[EntityState, ...]:
+        """Snapshot actors observed since subscription; not a world entity scan."""
+        return tuple(self._by_runtime.values())
+
+    def _on_packet(self, raw) -> None:
+        b = self.packets.protocol.binding
+        if raw.packet_id == b.AddActorPacket.ID:
+            actor = self.packets.protocol.decode(raw)
+            entity_id, runtime_id = int(actor.entity_id), int(actor.runtime_id)
+            previous = self._by_runtime.get(runtime_id)
+            if previous is not None:
+                self._runtime_by_id.pop(previous.entity_id, None)
+            previous_runtime = self._runtime_by_id.get(entity_id)
+            if previous_runtime is not None and previous_runtime != runtime_id:
+                self._by_runtime.pop(previous_runtime, None)
+            self._by_runtime[runtime_id] = EntityState(
+                entity_id, runtime_id, actor.actor_type,
+                (float(actor.pos.x), float(actor.pos.y), float(actor.pos.z)),
+            )
+            self._runtime_by_id[entity_id] = runtime_id
+        elif raw.packet_id == b.RemoveActorPacket.ID:
+            entity_id = int(self.packets.protocol.decode(raw).entity_id)
+            runtime_id = self._runtime_by_id.pop(entity_id, None)
+            if runtime_id is not None:
+                self._by_runtime.pop(runtime_id, None)
+        elif raw.packet_id in (b.MoveActorAbsolutePacket.ID, b.MoveActorDeltaPacket.ID):
+            move = self.packets.protocol.decode(raw).move_data
+            runtime_id = int(move.runtime_id)
+            state = self._by_runtime.get(runtime_id)
+            if state is None:
+                return
+            if raw.packet_id == b.MoveActorAbsolutePacket.ID:
+                position = (float(move.pos.x), float(move.pos.y), float(move.pos.z))
+            else:
+                position = tuple(
+                    float(value) if value is not None else old
+                    for value, old in zip(
+                        (move.new_position_x, move.new_position_y, move.new_position_z),
+                        state.position,
+                    )
+                )
+            self._by_runtime[runtime_id] = EntityState(
+                state.entity_id, runtime_id, state.actor_type, position
+            )
 
     async def wait_for_spawn(self, *, actor_type: str | None = None, timeout: float = 15) -> EntitySpawn:
         """Wait for a new AddActor; an entity already in view will not be replayed."""

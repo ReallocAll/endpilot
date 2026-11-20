@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from endpilot.entities import Entities, EntityMovement, EntitySpawn
+from endpilot.entities import Entities, EntityMovement, EntitySpawn, EntityState
 from endpilot.protocol import Protocol, RawPacket
 
 
@@ -88,3 +88,54 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await Entities(packets).wait_for_movement(77)
         self.assertEqual(result, EntityMovement(77, 6.0, 100.0, 0.5))
+
+    async def test_snapshot_accumulates_partial_moves_and_removal(self):
+        binding = Protocol(2193).binding
+        decoded = {
+            b"spawn": SimpleNamespace(
+                entity_id=42, runtime_id=77, actor_type="minecraft:cow",
+                pos=SimpleNamespace(x=2.5, y=100.0, z=0.5),
+            ),
+            b"delta": SimpleNamespace(move_data=SimpleNamespace(
+                runtime_id=77, new_position_x=6.0,
+                new_position_y=None, new_position_z=None,
+            )),
+            b"absolute": SimpleNamespace(move_data=SimpleNamespace(
+                runtime_id=77, pos=SimpleNamespace(x=7.0, y=101.0, z=1.0),
+            )),
+            b"remove": SimpleNamespace(entity_id=42),
+        }
+        callbacks = []
+
+        def subscribe(callback):
+            callbacks.append(callback)
+            return lambda: callbacks.remove(callback)
+
+        packets = SimpleNamespace(
+            protocol=SimpleNamespace(
+                binding=binding, decode=lambda raw: decoded[raw.body],
+            ),
+            subscribe_raw=subscribe,
+        )
+        entities = Entities(packets)
+        entities.start()
+
+        def emit(packet_type, body):
+            callbacks[0](RawPacket(packet_type, body))
+
+        emit(binding.MoveActorDeltaPacket.ID, b"delta")
+        self.assertEqual(entities.snapshot(), ())
+        emit(binding.AddActorPacket.ID, b"spawn")
+        initial = entities.snapshot()
+        self.assertEqual(initial, (
+            EntityState(42, 77, "minecraft:cow", (2.5, 100.0, 0.5)),
+        ))
+        emit(binding.MoveActorDeltaPacket.ID, b"delta")
+        self.assertEqual(entities.snapshot()[0].position, (6.0, 100.0, 0.5))
+        self.assertEqual(initial[0].position, (2.5, 100.0, 0.5))
+        emit(binding.MoveActorAbsolutePacket.ID, b"absolute")
+        self.assertEqual(entities.snapshot()[0].position, (7.0, 101.0, 1.0))
+        emit(binding.RemoveActorPacket.ID, b"remove")
+        self.assertEqual(entities.snapshot(), ())
+        entities.close()
+        self.assertEqual(callbacks, [])

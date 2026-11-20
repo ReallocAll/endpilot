@@ -25,6 +25,10 @@ async def run(url: str):
         await asyncio.sleep(0)
         print("entity_spawn_watcher_ready", flush=True)
         spawn = await pending
+        tracked = next((entity for entity in bot.observed_entities
+                        if entity.runtime_id == spawn.runtime_id), None)
+        if tracked is None or tracked.entity_id != spawn.entity_id:
+            raise AssertionError("spawn missing from observed entity snapshot")
         print("entity_spawn=" + json.dumps({
             "entity_id": spawn.entity_id, "runtime_id": spawn.runtime_id,
             "actor_type": spawn.actor_type, "position": spawn.position,
@@ -44,6 +48,13 @@ async def run(url: str):
         await asyncio.sleep(0)
         print("entity_movement_watcher_ready", flush=True)
         move = await pending
+        tracked = next((entity for entity in bot.observed_entities
+                        if entity.runtime_id == spawn.runtime_id), None)
+        if tracked is None or abs(tracked.position[0] - target_x) >= 1:
+            raise AssertionError(f"server movement absent from entity snapshot: {tracked}")
+        print("entity_state_after_move=" + json.dumps({
+            "runtime_id": tracked.runtime_id, "position": tracked.position,
+        }), flush=True)
         print("entity_movement=" + json.dumps({
             "runtime_id": move.runtime_id, "x": move.x, "y": move.y, "z": move.z,
         }), flush=True)
@@ -53,6 +64,8 @@ async def run(url: str):
         await asyncio.sleep(0)
         print("entity_removal_watcher_ready", flush=True)
         await pending
+        if any(entity.entity_id == spawn.entity_id for entity in bot.observed_entities):
+            raise AssertionError("removed actor remained in observed entity snapshot")
         print("entity_removed=" + json.dumps({"entity_id": spawn.entity_id}), flush=True)
         await asyncio.to_thread(sys.stdin.readline)
     finally:
