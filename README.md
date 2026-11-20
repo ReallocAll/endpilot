@@ -38,4 +38,15 @@ python examples/walk.py raknet://127.0.0.1:19132
 
 `walk_forward()` returns submitted input frames, not confirmed server displacement. Use BDS `querytarget` to verify actual movement. The example's wait for Enter also supports Testbed world setup.
 
+## Place a block through MCP
+
+Install the optional MCP tools and register `python -m endpilot.mcp_server` as a local **stdio** MCP server:
+
+```sh
+python -m pip install -e ".[nethernet,raknet,mcp]"
+python examples/place_block_mcp.py http://localhost:19132
+```
+
+The MCP tools `connect`, `watch_block`, `read_block`, `place_against`, and `disconnect` use the ordinary Bot SDK. First watch and read an actual server block update for the support, then submit `place_against` against that observed runtime ID. The returned tick only confirms **input submission**, not that Endstone accepted placement. Observe the target block and use the server state to establish the outcome. The example mirrors Testbed's cancel/allow placement scenario; it expects the Testbed to set up its world and prompt it.
+
 [Contributing](CONTRIBUTING.md) · [Roadmap](ROADMAP.md) · [Apache-2.0](LICENSE)

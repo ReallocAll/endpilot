@@ -21,7 +21,7 @@ jobs:
           else
             python -m pip install git+https://github.com/EndstoneMC/bedrock-protocol.git@1aa8ae119ccb0a4e60f693217d6dcdde00238d13
           fi
-          python -m pip install '.[nethernet,raknet]'
+          python -m pip install '.[nethernet,raknet,mcp]'
       - name: Test the SDK and run the offline example
         run: |
           python -m unittest discover -s tests -v
