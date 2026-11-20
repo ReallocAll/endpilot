@@ -98,6 +98,12 @@ class Bot:
             self._entities, runtime_id, ticks=ticks, stop_distance=stop_distance
         )
 
+    def switch_follow_target(self, runtime_id: int) -> None:
+        """Redirect an active follow to another actor on the next input frame."""
+        if self._movement is None:
+            raise RuntimeError("player has not joined")
+        self._movement.switch_follow_target(runtime_id)
+
     async def wait_for_block_update(
         self, position: tuple[int, int, int], *, layer: int = 0, timeout: float = 15
     ) -> BlockUpdate:
