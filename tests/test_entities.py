@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -247,30 +248,48 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
     async def test_collect_drop_releases_movement_after_confirmed_take(self):
         protocol = Protocol(2193)
         b = protocol.binding
-        callbacks = []
-        packets = SimpleNamespace(
-            protocol=protocol,
-            subscribe_raw=lambda callback: callbacks.append(callback)
-            or (lambda: callbacks.remove(callback)),
-        )
-        pending = asyncio.get_running_loop().create_future()
+        packet_ready = asyncio.Event()
+        move_started = asyncio.Event()
+        incoming = asyncio.get_running_loop().create_future()
 
         async def wait_for_packet(packet_id, *, match, timeout):
             self.assertEqual(packet_id, b.TakeItemActorPacket.ID)
-            pending.set_result(match)
+            self.assertEqual(timeout, 2)
+            packet_ready.set()
+            raw = await incoming
+            self.assertTrue(match(raw))
+            return raw
+
+        async def follow(*_args, **_kwargs):
+            move_started.set()
             await asyncio.Event().wait()
 
-        packets.wait_for_packet = wait_for_packet
+        packets = SimpleNamespace(
+            protocol=protocol, wait_for_packet=wait_for_packet,
+        )
         entities = Entities(packets)
-        entities.start()
         item = EntityState(13, 23, "minecraft:item", (3.5, 100.5, 0.5), "minecraft:dirt", 1, 3)
         entities._record(item)
-        movement = SimpleNamespace(follow_entity=AsyncMock(side_effect=lambda *_args, **_kwargs: asyncio.sleep(60)))
-        task = asyncio.create_task(entities.collect_drop(movement, 23, 7, timeout=1))
-        match = await asyncio.wait_for(pending, 1)
-        self.assertFalse(match(protocol.encode(b.TakeItemActorPacket(item_id=23, actor_id=9))))
-        self.assertTrue(match(protocol.encode(b.TakeItemActorPacket(item_id=23, actor_id=7))))
-        task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await task
-        entities.close()
+        movement = SimpleNamespace(follow_entity=AsyncMock(side_effect=follow))
+        task = asyncio.create_task(entities.collect_drop(movement, 23, 7, timeout=2))
+        try:
+            await asyncio.wait_for(packet_ready.wait(), 1)
+            await asyncio.wait_for(move_started.wait(), 1)
+            incoming.set_result(protocol.encode(
+                b.TakeItemActorPacket(item_id=23, actor_id=7)
+            ))
+            self.assertEqual(await asyncio.wait_for(task, 1), item)
+            movement.follow_entity.assert_awaited_once_with(
+                entities, 23, ticks=120, stop_distance=0.0
+            )
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def test_collect_drop_rejects_unknown_actor_without_walking(self):
+        movement = SimpleNamespace(follow_entity=AsyncMock())
+        entities = Entities(SimpleNamespace())
+        with self.assertRaisesRegex(ValueError, "item actor"):
+            await entities.collect_drop(movement, 13, 7)
+        movement.follow_entity.assert_not_awaited()
