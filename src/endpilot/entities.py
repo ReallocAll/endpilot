@@ -174,12 +174,13 @@ class Entities:
         pickup = asyncio.create_task(self.wait_for_item_pickup(
             runtime_id, player_id, timeout=timeout
         ))
-        # Register the packet waiter before sending any movement input.
-        await asyncio.sleep(0)
-        follow = asyncio.create_task(movement.follow_entity(
-            self, runtime_id, ticks=ticks, stop_distance=0.0
-        ))
+        follow = None
         try:
+            # Register the packet waiter before sending any movement input.
+            await asyncio.sleep(0)
+            follow = asyncio.create_task(movement.follow_entity(
+                self, runtime_id, ticks=ticks, stop_distance=0.0
+            ))
             done, _ = await asyncio.wait(
                 (pickup, follow), return_when=asyncio.FIRST_COMPLETED
             )
@@ -188,10 +189,11 @@ class Entities:
             await pickup
             return drop
         finally:
-            for task in (pickup, follow):
+            tasks = (pickup, follow) if follow is not None else (pickup,)
+            for task in tasks:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(pickup, follow, return_exceptions=True)
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def wait_for_item_drop(self, timeout: float = 15) -> EntityState:
         """Observe the next server-sent item spawn, not an inventory transfer."""
