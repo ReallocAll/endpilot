@@ -112,3 +112,59 @@ class BlocksTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(int(decoded.item_use_transaction.transaction.target_block_id), 77)
         self.assertEqual(decoded.client_tick, 1)
         inventory.close()
+
+    async def test_mine_block_uses_auth_input_actions_and_waits_for_server_air(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        stream = PacketStream(protocol)
+        movement = Movement(stream, 7)
+        movement._input_position = (0.5, 101.62, 0.5)
+        movement._updated.set()
+        blocks = Blocks(stream, movement, None, hashed_runtime_ids=True)
+        original_send = stream.send
+
+        async def send(packet):
+            await original_send(packet)
+            if not isinstance(packet, b.PlayerAuthInputPacket) or not packet.player_block_actions:
+                return
+            if packet.player_block_actions[0].player_action_type != b.PlayerActionType.START_DESTROY_BLOCK:
+                return
+            # An unrelated change is not completion; only server-reported air is.
+            for x, runtime_id in ((2, 123), (1, 0xDBF44120)):
+                update = b.UpdateBlockPacket()
+                update.pos = b.BlockPos(x=x, y=100, z=0)
+                update.runtime_id = runtime_id
+                update.update_flags = 0
+                update.layer = 0
+                stream.emit(protocol.encode(update))
+
+        stream.send = send
+        observed = await blocks.mine_block((1, 100, 0), face=4, timeout=1)
+        self.assertEqual(observed, BlockUpdate((1, 100, 0), 0xDBF44120, 0))
+        self.assertEqual([packet.client_tick for packet in stream.sent], [1, 2])
+        start, stop = [protocol.decode(protocol.encode(p)) for p in stream.sent]
+        self.assertIn(b.PlayerAuthInputPacket.InputData.PERFORM_BLOCK_ACTIONS, start.input_data)
+        self.assertEqual(start.player_block_actions[0].player_action_type, b.PlayerActionType.START_DESTROY_BLOCK)
+        self.assertEqual(tuple((start.player_block_actions[0].pos.x,
+                                start.player_block_actions[0].pos.y,
+                                start.player_block_actions[0].pos.z)), (1, 100, 0))
+        self.assertEqual(start.player_block_actions[0].facing, 4)
+        self.assertEqual(stop.player_block_actions[0].player_action_type, b.PlayerActionType.STOP_DESTROY_BLOCK)
+        self.assertEqual(stream.observers, [])
+
+    async def test_mining_timeout_aborts_the_target(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        stream = PacketStream(protocol)
+        movement = Movement(stream, 7)
+        movement._input_position = (0.5, 101.62, 0.5)
+        movement._updated.set()
+        blocks = Blocks(stream, movement, None, hashed_runtime_ids=True)
+        with self.assertRaises(TimeoutError):
+            await blocks.mine_block((1, 100, 0), face=4, timeout=0.02)
+        self.assertEqual([p.client_tick for p in stream.sent], [1, 2])
+        self.assertEqual([action.player_action_type for action in stream.sent[1].player_block_actions], [
+            b.PlayerActionType.ABORT_DESTROY_BLOCK,
+            b.PlayerActionType.STOP_DESTROY_BLOCK,
+        ])
+        self.assertEqual(stream.observers, [])

@@ -140,6 +140,14 @@ class Bot:
             raise RuntimeError("player has not joined")
         await self._inventory.select_hotbar(slot)
 
+    async def mine_block(
+        self, position: tuple[int, int, int], *, face: int = 1, timeout: float = 15
+    ) -> BlockUpdate:
+        """Mine until a server block update, not merely input submission."""
+        if self._blocks is None:
+            raise RuntimeError("player has not joined")
+        return await self._blocks.mine_block(position, face=face, timeout=timeout)
+
     async def place_against(self, against: BlockUpdate, *, face: int = 1, slot: int = 0) -> int:
         if self._blocks is None:
             raise RuntimeError("player has not joined")
