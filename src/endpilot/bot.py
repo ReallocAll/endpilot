@@ -8,6 +8,7 @@ from .entities import Entities, EntityMovement, EntitySpawn, EntityState
 from .inventory import Inventory
 from .login import JoinSession
 from .movement import Movement
+from .player_state import PlayerState
 from .protocol import Protocol
 
 
@@ -22,6 +23,7 @@ class Bot:
         self._chat: Chat | None = None
         self._commands: Commands | None = None
         self._entities: Entities | None = None
+        self._player_state: PlayerState | None = None
 
     async def join_nethernet(self, url: str, *, timeout: float = 30, server_key_sha256: str | None = None) -> None:
         if self._session is not None:
@@ -44,6 +46,7 @@ class Bot:
         self._chat = Chat(session.packets, self.identity.name)
         self._commands = Commands(session.packets, self.identity.uuid, session.player_unique_id)
         self._entities = Entities(session.packets)
+        self._player_state = PlayerState(session.packets, session.player_id)
         self._session = session
         self._entities.start()
         self._movement.start()
@@ -104,6 +107,18 @@ class Bot:
         return await self._commands.execute(command, timeout=timeout)
 
     @property
+    def health(self) -> float | None:
+        """Latest server-reported health; None until a health packet arrives."""
+        if self._player_state is None:
+            raise RuntimeError("player has not joined")
+        return self._player_state.health
+
+    async def wait_for_health_update(self, timeout: float = 15) -> float:
+        if self._player_state is None:
+            raise RuntimeError("player has not joined")
+        return await self._player_state.wait_for_health_update(timeout)
+
+    @property
     def observed_entities(self) -> tuple[EntityState, ...]:
         """Last observed AddActor states, not a complete scan of loaded entities."""
         if self._entities is None:
@@ -152,6 +167,9 @@ class Bot:
         self._chat = None
         self._commands = None
         entities, self._entities = self._entities, None
+        player_state, self._player_state = self._player_state, None
+        if player_state is not None:
+            player_state.close()
         if entities is not None:
             entities.close()
         if movement is not None:
