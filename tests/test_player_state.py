@@ -99,15 +99,15 @@ class PlayerStateTests(unittest.IsolatedAsyncioTestCase):
 
         # A server reply for this player updates movement before the waiter resolves.
         reply = b.RespawnPacket(
-            pos=b.Vec3(x=3.5, y=103.62, z=9.5),
+            pos=b.Vec3(x=3.5, y=103.625, z=9.5),
             state=b.PlayerRespawnState.READY_TO_SPAWN, runtime_id=7,
         )
         raw = protocol.encode(reply)
         for callback in tuple(observer):
             callback(raw)
         received.set_result(raw)
-        self.assertEqual(await pending, (3.5, 103.62, 9.5))
-        self.assertEqual(movement.position, (3.5, 103.62, 9.5))
+        self.assertEqual(await pending, (3.5, 103.625, 9.5))
+        self.assertEqual(movement.position, (3.5, 103.625, 9.5))
         self.assertEqual(movement._input_position, movement.position)
         self.assertEqual(len(sent), 2)
         self.assertEqual(sent[1].action, b.PlayerActionType.RESPAWN)
