@@ -1,7 +1,7 @@
-"""Attack a server-spawned cow through Bot.attack_entity; await server removal.
+"""Submit one attack on a server-spawned cow through Bot.attack_entity.
 
-The Testbed summons the cow after receiving the ready marker. Attacks only
-submit packets; removal of the actor is separate server evidence of its death.
+The Testbed summons the cow after receiving the ready marker and separately
+checks the server's ActorDamageEvent. Submission alone does not prove damage.
 """
 import argparse
 import asyncio
@@ -33,33 +33,14 @@ async def run(url: str) -> None:
         }), flush=True)
 
         await asyncio.to_thread(sys.stdin.readline)
-        removal = asyncio.create_task(bot.wait_for_entity_removal(spawned.entity_id, timeout=30))
-        await asyncio.sleep(0)
-        print("entity_removal_watcher_ready", flush=True)
-        attacks = 0
-        try:
-            for _ in range(35):
-                if removal.done():
-                    break
-                target = next((actor for actor in bot.observed_entities
-                               if actor.runtime_id == spawned.runtime_id), None)
-                if target is None:
-                    break
-                await bot.look_at((target.position[0], target.position[1] + 0.75,
-                                   target.position[2]))
-                await asyncio.sleep(0.06)
-                await bot.attack_entity(spawned.runtime_id)
-                attacks += 1
-                await asyncio.sleep(0.55)
-            print("attacks_submitted=" + str(attacks), flush=True)
-            await removal
-            print("entity_removed=" + json.dumps({
-                "entity_id": spawned.entity_id, "runtime_id": spawned.runtime_id,
-            }), flush=True)
-        finally:
-            if not removal.done():
-                removal.cancel()
-            await asyncio.gather(removal, return_exceptions=True)
+        await bot.look_at((
+            spawned.position[0], spawned.position[1] + 0.75,
+            spawned.position[2],
+        ))
+        await asyncio.sleep(0.25)
+        await bot.attack_entity(spawned.runtime_id)
+        # Packet submission is separate from the server's damage event.
+        print("attacks_submitted=1", flush=True)
         await asyncio.to_thread(sys.stdin.readline)
     finally:
         await bot.close()
