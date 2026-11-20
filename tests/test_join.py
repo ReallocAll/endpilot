@@ -11,6 +11,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 from endpilot.authentication import OfflineIdentity
+from endpilot.blocks import Blocks
 from endpilot.compression import PacketConnection
 from endpilot.login import JoinSession, LoginRefused
 from endpilot.protocol import Protocol, RawPacket, read_batch, write_batch
@@ -202,6 +203,30 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ConnectionError):
             await stream.close()
         self.assertTrue(fake.closed)
+
+    async def test_block_wait_differentiates_live_timeout_from_stream_loss(self):
+        protocol = Protocol(2193)
+        settings = protocol.binding.NetworkSettingsPacket()
+        settings.compression_algorithm = protocol.binding.PacketCompressionAlgorithm.ZLIB
+        settings.compression_threshold = 1
+        fake = FakeTransport()
+        stream = PacketConnection(fake, protocol, settings)
+        stream.start_receiving()
+        blocks = Blocks(stream, None, None)
+
+        with self.assertRaises(TimeoutError):
+            await blocks.wait_for_update((2, 100, 0), timeout=0.01)
+        self.assertEqual(stream._subscribers, [])
+
+        waiting = asyncio.create_task(blocks.wait_for_update((2, 100, 0), timeout=1))
+        await asyncio.sleep(0)
+        await fake.received.put(b"")
+        with self.assertRaises(ConnectionError) as failure:
+            await waiting
+        self.assertIsInstance(failure.exception.__cause__, ConnectionError)
+        self.assertEqual(stream._subscribers, [])
+        with self.assertRaises(ConnectionError):
+            await stream.close()
 
     async def test_reader_failure_still_closes_transport(self):
         protocol = Protocol(2193)

@@ -1,6 +1,5 @@
 """Block updates and player-initiated placement against observed server blocks."""
 
-import asyncio
 from dataclasses import dataclass
 
 
@@ -22,21 +21,17 @@ class Blocks:
     ) -> BlockUpdate:
         """Wait for a *new* UpdateBlock packet, not a snapshot of the world."""
         binding = self.packets.protocol.binding
-        future = asyncio.get_running_loop().create_future()
 
-        def observe(raw):
-            if raw.packet_id != binding.UpdateBlockPacket.ID:
-                return
+        def matches(raw):
             packet = self.packets.protocol.decode(raw)
             pos = (int(packet.pos.x), int(packet.pos.y), int(packet.pos.z))
-            if pos == position and int(packet.layer) == layer and not future.done():
-                future.set_result(BlockUpdate(pos, int(packet.runtime_id), int(packet.layer)))
+            return pos == position and int(packet.layer) == layer
 
-        unsubscribe = self.packets.subscribe_raw(observe)
-        try:
-            return await asyncio.wait_for(future, timeout)
-        finally:
-            unsubscribe()
+        raw = await self.packets.wait_for_packet(
+            binding.UpdateBlockPacket.ID, timeout=timeout, match=matches
+        )
+        packet = self.packets.protocol.decode(raw)
+        return BlockUpdate(position, int(packet.runtime_id), int(packet.layer))
 
     async def place_against(self, against: BlockUpdate, *, face: int = 1, slot: int = 0) -> int:
         """Submit a placement on a known block face; return the input tick, not acceptance.

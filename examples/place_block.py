@@ -8,7 +8,7 @@ import sys
 from endpilot import Bot
 
 
-async def run(url, name, expect_kick=False):
+async def run(url, name, expect_kick=False, check_timeout=False):
     bot = Bot(name)
     try:
         if url.startswith("raknet://"):
@@ -34,6 +34,15 @@ async def run(url, name, expect_kick=False):
         print("target_watchers_ready", flush=True)
         empty = await asyncio.gather(*pending)
         print("targets_observed=" + json.dumps([u.runtime_id for u in empty]), flush=True)
+
+        if check_timeout:
+            await asyncio.to_thread(sys.stdin.readline)
+            try:
+                await bot.wait_for_block_update((2, 100, 0), timeout=1)
+            except TimeoutError:
+                print("block_wait_timeout=" + json.dumps({"position": [2, 100, 0]}), flush=True)
+            else:
+                raise AssertionError("unchanged target unexpectedly received an UpdateBlock")
 
         for x, update, baseline in zip((2, 3), against, empty):
             await asyncio.to_thread(sys.stdin.readline)
@@ -71,5 +80,6 @@ if __name__ == "__main__":
     parser.add_argument("url", help="NetherNet HTTP URL or raknet://host:port")
     parser.add_argument("--name", default="EndPilotTest")
     parser.add_argument("--expect-kick", action="store_true", help="Wait for a BDS kick after placements")
+    parser.add_argument("--check-timeout", action="store_true", help="Verify an idle block update wait times out")
     args = parser.parse_args()
-    asyncio.run(run(args.url, args.name, args.expect_kick))
+    asyncio.run(run(args.url, args.name, args.expect_kick, args.check_timeout))
