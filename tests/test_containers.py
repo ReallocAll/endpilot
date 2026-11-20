@@ -55,6 +55,7 @@ class ContainerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(tx.action_type, b.ItemUseInventoryTransaction.ActionType.PLACE)
             self.assertEqual(tx.trigger_type, b.ItemUseInventoryTransaction.TriggerType.PLAYER_INPUT)
             self.assertEqual(int(tx.face), 4)
+            self.assertEqual((tx.click_pos.x, tx.click_pos.y, tx.click_pos.z), (0.0, 0.5, 0.5))
             self.assertEqual((tx.pos.x, tx.pos.y, tx.pos.z), (1, 100, 0))
             self.assertEqual((tx.from_pos.x, tx.from_pos.z), (0.5, 0.5))
             self.assertAlmostEqual(tx.from_pos.y, 101.62, places=4)
