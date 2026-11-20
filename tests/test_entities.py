@@ -13,7 +13,7 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
         b = protocol.binding
         item = b.SerializedNetworkItemStackDescriptor(
             id=1, stack_size=1, aux_value=0, net_id_variant=9,
-            block_runtime_id=123, user_data_buffer=b"\\x00" * 10,
+            block_runtime_id=123, user_data_buffer=b"\x00" * 10,
         )
         packets = SimpleNamespace(protocol=protocol, send=AsyncMock())
         entities = Entities(packets)
