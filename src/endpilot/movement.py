@@ -64,7 +64,7 @@ class Movement:
         self._rotation = (pitch, yaw)
         return self._rotation
 
-    async def _send_input(self, forward: bool, item_use_transaction=None):
+    async def _send_input(self, forward: bool, item_use_transaction=None, block_actions=()):
         """Submit one predicted frame; only a later server observation proves acceptance."""
         b = self.packets.protocol.binding
         x, y, z = self._input_position
@@ -78,6 +78,8 @@ class Movement:
         flags = [b.PlayerAuthInputPacket.InputData.UP] if forward else []
         if item_use_transaction is not None:
             flags.append(b.PlayerAuthInputPacket.InputData.PERFORM_ITEM_INTERACTION)
+        if block_actions:
+            flags.append(b.PlayerAuthInputPacket.InputData.PERFORM_BLOCK_ACTIONS)
         if self._teleport_pending:
             flags.append(b.PlayerAuthInputPacket.InputData.HANDLED_TELEPORT)
         packet = b.PlayerAuthInputPacket(
@@ -94,7 +96,14 @@ class Movement:
             pos_delta=b.Vec3(x=dx, y=0.0, z=dz),
             item_use_transaction=item_use_transaction,
             item_stack_request=None,
-            player_block_actions=None,
+            player_block_actions=[
+                b.PlayerBlockActionData(
+                    player_action_type=getattr(b.PlayerActionType, action),
+                    pos=b.BlockPos(x=pos[0], y=pos[1], z=pos[2]),
+                    facing=face,
+                )
+                for action, pos, face in block_actions
+            ] or None,
             vehicle_rot=None,
             client_predicted_vehicle=None,
             analog_move_vector=movement,
@@ -300,6 +309,13 @@ class Movement:
             if self._input_position is None:
                 await self.wait_for_position_sync()
             return await self._send_input(False, item_use_transaction=transaction)
+
+    async def send_block_actions(self, actions) -> int:
+        """Submit one or more block actions in a single player input tick."""
+        async with self._action_lock:
+            if self._input_position is None:
+                await self.wait_for_position_sync()
+            return await self._send_input(False, block_actions=actions)
 
     def close(self):
         if self._ticker is not None:

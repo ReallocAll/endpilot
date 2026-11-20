@@ -1,5 +1,6 @@
 """Block updates, observed sub-chunks and player-initiated placement."""
 
+import asyncio
 from dataclasses import dataclass
 
 from .subchunks import SubChunk, parse_sub_chunk
@@ -162,3 +163,55 @@ class Blocks:
             transaction=transaction,
         )
         return await self.movement.send_item_use(packed)
+
+    async def mine_block(
+        self, position: tuple[int, int, int], *, face: int = 1, timeout: float = 15
+    ) -> BlockUpdate:
+        """Hold a server-authoritative break until a block update is observed.
+
+        On hashed-runtime-ID worlds, require an air update. Palette-ID worlds
+        return the first matching update; callers must interpret its runtime ID.
+        A timed-out or cancelled break is aborted, not treated as completed.
+        """
+        b = self.packets.protocol.binding
+
+        def matches(raw):
+            packet = self.packets.protocol.decode(raw)
+            return (
+                (int(packet.pos.x), int(packet.pos.y), int(packet.pos.z)) == position
+                and int(packet.layer) == 0
+                and (not self.hashed_runtime_ids
+                     or int(packet.runtime_id) == HASHED_AIR_RUNTIME_ID)
+            )
+
+        waiter = asyncio.create_task(self.packets.wait_for_packet(
+            b.UpdateBlockPacket.ID, timeout=timeout, match=matches
+        ))
+        started = False
+        try:
+            # Register the observation before sending START; cancellation must
+            # also clean up the waiting task at this suspension point.
+            await asyncio.sleep(0)
+            await self.movement.send_block_actions([
+                ("START_DESTROY_BLOCK", position, face),
+            ])
+            started = True
+            raw = await waiter
+        except BaseException as error:
+            waiter.cancel()
+            if started:
+                try:
+                    await self.movement.send_block_actions([
+                        ("ABORT_DESTROY_BLOCK", position, 0),
+                        ("STOP_DESTROY_BLOCK", (0, 0, 0), 0),
+                    ])
+                except Exception as cleanup_error:
+                    # A lost transport may also reject ABORT. Keep the cause.
+                    error.add_note(f"mining abort failed: {cleanup_error!r}")
+            raise
+        await self.movement.send_block_actions([
+            ("STOP_DESTROY_BLOCK", (0, 0, 0), 0),
+        ])
+        packet = self.packets.protocol.decode(raw)
+        return BlockUpdate(position, int(packet.runtime_id), int(packet.layer))
+
