@@ -59,6 +59,7 @@ class JoinSession:
         self.identity = identity
         self.address = address
         self.player_id = None
+        self.player_unique_id = None
         self.spawned = False
 
     @classmethod
@@ -145,6 +146,7 @@ class JoinSession:
             elif raw.packet_id == binding.StartGamePacket.ID:
                 game = self.packets.protocol.decode(raw)
                 self.player_id = int(game.runtime_id)
+                self.player_unique_id = int(game.entity_id)
                 radius = binding.RequestChunkRadiusPacket()
                 radius.chunk_radius = 8
                 radius.max_chunk_radius = 8
