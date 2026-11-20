@@ -19,7 +19,9 @@ async def run(url: str, command: str):
         else:
             await bot.join_nethernet(url)
         print("spawned EndPilotTest", flush=True)
-        await asyncio.to_thread(sys.stdin.readline)
+        entered = (await asyncio.to_thread(sys.stdin.readline)).strip()
+        if entered:
+            command = entered
         packet = await bot.execute_command(command)
         print("command_feedback=" + json.dumps({
             "type": int(packet.body.type), "message": packet.body.message,
