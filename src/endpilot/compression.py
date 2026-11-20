@@ -58,15 +58,16 @@ class PacketConnection:
 
         return unsubscribe
 
-    async def wait_for_packet(self, packet_id: int, *, timeout: float = 15, match=None) -> RawPacket:
-        """Wait for a live packet ID, distinguishing a lost stream from a timeout."""
+    async def wait_for_packet(self, packet_id: int | tuple[int, ...], *, timeout: float = 15, match=None) -> RawPacket:
+        """Wait for one of the specified packet IDs; distinguish loss from timeout."""
+        packet_ids = (packet_id,) if isinstance(packet_id, int) else packet_id
         reader = self._reader_task
         if reader is None:
             raise RuntimeError("packet receiver has not started")
         received = asyncio.get_running_loop().create_future()
 
         def observe(raw):
-            if raw.packet_id != packet_id or received.done():
+            if raw.packet_id not in packet_ids or received.done():
                 return
             try:
                 if match is None or match(raw):
