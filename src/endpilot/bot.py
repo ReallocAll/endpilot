@@ -195,6 +195,16 @@ class Bot:
             source_slot, destination_slot, amount, timeout=timeout
         )
 
+    async def put_into_container(
+        self, source_slot: int, destination_slot: int, amount: int = 1, *, timeout: float = 15
+    ):
+        """Return the server's verdict for inventory-to-container transfer."""
+        if self._containers is None:
+            raise RuntimeError("player has not joined")
+        return await self._containers.put_into_container(
+            source_slot, destination_slot, amount, timeout=timeout
+        )
+
     async def close_container(self, *, timeout: float = 15) -> ContainerWindow | None:
         """Close the active window; wait for the matching server close packet."""
         if self._containers is None:

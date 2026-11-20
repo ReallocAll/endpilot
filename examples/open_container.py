@@ -7,7 +7,8 @@ import sys
 from endpilot import Bot
 
 
-async def run(url: str, take_count: int = 0, destination_slot: int = 0) -> None:
+async def run(url: str, take_count: int = 0, destination_slot: int = 0,
+              put_back_count: int = 0) -> None:
     bot = Bot("EndPilotTest")
     target = (1, 100, 0)
     try:
@@ -50,6 +51,14 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0) -> None:
                     item := slots[0]
                 ) else None,
             }), flush=True)
+        if put_back_count:
+            response = await bot.put_into_container(destination_slot, 0, put_back_count)
+            print("container_put_response=" + json.dumps({
+                "request_id": int(response.client_request_id.raw_id),
+                "result": response.result.name,
+                "chest_slot_count": int(bot.container_slots[0].stack_size),
+                "inventory_count": bot.inventory_count(int(slots[0].id)),
+            }), flush=True)
         await asyncio.to_thread(sys.stdin.readline)
         closed = await bot.close_container()
         print("container_closed=" + json.dumps({
@@ -68,5 +77,7 @@ if __name__ == "__main__":
     parser.add_argument("--take-count", type=int, default=0,
                         help="after opening, take this many items from chest slot 0")
     parser.add_argument("--destination-slot", type=int, default=0)
+    parser.add_argument("--put-back-count", type=int, default=0,
+                        help="return this many items from destination slot to chest slot 0")
     args = parser.parse_args()
-    asyncio.run(run(args.url, args.take_count, args.destination_slot))
+    asyncio.run(run(args.url, args.take_count, args.destination_slot, args.put_back_count))
