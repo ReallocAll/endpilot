@@ -30,6 +30,24 @@ async def run(url: str):
             "actor_type": spawn.actor_type, "position": spawn.position,
         }), flush=True)
 
+        # Read the expected X coordinate so unrelated mob movement does not pass.
+        target_x = float((await asyncio.to_thread(sys.stdin.readline)).strip())
+
+        async def await_target():
+            async with asyncio.timeout(15):
+                while True:
+                    move = await bot.wait_for_entity_movement(spawn.runtime_id)
+                    if move.x is not None and abs(move.x - target_x) < 1:
+                        return move
+
+        pending = asyncio.create_task(await_target())
+        await asyncio.sleep(0)
+        print("entity_movement_watcher_ready", flush=True)
+        move = await pending
+        print("entity_movement=" + json.dumps({
+            "runtime_id": move.runtime_id, "x": move.x, "y": move.y, "z": move.z,
+        }), flush=True)
+
         await asyncio.to_thread(sys.stdin.readline)
         pending = asyncio.create_task(bot.wait_for_entity_removal(spawn.entity_id))
         await asyncio.sleep(0)

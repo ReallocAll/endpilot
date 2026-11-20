@@ -4,7 +4,7 @@ from .authentication import OfflineIdentity
 from .blocks import Blocks, BlockUpdate
 from .chat import Chat, ChatMessage
 from .commands import Commands
-from .entities import Entities, EntitySpawn
+from .entities import Entities, EntityMovement, EntitySpawn
 from .inventory import Inventory
 from .login import JoinSession
 from .movement import Movement
@@ -115,6 +115,14 @@ class Bot:
         if self._entities is None:
             raise RuntimeError("player has not joined")
         await self._entities.wait_for_removal(entity_id, timeout=timeout)
+
+    async def wait_for_entity_movement(
+        self, runtime_id: int, *, timeout: float = 15
+    ) -> EntityMovement:
+        """Observe one actor movement event, not a continuously tracked position."""
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return await self._entities.wait_for_movement(runtime_id, timeout=timeout)
 
     async def wait_for_server_disconnect(self, timeout: float = 15):
         if self._session is None:
