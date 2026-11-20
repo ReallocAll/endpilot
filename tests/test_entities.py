@@ -143,3 +143,84 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entities.snapshot(), ())
         entities.close()
         self.assertEqual(callbacks, [])
+
+
+    async def test_item_drop_from_registry_tracks_movement_and_take(self):
+        b = Protocol(2193).binding
+        callbacks = []
+        decoded = {
+            b"registry": SimpleNamespace(items=[
+                SimpleNamespace(id=42, name="minecraft:beef"),
+            ]),
+            b"drop": SimpleNamespace(
+                id=101, runtime_id=202,
+                item=SimpleNamespace(id=42, stack_size=2),
+                pos=SimpleNamespace(x=3.5, y=100.5, z=0.5),
+            ),
+            b"move": SimpleNamespace(move_data=SimpleNamespace(
+                runtime_id=202, new_position_x=4.5,
+                new_position_y=None, new_position_z=None,
+            )),
+            b"take": SimpleNamespace(item_id=202),
+        }
+        packets = SimpleNamespace(
+            protocol=SimpleNamespace(binding=b, decode=lambda raw: decoded[raw.body]),
+            subscribe_raw=lambda callback: callbacks.append(callback) or (lambda: callbacks.remove(callback)),
+        )
+        entities = Entities(packets)
+        entities.start()
+        callbacks[0](RawPacket(b.ItemRegistryPacket.ID, b"registry"))
+        callbacks[0](RawPacket(b.AddItemActorPacket.ID, b"drop"))
+        initial = entities.drops()[0]
+        self.assertEqual(initial, EntityState(
+            101, 202, "minecraft:item", (3.5, 100.5, 0.5), "minecraft:beef", 2, 42
+        ))
+        callbacks[0](RawPacket(b.MoveActorDeltaPacket.ID, b"move"))
+        self.assertEqual(entities.drops()[0].position, (4.5, 100.5, 0.5))
+        self.assertEqual(initial.position, (3.5, 100.5, 0.5))
+        callbacks[0](RawPacket(b.TakeItemActorPacket.ID, b"take"))
+        self.assertEqual(entities.drops(), ())
+        self.assertEqual(entities.snapshot(), ())
+        entities.close()
+        self.assertEqual(callbacks, [])
+
+    async def test_item_drop_fallback_id_and_unique_id_removal(self):
+        b = Protocol(2193).binding
+        callbacks = []
+        decoded = {
+            b"drop": SimpleNamespace(
+                id=101, runtime_id=202,
+                item=SimpleNamespace(id=52, stack_size=1),
+                pos=SimpleNamespace(x=0.5, y=101, z=0.5),
+            ),
+            b"remove": SimpleNamespace(entity_id=101),
+        }
+        packets = SimpleNamespace(
+            protocol=SimpleNamespace(binding=b, decode=lambda raw: decoded[raw.body]),
+            subscribe_raw=lambda callback: callbacks.append(callback) or (lambda: callbacks.remove(callback)),
+        )
+        entities = Entities(packets)
+        entities.start()
+        callbacks[0](RawPacket(b.AddItemActorPacket.ID, b"drop"))
+        self.assertEqual(entities.drops()[0].item_id, "#52")
+        callbacks[0](RawPacket(b.RemoveActorPacket.ID, b"remove"))
+        self.assertEqual(entities.drops(), ())
+        entities.close()
+
+    async def test_wait_for_item_drop_returns_server_snapshot(self):
+        b = Protocol(2193).binding
+        raw = RawPacket(b.AddItemActorPacket.ID, b"drop")
+        packet = SimpleNamespace(
+            id=30, runtime_id=31,
+            item=SimpleNamespace(id=4, stack_size=3),
+            pos=SimpleNamespace(x=1, y=2, z=3),
+        )
+        packets = SimpleNamespace(
+            protocol=SimpleNamespace(binding=b, decode=lambda _: packet),
+            wait_for_packet=AsyncMock(return_value=raw),
+        )
+        result = await Entities(packets, item_names={4: "minecraft:stone"}).wait_for_item_drop(timeout=7)
+        packets.wait_for_packet.assert_awaited_once_with(b.AddItemActorPacket.ID, timeout=7)
+        self.assertEqual(result, EntityState(
+            30, 31, "minecraft:item", (1.0, 2.0, 3.0), "minecraft:stone", 3, 4
+        ))

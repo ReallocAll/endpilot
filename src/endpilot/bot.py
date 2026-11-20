@@ -48,7 +48,7 @@ class Bot:
         )
         self._chat = Chat(session.packets, self.identity.name)
         self._commands = Commands(session.packets, self.identity.uuid, session.player_unique_id)
-        self._entities = Entities(session.packets)
+        self._entities = Entities(session.packets, item_names=session.item_names)
         self._player_state = PlayerState(session.packets, session.player_id)
         self._session = session
         self._entities.start()
@@ -142,6 +142,19 @@ class Bot:
         if self._entities is None:
             raise RuntimeError("player has not joined")
         return self._entities.snapshot()
+
+    @property
+    def observed_drops(self) -> tuple[EntityState, ...]:
+        """Dropped items visible on this player stream, not all world drops."""
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return self._entities.drops()
+
+    async def wait_for_item_drop(self, timeout: float = 15) -> EntityState:
+        """Observe the next item actor spawn sent by the server."""
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return await self._entities.wait_for_item_drop(timeout)
 
     async def wait_for_entity_spawn(
         self, *, actor_type: str | None = None, timeout: float = 15

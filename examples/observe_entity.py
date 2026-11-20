@@ -60,10 +60,21 @@ async def run(url: str):
         }), flush=True)
 
         await asyncio.to_thread(sys.stdin.readline)
+        pending_drop = asyncio.create_task(bot.wait_for_item_drop())
         pending = asyncio.create_task(bot.wait_for_entity_removal(spawn.entity_id))
         await asyncio.sleep(0)
         print("entity_removal_watcher_ready", flush=True)
         await pending
+        drop = await pending_drop
+        if drop.item_id not in ("minecraft:beef", "minecraft:leather") or drop.item_count < 1:
+            raise AssertionError(f"Unexpected cow loot from BDS: {drop}")
+        if not any(entity.runtime_id == drop.runtime_id for entity in bot.observed_drops):
+            raise AssertionError("BDS item drop missing from observed snapshot")
+        print("item_drop=" + json.dumps({
+            "entity_id": drop.entity_id, "runtime_id": drop.runtime_id,
+            "item_id": drop.item_id, "item_count": drop.item_count,
+            "position": drop.position,
+        }), flush=True)
         if any(entity.entity_id == spawn.entity_id for entity in bot.observed_entities):
             raise AssertionError("removed actor remained in observed entity snapshot")
         print("entity_removed=" + json.dumps({"entity_id": spawn.entity_id}), flush=True)
