@@ -3,6 +3,24 @@
 import asyncio
 
 
+def _response_item(binding, previous, fallback, response_slot):
+    """Apply a server slot correction without inventing a new item identity."""
+    amount = int(response_slot.amount)
+    if amount == 0:
+        return binding.SerializedNetworkItemStackDescriptor(
+            id=0, stack_size=0, aux_value=0, net_id_variant=None,
+            block_runtime_id=0, user_data_buffer=b"",
+        )
+    item = previous if int(previous.id) != 0 else fallback
+    net_id = response_slot.item_stack_net_id
+    return binding.SerializedNetworkItemStackDescriptor(
+        id=int(item.id), stack_size=amount, aux_value=int(item.aux_value),
+        net_id_variant=int(net_id.raw_id) if net_id is not None else item.net_id_variant,
+        block_runtime_id=int(item.block_runtime_id),
+        user_data_buffer=item.user_data_buffer,
+    )
+
+
 class Inventory:
     def __init__(self, packets, player_id: int):
         self.packets = packets

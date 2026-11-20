@@ -7,7 +7,7 @@ import sys
 from endpilot import Bot
 
 
-async def run(url: str) -> None:
+async def run(url: str, take_count: int = 0, destination_slot: int = 0) -> None:
     bot = Bot("EndPilotTest")
     target = (1, 100, 0)
     try:
@@ -40,6 +40,16 @@ async def run(url: str) -> None:
                 for slot, item in sorted(slots.items()) if int(item.id) != 0
             ],
         }), flush=True)
+        if take_count:
+            response = await bot.take_from_container(0, destination_slot, take_count)
+            print("container_take_response=" + json.dumps({
+                "request_id": int(response.client_request_id.raw_id),
+                "result": response.result.name,
+                "chest_slot_count": int(bot.container_slots[0].stack_size),
+                "inventory_count": bot.inventory_count(int(item.id)) if (
+                    item := slots[0]
+                ) else None,
+            }), flush=True)
         await asyncio.to_thread(sys.stdin.readline)
         closed = await bot.close_container()
         print("container_closed=" + json.dumps({
@@ -55,5 +65,8 @@ async def run(url: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("url", help="NetherNet HTTP URL or raknet://host:port")
+    parser.add_argument("--take-count", type=int, default=0,
+                        help="after opening, take this many items from chest slot 0")
+    parser.add_argument("--destination-slot", type=int, default=0)
     args = parser.parse_args()
-    asyncio.run(run(args.url))
+    asyncio.run(run(args.url, args.take_count, args.destination_slot))
