@@ -134,6 +134,12 @@ class Bot:
             raise RuntimeError("player has not joined")
         await self._blocks.request_sub_chunk(position)
 
+    async def select_hotbar(self, slot: int) -> None:
+        """Request a hotbar slot; observe BDS to confirm the equipped item."""
+        if self._inventory is None:
+            raise RuntimeError("player has not joined")
+        await self._inventory.select_hotbar(slot)
+
     async def place_against(self, against: BlockUpdate, *, face: int = 1, slot: int = 0) -> int:
         if self._blocks is None:
             raise RuntimeError("player has not joined")

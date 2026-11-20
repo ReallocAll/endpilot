@@ -139,7 +139,7 @@ class Blocks:
         b = self.packets.protocol.binding
         item = await self.inventory.wait_for_item(slot)
         x, y, z = await self.movement.wait_for_position_sync()
-        await self.inventory.select_hotbar(slot, item)
+        await self.inventory.announce_equipment(slot, item)
         px, py, pz = against.position
         transaction = b.ItemUseInventoryTransaction(
             transaction=b.InventoryTransaction(actions=[]),

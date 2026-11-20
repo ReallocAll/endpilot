@@ -40,8 +40,21 @@ class Inventory:
                 event.clear()
                 await event.wait()
 
-    async def select_hotbar(self, slot: int, item) -> None:
-        """Submit a hotbar selection with the exact item descriptor from BDS."""
+    async def select_hotbar(self, slot: int) -> None:
+        """Request a selected hotbar slot; only BDS can confirm the held item."""
+        if not 0 <= slot < 9:
+            raise ValueError("hotbar slot must be between 0 and 8")
+        b = self.packets.protocol.binding
+        # BDS 1.26.52 accepts this even though EndstoneMC/client uses
+        # MobEquipment; that packet alone did not switch the server's slot.
+        await self.packets.send(b.PlayerHotbarPacket(
+            selected_slot=slot,
+            container_id=b.ContainerID.INVENTORY,
+            should_select_slot=True,
+        ))
+
+    async def announce_equipment(self, slot: int, item) -> None:
+        """Carry the server-observed item descriptor for a use transaction."""
         b = self.packets.protocol.binding
         await self.packets.send(b.MobEquipmentPacket(
             runtime_id=self.player_id,
