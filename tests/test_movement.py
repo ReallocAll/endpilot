@@ -155,3 +155,66 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(down.rot.x, 90.0, places=5)
         self.assertAlmostEqual(down.camera_orientation.y, -1.0, places=5)
         self.assertEqual(list(down.input_data), [])
+    async def test_follow_entity_retargets_and_releases(self):
+        from endpilot.entities import Entities, EntityState
+
+        protocol = Protocol(2193)
+        b = protocol.binding
+        stream = PacketSink(protocol)
+        movement = Movement(stream, 1)
+        teleport = b.MovePlayerPacket()
+        teleport.player_id = 1
+        teleport.pos = b.Vec3(x=0.5, y=101.62, z=0.5)
+        teleport.rot = b.Vec2(x=0.0, y=0.0)
+        teleport.y_head_rot = 0.0
+        teleport.riding_id = 0
+        teleport.teleport_data = None
+        teleport.tick = 0
+        movement._on_packet(protocol.encode(teleport))
+        entities = Entities(stream)
+        entities._record(EntityState(4, 7, "minecraft:cow", (4.5, 100.0, 0.5)))
+
+        def move_target():
+            if len(stream.sent) == 2:
+                entities._record(EntityState(4, 7, "minecraft:cow", (-4.5, 100.0, 0.5)))
+
+        stream.on_send = move_target
+        self.assertEqual(await movement.follow_entity(entities, 7, ticks=5), 5)
+        self.assertAlmostEqual(stream.sent[0].rot.y, -90.0)
+        self.assertTrue(any(abs(p.rot.y - 90.0) < 1e-6 for p in stream.sent[2:5]))
+        self.assertTrue(all(b.PlayerAuthInputPacket.InputData.UP in p.input_data
+                            for p in stream.sent[:5]))
+        self.assertEqual([list(p.input_data) for p in stream.sent[-2:]], [[], []])
+        self.assertEqual([p.client_tick for p in stream.sent], list(range(1, 8)))
+
+        # Cancelled tracking must release input and allow an immediate new target.
+        entities._record(EntityState(5, 8, "minecraft:cow", (4.5, 100.0, 0.5)))
+        task = asyncio.create_task(movement.follow_entity(entities, 7, ticks=100))
+        await asyncio.sleep(0.08)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual([list(p.input_data) for p in stream.sent[-2:]], [[], []])
+        before = len(stream.sent)
+        self.assertEqual(await movement.follow_entity(entities, 8, ticks=2), 2)
+        self.assertAlmostEqual(stream.sent[before].rot.y, -90.0)
+        self.assertEqual([list(p.input_data) for p in stream.sent[-2:]], [[], []])
+
+    async def test_follow_entity_unobserved_target_stops_without_moving(self):
+        from endpilot.entities import Entities
+
+        protocol = Protocol(2193)
+        b = protocol.binding
+        stream = PacketSink(protocol)
+        movement = Movement(stream, 1)
+        packet = b.MovePlayerPacket()
+        packet.player_id = 1
+        packet.pos = b.Vec3(x=0.5, y=101.62, z=0.5)
+        packet.rot = b.Vec2(x=0.0, y=0.0)
+        packet.y_head_rot = 0.0
+        packet.riding_id = 0
+        packet.teleport_data = None
+        packet.tick = 0
+        movement._on_packet(protocol.encode(packet))
+        self.assertEqual(await movement.follow_entity(Entities(stream), 123, ticks=10), 0)
+        self.assertEqual([list(p.input_data) for p in stream.sent], [[], []])

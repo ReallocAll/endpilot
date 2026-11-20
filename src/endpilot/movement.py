@@ -133,6 +133,39 @@ class Movement:
                     await self._send_input(False)
             return ticks
 
+    async def follow_entity(self, entities, runtime_id: int, *, ticks: int = 80,
+                            stop_distance: float = 1.5) -> int:
+        """Track an observed actor for up to ticks frames, releasing input on exit.
+
+        Return submitted moving frames, not a server-confirmed arrival.
+        The route is not obstacle-aware; a missing actor ends tracking.
+        """
+        if not math.isfinite(stop_distance) or stop_distance < 0:
+            raise ValueError("stop_distance must be finite and nonnegative")
+        async with self._action_lock:
+            if self._input_position is None:
+                await self.wait_for_position_sync()
+            submitted = 0
+            try:
+                for _ in range(ticks):
+                    actor = entities.get(runtime_id)
+                    if actor is None:
+                        break
+                    x, y, z = self._input_position
+                    dx, dz = actor.position[0] - x, actor.position[2] - z
+                    forward = math.hypot(dx, dz) > stop_distance
+                    if forward:
+                        await self.look_at((actor.position[0], y, actor.position[2]))
+                        submitted += 1
+                    await self._send_input(forward)
+                    await asyncio.sleep(0.05)
+            finally:
+                if self._input_position is not None:
+                    await self._send_input(False)
+                    await asyncio.sleep(0.05)
+                    await self._send_input(False)
+            return submitted
+
     async def send_item_use(self, transaction) -> int:
         """Serialize an item action in the same client-tick stream as movement."""
         async with self._action_lock:
