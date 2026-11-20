@@ -8,7 +8,7 @@ import sys
 from endpilot import Bot
 
 
-async def main(url: str):
+async def main(url: str, *, stop: bool = False):
     bot = Bot("EndPilotTest")
     try:
         if url.startswith("raknet://"):
@@ -28,11 +28,14 @@ async def main(url: str):
             "runtime_id": spawn.runtime_id, "position": spawn.position,
         }), flush=True)
         await asyncio.to_thread(sys.stdin.readline)
-        task = asyncio.create_task(bot.follow_entity(spawn.runtime_id, ticks=80))
+        task = asyncio.create_task(bot.follow_entity(spawn.runtime_id, ticks=160 if stop else 80))
         await asyncio.sleep(0.1)
         print("follow_started", flush=True)
+        if stop:
+            await asyncio.to_thread(sys.stdin.readline)
+            await bot.stop_moving()
         submitted = await task
-        print("follow_input_submitted=" + json.dumps({
+        print(("follow_stopped=" if stop else "follow_input_submitted=") + json.dumps({
             "frames": submitted, "position": bot.position,
         }), flush=True)
         await asyncio.to_thread(sys.stdin.readline)
@@ -44,4 +47,6 @@ async def main(url: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("url")
-    asyncio.run(main(parser.parse_args().url))
+    parser.add_argument("--stop", action="store_true", help="Stop active following on stdin")
+    args = parser.parse_args()
+    asyncio.run(main(args.url, stop=args.stop))

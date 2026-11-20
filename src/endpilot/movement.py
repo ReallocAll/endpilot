@@ -16,6 +16,7 @@ class Movement:
         self._updated = asyncio.Event()
         self._unsubscribe = None
         self._action_lock = asyncio.Lock()
+        self._stop_requested = False
         self._ticker: asyncio.Task | None = None
 
     def start(self):
@@ -116,22 +117,33 @@ class Movement:
                 await self._send_input(False)
             await asyncio.sleep(0.05)
 
+    async def stop_moving(self) -> None:
+        """Stop an active walk/follow and wait for its release frames."""
+        self._stop_requested = True
+        async with self._action_lock:
+            pass
+
     async def walk_forward(self, ticks: int = 24) -> int:
         """Submit forward input at 20 Hz, then release it. Return submitted moving frames."""
         async with self._action_lock:
+            self._stop_requested = False
             if self._input_position is None:
                 await self.wait_for_position_sync()
+            submitted = 0
             try:
                 for _ in range(ticks):
+                    if self._stop_requested:
+                        break
                     await self._send_input(True)
+                    submitted += 1
                     await asyncio.sleep(0.05)
             finally:
-                # Release input after either completion or interruption.
+                # Release input after completion, stop or cancellation.
                 if self._input_position is not None:
                     await self._send_input(False)
                     await asyncio.sleep(0.05)
                     await self._send_input(False)
-            return ticks
+            return submitted
 
     async def follow_entity(self, entities, runtime_id: int, *, ticks: int = 80,
                             stop_distance: float = 1.5) -> int:
@@ -143,11 +155,14 @@ class Movement:
         if not math.isfinite(stop_distance) or stop_distance < 0:
             raise ValueError("stop_distance must be finite and nonnegative")
         async with self._action_lock:
+            self._stop_requested = False
             if self._input_position is None:
                 await self.wait_for_position_sync()
             submitted = 0
             try:
                 for _ in range(ticks):
+                    if self._stop_requested:
+                        break
                     actor = entities.get(runtime_id)
                     if actor is None:
                         break

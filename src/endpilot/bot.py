@@ -83,6 +83,12 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._movement.walk_forward(ticks)
 
+    async def stop_moving(self) -> None:
+        """Stop an active walk/follow, waiting for its input to be released."""
+        if self._movement is None:
+            raise RuntimeError("player has not joined")
+        await self._movement.stop_moving()
+
     async def follow_entity(self, runtime_id: int, *, ticks: int = 80,
                             stop_distance: float = 1.5) -> int:
         """Follow the latest server-observed actor position for a bounded time."""
