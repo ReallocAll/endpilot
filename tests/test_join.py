@@ -12,7 +12,7 @@ from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 from endpilot.authentication import OfflineIdentity
 from endpilot.compression import PacketConnection
-from endpilot.login import JoinSession
+from endpilot.login import JoinSession, LoginRefused
 from endpilot.protocol import Protocol, RawPacket, read_batch, write_batch
 
 
@@ -56,6 +56,32 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
                 await JoinSession.connect_nethernet(
                     "http://127.0.0.1:19132", OfflineIdentity("EndPilotTest"), object(), timeout=0.01
                 )
+
+    async def test_explicit_login_refusal_has_its_own_error(self):
+        protocol = Protocol(2193)
+        binding = protocol.binding
+
+        class RejectedPackets:
+            def __init__(self, packet_id):
+                self.protocol = protocol
+                self.packet_id = packet_id
+
+            async def send(self, packet):
+                pass
+
+            async def recv_raw(self):
+                return RawPacket(self.packet_id, b"")
+
+        for packet_id, decoded in (
+            (binding.DisconnectPacket.ID, SimpleNamespace(message="not allowed")),
+            (binding.PlayStatusPacket.ID, SimpleNamespace(status=1)),
+        ):
+            with self.subTest(packet_id=packet_id), patch.object(protocol, "decode", return_value=decoded):
+                session = JoinSession(RejectedPackets(packet_id), OfflineIdentity("DeniedPlayer"), "")
+                with self.assertRaises(LoginRefused) as rejected:
+                    await session.join()
+                self.assertIsInstance(rejected.exception, ConnectionError)
+                self.assertFalse(session.spawned)
 
     async def test_player_spawn_finishes_loading_screen(self):
         protocol = Protocol(2193)

@@ -45,6 +45,11 @@ packet stream ends first, or `TimeoutError` if neither occurs by the deadline.
 Closing the bot locally is separate. Confirm a server crash from BDS process
 status or logs rather than inferring it from a missing client packet.
 
+A server that explicitly rejects a player before spawn raises `LoginRefused`
+(a `ConnectionError` subclass), distinct from a join timeout or transport loss.
+To test a BDS allow-list refusal with either transport, run
+`python examples/refused_login.py URL` against a server that denies the player.
+
 ## Place a block through MCP
 
 Install the optional MCP tools and register `python -m endpilot.mcp_server` as a local **stdio** MCP server:
