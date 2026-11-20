@@ -91,7 +91,10 @@ class Bot:
         return await self._chat.wait_for_message(author=author, timeout=timeout)
 
     async def execute_command(self, command: str, *, timeout: float = 15):
-        """Run a player command and return its matching typed server output."""
+        """Submit a player command and observe the next command-style server text.
+
+        The text has no request ID and does not prove the command took effect.
+        """
         if self._commands is None:
             raise RuntimeError("player has not joined")
         return await self._commands.execute(command, timeout=timeout)
