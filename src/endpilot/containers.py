@@ -54,6 +54,17 @@ class Containers:
                     and int(packet.inventory_id) == self.window.container_id):
                 self._slots[int(packet.slot)] = packet.item
                 self._slots_updated.set()
+        elif raw.packet_id == b.InventoryTransactionPacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            transaction = getattr(packet.variant_transaction, "transaction", None)
+            for action in getattr(transaction, "actions", ()):
+                source = action.source
+                if (self.window is not None and self._slots is not None
+                        and source.type.name == "CONTAINER_INVENTORY"
+                        and source.container_id is not None
+                        and int(source.container_id) == self.window.container_id):
+                    self._slots[int(action.slot)] = action.to_item_descriptor
+                    self._slots_updated.set()
         elif raw.packet_id == b.ContainerClosePacket.ID:
             packet = self.packets.protocol.decode(raw)
             if self.window is not None and int(packet.container_id) == self.window.container_id:
@@ -72,7 +83,7 @@ class Containers:
         if window is None:
             raise RuntimeError("no container window is open")
         async with asyncio.timeout(timeout):
-            while self.window is not None and self.window.container_id == window.container_id:
+            while self.window is window:
                 if self._slots is not None:
                     return dict(self._slots)
                 self._slots_updated.clear()
