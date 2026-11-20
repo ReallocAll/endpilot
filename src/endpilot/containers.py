@@ -138,6 +138,25 @@ class Containers:
                 pending.cancel()
                 await asyncio.gather(pending, return_exceptions=True)
 
+    async def open_inventory_screen(self, *, timeout: float = 15) -> ContainerWindow:
+        """Open the player inventory UI and await BDS's ContainerOpen response."""
+        b = self.packets.protocol.binding
+        pending = asyncio.create_task(self.packets.wait_for_packet(
+            b.ContainerOpenPacket.ID, timeout=timeout, match=lambda raw: True,
+        ))
+        try:
+            await asyncio.sleep(0)
+            await self.packets.send(b.InteractPacket(
+                action=b.InteractPacket.Action.OPEN_INVENTORY,
+                target_id=self.inventory.player_id,
+                pos=None,
+            ))
+            return self._decode_open(await pending)
+        finally:
+            if not pending.done():
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+
     async def close_window(self, *, timeout: float = 15) -> ContainerWindow | None:
         """Request close; return after the same window's server close packet."""
         window = self.window

@@ -225,6 +225,12 @@ class Bot:
             source_slot, destination_slot, amount, timeout=timeout
         )
 
+    async def open_inventory_screen(self, *, timeout: float = 15) -> ContainerWindow:
+        """Open the player inventory UI and await its server-created window."""
+        if self._containers is None:
+            raise RuntimeError("bot is not joined")
+        return await self._containers.open_inventory_screen(timeout=timeout)
+
     async def close_container(self, *, timeout: float = 15) -> ContainerWindow | None:
         """Close the active window; wait for the matching server close packet."""
         if self._containers is None:

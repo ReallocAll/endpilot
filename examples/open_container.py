@@ -66,6 +66,11 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
             "open_window": bot.open_window is not None,
         }), flush=True)
         if equip_armor_slot is not None:
+            inventory_window = await bot.open_inventory_screen()
+            print("player_inventory_opened=" + json.dumps({
+                "id": inventory_window.container_id,
+                "type": inventory_window.container_type,
+            }), flush=True)
             source = bot.inventory_slots.get(destination_slot)
             previous = bot.armor_slots.get(equip_armor_slot)
             print("armor_equip_before=" + json.dumps({
@@ -82,6 +87,11 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
                 "armor_item_id": None if armor is None else int(armor.id),
                 "armor_count": None if armor is None else int(armor.stack_size),
                 "inventory_count": bot.inventory_count(int(slots[0].id)),
+            }), flush=True)
+            inventory_closed = await bot.close_container()
+            print("player_inventory_closed=" + json.dumps({
+                "id": None if inventory_closed is None else inventory_closed.container_id,
+                "open_window": bot.open_window is not None,
             }), flush=True)
         await asyncio.to_thread(sys.stdin.readline)
     finally:
