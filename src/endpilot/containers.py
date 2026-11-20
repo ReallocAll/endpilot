@@ -258,8 +258,8 @@ class Containers:
                 reply for reply in packet.responses
                 if int(reply.client_request_id.raw_id) == request_id
             )
-            # Apply server slot corrections even after rejection, as the upstream
-        # client does. A request alone does not establish an effect.
+            # Apply reported slot corrections on rejection too, matching the
+            # upstream client; a request alone does not establish an effect.
             for container in response.containers or ():
                 name = container.full_container_name.name.name
                 for slot in container.slots:
