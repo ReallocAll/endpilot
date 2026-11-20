@@ -104,6 +104,15 @@ class Bot:
             raise RuntimeError("player has not joined")
         self._movement.switch_follow_target(runtime_id)
 
+    async def navigate_to(self, target: tuple[float, float, float], *,
+                          ticks: int = 160, search_radius: int = 8) -> int:
+        """Submit a flat route through observed blocks; return moving frames."""
+        if self._movement is None or self._blocks is None:
+            raise RuntimeError("player has not joined")
+        return await self._movement.navigate_to(
+            self._blocks, target, ticks=ticks, search_radius=search_radius
+        )
+
     async def wait_for_block_update(
         self, position: tuple[int, int, int], *, layer: int = 0, timeout: float = 15
     ) -> BlockUpdate:
