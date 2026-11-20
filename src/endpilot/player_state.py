@@ -29,11 +29,12 @@ class PlayerState:
         b = self.packets.protocol.binding
         if raw.packet_id == b.RespawnPacket.ID:
             packet = self.packets.protocol.decode(raw)
-            if int(packet.runtime_id) == self.runtime_id:
-                if packet.state == b.PlayerRespawnState.SEARCHING_FOR_SPAWN:
-                    self._respawn_searching.set()
-                elif packet.state == b.PlayerRespawnState.READY_TO_SPAWN:
-                    self._respawn_searching.clear()
+            # Clientbound BDS RespawnPacket uses runtime ID 0, unlike the
+            # outgoing client packet. The server stream is already local-player scoped.
+            if packet.state == b.PlayerRespawnState.SEARCHING_FOR_SPAWN:
+                self._respawn_searching.set()
+            elif packet.state == b.PlayerRespawnState.READY_TO_SPAWN:
+                self._respawn_searching.clear()
         value = self._read_health(raw)
         if value is not None:
             self.health = value
@@ -58,8 +59,7 @@ class PlayerState:
 
         def ready(raw):
             packet = self.packets.protocol.decode(raw)
-            return (int(packet.runtime_id) == self.runtime_id
-                    and packet.state == b.PlayerRespawnState.READY_TO_SPAWN)
+            return packet.state == b.PlayerRespawnState.READY_TO_SPAWN
 
         # BDS ignores CLIENT_READY_TO_SPAWN until it has announced the
         # death's SEARCHING_FOR_SPAWN. Keep a single end-to-end timeout.

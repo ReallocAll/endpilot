@@ -95,7 +95,7 @@ class PlayerStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(sent, "cannot send client-ready before BDS death state 0")
         searching = protocol.encode(b.RespawnPacket(
             pos=b.Vec3(x=0, y=100, z=0),
-            state=b.PlayerRespawnState.SEARCHING_FOR_SPAWN, runtime_id=7,
+            state=b.PlayerRespawnState.SEARCHING_FOR_SPAWN, runtime_id=0,
         ))
         for callback in tuple(observer):
             callback(searching)
@@ -108,7 +108,7 @@ class PlayerStateTests(unittest.IsolatedAsyncioTestCase):
         # A server reply for this player updates movement before the waiter resolves.
         reply = b.RespawnPacket(
             pos=b.Vec3(x=3.5, y=103.625, z=9.5),
-            state=b.PlayerRespawnState.READY_TO_SPAWN, runtime_id=7,
+            state=b.PlayerRespawnState.READY_TO_SPAWN, runtime_id=0,
         )
         raw = protocol.encode(reply)
         for callback in tuple(observer):
@@ -145,7 +145,7 @@ class PlayerStateTests(unittest.IsolatedAsyncioTestCase):
         state = PlayerState(FakePackets(), 7)
         state._on_packet(protocol.encode(b.RespawnPacket(
             pos=b.Vec3(x=0, y=100, z=0),
-            state=b.PlayerRespawnState.SEARCHING_FOR_SPAWN, runtime_id=7,
+            state=b.PlayerRespawnState.SEARCHING_FOR_SPAWN, runtime_id=0,
         )))
         with self.assertRaises(TimeoutError):
             await state.respawn(timeout=0.1)
@@ -154,7 +154,7 @@ class PlayerStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent[0].state, b.PlayerRespawnState.CLIENT_READY_TO_SPAWN)
 
 
-    async def test_respawn_waits_for_searching_state_from_own_player(self):
+    async def test_respawn_does_not_send_before_searching_state(self):
         protocol = Protocol(2193)
         b = protocol.binding
         sent = []
@@ -163,9 +163,10 @@ class PlayerStateTests(unittest.IsolatedAsyncioTestCase):
             subscribe_raw=lambda callback: lambda: None,
             send=AsyncMock(side_effect=lambda packet: sent.append(packet)),
         ), 7)
+        # An unrelated READY packet without death SEARCHING must not start a respawn.
         state._on_packet(protocol.encode(b.RespawnPacket(
             pos=b.Vec3(x=0, y=100, z=0),
-            state=b.PlayerRespawnState.SEARCHING_FOR_SPAWN, runtime_id=99,
+            state=b.PlayerRespawnState.READY_TO_SPAWN, runtime_id=0,
         )))
         with self.assertRaises(TimeoutError):
             await state.respawn(timeout=0.01)
