@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from endpilot.entities import Entities, EntityMovement, EntitySpawn, EntityState
+from endpilot.inventory import Inventory
 from endpilot.protocol import Protocol, RawPacket
 
 
@@ -15,13 +16,20 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
             id=1, stack_size=1, aux_value=0, net_id_variant=9,
             block_runtime_id=123, user_data_buffer=b"\x00" * 10,
         )
-        packets = SimpleNamespace(protocol=protocol, send=AsyncMock())
+        callbacks = []
+        packets = SimpleNamespace(
+            protocol=protocol, send=AsyncMock(),
+            subscribe_raw=lambda cb: callbacks.append(cb) or (lambda: callbacks.remove(cb)),
+        )
         entities = Entities(packets)
         entities._record(EntityState(42, 77, "minecraft:cow", (2.5, 100.0, 0.5)))
         movement = SimpleNamespace(wait_for_position_sync=AsyncMock(return_value=(0.5, 101.62, 0.5)))
-        inventory = SimpleNamespace(item_or_empty=lambda slot: item)
+        inventory = Inventory(packets, 7)
+        inventory._set_slot(2, item)
+        await inventory.select_hotbar(2)
+        packets.send.reset_mock()
 
-        await entities.attack(movement, inventory, 77, slot=2, hit_height=0.75)
+        await entities.attack(movement, inventory, 77, hit_height=0.75)
         packets.send.assert_awaited_once()
         packet = protocol.decode(protocol.encode(packets.send.await_args.args[0]))
         self.assertIsInstance(packet, b.InventoryTransactionPacket)
@@ -36,6 +44,8 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(tx.hit_pos.x, 2.5)
         self.assertAlmostEqual(tx.hit_pos.y, 100.75)
         self.assertEqual(tx.transaction.actions, [])
+        inventory.close()
+        self.assertEqual(callbacks, [])
 
     async def test_attack_unobserved_actor_uses_upstream_player_position_fallback(self):
         protocol = Protocol(2193)
@@ -48,7 +58,7 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
             id=0, stack_size=0, aux_value=0, net_id_variant=None,
             block_runtime_id=0, user_data_buffer=b"",
         )
-        inventory = SimpleNamespace(item_or_empty=lambda slot: item)
+        inventory = SimpleNamespace(item_or_empty=lambda slot: item, selected_slot=0)
         await entities.attack(movement, inventory, 999)
         packet = protocol.decode(protocol.encode(packets.send.await_args.args[0]))
         tx = packet.variant_transaction

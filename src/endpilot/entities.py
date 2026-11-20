@@ -128,13 +128,14 @@ class Entities:
             self._by_runtime[runtime_id] = replace(state, position=position)
 
     async def attack(self, movement, inventory, runtime_id: int, *,
-                     slot: int = 0, hit_height: float = 0.5) -> None:
+                     hit_height: float = 0.5) -> None:
         """Submit one attack using the observed actor position when available.
 
         Uses the same ItemUseOnActor inventory transaction as EndstoneMC/client.
         Completion means only that the packet was submitted, not server damage.
         """
         actor = self.get(runtime_id)
+        slot = inventory.selected_slot
         item = inventory.item_or_empty(slot)
         x, y, z = await movement.wait_for_position_sync()
         # EndstoneMC/client uses player position when this actor is not tracked.

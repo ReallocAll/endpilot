@@ -8,6 +8,7 @@ class Inventory:
         self.packets = packets
         self.player_id = int(player_id)
         self._slots = {}
+        self._selected_slot = 0
         self._events = {}
         self._changed = asyncio.Event()
         self._unsubscribe = packets.subscribe_raw(self._on_packet)
@@ -62,6 +63,11 @@ class Inventory:
                 self._changed.clear()
                 await self._changed.wait()
 
+    @property
+    def selected_slot(self) -> int:
+        """Last locally selected hotbar slot, not a BDS acceptance receipt."""
+        return self._selected_slot
+
     def item_or_empty(self, slot: int):
         """Return an observed item or the client's initial empty-hand descriptor.
 
@@ -98,6 +104,7 @@ class Inventory:
             container_id=b.ContainerID.INVENTORY,
             should_select_slot=True,
         ))
+        self._selected_slot = slot
 
     async def announce_equipment(self, slot: int, item) -> None:
         """Carry the server-observed item descriptor for a use transaction."""

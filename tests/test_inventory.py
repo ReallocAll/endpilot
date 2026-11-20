@@ -19,9 +19,12 @@ class InventoryTests(unittest.IsolatedAsyncioTestCase):
         )
         inventory = Inventory(packets, 7)
         try:
+            self.assertEqual(inventory.selected_slot, 0)
             # Empty or not-yet-observed slots remain valid player selections.
             await inventory.select_hotbar(2)
+            self.assertEqual(inventory.selected_slot, 2)
             await inventory.select_hotbar(8)
+            self.assertEqual(inventory.selected_slot, 8)
             self.assertEqual(packets.send.await_count, 2)
             for index, call in zip((2, 8), packets.send.await_args_list):
                 encoded = protocol.encode(call.args[0])
@@ -35,6 +38,7 @@ class InventoryTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(ValueError):
                     await inventory.select_hotbar(invalid)
             self.assertEqual(packets.send.await_count, 2)
+            self.assertEqual(inventory.selected_slot, 8)
         finally:
             inventory.close()
         self.assertEqual(callbacks, [])
