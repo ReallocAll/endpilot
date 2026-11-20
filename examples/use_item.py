@@ -17,8 +17,12 @@ async def run(url: str) -> None:
         else:
             await bot.join_nethernet(url)
         print("spawned EndPilotTest", flush=True)
-        # Testbed equips a snowball and verifies the server's held-item count.
-        # The SDK operation is general: food and other items use the same path.
+        # Exercise normal hotbar switching before using a server-equipped item.
+        # The Testbed verifies each selection and the snowball decrement.
+        for slot in (0, 2, 0):
+            await asyncio.to_thread(sys.stdin.readline)
+            await bot.select_hotbar(slot)
+            print(f"hotbar_selection_submitted={slot}", flush=True)
         await asyncio.to_thread(sys.stdin.readline)
         await bot.use_item()
         print("item_use_submitted=1", flush=True)
