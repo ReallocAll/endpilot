@@ -60,3 +60,16 @@ class MCPPlayerTests(unittest.IsolatedAsyncioTestCase):
             await player.disconnect()
             self.assertTrue(bot.closed)
             self.assertEqual(player._pending, {})
+
+    async def test_timed_out_watch_can_be_rearmed_without_read(self):
+        with patch("endpilot.mcp_server.Bot", FakeBot):
+            player = MCPPlayer()
+            await player.connect("http://localhost:19132")
+            await player.watch_block(2, 99, 0, timeout=0.01)
+            with self.assertRaisesRegex(RuntimeError, "already being watched"):
+                await player.watch_block(2, 99, 0)
+            await asyncio.sleep(0.03)
+            await player.watch_block(2, 99, 0)
+            player.bot.updated.set()
+            self.assertEqual((await player.read_block(2, 99, 0))["runtime_id"], 42)
+            await player.disconnect()
