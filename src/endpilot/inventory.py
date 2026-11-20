@@ -118,5 +118,33 @@ class Inventory:
         ))
         self._selected_slot = slot
 
+
+    async def use_item(self, movement) -> None:
+        """Submit one use-in-air transaction; server effects are observed separately."""
+        x, y, z = await movement.wait_for_position_sync()
+        b = self.packets.protocol.binding
+        transaction = b.ItemUseInventoryTransaction(
+            transaction=b.InventoryTransaction(actions=[]),
+            action_type=b.ItemUseInventoryTransaction.ActionType.USE,
+            trigger_type=b.ItemUseInventoryTransaction.TriggerType.PLAYER_INPUT,
+            pos=b.BlockPos(x=0, y=0, z=0),
+            face=255,
+            slot=self.selected_slot,
+            hand=b.HandSlot.MAINHAND,
+            item=self.item_or_empty(self.selected_slot),
+            from_pos=b.Vec3(x=x, y=y, z=z),
+            click_pos=b.Vec3(x=0.0, y=0.0, z=0.0),
+            target_block_id=0,
+            client_predicted_result=b.ItemUseInventoryTransaction.PredictedResult.SUCCESS,
+            client_cooldown_state=b.ItemUseInventoryTransaction.ClientCooldownState.OFF,
+        )
+        # Match EndstoneMC/client GameMode.use_item: an independent transaction,
+        # not a PlayerAuthInput block-placement action.
+        await self.packets.send(b.InventoryTransactionPacket(
+            legacy_request_id=b.ItemStackLegacyRequestId(raw_id=0),
+            legacy_set_item_slots=None,
+            variant_transaction=transaction,
+        ))
+
     def close(self):
         self._unsubscribe()
