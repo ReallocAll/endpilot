@@ -4,7 +4,7 @@ from .authentication import OfflineIdentity
 from .blocks import Blocks, BlockUpdate
 from .chat import Chat, ChatMessage
 from .commands import Commands
-from .entities import Entities, EntityMovement, EntitySpawn
+from .entities import Entities, EntityMovement, EntitySpawn, EntityState
 from .inventory import Inventory
 from .login import JoinSession
 from .movement import Movement
@@ -45,6 +45,7 @@ class Bot:
         self._commands = Commands(session.packets, self.identity.uuid, session.player_unique_id)
         self._entities = Entities(session.packets)
         self._session = session
+        self._entities.start()
         self._movement.start()
 
     @property
@@ -102,6 +103,13 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._commands.execute(command, timeout=timeout)
 
+    @property
+    def observed_entities(self) -> tuple[EntityState, ...]:
+        """Last observed AddActor states, not a complete scan of loaded entities."""
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return self._entities.snapshot()
+
     async def wait_for_entity_spawn(
         self, *, actor_type: str | None = None, timeout: float = 15
     ) -> EntitySpawn:
@@ -143,7 +151,9 @@ class Bot:
         self._blocks = None
         self._chat = None
         self._commands = None
-        self._entities = None
+        entities, self._entities = self._entities, None
+        if entities is not None:
+            entities.close()
         if movement is not None:
             movement.close()
         if inventory is not None:
