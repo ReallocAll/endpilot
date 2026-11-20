@@ -155,6 +155,13 @@ class Bot:
             raise RuntimeError("player has not joined")
         await self._inventory.select_hotbar(slot)
 
+
+    async def use_item(self) -> None:
+        """Use the selected item in air; await BDS observations to confirm its effect."""
+        if self._inventory is None or self._movement is None:
+            raise RuntimeError("player has not joined")
+        await self._inventory.use_item(self._movement)
+
     async def mine_block(
         self, position: tuple[int, int, int], *, face: int = 1, timeout: float = 15
     ) -> BlockUpdate:

@@ -141,3 +141,54 @@ class InventoryTests(unittest.IsolatedAsyncioTestCase):
         finally:
             inventory.close()
         self.assertEqual(callbacks, [])
+
+
+    async def test_use_item_in_air_matches_upstream_typed_transaction(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        callbacks = []
+        packets = SimpleNamespace(
+            protocol=protocol,
+            subscribe_raw=lambda callback: callbacks.append(callback)
+            or (lambda: callbacks.remove(callback)),
+            send=AsyncMock(),
+        )
+        movement = SimpleNamespace(
+            wait_for_position_sync=AsyncMock(return_value=(1.5, 64.0, -2.5)),
+        )
+        inventory = Inventory(packets, 7)
+        try:
+            item = b.SerializedNetworkItemStackDescriptor(
+                id=42, stack_size=2, aux_value=0, net_id_variant=None,
+                block_runtime_id=0, user_data_buffer=b"",
+            )
+            inventory._set_slot(3, item)
+            await inventory.select_hotbar(3)
+            packets.send.reset_mock()
+            await inventory.use_item(movement)
+            self.assertEqual(packets.send.await_count, 1)
+            packet = protocol.decode(protocol.encode(packets.send.await_args.args[0]))
+            self.assertIsInstance(packet, b.InventoryTransactionPacket)
+            self.assertEqual(int(packet.legacy_request_id.raw_id), 0)
+            tx = packet.variant_transaction
+            self.assertIsInstance(tx, b.ItemUseInventoryTransaction)
+            self.assertEqual(tx.action_type, b.ItemUseInventoryTransaction.ActionType.USE)
+            self.assertEqual(tx.trigger_type, b.ItemUseInventoryTransaction.TriggerType.PLAYER_INPUT)
+            self.assertEqual(int(tx.face), 255)
+            self.assertEqual(int(tx.slot), 3)
+            self.assertEqual(tx.hand, b.HandSlot.MAINHAND)
+            self.assertEqual(int(tx.item.id), 42)
+            self.assertEqual(int(tx.item.stack_size), 2)
+            self.assertEqual((tx.from_pos.x, tx.from_pos.y, tx.from_pos.z),
+                             (1.5, 64.0, -2.5))
+            self.assertEqual(int(tx.target_block_id), 0)
+            self.assertEqual(tx.transaction.actions, [])
+
+            # An empty hand is a legal input; do not require a preloaded item.
+            inventory._slots.clear()
+            await inventory.use_item(movement)
+            empty = protocol.decode(protocol.encode(packets.send.await_args.args[0]))
+            self.assertEqual(int(empty.variant_transaction.item.id), 0)
+        finally:
+            inventory.close()
+        self.assertEqual(callbacks, [])
