@@ -4,6 +4,7 @@ from .authentication import OfflineIdentity
 from .blocks import Blocks, BlockUpdate
 from .chat import Chat, ChatMessage
 from .commands import Commands
+from .entities import Entities, EntitySpawn
 from .inventory import Inventory
 from .login import JoinSession
 from .movement import Movement
@@ -20,6 +21,7 @@ class Bot:
         self._blocks: Blocks | None = None
         self._chat: Chat | None = None
         self._commands: Commands | None = None
+        self._entities: Entities | None = None
 
     async def join_nethernet(self, url: str, *, timeout: float = 30, server_key_sha256: str | None = None) -> None:
         if self._session is not None:
@@ -41,6 +43,7 @@ class Bot:
         self._blocks = Blocks(session.packets, self._movement, self._inventory)
         self._chat = Chat(session.packets, self.identity.name)
         self._commands = Commands(session.packets, self.identity.uuid, session.player_unique_id)
+        self._entities = Entities(session.packets)
         self._session = session
         self._movement.start()
 
@@ -99,6 +102,20 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._commands.execute(command, timeout=timeout)
 
+    async def wait_for_entity_spawn(
+        self, *, actor_type: str | None = None, timeout: float = 15
+    ) -> EntitySpawn:
+        """Observe the next server actor spawn; not a scan of all world entities."""
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return await self._entities.wait_for_spawn(actor_type=actor_type, timeout=timeout)
+
+    async def wait_for_entity_removal(self, entity_id: int, *, timeout: float = 15) -> None:
+        """Observe the server removing the actor with this unique ID from view."""
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        await self._entities.wait_for_removal(entity_id, timeout=timeout)
+
     async def wait_for_server_disconnect(self, timeout: float = 15):
         if self._session is None:
             raise RuntimeError("player has not joined")
@@ -118,6 +135,7 @@ class Bot:
         self._blocks = None
         self._chat = None
         self._commands = None
+        self._entities = None
         if movement is not None:
             movement.close()
         if inventory is not None:
