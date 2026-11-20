@@ -51,8 +51,8 @@ async def run(url: str) -> None:
                 await bot.attack_entity(spawned.runtime_id)
                 attacks += 1
                 await asyncio.sleep(0.55)
-            await removal
             print("attacks_submitted=" + str(attacks), flush=True)
+            await removal
             print("entity_removed=" + json.dumps({
                 "entity_id": spawned.entity_id, "runtime_id": spawned.runtime_id,
             }), flush=True)
