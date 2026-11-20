@@ -31,13 +31,27 @@ async def run(url: str, name: str):
                 supports = [await call("read_block", x=x, y=99, z=0) for x in (2, 3)]
                 print("supports_observed=" + json.dumps([s["runtime_id"] for s in supports]), flush=True)
 
+                await asyncio.to_thread(sys.stdin.readline)
                 for x in (2, 3):
+                    await call("watch_block", x=x, y=100, z=0)
+                print("target_watchers_ready", flush=True)
+                empty = [await call("read_block", x=x, y=100, z=0) for x in (2, 3)]
+                print("targets_observed=" + json.dumps([u["runtime_id"] for u in empty]), flush=True)
+
+                for index, x in enumerate((2, 3)):
                     await asyncio.to_thread(sys.stdin.readline)
                     await call("watch_block", x=x, y=100, z=0, timeout=3)
                     submission = await call("place_against", x=x, y=99, z=0, face=1, slot=0)
                     print("placement_submitted=" + json.dumps({"x": x, "tick": submission["submitted_tick"]}), flush=True)
                     update = await call("read_block", x=x, y=100, z=0)
-                    print("placement_update=" + json.dumps({"x": x, **update}), flush=True)
+                    expected = empty[index]["runtime_id"] if x == 2 else supports[index]["runtime_id"]
+                    if update["runtime_id"] != expected:
+                        raise AssertionError(
+                            f"target {x}: expected runtime ID {expected}, received {update['runtime_id']}"
+                        )
+                    print("placement_update=" + json.dumps({
+                        "x": x, **update, "effect": "unchanged" if x == 2 else "placed",
+                    }), flush=True)
 
                 print("placement_checks_ready", flush=True)
                 await asyncio.to_thread(sys.stdin.readline)
