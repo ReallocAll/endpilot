@@ -62,8 +62,11 @@ async def run(url: str, position: tuple[int, int, int], face: int, place_collect
             await asyncio.sleep(0)
             try:
                 tick = await bot.place_against(support, face=1, slot=0)
-                print("placement_submitted=" + json.dumps({"tick": tick}), flush=True)
+                print("placement_submitted=" + json.dumps({"tick": tick, "player_position": bot.position}), flush=True)
                 placed = await target_watch
+                print("placement_block=" + json.dumps({
+                    "position": placed.position, "runtime_id": placed.runtime_id,
+                }), flush=True)
             finally:
                 if not target_watch.done():
                     target_watch.cancel()
