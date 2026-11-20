@@ -40,8 +40,11 @@ class MCPPlayer:
         bot = self._joined()
         position = (x, y, z)
         key = (position, layer)
-        if key in self._pending:
-            raise RuntimeError("this block is already being watched; read its update first")
+        previous = self._pending.get(key)
+        if previous is not None:
+            # Preserve unread updates, but allow retry once a watcher has failed.
+            if not previous.done() or (not previous.cancelled() and previous.exception() is None):
+                raise RuntimeError("this block is already being watched; read its update first")
         task = asyncio.create_task(bot.wait_for_block_update(position, layer=layer, timeout=timeout))
         self._pending[key] = task
         # The SDK subscribes before the server may publish an UpdateBlock.
