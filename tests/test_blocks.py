@@ -168,3 +168,50 @@ class BlocksTests(unittest.IsolatedAsyncioTestCase):
             b.PlayerActionType.STOP_DESTROY_BLOCK,
         ])
         self.assertEqual(stream.observers, [])
+
+    async def test_mining_cancel_before_start_unsubscribes_waiter(self):
+        protocol = Protocol(2193)
+        stream = PacketStream(protocol)
+        movement = Movement(stream, 7)
+        movement._input_position = (0.5, 101.62, 0.5)
+        movement._updated.set()
+        blocks = Blocks(stream, movement, None, hashed_runtime_ids=True)
+        subscribe = stream.subscribe_raw
+        task = None
+
+        def cancel_on_subscribe(observer):
+            unsubscribe = subscribe(observer)
+            task.cancel()  # Cancel while the newly registered waiter is pending.
+            return unsubscribe
+
+        stream.subscribe_raw = cancel_on_subscribe
+        task = asyncio.create_task(blocks.mine_block((1, 100, 0), timeout=1))
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0)
+        self.assertEqual(stream.observers, [])
+        self.assertEqual(stream.sent, [])
+
+    async def test_mining_disconnect_preserves_original_error_when_abort_fails(self):
+        protocol = Protocol(2193)
+        stream = PacketStream(protocol)
+        movement = Movement(stream, 7)
+        movement._input_position = (0.5, 101.62, 0.5)
+        movement._updated.set()
+        blocks = Blocks(stream, movement, None, hashed_runtime_ids=True)
+        original_send = stream.send
+
+        async def send(packet):
+            if stream.sent:
+                raise OSError("connection already closed")
+            await original_send(packet)
+
+        async def disconnected(*args, **kwargs):
+            raise ConnectionError("packet stream lost")
+
+        stream.send = send
+        stream.wait_for_packet = disconnected
+        with self.assertRaisesRegex(ConnectionError, "packet stream lost") as caught:
+            await blocks.mine_block((1, 100, 0), timeout=1)
+        self.assertIn("mining abort failed", " ".join(caught.exception.__notes__))
+        self.assertEqual(len(stream.sent), 1)
