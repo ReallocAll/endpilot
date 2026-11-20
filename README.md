@@ -47,8 +47,8 @@ status or logs rather than inferring it from a missing client packet.
 
 A server that explicitly rejects a player before spawn raises `LoginRefused`
 (a `ConnectionError` subclass), distinct from a join timeout or transport loss.
-To test a BDS allow-list refusal with either transport, run
-`python examples/refused_login.py URL` against a server that denies the player.
+To test a full-server login refusal with either transport, run
+`python examples/refused_login.py URL` against a server whose player limit is already occupied.
 
 ## Place a block through MCP
 

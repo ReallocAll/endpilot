@@ -1,4 +1,4 @@
-"""Assert that a server explicitly refuses an unapproved headless player."""
+"""Assert that a server explicitly refuses a headless player before spawn."""
 
 import argparse
 import asyncio
