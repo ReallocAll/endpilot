@@ -28,7 +28,6 @@ class Containers:
         self.window: ContainerWindow | None = None
         self._slots: dict[int, object] | None = None
         self._slots_updated = asyncio.Event()
-        self._next_request_id = -1
         self._unsubscribe = packets.subscribe_raw(self._on_packet)
 
     def _decode_open(self, raw) -> ContainerWindow:
@@ -227,8 +226,7 @@ class Containers:
                 net_id_variant=int(item.net_id_variant or 0),
             )
 
-        request_id = self._next_request_id
-        self._next_request_id -= 2
+        request_id = self.inventory._allocate_request_id()
         request = b.ItemStackRequestPacketData.RequestData(
             client_request_id=b.ItemStackRequestId(raw_id=request_id),
             actions=[action_type(

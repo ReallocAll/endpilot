@@ -159,6 +159,19 @@ class Bot:
         await self._inventory.select_hotbar(slot)
 
 
+    @property
+    def armor_slots(self) -> dict[int, object]:
+        """Latest server-described armor slots; absent slots are not confirmed empty."""
+        if self._inventory is None:
+            raise RuntimeError("bot is not joined")
+        return self._inventory.armor_slots
+
+    async def equip_armor(self, source_slot: int, armor_slot: int, *, timeout: float = 15):
+        """Return the server's item-stack verdict for an inventory/armor swap."""
+        if self._inventory is None:
+            raise RuntimeError("bot is not joined")
+        return await self._inventory.equip_armor(source_slot, armor_slot, timeout=timeout)
+
     async def use_item(self) -> None:
         """Use the selected item in air; await BDS observations to confirm its effect."""
         if self._inventory is None or self._movement is None:
