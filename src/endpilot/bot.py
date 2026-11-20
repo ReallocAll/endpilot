@@ -72,6 +72,11 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._blocks.place_against(against, face=face, slot=slot)
 
+    async def wait_for_server_disconnect(self, timeout: float = 15):
+        if self._session is None:
+            raise RuntimeError("player has not joined")
+        return await self._session.wait_for_server_disconnect(timeout)
+
     @property
     def packets(self):
         """Expose typed and raw packet I/O for external extensions."""
