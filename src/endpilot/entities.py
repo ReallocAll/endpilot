@@ -1,5 +1,6 @@
 """Observe server actors and dropped items on this player's packet stream."""
 
+import asyncio
 from dataclasses import dataclass, replace
 
 
@@ -143,6 +144,54 @@ class Entities:
             packet.actor_type,
             (float(packet.pos.x), float(packet.pos.y), float(packet.pos.z)),
         )
+
+    async def wait_for_item_pickup(
+        self, runtime_id: int, player_id: int, *, timeout: float = 15
+    ) -> None:
+        """Wait for BDS to name this player as the collector of this item actor."""
+        b = self.packets.protocol.binding
+
+        def matches(raw):
+            packet = self.packets.protocol.decode(raw)
+            return int(packet.item_id) == runtime_id and int(packet.actor_id) == player_id
+
+        await self.packets.wait_for_packet(
+            b.TakeItemActorPacket.ID, match=matches, timeout=timeout
+        )
+
+    async def collect_drop(
+        self, movement, runtime_id: int, player_id: int, *,
+        ticks: int = 120, timeout: float = 15
+    ) -> EntityState:
+        """Approach an observed drop; return only after BDS confirms our pickup.
+
+        Movement uses a straight path on level terrain; the item may be taken by
+        another actor, despawn, or remain unreachable. Those do not imply success.
+        """
+        drop = self.get(runtime_id)
+        if drop is None or drop.actor_type != "minecraft:item":
+            raise ValueError("item actor is not currently observed")
+        pickup = asyncio.create_task(self.wait_for_item_pickup(
+            runtime_id, player_id, timeout=timeout
+        ))
+        # Register the packet waiter before sending any movement input.
+        await asyncio.sleep(0)
+        follow = asyncio.create_task(movement.follow_entity(
+            self, runtime_id, ticks=ticks, stop_distance=0.0
+        ))
+        try:
+            done, _ = await asyncio.wait(
+                (pickup, follow), return_when=asyncio.FIRST_COMPLETED
+            )
+            if follow in done:
+                await follow
+            await pickup
+            return drop
+        finally:
+            for task in (pickup, follow):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(pickup, follow, return_exceptions=True)
 
     async def wait_for_item_drop(self, timeout: float = 15) -> EntityState:
         """Observe the next server-sent item spawn, not an inventory transfer."""

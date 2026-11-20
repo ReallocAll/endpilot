@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -34,6 +35,57 @@ class InventoryTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(ValueError):
                     await inventory.select_hotbar(invalid)
             self.assertEqual(packets.send.await_count, 2)
+        finally:
+            inventory.close()
+        self.assertEqual(callbacks, [])
+
+    async def test_server_inventory_transaction_updates_only_player_slots(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        callbacks = []
+        decoded = {
+            b"content": SimpleNamespace(
+                inventory_id=b.ContainerID.INVENTORY,
+                slots=[SimpleNamespace(id=0, stack_size=0)],
+            ),
+            b"pickup": SimpleNamespace(variant_transaction=SimpleNamespace(
+                transaction=SimpleNamespace(actions=[
+                    SimpleNamespace(
+                        source=SimpleNamespace(
+                            type=SimpleNamespace(name="CONTAINER_INVENTORY"),
+                            container_id=b.ContainerID.INVENTORY,
+                        ), slot=0, to_item_descriptor=SimpleNamespace(id=42, stack_size=1),
+                    ),
+                    SimpleNamespace(
+                        source=SimpleNamespace(
+                            type=SimpleNamespace(name="WORLD_INTERACTION"),
+                            container_id=None,
+                        ), slot=0, to_item_descriptor=SimpleNamespace(id=43, stack_size=7),
+                    ),
+                ])
+            )),
+            b"slot": SimpleNamespace(
+                inventory_id=b.ContainerID.INVENTORY,
+                slot=0, item=SimpleNamespace(id=42, stack_size=2),
+            ),
+        }
+        stream = SimpleNamespace(
+            protocol=SimpleNamespace(binding=b, decode=lambda raw: decoded[raw.body]),
+            subscribe_raw=lambda callback: callbacks.append(callback)
+            or (lambda: callbacks.remove(callback)),
+        )
+        from endpilot.protocol import RawPacket
+        inventory = Inventory(stream, 7)
+        try:
+            callbacks[0](RawPacket(b.InventoryContentPacket.ID, b"content"))
+            self.assertEqual(inventory.count_item(42), 0)
+            pending = asyncio.create_task(inventory.wait_for_item_count(42, 1, timeout=1))
+            await asyncio.sleep(0)
+            callbacks[0](RawPacket(b.InventoryTransactionPacket.ID, b"pickup"))
+            self.assertEqual(await pending, 1)
+            callbacks[0](RawPacket(b.InventorySlotPacket.ID, b"slot"))
+            self.assertEqual(inventory.count_item(42), 2)
+            self.assertEqual(inventory.count_item(43), 0)
         finally:
             inventory.close()
         self.assertEqual(callbacks, [])

@@ -134,6 +134,21 @@ class Bot:
             raise RuntimeError("player has not joined")
         await self._blocks.request_sub_chunk(position)
 
+    def inventory_count(self, item_id: int) -> int:
+        """Current server-described count of a numeric inventory item ID."""
+        if self._inventory is None:
+            raise RuntimeError("player has not joined")
+        return self._inventory.count_item(item_id)
+
+    async def wait_for_inventory_item_count(
+        self, item_id: int, minimum: int, *, timeout: float = 15
+    ) -> int:
+        if self._inventory is None:
+            raise RuntimeError("player has not joined")
+        return await self._inventory.wait_for_item_count(
+            item_id, minimum, timeout=timeout
+        )
+
     async def select_hotbar(self, slot: int) -> None:
         """Request a hotbar slot; observe BDS to confirm the equipped item."""
         if self._inventory is None:
@@ -199,6 +214,16 @@ class Bot:
         if self._entities is None:
             raise RuntimeError("player has not joined")
         return self._entities.drops()
+
+    async def collect_drop(
+        self, runtime_id: int, *, ticks: int = 120, timeout: float = 15
+    ) -> EntityState:
+        """Approach an observed dropped item; confirm this player picked it up."""
+        if self._entities is None or self._movement is None:
+            raise RuntimeError("player has not joined")
+        return await self._entities.collect_drop(
+            self._movement, runtime_id, self.player_id, ticks=ticks, timeout=timeout
+        )
 
     async def wait_for_item_drop(self, timeout: float = 15) -> EntityState:
         """Observe the next item actor spawn sent by the server."""
