@@ -127,6 +127,38 @@ class Entities:
                 )
             self._by_runtime[runtime_id] = replace(state, position=position)
 
+    async def attack(self, movement, inventory, runtime_id: int, *,
+                     slot: int = 0, hit_height: float = 0.5) -> None:
+        """Submit one attack using the latest observed actor position.
+
+        Uses the same ItemUseOnActor inventory transaction as EndstoneMC/client.
+        Completion means only that the packet was submitted, not server damage.
+        """
+        actor = self.get(runtime_id)
+        if actor is None:
+            raise ValueError("actor is not currently observed")
+        item = await inventory.wait_for_slot(slot)
+        x, y, z = await movement.wait_for_position_sync()
+        b = self.packets.protocol.binding
+        action = b.ItemUseOnActorInventoryTransaction(
+            transaction=b.InventoryTransaction(actions=[]),
+            runtime_id=runtime_id,
+            action_type=b.ItemUseOnActorInventoryTransaction.ActionType.ATTACK,
+            slot=slot,
+            item=item,
+            from_pos=b.Vec3(x=x, y=y, z=z),
+            hit_pos=b.Vec3(
+                x=actor.position[0],
+                y=actor.position[1] + hit_height,
+                z=actor.position[2],
+            ),
+        )
+        await self.packets.send(b.InventoryTransactionPacket(
+            legacy_request_id=b.ItemStackLegacyRequestId(raw_id=0),
+            legacy_set_item_slots=None,
+            variant_transaction=action,
+        ))
+
     async def wait_for_spawn(self, *, actor_type: str | None = None, timeout: float = 15) -> EntitySpawn:
         """Wait for a new AddActor; an entity already in view will not be replayed."""
         b = self.packets.protocol.binding

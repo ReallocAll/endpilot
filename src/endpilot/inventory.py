@@ -62,6 +62,15 @@ class Inventory:
                 self._changed.clear()
                 await self._changed.wait()
 
+    async def wait_for_slot(self, slot: int, timeout: float = 15):
+        """Return a server-reported slot descriptor, including an empty hand."""
+        event = self._events.setdefault(slot, asyncio.Event())
+        async with asyncio.timeout(timeout):
+            while slot not in self._slots:
+                event.clear()
+                await event.wait()
+        return self._slots[slot]
+
     async def wait_for_item(self, slot: int, timeout: float = 15):
         """Return the current server-reported nonempty inventory slot."""
         event = self._events.setdefault(slot, asyncio.Event())
