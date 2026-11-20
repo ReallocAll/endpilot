@@ -72,6 +72,12 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._movement.wait_for_position_sync(timeout)
 
+    async def look_at(self, target: tuple[float, float, float]) -> tuple[float, float]:
+        """Aim toward a world-space eye-height target on subsequent input frames."""
+        if self._movement is None:
+            raise RuntimeError("player has not joined")
+        return await self._movement.look_at(target)
+
     async def walk_forward(self, ticks: int = 24) -> int:
         if self._movement is None:
             raise RuntimeError("player has not joined")
