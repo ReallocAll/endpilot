@@ -29,15 +29,6 @@ class Inventory:
             if slot in self._events:
                 self._events[slot].set()
 
-    async def wait_for_slot(self, slot: int, timeout: float = 15):
-        """Wait until BDS reports the slot, including an empty slot."""
-        event = self._events.setdefault(slot, asyncio.Event())
-        async with asyncio.timeout(timeout):
-            while slot not in self._slots:
-                event.clear()
-                await event.wait()
-        return self._slots[slot]
-
     async def wait_for_item(self, slot: int, timeout: float = 15):
         """Return the current server-reported nonempty inventory slot."""
         event = self._events.setdefault(slot, asyncio.Event())
@@ -49,12 +40,21 @@ class Inventory:
                 event.clear()
                 await event.wait()
 
-    async def select_hotbar(self, slot: int, item=None) -> None:
-        """Submit a hotbar selection; server acceptance is not implied."""
+    async def select_hotbar(self, slot: int) -> None:
+        """Request a selected hotbar slot; only BDS can confirm the held item."""
         if not 0 <= slot < 9:
             raise ValueError("hotbar slot must be between 0 and 8")
-        if item is None:
-            item = await self.wait_for_slot(slot)
+        b = self.packets.protocol.binding
+        # BDS 1.26.52 accepts this even though EndstoneMC/client uses
+        # MobEquipment; that packet alone did not switch the server's slot.
+        await self.packets.send(b.PlayerHotbarPacket(
+            selected_slot=slot,
+            container_id=b.ContainerID.INVENTORY,
+            should_select_slot=True,
+        ))
+
+    async def announce_equipment(self, slot: int, item) -> None:
+        """Carry the server-observed item descriptor for a use transaction."""
         b = self.packets.protocol.binding
         await self.packets.send(b.MobEquipmentPacket(
             runtime_id=self.player_id,
