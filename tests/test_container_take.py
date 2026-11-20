@@ -139,7 +139,7 @@ class TakeContainerTests(unittest.IsolatedAsyncioTestCase):
         codec = Protocol(2193)
         b = codec.binding
 
-        def response(request_id, accepted=True):
+        def response(request_id, accepted=True, corrected=False):
             def container(name, index, count, net):
                 return SimpleNamespace(
                     full_container_name=SimpleNamespace(name=SimpleNamespace(name=name)),
@@ -153,15 +153,15 @@ class TakeContainerTests(unittest.IsolatedAsyncioTestCase):
                 client_request_id=SimpleNamespace(raw_id=request_id),
                 result=b.ItemStackNetResult.SUCCESS if accepted else b.ItemStackNetResult.ERROR,
                 containers=[
-                    container("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 2, 1, 21),
-                    container("LEVEL_ENTITY_CONTAINER", 0, 3, 17),
+                    container("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 2, 2 if corrected else 1, 21),
+                    container("LEVEL_ENTITY_CONTAINER", 0, 2 if corrected else 3, 17),
                     container("LEVEL_ENTITY_CONTAINER", 4, 99, 33),
-                ] if accepted else None,
+                ] if accepted or corrected else None,
             )
 
         replies = {
             b"ok": SimpleNamespace(responses=[response(-1)]),
-            b"reject": SimpleNamespace(responses=[response(-3, False)]),
+            b"reject": SimpleNamespace(responses=[response(-3, False, corrected=True)]),
             b"other": SimpleNamespace(responses=[response(-7)]),
         }
         sent = []
@@ -213,8 +213,10 @@ class TakeContainerTests(unittest.IsolatedAsyncioTestCase):
             rejected = await containers.put_into_container(2, 0, 1, timeout=3)
             self.assertEqual(rejected.result.name, "ERROR")
             self.assertEqual(int(codec.decode(codec.encode(sent[1])).requests[0].client_request_id.raw_id), -3)
-            self.assertEqual(int(containers.slots[0].stack_size), 3)
-            self.assertEqual(int(inventory.item_or_empty(2).stack_size), 1)
+            # A rejected request can still correct stale local slot counts.
+            self.assertEqual(int(containers.slots[0].stack_size), 2)
+            self.assertEqual(int(inventory.item_or_empty(2).stack_size), 2)
+            self.assertEqual(int(containers.slots[4].id), 0)
         finally:
             containers.close()
             inventory.close()
