@@ -8,7 +8,7 @@ import sys
 from endpilot import Bot
 
 
-async def main(url: str, *, stop: bool = False):
+async def main(url: str, *, stop: bool = False, switch: bool = False):
     bot = Bot("EndPilotTest")
     try:
         if url.startswith("raknet://"):
@@ -28,14 +28,26 @@ async def main(url: str, *, stop: bool = False):
             "runtime_id": spawn.runtime_id, "position": spawn.position,
         }), flush=True)
         await asyncio.to_thread(sys.stdin.readline)
-        task = asyncio.create_task(bot.follow_entity(spawn.runtime_id, ticks=160 if stop else 80))
+        task = asyncio.create_task(bot.follow_entity(spawn.runtime_id, ticks=160 if stop or switch else 80))
         await asyncio.sleep(0.1)
         print("follow_started", flush=True)
-        if stop:
+        if switch:
+            next_spawn = asyncio.create_task(bot.wait_for_entity_spawn(actor_type="minecraft:cow"))
+            await asyncio.sleep(0)
+            print("follow_switch_watcher_ready", flush=True)
+            actor = await next_spawn
+            bot.switch_follow_target(actor.runtime_id)
+            print("follow_switched=" + json.dumps({
+                "runtime_id": actor.runtime_id, "position": actor.position,
+            }), flush=True)
+            await asyncio.to_thread(sys.stdin.readline)
+            await bot.stop_moving()
+        elif stop:
             await asyncio.to_thread(sys.stdin.readline)
             await bot.stop_moving()
         submitted = await task
-        print(("follow_stopped=" if stop else "follow_input_submitted=") + json.dumps({
+        print(("follow_switched_stopped=" if switch else
+               "follow_stopped=" if stop else "follow_input_submitted=") + json.dumps({
             "frames": submitted, "position": bot.position,
         }), flush=True)
         await asyncio.to_thread(sys.stdin.readline)
@@ -48,5 +60,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("url")
     parser.add_argument("--stop", action="store_true", help="Stop active following on stdin")
+    parser.add_argument("--switch", action="store_true", help="Switch to a newly spawned cow, then stop on stdin")
     args = parser.parse_args()
-    asyncio.run(main(args.url, stop=args.stop))
+    asyncio.run(main(args.url, stop=args.stop, switch=args.switch))

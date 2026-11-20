@@ -200,6 +200,50 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(stream.sent[before].rot.y, -90.0)
         self.assertEqual([list(p.input_data) for p in stream.sent[-2:]], [[], []])
 
+
+    async def test_switch_active_follow_without_releasing_input(self):
+        from endpilot.entities import Entities, EntityState
+
+        protocol = Protocol(2193)
+        b = protocol.binding
+        stream = PacketSink(protocol)
+        movement = Movement(stream, 1)
+        packet = b.MovePlayerPacket()
+        packet.player_id = 1
+        packet.pos = b.Vec3(x=0.5, y=101.62, z=0.5)
+        packet.rot = b.Vec2(x=0.0, y=0.0)
+        packet.y_head_rot = 0.0
+        packet.riding_id = 0
+        packet.teleport_data = None
+        packet.tick = 0
+        movement._on_packet(protocol.encode(packet))
+        entities = Entities(stream)
+        entities._record(EntityState(4, 7, "minecraft:cow", (-6.0, 100.0, 0.5)))
+        entities._record(EntityState(5, 8, "minecraft:cow", (6.0, 100.0, 0.5)))
+
+        with self.assertRaisesRegex(RuntimeError, "no active entity follow"):
+            movement.switch_follow_target(8)
+        task = asyncio.create_task(movement.follow_entity(entities, 7, ticks=100))
+        await asyncio.sleep(0.14)
+        before = len(stream.sent)
+        self.assertGreaterEqual(before, 2)
+        self.assertTrue(all(abs(p.rot.y - 90.0) < 1e-6 for p in stream.sent))
+        movement.switch_follow_target(8)
+        await asyncio.sleep(0.14)
+        after = len(stream.sent)
+        self.assertGreater(after, before)
+        self.assertTrue(all(abs(p.rot.y + 90.0) < 1e-6
+                            for p in stream.sent[before:after]))
+        self.assertTrue(all(b.PlayerAuthInputPacket.InputData.UP in p.input_data
+                            for p in stream.sent[:after]))
+        await movement.stop_moving()
+        self.assertLess(await task, 100)
+        self.assertEqual([list(p.input_data) for p in stream.sent[-2:]], [[], []])
+        self.assertEqual([p.client_tick for p in stream.sent],
+                         list(range(1, len(stream.sent) + 1)))
+        with self.assertRaisesRegex(RuntimeError, "no active entity follow"):
+            movement.switch_follow_target(7)
+
     async def test_follow_entity_unobserved_target_stops_without_moving(self):
         from endpilot.entities import Entities
 

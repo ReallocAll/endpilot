@@ -18,6 +18,7 @@ class Movement:
         self._action_lock = asyncio.Lock()
         self._stop_requested = False
         self._active_done: asyncio.Event | None = None
+        self._follow_target_id: int | None = None
         self._ticker: asyncio.Task | None = None
 
     def start(self):
@@ -152,6 +153,12 @@ class Movement:
                     self._active_done = None
                     done.set()
 
+    def switch_follow_target(self, runtime_id: int) -> None:
+        """Use a new runtime ID on the next active follow frame."""
+        if self._follow_target_id is None or self._stop_requested:
+            raise RuntimeError("no active entity follow")
+        self._follow_target_id = runtime_id
+
     async def follow_entity(self, entities, runtime_id: int, *, ticks: int = 80,
                             stop_distance: float = 1.5) -> int:
         """Track an observed actor for up to ticks frames, releasing input on exit.
@@ -163,6 +170,7 @@ class Movement:
             raise ValueError("stop_distance must be finite and nonnegative")
         async with self._action_lock:
             self._stop_requested = False
+            self._follow_target_id = runtime_id
             done = self._active_done = asyncio.Event()
             submitted = 0
             try:
@@ -171,7 +179,7 @@ class Movement:
                 for _ in range(ticks):
                     if self._stop_requested:
                         break
-                    actor = entities.get(runtime_id)
+                    actor = entities.get(self._follow_target_id)
                     if actor is None:
                         break
                     x, y, z = self._input_position
@@ -184,6 +192,7 @@ class Movement:
                     await asyncio.sleep(0.05)
                 return submitted
             finally:
+                self._follow_target_id = None
                 try:
                     if self._input_position is not None:
                         await self._send_input(False)
