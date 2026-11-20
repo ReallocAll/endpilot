@@ -116,6 +116,7 @@ class Inventory:
             selected_slot=slot,
             container_id=b.ContainerID.INVENTORY,
         ))
+        self._selected_slot = slot
 
     def close(self):
         self._unsubscribe()

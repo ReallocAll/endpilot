@@ -43,6 +43,30 @@ class InventoryTests(unittest.IsolatedAsyncioTestCase):
             inventory.close()
         self.assertEqual(callbacks, [])
 
+    async def test_equipment_announcement_updates_locally_selected_slot(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        callbacks = []
+        packets = SimpleNamespace(
+            protocol=protocol, send=AsyncMock(),
+            subscribe_raw=lambda cb: callbacks.append(cb) or (lambda: callbacks.remove(cb)),
+        )
+        inventory = Inventory(packets, 7)
+        try:
+            item = b.SerializedNetworkItemStackDescriptor(
+                id=1, stack_size=1, aux_value=0, net_id_variant=None,
+                block_runtime_id=0, user_data_buffer=b"",
+            )
+            await inventory.announce_equipment(3, item)
+            self.assertEqual(inventory.selected_slot, 3)
+            sent = protocol.decode(protocol.encode(packets.send.await_args.args[0]))
+            self.assertIsInstance(sent, b.MobEquipmentPacket)
+            self.assertEqual(int(sent.selected_slot), 3)
+            self.assertEqual(int(sent.slot), 3)
+        finally:
+            inventory.close()
+        self.assertEqual(callbacks, [])
+
     async def test_empty_inventory_slot_needs_no_server_content_for_attack(self):
         protocol = Protocol(2193)
         b = protocol.binding
