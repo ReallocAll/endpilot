@@ -38,6 +38,13 @@ python examples/walk.py raknet://127.0.0.1:19132
 
 `walk_forward()` returns submitted input frames, not confirmed server displacement. Use BDS `querytarget` to verify actual movement. The example's wait for Enter also supports Testbed world setup.
 
+A running player can await a server-initiated kick with
+`await bot.wait_for_server_disconnect(timeout=10)`. This returns the upstream
+typed `DisconnectPacket` if BDS sent one, raises `ConnectionError` if the
+packet stream ends first, or `TimeoutError` if neither occurs by the deadline.
+Closing the bot locally is separate. Confirm a server crash from BDS process
+status or logs rather than inferring it from a missing client packet.
+
 ## Place a block through MCP
 
 Install the optional MCP tools and register `python -m endpilot.mcp_server` as a local **stdio** MCP server:

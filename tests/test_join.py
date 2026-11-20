@@ -135,6 +135,48 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
         await stream.close()
         self.assertTrue(fake.closed)
 
+    async def test_wait_for_server_disconnect_returns_upstream_packet(self):
+        protocol = Protocol(2193)
+        settings = protocol.binding.NetworkSettingsPacket()
+        settings.compression_algorithm = protocol.binding.PacketCompressionAlgorithm.ZLIB
+        settings.compression_threshold = 1
+        fake = FakeTransport()
+        stream = PacketConnection(fake, protocol, settings)
+        session = JoinSession(stream, OfflineIdentity("EndPilotTest"), "")
+        stream.start_receiving()
+        waiting = asyncio.create_task(session.wait_for_server_disconnect(timeout=1))
+        await asyncio.sleep(0)
+        packet = RawPacket(protocol.binding.DisconnectPacket.ID, b"kick")
+        observed = SimpleNamespace(reason="kicked")
+        with patch.object(protocol, "decode", return_value=observed):
+            await fake.received.put(b"\xff" + write_batch([packet]))
+            self.assertIs(await waiting, observed)
+        self.assertEqual(stream._subscribers, [])
+        await stream.close()
+
+    async def test_wait_for_server_disconnect_distinguishes_drop_and_timeout(self):
+        protocol = Protocol(2193)
+        settings = protocol.binding.NetworkSettingsPacket()
+        settings.compression_algorithm = protocol.binding.PacketCompressionAlgorithm.ZLIB
+        settings.compression_threshold = 1
+        fake = FakeTransport()
+        stream = PacketConnection(fake, protocol, settings)
+        session = JoinSession(stream, OfflineIdentity("EndPilotTest"), "")
+        stream.start_receiving()
+        with self.assertRaises(TimeoutError):
+            await session.wait_for_server_disconnect(timeout=0.01)
+        self.assertEqual(stream._subscribers, [])
+        waiting = asyncio.create_task(session.wait_for_server_disconnect(timeout=1))
+        await asyncio.sleep(0)
+        await fake.received.put(b"")
+        with self.assertRaises(ConnectionError) as failure:
+            await waiting
+        self.assertIsInstance(failure.exception.__cause__, ConnectionError)
+        self.assertEqual(stream._subscribers, [])
+        with self.assertRaises(ConnectionError):
+            await stream.close()
+        self.assertTrue(fake.closed)
+
     async def test_reader_failure_still_closes_transport(self):
         protocol = Protocol(2193)
         settings = protocol.binding.NetworkSettingsPacket()
