@@ -4,6 +4,12 @@ import asyncio
 from dataclasses import dataclass
 
 
+_FACE_OFFSETS = {
+    0: (0, -1, 0), 1: (0, 1, 0), 2: (0, 0, -1),
+    3: (0, 0, 1), 4: (-1, 0, 0), 5: (1, 0, 0),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class ContainerWindow:
     container_id: int
@@ -46,6 +52,7 @@ class Containers:
         observed = blocks.observed_block(position)
         runtime_id = 0 if observed is None or observed.runtime_id is None else observed.runtime_id
         px, py, pz = position
+        dx, dy, dz = _FACE_OFFSETS.get(face, (0, 0, 0))
         transaction = b.ItemUseInventoryTransaction(
             transaction=b.InventoryTransaction(actions=[]),
             action_type=b.ItemUseInventoryTransaction.ActionType.PLACE,
@@ -56,7 +63,7 @@ class Containers:
             hand=b.HandSlot.MAINHAND,
             item=self.inventory.item_or_empty(self.inventory.selected_slot),
             from_pos=b.Vec3(x=x, y=y, z=z),
-            click_pos=b.Vec3(x=0.5, y=0.5, z=0.5),
+            click_pos=b.Vec3(x=0.5 + dx * 0.5, y=0.5 + dy * 0.5, z=0.5 + dz * 0.5),
             target_block_id=runtime_id,
             client_predicted_result=b.ItemUseInventoryTransaction.PredictedResult.SUCCESS,
             client_cooldown_state=b.ItemUseInventoryTransaction.ClientCooldownState.OFF,
