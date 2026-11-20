@@ -62,6 +62,7 @@ class JoinSession:
         self.player_unique_id = None
         self.spawned = False
         self.block_network_ids_are_hashes = False
+        self.item_names: dict[int, str] = {}
 
     @classmethod
     async def connect_nethernet(
@@ -144,6 +145,9 @@ class JoinSession:
                 response = binding.ResourcePackClientResponsePacket()
                 response.response = binding.ResourcePackClientResponsePacket.ResourcePackStackFinished()
                 await self.packets.send(response)
+            elif raw.packet_id == binding.ItemRegistryPacket.ID:
+                registry = self.packets.protocol.decode(raw)
+                self.item_names = {int(item.id): str(item.name) for item in registry.items}
             elif raw.packet_id == binding.StartGamePacket.ID:
                 game = self.packets.protocol.decode(raw)
                 self.player_id = int(game.runtime_id)
