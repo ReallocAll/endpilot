@@ -23,6 +23,18 @@ async def run(url: str) -> None:
         else:
             await bot.join_nethernet(url)
         print("spawned EndPilotTest", flush=True)
+        binding = bot.packets.protocol.binding
+
+        def observe_respawn(raw):
+            if raw.packet_id == binding.RespawnPacket.ID:
+                packet = bot.packets.protocol.decode(raw)
+                print("observed_respawn=" + json.dumps({
+                    "state": packet.state.name,
+                    "runtime_id": int(packet.runtime_id),
+                    "own_runtime_id": bot.player_id,
+                }), flush=True)
+
+        unsubscribe = bot.packets.subscribe_raw(observe_respawn)
         while True:
             command = (await asyncio.to_thread(sys.stdin.readline)).strip()
             if not command or command == "close":
