@@ -114,3 +114,43 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
             b.PlayerAuthInputPacket.InputData.HANDLED_TELEPORT,
             stream.sent[1].input_data,
         )
+
+    async def test_look_at_sets_packet_rotation_camera_and_forward_direction(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        stream = PacketSink(protocol)
+        movement = Movement(stream, 1)
+
+        teleport = b.MovePlayerPacket()
+        teleport.player_id = 1
+        teleport.pos = b.Vec3(x=0.5, y=101.62, z=0.5)
+        teleport.rot = b.Vec2(x=0.0, y=0.0)
+        teleport.y_head_rot = 0.0
+        teleport.riding_id = 0
+        teleport.teleport_data = None
+        teleport.tick = 0
+        movement._on_packet(protocol.encode(teleport))
+
+        pitch, yaw = await movement.look_at((-9.5, 101.62, 0.5))
+        self.assertAlmostEqual(pitch, 0.0)
+        self.assertAlmostEqual(yaw, 90.0)
+        await movement._send_input(True)
+        west = stream.sent[-1]
+        self.assertAlmostEqual(west.rot.y, 90.0)
+        self.assertAlmostEqual(west.y_head_rot, 90.0)
+        self.assertAlmostEqual(west.interact_rotation.y, 90.0)
+        self.assertAlmostEqual(west.camera_orientation.x, -1.0)
+        self.assertAlmostEqual(west.camera_orientation.y, 0.0)
+        self.assertAlmostEqual(west.camera_orientation.z, 0.0, places=5)
+        self.assertAlmostEqual(west.pos.x, 0.41, places=5)
+        self.assertAlmostEqual(west.pos.z, 0.5, places=5)
+        self.assertAlmostEqual(west.pos_delta.x, -0.09, places=5)
+        self.assertEqual(list(west.input_data), [b.PlayerAuthInputPacket.InputData.UP])
+        self.assertEqual(movement.position, (0.5, 101.62, 0.5))
+
+        await movement.look_at((0.41, 91.62, 0.5))
+        await movement._send_input(False)
+        down = stream.sent[-1]
+        self.assertAlmostEqual(down.rot.x, 90.0, places=5)
+        self.assertAlmostEqual(down.camera_orientation.y, -1.0, places=5)
+        self.assertEqual(list(down.input_data), [])

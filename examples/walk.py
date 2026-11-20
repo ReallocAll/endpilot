@@ -9,7 +9,7 @@ import time
 from endpilot import Bot
 
 
-async def main(url: str, name: str, ticks: int, hold: float):
+async def main(url: str, name: str, ticks: int, hold: float, look_west: bool):
     bot = Bot(name)
     try:
         if url.startswith("raknet://"):
@@ -38,12 +38,14 @@ async def main(url: str, name: str, ticks: int, hold: float):
         observed["movement_modes"].clear()
         observed["corrections"] = 0
         before = bot.position or await bot.wait_for_position_sync()
+        facing = await bot.look_at((before[0] - 10, before[1], before[2])) if look_west else None
         start = time.monotonic()
         submitted = await bot.walk_forward(ticks)
         elapsed_ms = round((time.monotonic() - start) * 1000, 2)
         print("walk_input_submitted=" + json.dumps({
             "frames": submitted, "elapsed_ms": elapsed_ms,
             "start": dict(zip(("x", "y", "z"), before)),
+            "facing": facing,
         }), flush=True)
         await asyncio.sleep(hold)
         print("walk_server_packets=" + json.dumps(observed), flush=True)
@@ -59,5 +61,6 @@ if __name__ == "__main__":
     parser.add_argument("--name", default="EndPilotTest")
     parser.add_argument("--ticks", type=int, default=24)
     parser.add_argument("--hold", type=float, default=4)
+    parser.add_argument("--look-west", action="store_true", help="Face west before walking")
     args = parser.parse_args()
-    asyncio.run(main(args.url, args.name, args.ticks, args.hold))
+    asyncio.run(main(args.url, args.name, args.ticks, args.hold, args.look_west))
