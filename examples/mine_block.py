@@ -19,6 +19,7 @@ async def run(url: str, position: tuple[int, int, int], face: int):
             await bot.join_nethernet(url)
         print("spawned EndPilotTest", flush=True)
         await asyncio.to_thread(sys.stdin.readline)
+        await bot.look_at((position[0] + 0.5, position[1] + 0.5, position[2] + 0.5))
         update = await bot.mine_block(position, face=face, timeout=15)
         print("mining_update=" + json.dumps({
             "position": update.position, "runtime_id": update.runtime_id,
