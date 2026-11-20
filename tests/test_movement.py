@@ -131,7 +131,8 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         teleport.tick = 0
         movement._on_packet(protocol.encode(teleport))
 
-        pitch, yaw = await movement.look_at((-9.5, 101.62, 0.5))
+        eye = movement.position
+        pitch, yaw = await movement.look_at((eye[0] - 10, eye[1], eye[2]))
         self.assertAlmostEqual(pitch, 0.0)
         self.assertAlmostEqual(yaw, 90.0)
         await movement._send_input(True)
