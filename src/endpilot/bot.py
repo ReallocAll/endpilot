@@ -1,7 +1,7 @@
 """Public player entry point; game state delegates to the relevant feature."""
 
 from .authentication import OfflineIdentity
-from .blocks import Blocks, BlockUpdate
+from .blocks import Blocks, BlockObservation, BlockUpdate
 from .chat import Chat, ChatMessage
 from .commands import Commands
 from .entities import Entities, EntityMovement, EntitySpawn, EntityState
@@ -42,13 +42,17 @@ class Bot:
     def _start_session(self, session: JoinSession) -> None:
         self._movement = Movement(session.packets, session.player_id)
         self._inventory = Inventory(session.packets, session.player_id)
-        self._blocks = Blocks(session.packets, self._movement, self._inventory)
+        self._blocks = Blocks(
+            session.packets, self._movement, self._inventory,
+            hashed_runtime_ids=session.block_network_ids_are_hashes,
+        )
         self._chat = Chat(session.packets, self.identity.name)
         self._commands = Commands(session.packets, self.identity.uuid, session.player_unique_id)
         self._entities = Entities(session.packets)
         self._player_state = PlayerState(session.packets, session.player_id)
         self._session = session
         self._entities.start()
+        self._blocks.start()
         self._movement.start()
 
     @property
@@ -79,6 +83,20 @@ class Bot:
         if self._blocks is None:
             raise RuntimeError("player has not joined")
         return await self._blocks.wait_for_update(position, layer=layer, timeout=timeout)
+
+    def observed_block(
+        self, position: tuple[int, int, int], *, layer: int = 0
+    ) -> BlockObservation | None:
+        """Last server-supplied block, or None until that position is known."""
+        if self._blocks is None:
+            raise RuntimeError("player has not joined")
+        return self._blocks.observed_block(position, layer=layer)
+
+    async def request_sub_chunk(self, position: tuple[int, int, int]) -> None:
+        """Ask BDS for the containing section; inspect observed_block afterwards."""
+        if self._blocks is None:
+            raise RuntimeError("player has not joined")
+        await self._blocks.request_sub_chunk(position)
 
     async def place_against(self, against: BlockUpdate, *, face: int = 1, slot: int = 0) -> int:
         if self._blocks is None:
@@ -163,7 +181,9 @@ class Bot:
         session, self._session = self._session, None
         movement, self._movement = self._movement, None
         inventory, self._inventory = self._inventory, None
-        self._blocks = None
+        blocks, self._blocks = self._blocks, None
+        if blocks is not None:
+            blocks.close()
         self._chat = None
         self._commands = None
         entities, self._entities = self._entities, None

@@ -61,6 +61,7 @@ class JoinSession:
         self.player_id = None
         self.player_unique_id = None
         self.spawned = False
+        self.block_network_ids_are_hashes = False
 
     @classmethod
     async def connect_nethernet(
@@ -147,6 +148,7 @@ class JoinSession:
                 game = self.packets.protocol.decode(raw)
                 self.player_id = int(game.runtime_id)
                 self.player_unique_id = int(game.entity_id)
+                self.block_network_ids_are_hashes = bool(game.block_network_ids_are_hashes)
                 radius = binding.RequestChunkRadiusPacket()
                 radius.chunk_radius = 8
                 radius.max_chunk_radius = 8

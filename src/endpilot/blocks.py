@@ -1,6 +1,11 @@
-"""Block updates and player-initiated placement against observed server blocks."""
+"""Block updates, observed sub-chunks and player-initiated placement."""
 
 from dataclasses import dataclass
+
+from .subchunks import SubChunk, parse_sub_chunk
+
+# Network hash of minecraft:air, as used by EndstoneMC/client.
+HASHED_AIR_RUNTIME_ID = 0xDBF44120
 
 
 @dataclass(frozen=True, slots=True)
@@ -10,11 +15,103 @@ class BlockUpdate:
     layer: int
 
 
+@dataclass(frozen=True, slots=True)
+class BlockObservation:
+    """Known server block. None from observed_block() instead means unknown terrain."""
+
+    position: tuple[int, int, int]
+    runtime_id: int | None
+    layer: int
+    is_air: bool | None
+
+
 class Blocks:
-    def __init__(self, packets, movement, inventory):
+    def __init__(self, packets, movement, inventory, *, hashed_runtime_ids: bool = False):
         self.packets = packets
         self.movement = movement
         self.inventory = inventory
+        self.hashed_runtime_ids = hashed_runtime_ids
+        self.dimension_id = 0
+        self._updates: dict[tuple[int, int, int, int], int] = {}
+        self._sub_chunks: dict[tuple[int, int, int], SubChunk | None] = {}
+        self._unsubscribe = None
+
+    def start(self) -> None:
+        self._unsubscribe = self.packets.subscribe_raw(self._on_packet)
+
+    def close(self) -> None:
+        if self._unsubscribe is not None:
+            self._unsubscribe()
+            self._unsubscribe = None
+
+    def _on_packet(self, raw) -> None:
+        b = self.packets.protocol.binding
+        if raw.packet_id == b.ChangeDimensionPacket.ID:
+            self.dimension_id = int(self.packets.protocol.decode(raw).dimension_id)
+            self._updates.clear()
+            self._sub_chunks.clear()
+        elif raw.packet_id == b.UpdateBlockPacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            pos = (int(packet.pos.x), int(packet.pos.y), int(packet.pos.z), int(packet.layer))
+            self._updates[pos] = int(packet.runtime_id)
+        elif raw.packet_id == b.UpdateSubChunkBlocksPacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            for layer, changes in enumerate((packet.blocks_changed.standards, packet.blocks_changed.extras)):
+                for change in changes:
+                    pos = (int(change.pos.x), int(change.pos.y), int(change.pos.z), layer)
+                    self._updates[pos] = int(change.runtime_id)
+        elif raw.packet_id == b.SubChunkPacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            if int(packet.dimension_type) != self.dimension_id:
+                return
+            center = packet.center_pos
+            for entry in packet.sub_chunk_data:
+                delta = entry.sub_chunk_pos_offset
+                key = (int(center.x) + int(delta.x),
+                       int(center.y) + int(delta.y), int(center.z) + int(delta.z))
+                if entry.result.name == "SUCCESS_ALL_AIR":
+                    self._set_sub_chunk(key, None)
+                elif entry.result.name == "SUCCESS" and entry.serialized_sub_chunk is not None:
+                    self._set_sub_chunk(key, parse_sub_chunk(entry.serialized_sub_chunk))
+
+    def _set_sub_chunk(self, key: tuple[int, int, int], chunk: SubChunk | None) -> None:
+        self._sub_chunks[key] = chunk
+        for pos in tuple(self._updates):
+            if (pos[0] >> 4, pos[1] >> 4, pos[2] >> 4) == key:
+                del self._updates[pos]
+
+    def observed_block(self, position: tuple[int, int, int], *, layer: int = 0) -> BlockObservation | None:
+        """Return the latest server observation, or None for unknown/unreceived terrain."""
+        x, y, z = position
+        runtime_id = self._updates.get((x, y, z, layer))
+        if runtime_id is None:
+            key = (x >> 4, y >> 4, z >> 4)
+            if key not in self._sub_chunks:
+                return None
+            chunk = self._sub_chunks[key]
+            if chunk is None:
+                if layer != 0:
+                    return None
+                runtime_id = HASHED_AIR_RUNTIME_ID if self.hashed_runtime_ids else None
+                return BlockObservation(position, runtime_id, layer, True)
+            runtime_id = chunk.get_block(x & 15, y & 15, z & 15, layer)
+            if runtime_id is None:
+                return None
+        return BlockObservation(
+            position, runtime_id, layer,
+            runtime_id == HASHED_AIR_RUNTIME_ID if self.hashed_runtime_ids else None,
+        )
+
+    async def request_sub_chunk(self, position: tuple[int, int, int]) -> None:
+        """Request the 16³ section containing position; submission is not a response."""
+        b = self.packets.protocol.binding
+        x, y, z = position
+        request = b.SubChunkRequestPacket(
+            dimension_type=self.dimension_id,
+            center_pos=b.SubChunkPos(x=x >> 4, y=0, z=z >> 4),
+            sub_chunk_pos_offsets=[b.SubChunkPacket.SubChunkPosOffset(x=0, y=y >> 4, z=0)],
+        )
+        await self.packets.send(request)
 
     async def wait_for_update(
         self, position: tuple[int, int, int], *, layer: int = 0, timeout: float = 15
