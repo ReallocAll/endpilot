@@ -185,6 +185,16 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._containers.wait_for_slots(timeout=timeout)
 
+    async def take_from_container(
+        self, source_slot: int, destination_slot: int, amount: int = 1, *, timeout: float = 15
+    ):
+        """Return the server's item-stack verdict; response slots update observed state."""
+        if self._containers is None:
+            raise RuntimeError("player has not joined")
+        return await self._containers.take_from_container(
+            source_slot, destination_slot, amount, timeout=timeout
+        )
+
     async def close_container(self, *, timeout: float = 15) -> ContainerWindow | None:
         """Close the active window; wait for the matching server close packet."""
         if self._containers is None:

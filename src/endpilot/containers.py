@@ -3,6 +3,8 @@
 import asyncio
 from dataclasses import dataclass
 
+from .inventory import _response_item
+
 
 _FACE_OFFSETS = {
     0: (0, -1, 0), 1: (0, 1, 0), 2: (0, 0, -1),
@@ -26,6 +28,7 @@ class Containers:
         self.window: ContainerWindow | None = None
         self._slots: dict[int, object] | None = None
         self._slots_updated = asyncio.Event()
+        self._next_request_id = -1
         self._unsubscribe = packets.subscribe_raw(self._on_packet)
 
     def _decode_open(self, raw) -> ContainerWindow:
@@ -163,6 +166,96 @@ class Containers:
             ))
             await pending
             return window
+        finally:
+            if not pending.done():
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+
+    async def take_from_container(
+        self, source_slot: int, destination_slot: int, amount: int = 1, *, timeout: float = 15
+    ):
+        """Take from the open block container into player inventory.
+
+        Return the matching server ItemStackResponseInfo (including rejection).
+        Only response-listed slots are reconciled; a request alone is not an effect.
+        """
+        window = self.window
+        if window is None or self._slots is None:
+            raise RuntimeError("container window or its server-reported slots are unavailable")
+        if not 0 <= source_slot <= 255 or not 0 <= destination_slot <= 255:
+            raise ValueError("item-stack request slots must fit in a byte")
+        if not 1 <= amount <= 255:
+            raise ValueError("item-stack request amount must be between 1 and 255")
+        source = self._slots.get(source_slot)
+        if source is None or int(source.id) == 0:
+            raise ValueError("source container slot has no observed item")
+
+        b = self.packets.protocol.binding
+        cereal = b.ItemStackRequestCereal
+        destination = self.inventory.item_or_empty(destination_slot)
+
+        def slot_info(name, slot, item):
+            return cereal.SlotInfoData(
+                full_container_name=b.FullContainerName(
+                    name=b.ContainerEnumName[name], dynamic_id=None,
+                ),
+                slot=slot,
+                net_id_variant=int(item.net_id_variant or 0),
+            )
+
+        request_id = self._next_request_id
+        self._next_request_id -= 2
+        request = b.ItemStackRequestPacketData.RequestData(
+            client_request_id=b.ItemStackRequestId(raw_id=request_id),
+            actions=[cereal.TakeActionData(
+                amount=amount,
+                source=slot_info("LEVEL_ENTITY_CONTAINER", source_slot, source),
+                destination=slot_info(
+                    "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", destination_slot, destination
+                ),
+            )],
+            strings_to_filter=[],
+            strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
+        )
+
+        def matches(raw):
+            packet = self.packets.protocol.decode(raw)
+            return any(
+                int(reply.client_request_id.raw_id) == request_id
+                for reply in packet.responses
+            )
+
+        pending = asyncio.create_task(self.packets.wait_for_packet(
+            b.ItemStackResponsePacket.ID, timeout=timeout, match=matches,
+        ))
+        try:
+            # Arm before sending; a server response can arrive in the same tick.
+            await asyncio.sleep(0)
+            await self.packets.send(b.ItemStackRequestPacket(requests=[request]))
+            packet = self.packets.protocol.decode(await pending)
+            response = next(
+                reply for reply in packet.responses
+                if int(reply.client_request_id.raw_id) == request_id
+            )
+            if response.result == b.ItemStackNetResult.SUCCESS:
+                for container in response.containers or ():
+                    name = container.full_container_name.name.name
+                    for slot in container.slots:
+                        index = int(slot.slot)
+                        if (name == "LEVEL_ENTITY_CONTAINER" and index == source_slot
+                                and self.window is window and self._slots is not None):
+                            previous = self._slots[source_slot]
+                            self._slots[source_slot] = _response_item(b, previous, source, slot)
+                            self._slots_updated.set()
+                        elif (name in (
+                                "HOTBAR_CONTAINER", "INVENTORY_CONTAINER",
+                                "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER",
+                        ) and index == destination_slot):
+                            current = self.inventory.item_or_empty(index)
+                            self.inventory._set_slot(
+                                index, _response_item(b, current, source, slot)
+                            )
+            return response
         finally:
             if not pending.done():
                 pending.cancel()
