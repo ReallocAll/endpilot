@@ -17,7 +17,7 @@ async def run(url: str, name: str):
 
             async def call(tool: str, **arguments):
                 result = await session.call_tool(tool, arguments=arguments)
-                if result.isError:
+                if result.is_error:
                     raise RuntimeError(f"MCP {tool}: {result.content}")
                 return result.structured_content or json.loads(result.content[0].text)
 
