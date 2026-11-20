@@ -73,7 +73,8 @@ class ArmorEquipTests(unittest.IsolatedAsyncioTestCase):
             request = sent.requests[0]
             self.assertEqual(int(request.client_request_id.raw_id), -1)
             action = request.actions[0]
-            self.assertIsInstance(action, b.ItemStackRequestCereal.SwapActionData)
+            self.assertIsInstance(action, b.ItemStackRequestCereal.PlaceActionData)
+            self.assertEqual(int(action.amount), 1)
             self.assertEqual(action.source.full_container_name.name,
                              b.ContainerEnumName.COMBINED_HOTBAR_AND_INVENTORY_CONTAINER)
             self.assertEqual(action.destination.full_container_name.name,
@@ -123,6 +124,10 @@ class ArmorEquipTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(int(inventory.armor_slots[0].id), 50)
             self.assertEqual(int(inventory.item_or_empty(2).id), 42)
             self.assertEqual(int(inventory.armor_slots[0].net_id_variant), 55)
+            sent = codec.decode(codec.encode(stream.send.await_args.args[0]))
+            self.assertIsInstance(
+                sent.requests[0].actions[0], b.ItemStackRequestCereal.SwapActionData,
+            )
         finally:
             inventory.close()
 
@@ -166,6 +171,9 @@ class ArmorEquipTests(unittest.IsolatedAsyncioTestCase):
             snapshot = inventory.armor_slots
             snapshot.clear()
             self.assertEqual(len(inventory.armor_slots), 2)
+            inventory_snapshot = inventory.slots
+            inventory_snapshot[3] = item(b, 42, 1)
+            self.assertEqual(inventory.slots, {})
             for src, dst in ((-1, 0), (256, 0), (0, -1), (0, 4)):
                 with self.assertRaises(ValueError):
                     await inventory.equip_armor(src, dst)

@@ -66,6 +66,14 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
             "open_window": bot.open_window is not None,
         }), flush=True)
         if equip_armor_slot is not None:
+            source = bot.inventory_slots.get(destination_slot)
+            previous = bot.armor_slots.get(equip_armor_slot)
+            print("armor_equip_before=" + json.dumps({
+                "inventory_item_id": None if source is None else int(source.id),
+                "inventory_net_id": None if source is None else source.net_id_variant,
+                "armor_item_id": None if previous is None else int(previous.id),
+                "armor_net_id": None if previous is None else previous.net_id_variant,
+            }), flush=True)
             response = await bot.equip_armor(destination_slot, equip_armor_slot)
             armor = bot.armor_slots.get(equip_armor_slot)
             print("armor_equip_response=" + json.dumps({

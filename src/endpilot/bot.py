@@ -160,6 +160,13 @@ class Bot:
 
 
     @property
+    def inventory_slots(self) -> dict[int, object]:
+        """Latest server-described player inventory slots."""
+        if self._inventory is None:
+            raise RuntimeError("bot is not joined")
+        return self._inventory.slots
+
+    @property
     def armor_slots(self) -> dict[int, object]:
         """Latest server-described armor slots; absent slots are not confirmed empty."""
         if self._inventory is None:

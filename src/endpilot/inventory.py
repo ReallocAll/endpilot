@@ -76,6 +76,11 @@ class Inventory:
                     self._armor_slots[int(action.slot)] = action.to_item_descriptor
 
     @property
+    def slots(self) -> dict[int, object]:
+        """Latest server-described inventory slots; missing slots are unknown."""
+        return dict(self._slots)
+
+    @property
     def armor_slots(self) -> dict[int, object]:
         """Latest server-described armor slots; missing slots are not observations."""
         return dict(self._armor_slots)
@@ -187,13 +192,25 @@ class Inventory:
                 net_id_variant=int(item.net_id_variant or 0),
             )
 
+        source_info = slot_info(
+            "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", source_slot, source,
+        )
+        destination_info = slot_info("ARMOR_CONTAINER", armor_slot, destination)
+        # Match client item-stack actions: place into an empty armor slot,
+        # swap when replacing an already equipped item.
+        placing = int(destination.id) == 0
+        action = (
+            cereal.PlaceActionData(
+                amount=1, source=source_info, destination=destination_info,
+            )
+            if placing else cereal.SwapActionData(
+                source=source_info, destination=destination_info,
+            )
+        )
         request_id = self._allocate_request_id()
         request = b.ItemStackRequestPacketData.RequestData(
             client_request_id=b.ItemStackRequestId(raw_id=request_id),
-            actions=[cereal.SwapActionData(
-                source=slot_info("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", source_slot, source),
-                destination=slot_info("ARMOR_CONTAINER", armor_slot, destination),
-            )],
+            actions=[action],
             strings_to_filter=[],
             strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
         )
@@ -228,7 +245,7 @@ class Inventory:
                         "HOTBAR_CONTAINER", "INVENTORY_CONTAINER",
                         "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER",
                     ) and index == source_slot:
-                        item = destination if success else source
+                        item = (source if placing else destination) if success else source
                         self._set_slot(index, _response_item(b, item, item, slot))
             return response
         finally:
