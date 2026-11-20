@@ -129,11 +129,19 @@ class Entities:
 
     async def attack(self, movement, inventory, runtime_id: int, *,
                      hit_height: float = 0.5) -> None:
-        """Submit one attack using the observed actor position when available.
+        """Submit an attack transaction; server damage is observed separately."""
+        await self._use_actor(movement, inventory, runtime_id,
+                              hit_height=hit_height, interact=False)
 
-        Uses the same ItemUseOnActor inventory transaction as EndstoneMC/client.
-        Completion means only that the packet was submitted, not server damage.
-        """
+    async def interact(self, movement, inventory, runtime_id: int, *,
+                       hit_height: float = 0.5) -> None:
+        """Submit a right-click actor transaction; no server effect is implied."""
+        await self._use_actor(movement, inventory, runtime_id,
+                              hit_height=hit_height, interact=True)
+
+    async def _use_actor(self, movement, inventory, runtime_id: int, *,
+                         hit_height: float, interact: bool) -> None:
+        """Use an ItemUseOnActor transaction with the selected item and position."""
         actor = self.get(runtime_id)
         slot = inventory.selected_slot
         item = inventory.item_or_empty(slot)
@@ -144,7 +152,8 @@ class Entities:
         action = b.ItemUseOnActorInventoryTransaction(
             transaction=b.InventoryTransaction(actions=[]),
             runtime_id=runtime_id,
-            action_type=b.ItemUseOnActorInventoryTransaction.ActionType.ATTACK,
+            action_type=(b.ItemUseOnActorInventoryTransaction.ActionType.INTERACT
+                         if interact else b.ItemUseOnActorInventoryTransaction.ActionType.ATTACK),
             slot=slot,
             item=item,
             from_pos=b.Vec3(x=x, y=y, z=z),
