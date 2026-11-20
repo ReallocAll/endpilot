@@ -2,6 +2,7 @@
 
 from .authentication import OfflineIdentity
 from .blocks import Blocks, BlockUpdate
+from .chat import Chat, ChatMessage
 from .inventory import Inventory
 from .login import JoinSession
 from .movement import Movement
@@ -16,6 +17,7 @@ class Bot:
         self._movement: Movement | None = None
         self._inventory: Inventory | None = None
         self._blocks: Blocks | None = None
+        self._chat: Chat | None = None
 
     async def join_nethernet(self, url: str, *, timeout: float = 30, server_key_sha256: str | None = None) -> None:
         if self._session is not None:
@@ -35,6 +37,7 @@ class Bot:
         self._movement = Movement(session.packets, session.player_id)
         self._inventory = Inventory(session.packets, session.player_id)
         self._blocks = Blocks(session.packets, self._movement, self._inventory)
+        self._chat = Chat(session.packets, self.identity.name)
         self._session = session
         self._movement.start()
 
@@ -72,6 +75,18 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._blocks.place_against(against, face=face, slot=slot)
 
+    async def send_chat(self, message: str) -> None:
+        """Submit a chat packet; server delivery is not implied."""
+        if self._chat is None:
+            raise RuntimeError("player has not joined")
+        await self._chat.send(message)
+
+    async def wait_for_chat(self, *, author: str | None = None, timeout: float = 15) -> ChatMessage:
+        """Wait for a new player chat relayed by the server."""
+        if self._chat is None:
+            raise RuntimeError("player has not joined")
+        return await self._chat.wait_for_message(author=author, timeout=timeout)
+
     async def wait_for_server_disconnect(self, timeout: float = 15):
         if self._session is None:
             raise RuntimeError("player has not joined")
@@ -89,6 +104,7 @@ class Bot:
         movement, self._movement = self._movement, None
         inventory, self._inventory = self._inventory, None
         self._blocks = None
+        self._chat = None
         if movement is not None:
             movement.close()
         if inventory is not None:
