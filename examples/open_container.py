@@ -33,6 +33,12 @@ async def run(url: str) -> None:
             "position": window.position, "entity_unique_id": window.entity_unique_id,
         }), flush=True)
         await asyncio.to_thread(sys.stdin.readline)
+        closed = await bot.close_container()
+        print("container_closed=" + json.dumps({
+            "id": None if closed is None else closed.container_id,
+            "open_window": bot.open_window is not None,
+        }), flush=True)
+        await asyncio.to_thread(sys.stdin.readline)
     finally:
         await bot.close()
     print("disconnected EndPilotTest", flush=True)
