@@ -1,4 +1,4 @@
-"""Run a permitted player command and observe the correlated server output."""
+"""Run a permitted command and observe real BDS text feedback."""
 
 import argparse
 import asyncio
@@ -20,26 +20,12 @@ async def run(url: str, command: str):
             await bot.join_nethernet(url)
         print("spawned EndPilotTest", flush=True)
         await asyncio.to_thread(sys.stdin.readline)
-        def observe(raw):
-            if raw.packet_id in (9, 79):
-                try:
-                    print("command_packet=" + repr(bot.protocol.decode(raw)), flush=True)
-                except Exception as error:
-                    print("command_packet_error=" + repr(error), flush=True)
-
-        unsubscribe = bot.packets.subscribe_raw(observe)
-        try:
-            packet = await bot.execute_command(command)
-        finally:
-            unsubscribe()
-        output = packet.output
-        print("command_result=" + json.dumps({
-            "success_count": int(output.success_count),
-            "messages": [
-                {"id": msg.message_id, "successful": bool(msg.successful), "params": list(msg.params)}
-                for msg in output.messages
-            ],
+        packet = await bot.execute_command(command)
+        print("command_feedback=" + json.dumps({
+            "type": int(packet.body.type), "message": packet.body.message,
         }), flush=True)
+        # Keep the player online while Testbed checks the server-side effect.
+        await asyncio.to_thread(sys.stdin.readline)
     finally:
         await bot.close()
     print("disconnected EndPilotTest", flush=True)
