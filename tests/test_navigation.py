@@ -38,7 +38,7 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
     async def test_detours_around_observed_obstacle_and_releases_input(self):
         stream = Sink()
         movement = Movement(stream, 1)
-        movement.position = movement._input_position = (0.5, 100.0, 0.5)
+        movement.position = movement._input_position = (0.5, 101.62, 0.5)
         movement._updated.set()
         blocks = BlocksSnapshot(blocked={(1, 100, 0), (1, 101, 0)})
         count = await movement.navigate_to(blocks, (3, 100, 0), ticks=100)
@@ -56,12 +56,12 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
                             for p in moving))
         self.assertAlmostEqual(stream.sent[-1].pos.x, 3.5, delta=0.15)
         self.assertAlmostEqual(stream.sent[-1].pos.z, 0.5, delta=0.15)
-        self.assertEqual(movement.position, (0.5, 100.0, 0.5))
+        self.assertEqual(movement.position, (0.5, 101.62, 0.5))
 
     async def test_unknown_terrain_never_becomes_air_or_input(self):
         stream = Sink()
         movement = Movement(stream, 1)
-        movement.position = movement._input_position = (0.5, 100.0, 0.5)
+        movement.position = movement._input_position = (0.5, 101.62, 0.5)
         movement._updated.set()
         blocks = BlocksSnapshot(unknown={(1, 100, 0), (0, 100, 1),
                                          (0, 100, -1), (-1, 100, 0)})
@@ -72,7 +72,7 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
     async def test_explicit_stop_releases_navigation_and_allows_new_walk(self):
         stream = Sink()
         movement = Movement(stream, 1)
-        movement.position = movement._input_position = (0.5, 100.0, 0.5)
+        movement.position = movement._input_position = (0.5, 101.62, 0.5)
         movement._updated.set()
         task = asyncio.create_task(movement.navigate_to(
             BlocksSnapshot(), (5, 100, 0), ticks=160

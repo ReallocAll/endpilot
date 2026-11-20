@@ -250,7 +250,8 @@ class Movement:
             if self._input_position is None:
                 await self.wait_for_position_sync()
             x, y, z = self._input_position
-            feet_y = math.floor(y)
+            # PlayerAuthInput/MovePlayer positions are eye-high (EndstoneMC/client).
+            feet_y = math.floor(y - 1.62 + 0.001)
             if math.floor(target[1]) != feet_y:
                 raise ValueError("flat navigation cannot change elevation")
             start = (math.floor(x), math.floor(z))
