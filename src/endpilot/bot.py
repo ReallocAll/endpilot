@@ -448,6 +448,16 @@ class Bot:
             source_slot, amount, ingredient=ingredient, timeout=timeout
         )
 
+    async def unstage_trade_ingredient(
+        self, destination_slot: int, *, ingredient: int = 1, timeout: float = 15
+    ):
+        """Return a staged trade input to inventory; await the BDS stack response."""
+        if self._trading is None:
+            raise RuntimeError("player has not joined")
+        return await self._trading.unstage_ingredient(
+            destination_slot, ingredient=ingredient, timeout=timeout
+        )
+
     async def collect_drop(
         self, runtime_id: int, *, ticks: int = 120, timeout: float = 15
     ) -> EntityState:
