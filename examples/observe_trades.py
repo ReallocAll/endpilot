@@ -91,23 +91,16 @@ async def run(url: str, *, interrupt: bool = False) -> None:
         if record["after"] != before - selected.buy_a.count:
             raise AssertionError(f"BDS inventory count mismatch: {record}")
         if interrupt:
-            # Arm before Testbed removes the villager; the close is server-originated.
-            close_waiter = asyncio.create_task(bot.wait_for_container_close(timeout=15))
-            try:
-                await asyncio.sleep(0)
-                print("trade_interrupt_watch_ready", flush=True)
-                await asyncio.to_thread(sys.stdin.readline)
-                closed = await close_waiter
-            finally:
-                if not close_waiter.done():
-                    close_waiter.cancel()
-                    await asyncio.gather(close_waiter, return_exceptions=True)
-            if (not closed.server_initiated_close
-                    or int(closed.container_id) != offers.window_id
+            # A villager's death does not necessarily close the trade UI on BDS.
+            # Explicitly cancel this staged exchange and await the server close reply.
+            print("trade_abort_ready", flush=True)
+            await asyncio.to_thread(sys.stdin.readline)
+            closed = await bot.close_container()
+            if (closed is None or closed.container_id != offers.window_id
                     or bot.open_window is not None):
-                raise AssertionError("BDS did not close the active trade window")
+                raise AssertionError("BDS did not acknowledge the trade cancellation")
 
-            # A stale recipe must not submit another stack request after the close.
+            # The closed window must reject stale offers without another request.
             try:
                 await bot.execute_trade(selected.recipe_net_id, 9)
             except RuntimeError as error:
@@ -118,11 +111,11 @@ async def run(url: str, *, interrupt: bool = False) -> None:
             deadline = asyncio.get_running_loop().time() + 15
             while bot.inventory_count(int(source.id)) < before:
                 if asyncio.get_running_loop().time() >= deadline:
-                    raise AssertionError("the interrupted ingredient was not returned")
+                    raise AssertionError("the cancelled ingredient was not returned")
                 await asyncio.sleep(0.1)
-            print("trade_interrupted=" + json.dumps({
-                "window_id": int(closed.container_id),
-                "server_initiated": bool(closed.server_initiated_close),
+            print("trade_aborted=" + json.dumps({
+                "window_id": closed.container_id,
+                "close_acknowledged": True,
                 "open_window": bot.open_window is not None,
                 "item_id": int(source.id),
                 "restored_count": bot.inventory_count(int(source.id)),
@@ -166,6 +159,6 @@ async def run(url: str, *, interrupt: bool = False) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("url", help="NetherNet HTTP URL or raknet://host:port")
-    parser.add_argument("--interrupt", action="store_true", help="inspect a BDS-interrupted trade")
+    parser.add_argument("--interrupt", action="store_true", help="cancel a staged trade and inspect returned inventory")
     args = parser.parse_args()
     asyncio.run(run(args.url, interrupt=args.interrupt))
