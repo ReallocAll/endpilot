@@ -65,6 +65,7 @@ class JoinSession:
         self.item_names: dict[int, str] = {}
         self.crafting_data_packets = []
         self.inventory_packets = []
+        self.entity_packets = []
 
     @classmethod
     async def connect_nethernet(
@@ -154,6 +155,14 @@ class JoinSession:
                 # Initial inventory can arrive before PlayStatus spawn; hand it
                 # to Inventory in the original wire order after joining.
                 self.inventory_packets.append(raw)
+            elif raw.packet_id in (
+                binding.AddActorPacket.ID, binding.AddItemActorPacket.ID,
+                binding.MoveActorAbsolutePacket.ID, binding.MoveActorDeltaPacket.ID,
+                binding.RemoveActorPacket.ID, binding.TakeItemActorPacket.ID,
+                binding.ChangeDimensionPacket.ID,
+            ):
+                # Entities may be sent before PlayStatus spawn on reconnect.
+                self.entity_packets.append(raw)
             elif raw.packet_id == binding.ItemRegistryPacket.ID:
                 registry = self.packets.protocol.decode(raw)
                 self.item_names = {int(item.id): str(item.name) for item in registry.items}
