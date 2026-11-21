@@ -214,7 +214,7 @@ class TradingTests(unittest.IsolatedAsyncioTestCase):
             b"trade": SimpleNamespace(
                 container_id=5, type=b.ContainerType.TRADE, entity_unique_id=42,
             ),
-            b"close": SimpleNamespace(container_id=5),
+            b"close": SimpleNamespace(container_id=5, server_initiated_close=False),
         }
         packets = SimpleNamespace(
             protocol=SimpleNamespace(binding=b, decode=lambda raw: replies[raw.body]),
