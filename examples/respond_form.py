@@ -25,9 +25,15 @@ async def answer_next_action_form(bot: Bot, button_index: int, *, timeout: float
     form = json.loads(request.form_json)
     if form.get("type") != "form":
         raise ValueError("expected a server action form")
-    buttons = form.get("buttons", [])
+    if "elements" in form:
+        button_count = sum(
+            1 for element in form["elements"]
+            if isinstance(element, dict) and element.get("type") == "button"
+        )
+    else:
+        button_count = len(form.get("buttons", []))
     if (isinstance(button_index, bool) or not isinstance(button_index, int)
-            or not 0 <= button_index < len(buttons)):
+            or not 0 <= button_index < button_count):
         raise ValueError("button index is outside the server's action form")
 
     await bot.packets.send(binding.ModalFormResponsePacket(
