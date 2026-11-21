@@ -80,6 +80,33 @@ class TradingTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(TimeoutError):
             await Trading(packets, entities, None, None).open(7)
 
+    async def test_native_nbt_recipe_uses_upstream_map_and_list_bindings(self):
+        from bedrock_protocol import nbt
+        from endpilot.trading import _read_offers
+
+        def item(name, count):
+            tag = nbt.CompoundTag()
+            tag["Name"] = nbt.StringTag(name)
+            tag["Count"] = nbt.ByteTag(count)
+            return tag
+
+        recipe = nbt.CompoundTag()
+        recipe["netId"] = nbt.IntTag(17)
+        recipe["buyA"] = item("minecraft:wheat", 20)
+        recipe["sell"] = item("minecraft:emerald", 1)
+        recipe["uses"] = nbt.IntTag(2)
+        recipe["maxUses"] = nbt.IntTag(16)
+        data = nbt.CompoundTag()
+        data["Recipes"] = nbt.ListTag([recipe], int(nbt.Type.COMPOUND))
+        packet = SimpleNamespace(
+            container_id=5, entity_unique_id=42, display_name="Farmer",
+            trader_tier=1, data=data,
+        )
+        observed = _read_offers(packet)
+        self.assertEqual(len(observed.offers), 1)
+        self.assertEqual(observed.offers[0].buy_a, TradeItem("minecraft:wheat", 20))
+        self.assertEqual(observed.offers[0].sell, TradeItem("minecraft:emerald", 1))
+
     async def test_update_trade_opens_and_closes_container_window(self):
         b = Protocol(2193).binding
         observers = []
