@@ -160,6 +160,12 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._movement.set_sneaking(sneaking)
 
+    async def jump(self) -> int:
+        """Submit a jump press; return its tick, not confirmed server movement."""
+        if self._movement is None:
+            raise RuntimeError("player has not joined")
+        return await self._movement.jump()
+
     async def stop_moving(self) -> None:
         """Stop an active walk/follow, waiting for its input to be released."""
         if self._movement is None:

@@ -15,6 +15,9 @@ class Movement:
         self._tick = 1
         self._teleport_pending = False
         self._sneaking = False
+        self._jump_floor_y: float | None = None
+        self._jump_velocity = 0.0
+        self._jump_was_pressed = False
         self._updated = asyncio.Event()
         self._unsubscribe = None
         self._action_lock = asyncio.Lock()
@@ -36,6 +39,8 @@ class Movement:
                 return
             if int(packet.reset_position) == 2:
                 self._teleport_pending = True
+                self._jump_floor_y = None
+                self._jump_velocity = 0.0
         elif raw.packet_id == b.CorrectPlayerMovePredictionPacket.ID:
             packet = self.packets.protocol.decode(raw)
             if int(packet.prediction_type) != 0:
@@ -46,6 +51,8 @@ class Movement:
             packet = self.packets.protocol.decode(raw)
             if packet.state != b.PlayerRespawnState.READY_TO_SPAWN:
                 return
+            self._jump_floor_y = None
+            self._jump_velocity = 0.0
         else:
             return
         self.position = (float(packet.pos.x), float(packet.pos.y), float(packet.pos.z))
@@ -70,7 +77,7 @@ class Movement:
         return self._rotation
 
     async def _send_input(self, forward: bool, item_use_transaction=None, block_actions=(),
-                          sneak_changed: bool = False):
+                          sneak_changed: bool = False, jump_pressed: bool = False):
         """Submit one predicted frame; only a later server observation proves acceptance."""
         b = self.packets.protocol.binding
         x, y, z = self._input_position
@@ -81,7 +88,21 @@ class Movement:
         scale = 0.3 if self._sneaking else 1.0
         step = 0.09 * scale if forward else 0.0
         dx, dz = -math.sin(y_rad) * step, math.cos(y_rad) * step
-        next_pos = (x + dx, y, z + dz)
+        # Grounded jump follows the upstream client's vertical travel:
+        # 0.42 launch velocity, then gravity 0.08 and vertical drag 0.98.
+        if jump_pressed and self._jump_floor_y is None:
+            self._jump_floor_y = y
+            self._jump_velocity = 0.42
+        next_y = y
+        if self._jump_floor_y is not None:
+            next_y = max(self._jump_floor_y, y + self._jump_velocity)
+            if next_y <= self._jump_floor_y:
+                self._jump_floor_y = None
+                self._jump_velocity = 0.0
+            else:
+                self._jump_velocity = (self._jump_velocity - 0.08) * 0.98
+        dy = next_y - y
+        next_pos = (x + dx, next_y, z + dz)
         movement = b.Vec2(x=0.0, y=scale if forward else 0.0)
         flags = [b.PlayerAuthInputPacket.InputData.UP] if forward else []
         if self._sneaking:
@@ -91,6 +112,19 @@ class Movement:
                 b.PlayerAuthInputPacket.InputData.SNEAK_CURRENT_RAW,
                 b.PlayerAuthInputPacket.InputData.WANT_DOWN,
             ))
+        if jump_pressed:
+            flags.extend((
+                b.PlayerAuthInputPacket.InputData.JUMPING,
+                b.PlayerAuthInputPacket.InputData.JUMP_DOWN,
+                b.PlayerAuthInputPacket.InputData.JUMP_CURRENT_RAW,
+                b.PlayerAuthInputPacket.InputData.WANT_UP,
+                b.PlayerAuthInputPacket.InputData.JUMP_PRESSED_RAW,
+            ))
+            if dy > 0 and self._jump_floor_y is not None and y == self._jump_floor_y:
+                flags.append(b.PlayerAuthInputPacket.InputData.START_JUMPING)
+        elif self._jump_was_pressed:
+            flags.append(b.PlayerAuthInputPacket.InputData.JUMP_RELEASED_RAW)
+        self._jump_was_pressed = jump_pressed
         if sneak_changed:
             flags.extend((
                 (b.PlayerAuthInputPacket.InputData.START_SNEAKING,
@@ -116,7 +150,7 @@ class Movement:
             new_interaction_model=b.NewInteractionModel.CROSSHAIR,
             interact_rotation=b.Vec2(x=pitch, y=yaw),
             client_tick=self._tick,
-            pos_delta=b.Vec3(x=dx, y=0.0, z=dz),
+            pos_delta=b.Vec3(x=dx, y=dy, z=dz),
             item_use_transaction=item_use_transaction,
             item_stack_request=None,
             player_block_actions=[
@@ -164,6 +198,17 @@ class Movement:
             changed = self._sneaking != sneaking
             self._sneaking = sneaking
             return await self._send_input(False, sneak_changed=changed)
+
+    async def jump(self) -> int:
+        """Submit a one-tick jump press and predicted vertical motion.
+
+        Return the submitted tick, not proof of BDS displacement. The idle
+        input stream continues the trajectory and releases the press.
+        """
+        async with self._action_lock:
+            if self._input_position is None:
+                await self.wait_for_position_sync()
+            return await self._send_input(False, jump_pressed=True)
 
     async def stop_moving(self) -> None:
         """Stop the currently active walk/follow and wait for its release frames."""
