@@ -53,6 +53,48 @@ class PlayerStateTests(unittest.IsolatedAsyncioTestCase):
         state.close()
         self.assertEqual(observers, [])
 
+    async def test_hunger_updates_only_from_local_player(self):
+        b = Protocol(2193).binding
+        decoded = {
+            b"other": SimpleNamespace(runtime_id=99, attribute_data=[
+                SimpleNamespace(name="minecraft:player.hunger", current_value=6),
+            ]),
+            b"health": SimpleNamespace(runtime_id=7, attribute_data=[
+                SimpleNamespace(name="minecraft:health", current_value=15),
+            ]),
+            b"hunger": SimpleNamespace(runtime_id=7, attribute_data=[
+                SimpleNamespace(name="minecraft:player.hunger", current_value=17),
+            ]),
+        }
+        observers = []
+        packets = SimpleNamespace(
+            protocol=SimpleNamespace(binding=b, decode=lambda raw: decoded[raw.body]),
+            subscribe_raw=lambda callback: (
+                observers.append(callback) or (lambda: observers.remove(callback))
+            ),
+            wait_for_packet=AsyncMock(),
+        )
+        state = PlayerState(packets, 7)
+        self.assertIsNone(state.hunger)
+        observers[0](RawPacket(b.UpdateAttributesPacket.ID, b"other"))
+        observers[0](RawPacket(b.UpdateAttributesPacket.ID, b"health"))
+        self.assertIsNone(state.hunger)
+        observers[0](RawPacket(b.UpdateAttributesPacket.ID, b"hunger"))
+        self.assertEqual(state.hunger, 17.0)
+
+        async def wait(packet_id, *, timeout, match):
+            self.assertEqual(packet_id, b.UpdateAttributesPacket.ID)
+            self.assertEqual(timeout, 3)
+            self.assertFalse(match(RawPacket(b.UpdateAttributesPacket.ID, b"other")))
+            self.assertFalse(match(RawPacket(b.UpdateAttributesPacket.ID, b"health")))
+            self.assertTrue(match(RawPacket(b.UpdateAttributesPacket.ID, b"hunger")))
+            return RawPacket(b.UpdateAttributesPacket.ID, b"hunger")
+
+        packets.wait_for_packet.side_effect = wait
+        self.assertEqual(await state.wait_for_hunger_update(timeout=3), 17.0)
+        state.close()
+        self.assertEqual(observers, [])
+
     async def test_respawn_uses_server_ready_position_then_acknowledges(self):
         from endpilot.movement import Movement
 

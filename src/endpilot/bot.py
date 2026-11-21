@@ -291,6 +291,18 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._player_state.wait_for_health_update(timeout)
 
+    @property
+    def hunger(self) -> float | None:
+        """Latest server-reported food level, or None until observed."""
+        if self._player_state is None:
+            raise RuntimeError("player has not joined")
+        return self._player_state.hunger
+
+    async def wait_for_hunger_update(self, timeout: float = 15) -> float:
+        if self._player_state is None:
+            raise RuntimeError("player has not joined")
+        return await self._player_state.wait_for_hunger_update(timeout)
+
     async def respawn(self, *, timeout: float = 15) -> tuple[float, float, float]:
         """Request respawn and acknowledge the server-provided spawn position."""
         if self._player_state is None:

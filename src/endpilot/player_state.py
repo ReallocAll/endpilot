@@ -1,4 +1,4 @@
-"""Server-reported health and respawn for the local player."""
+"""Server-reported health, hunger and respawn for the local player."""
 
 import asyncio
 
@@ -8,6 +8,7 @@ class PlayerState:
         self.packets = packets
         self.runtime_id = int(runtime_id)
         self.health: float | None = None
+        self.hunger: float | None = None
         self._respawn_searching = asyncio.Event()
         self._unsubscribe = packets.subscribe_raw(self._on_packet)
 
@@ -25,6 +26,18 @@ class PlayerState:
                 return float(attribute.current_value)
         return None
 
+    def _read_hunger(self, raw) -> float | None:
+        b = self.packets.protocol.binding
+        if raw.packet_id != b.UpdateAttributesPacket.ID:
+            return None
+        packet = self.packets.protocol.decode(raw)
+        if int(packet.runtime_id) != self.runtime_id:
+            return None
+        for attribute in packet.attribute_data:
+            if str(attribute.name) == "minecraft:player.hunger":
+                return float(attribute.current_value)
+        return None
+
     def _on_packet(self, raw) -> None:
         b = self.packets.protocol.binding
         if raw.packet_id == b.RespawnPacket.ID:
@@ -38,6 +51,9 @@ class PlayerState:
         value = self._read_health(raw)
         if value is not None:
             self.health = value
+        hunger = self._read_hunger(raw)
+        if hunger is not None:
+            self.hunger = hunger
 
     async def wait_for_health_update(self, timeout: float = 15) -> float:
         """Return the next server health update, not a locally predicted value."""
@@ -48,6 +64,16 @@ class PlayerState:
             match=lambda packet: self._read_health(packet) is not None,
         )
         return self._read_health(raw)
+
+    async def wait_for_hunger_update(self, timeout: float = 15) -> float:
+        """Return the next server-provided local-player hunger value."""
+        b = self.packets.protocol.binding
+        raw = await self.packets.wait_for_packet(
+            b.UpdateAttributesPacket.ID,
+            timeout=timeout,
+            match=lambda packet: self._read_hunger(packet) is not None,
+        )
+        return self._read_hunger(raw)
 
     async def respawn(self, *, timeout: float = 15) -> tuple[float, float, float]:
         """Press Respawn, await the server's spawn point, then acknowledge it.
