@@ -304,15 +304,17 @@ class Recipes:
 
     async def stage_grid(self, source_slot: int, grid_slot: int, amount: int = 1, *,
                          timeout: float = 15):
-        """Place an observed inventory item into the player 2x2 crafting grid.
+        """Place an observed inventory item into the active 2x2 or workbench 3x3 grid.
 
         Return the matching BDS ItemStackResponse. Grid state comes from the
         player UI packets or the server's corrected request slots.
         """
         if self.containers is None or self.containers.window is None:
             raise RuntimeError("open the inventory screen before staging crafting inputs")
-        if not 28 <= grid_slot <= 31:
-            raise ValueError("player 2x2 grid slots are 28 through 31")
+        grid_slots = (range(32, 41) if self.containers.window.container_type == "WORKBENCH"
+                      else range(28, 32))
+        if grid_slot not in grid_slots:
+            raise ValueError(f"active crafting grid slots are {grid_slots.start} through {grid_slots.stop - 1}")
         if not 0 <= source_slot <= 255:
             raise ValueError("source slot must fit in a byte")
         if not 1 <= amount <= 255:
@@ -386,7 +388,7 @@ class Recipes:
 
     async def craft_grid(self, recipe_id: str | int, destination_slot: int, *,
                          times: int = 1, timeout: float = 15):
-        """Craft from the observed 2x2 grid; return BDS's response, not a prediction.
+        """Craft from the observed 2x2 or workbench 3x3 grid; return BDS's response.
 
         Uses the upstream CraftRecipe/CraftResults/Consume/Place sequence.
         The server decides whether the staged layout matches the chosen recipe.
@@ -405,12 +407,14 @@ class Recipes:
         output = recipe.results[0]
         if not 1 <= output.count * times <= 255:
             raise ValueError("result stack count must fit in a byte")
+        grid_slots = (range(32, 41) if self.containers.window.container_type == "WORKBENCH"
+                      else range(28, 32))
         grid = {
             slot: item for slot, item in self._grid_slots.items()
-            if 28 <= slot <= 31 and int(item.id) != 0
+            if slot in grid_slots and int(item.id) != 0
         }
         if not grid:
-            raise ValueError("no observed crafting ingredients in the 2x2 grid")
+            raise ValueError("no observed crafting ingredients in the active grid")
         b = self.packets.protocol.binding
         cereal = b.ItemStackRequestCereal
 
