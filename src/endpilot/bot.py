@@ -10,6 +10,7 @@ from .inventory import Inventory
 from .login import JoinSession
 from .movement import Movement
 from .player_state import PlayerState
+from .trading import Trading, TradeOffers
 from .protocol import Protocol
 
 
@@ -26,6 +27,7 @@ class Bot:
         self._commands: Commands | None = None
         self._entities: Entities | None = None
         self._player_state: PlayerState | None = None
+        self._trading: Trading | None = None
 
     async def join_nethernet(self, url: str, *, timeout: float = 30, server_key_sha256: str | None = None) -> None:
         if self._session is not None:
@@ -53,6 +55,7 @@ class Bot:
         self._commands = Commands(session.packets, self.identity.uuid, session.player_unique_id)
         self._entities = Entities(session.packets, item_names=session.item_names)
         self._player_state = PlayerState(session.packets, session.player_id)
+        self._trading = Trading(session.packets, self._entities, self._movement, self._inventory)
         self._session = session
         self._entities.start()
         self._blocks.start()
@@ -337,6 +340,12 @@ class Bot:
         await self._entities.interact(self._movement, self._inventory, runtime_id,
                                       hit_height=hit_height)
 
+    async def open_trade(self, runtime_id: int, *, timeout: float = 15) -> TradeOffers:
+        """Interact with an observed actor and return its server-issued trade offers."""
+        if self._trading is None:
+            raise RuntimeError("player has not joined")
+        return await self._trading.open(runtime_id, timeout=timeout)
+
     async def collect_drop(
         self, runtime_id: int, *, ticks: int = 120, timeout: float = 15
     ) -> EntityState:
@@ -401,6 +410,7 @@ class Bot:
         self._commands = None
         entities, self._entities = self._entities, None
         player_state, self._player_state = self._player_state, None
+        self._trading = None
         if player_state is not None:
             player_state.close()
         if entities is not None:
