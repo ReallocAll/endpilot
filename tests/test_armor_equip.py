@@ -325,7 +325,7 @@ class ArmorEquipTests(unittest.IsolatedAsyncioTestCase):
                     await inventory.equip_armor(src, dst)
             with self.assertRaises(ValueError):
                 await inventory.equip_armor(0, 0)
-            for armor, dst in ((-1, 2), (4, 2), (0, -1), (0, 256), (0, 2)):
+            for armor, dst in ((-1, 2), (4, 2), (0, -1), (0, 256), (1, 2)):
                 with self.assertRaises(ValueError):
                     await inventory.unequip_armor(armor, dst)
             stream.send.assert_not_awaited()
