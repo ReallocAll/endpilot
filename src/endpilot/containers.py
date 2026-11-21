@@ -326,24 +326,31 @@ class Containers:
                 reply for reply in packet.responses
                 if int(reply.client_request_id.raw_id) == request_id
             )
-            # Apply reported slot corrections on rejection too, matching the
-            # upstream client; a request alone does not establish an effect.
+            # A reply can correct other slots as well as the action's endpoints.
+            # The response carries amounts/net IDs, not item types: unknown
+            # nonempty slots stay unknown until an inventory packet identifies them.
+            container_name = _container_slot_name(window, chest_slot)
+            empty = self.inventory.item_or_empty(-1)
             for container in response.containers or ():
                 name = container.full_container_name.name.name
                 for slot in container.slots:
                     index = int(slot.slot)
-                    if (name == _container_slot_name(window, chest_slot) and index == chest_slot
-                            and self.window is window and self._slots is not None):
-                        previous = self._slots.get(index) or self.inventory.item_or_empty(-1)
-                        self._slots[index] = _response_item(b, previous, source, slot)
+                    if name == container_name and self.window is window and self._slots is not None:
+                        previous = self._slots.get(index) or empty
+                        fallback = source if index == chest_slot else previous
+                        if int(slot.amount) > 0 and int(previous.id) == int(fallback.id) == 0:
+                            self._slots.pop(index, None)
+                        else:
+                            self._slots[index] = _response_item(b, previous, fallback, slot)
                         self._slots_updated.set()
-                    elif (name in (
-                            "HOTBAR_CONTAINER", "INVENTORY_CONTAINER", player_name,
-                    ) and index == player_slot):
-                        current = self.inventory.item_or_empty(index)
-                        self.inventory._set_slot(
-                            index, _response_item(b, current, source, slot)
+                    elif name in ("HOTBAR_CONTAINER", "INVENTORY_CONTAINER", player_name):
+                        previous = self.inventory.item_or_empty(index)
+                        fallback = source if index == player_slot else previous
+                        updated = (
+                            None if int(slot.amount) > 0 and int(previous.id) == int(fallback.id) == 0
+                            else _response_item(b, previous, fallback, slot)
                         )
+                        self.inventory._set_slot(index, updated)
             return response
         finally:
             if not pending.done():

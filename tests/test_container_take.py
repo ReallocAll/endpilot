@@ -155,7 +155,10 @@ class TakeContainerTests(unittest.IsolatedAsyncioTestCase):
                 containers=[
                     container("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 2, 2 if corrected else 1, 21),
                     container("LEVEL_ENTITY_CONTAINER", 0, 2 if corrected else 3, 17),
-                    container("LEVEL_ENTITY_CONTAINER", 4, 99, 33),
+                    container("LEVEL_ENTITY_CONTAINER", 4, 5, 33),
+                    container("LEVEL_ENTITY_CONTAINER", 6, 1, 123),
+                    container("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 7, 6, 77),
+                    container("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 8, 1, 124),
                 ] if accepted or corrected else None,
             )
 
@@ -186,9 +189,10 @@ class TakeContainerTests(unittest.IsolatedAsyncioTestCase):
         inventory = Inventory(packets, 11)
         containers = Containers(packets, None, inventory)
         containers.window = ContainerWindow(2, "CONTAINER", (1, 100, 0), -1)
-        containers._slots = {0: item(b, 3, 2, 17), 4: item(b)}
+        containers._slots = {0: item(b, 3, 2, 17), 4: item(b, 5, 8, 99), 6: item(b)}
         inventory._set_slot(2, item(b, 3, 2, 21))
         inventory._set_slot(7, item(b, 5, 8, 99))
+        inventory._set_slot(8, item(b))
         try:
             first = await containers.put_into_container(2, 0, 1, timeout=3)
             self.assertEqual(first.result.name, "SUCCESS")
@@ -207,8 +211,13 @@ class TakeContainerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(int(action.destination.net_id_variant), 17)
             self.assertEqual((int(containers.slots[0].id), int(containers.slots[0].stack_size)), (3, 3))
             self.assertEqual((int(inventory.item_or_empty(2).id), int(inventory.item_or_empty(2).stack_size)), (3, 1))
-            self.assertEqual(int(containers.slots[4].id), 0)
-            self.assertEqual(int(inventory.item_or_empty(7).stack_size), 8)
+            self.assertEqual((int(containers.slots[4].id), int(containers.slots[4].stack_size),
+                              int(containers.slots[4].net_id_variant)), (5, 5, 33))
+            self.assertEqual((int(inventory.item_or_empty(7).id),
+                              int(inventory.item_or_empty(7).stack_size),
+                              int(inventory.item_or_empty(7).net_id_variant)), (5, 6, 77))
+            self.assertNotIn(6, containers.slots)
+            self.assertNotIn(8, inventory.slots)
 
             rejected = await containers.put_into_container(2, 0, 1, timeout=3)
             self.assertEqual(rejected.result.name, "ERROR")
@@ -216,7 +225,8 @@ class TakeContainerTests(unittest.IsolatedAsyncioTestCase):
             # A rejected request can still correct stale local slot counts.
             self.assertEqual(int(containers.slots[0].stack_size), 2)
             self.assertEqual(int(inventory.item_or_empty(2).stack_size), 2)
-            self.assertEqual(int(containers.slots[4].id), 0)
+            self.assertEqual(int(containers.slots[4].stack_size), 5)
+            self.assertEqual(int(inventory.item_or_empty(7).stack_size), 6)
         finally:
             containers.close()
             inventory.close()
