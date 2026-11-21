@@ -257,6 +257,74 @@ class Inventory:
                 pending.cancel()
                 await asyncio.gather(pending, return_exceptions=True)
 
+
+    async def drop_item(self, slot: int, amount: int = 1, *, timeout: float = 15):
+        """Drop part of an observed inventory stack; return the matching BDS verdict.
+
+        Inventory state changes only through server response slots or later
+        inventory packets. A successful reply is not proof of a visible drop.
+        """
+        if not 0 <= slot <= 255:
+            raise ValueError("slot must fit in a byte")
+        if not 1 <= amount <= 255:
+            raise ValueError("amount must be between 1 and 255")
+        source = self._slots.get(slot)
+        if source is None or int(source.id) == 0:
+            raise ValueError("slot has no observed item")
+
+        b = self.packets.protocol.binding
+        cereal = b.ItemStackRequestCereal
+        request_id = self._allocate_request_id()
+        request = b.ItemStackRequestPacketData.RequestData(
+            client_request_id=b.ItemStackRequestId(raw_id=request_id),
+            actions=[cereal.DropActionData(
+                amount=amount,
+                source=cereal.SlotInfoData(
+                    full_container_name=b.FullContainerName(
+                        name=b.ContainerEnumName.COMBINED_HOTBAR_AND_INVENTORY_CONTAINER,
+                        dynamic_id=None,
+                    ),
+                    slot=slot, net_id_variant=int(source.net_id_variant or 0),
+                ),
+                randomly=False,
+            )],
+            strings_to_filter=[],
+            strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
+        )
+
+        def matches(raw):
+            packet = self.packets.protocol.decode(raw)
+            return any(
+                int(reply.client_request_id.raw_id) == request_id
+                for reply in packet.responses
+            )
+
+        pending = asyncio.create_task(self.packets.wait_for_packet(
+            b.ItemStackResponsePacket.ID, timeout=timeout, match=matches,
+        ))
+        try:
+            await asyncio.sleep(0)
+            await self.packets.send(b.ItemStackRequestPacket(requests=[request]))
+            packet = self.packets.protocol.decode(await pending)
+            response = next(
+                reply for reply in packet.responses
+                if int(reply.client_request_id.raw_id) == request_id
+            )
+            for container in response.containers or ():
+                if container.full_container_name.name.name not in (
+                    "HOTBAR_CONTAINER", "INVENTORY_CONTAINER",
+                    "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER",
+                ):
+                    continue
+                for updated in container.slots:
+                    if int(updated.slot) == slot:
+                        self._set_slot(slot, _response_item(b, source, source, updated))
+            return response
+        finally:
+            if not pending.done():
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+
     async def use_item(self, movement) -> None:
         """Submit one use-in-air transaction; server effects are observed separately."""
         x, y, z = await movement.wait_for_position_sync()
