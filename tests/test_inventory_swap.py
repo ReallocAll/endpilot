@@ -95,3 +95,88 @@ class SwapInventoryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(stream.send.await_count, 2)
         finally:
             inventory.close()
+
+async def test_same_slot_server_update_does_not_restore_stale_item_identity(self):
+        codec = Protocol(2193)
+        b = codec.binding
+
+        def item(item_id, count, net_id):
+            return b.SerializedNetworkItemStackDescriptor(
+                id=item_id, stack_size=count, aux_value=0,
+                net_id_variant=net_id, block_runtime_id=0,
+                user_data_buffer=b"",
+            )
+
+        for response_net_id, expected_id in ((404, 57), (505, None)):
+            with self.subTest(response_net_id=response_net_id):
+                old_source = item(3, 2, 101)
+                old_destination = item(1, 1, 202)
+                server_grant = item(57, 1, 404)
+                reply = SimpleNamespace(
+                    client_request_id=SimpleNamespace(raw_id=-1),
+                    result=SimpleNamespace(name="SUCCESS"),
+                    containers=[SimpleNamespace(
+                        full_container_name=SimpleNamespace(
+                            name=SimpleNamespace(
+                                name="COMBINED_HOTBAR_AND_INVENTORY_CONTAINER"
+                            )
+                        ),
+                        slots=[
+                            SimpleNamespace(
+                                slot=2, amount=1,
+                                item_stack_net_id=SimpleNamespace(raw_id=response_net_id),
+                            ),
+                            SimpleNamespace(
+                                slot=3, amount=2,
+                                item_stack_net_id=SimpleNamespace(raw_id=103),
+                            ),
+                        ],
+                    )],
+                )
+                decoded = {
+                    b"server_update": SimpleNamespace(
+                        inventory_id=b.ContainerID.INVENTORY,
+                        slot=2, item=server_grant,
+                    ),
+                    b"response": SimpleNamespace(responses=[reply]),
+                }
+                inventory = None
+
+                async def wait(packet_id, *, timeout, match):
+                    raw = RawPacket(packet_id, b"response")
+                    self.assertTrue(match(raw))
+                    # Server update arrives while the swap reply is pending.
+                    inventory._on_packet(RawPacket(
+                        b.InventorySlotPacket.ID, b"server_update"
+                    ))
+                    return raw
+
+                stream = SimpleNamespace(
+                    protocol=SimpleNamespace(
+                        binding=b, decode=lambda raw: decoded[raw.body]
+                    ),
+                    subscribe_raw=lambda cb: lambda: None,
+                    wait_for_packet=wait,
+                    send=AsyncMock(),
+                )
+                inventory = Inventory(stream, 1)
+                try:
+                    inventory._set_slot(2, old_source)
+                    inventory._set_slot(3, old_destination)
+                    self.assertIs(await inventory.swap_items(2, 3), reply)
+                    observed = inventory.slots.get(2)
+                    if expected_id is None:
+                        self.assertIsNone(observed)
+                    else:
+                        self.assertEqual(
+                            (int(observed.id), int(observed.stack_size),
+                             int(observed.net_id_variant)),
+                            (expected_id, 1, response_net_id),
+                        )
+                    self.assertEqual(
+                        (int(inventory.slots[3].id), int(inventory.slots[3].stack_size)),
+                        (3, 2),
+                    )
+                finally:
+                    inventory.close()
+
