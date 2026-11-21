@@ -309,3 +309,77 @@ class ContainerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             containers.close()
             inventory.close()
+
+
+    async def test_wait_for_close_observes_server_packet_without_requesting_close(self):
+        codec = Protocol(2193)
+        b = codec.binding
+        callbacks = []
+        packets_by_body = {
+            b"other": SimpleNamespace(
+                container_id=9, container_type=b.ContainerType.CONTAINER,
+                server_initiated_close=True,
+            ),
+            b"server": SimpleNamespace(
+                container_id=5, container_type=b.ContainerType.CONTAINER,
+                server_initiated_close=True,
+            ),
+        }
+        unrelated = RawPacket(b.ContainerClosePacket.ID, b"other")
+        matching = RawPacket(b.ContainerClosePacket.ID, b"server")
+
+        async def wait(packet_id, *, timeout, match):
+            self.assertEqual(packet_id, b.ContainerClosePacket.ID)
+            self.assertEqual(timeout, 4)
+            self.assertFalse(match(unrelated))
+            callbacks[0](unrelated)
+            self.assertIs(containers.window, opened)
+            self.assertTrue(match(matching))
+            callbacks[0](matching)
+            return matching
+
+        stream = SimpleNamespace(
+            protocol=SimpleNamespace(
+                binding=b, decode=lambda raw: packets_by_body[raw.body],
+            ),
+            subscribe_raw=lambda cb: callbacks.append(cb) or (lambda: callbacks.remove(cb)),
+            send=AsyncMock(), wait_for_packet=wait,
+        )
+        containers = Containers(stream, None, None)
+        opened = ContainerWindow(5, "CONTAINER", (1, 100, 0), -1)
+        containers.window = opened
+        try:
+            received = await containers.wait_for_close(timeout=4)
+            self.assertEqual(int(received.container_id), 5)
+            self.assertTrue(received.server_initiated_close)
+            self.assertIsNone(containers.window)
+            await asyncio.sleep(0)
+            # Only the existing server-close acknowledgement was sent.
+            self.assertEqual(stream.send.await_count, 1)
+            acknowledged = codec.decode(codec.encode(stream.send.await_args.args[0]))
+            self.assertTrue(acknowledged.server_initiated_close)
+            self.assertEqual(int(acknowledged.container_id), 5)
+            with self.assertRaisesRegex(RuntimeError, "no container window"):
+                await containers.wait_for_close()
+        finally:
+            containers.close()
+        self.assertEqual(callbacks, [])
+
+    async def test_wait_for_close_timeout_does_not_send_or_clear_window(self):
+        b = Protocol(2193).binding
+        stream = SimpleNamespace(
+            protocol=SimpleNamespace(binding=b),
+            subscribe_raw=lambda _: (lambda: None),
+            send=AsyncMock(),
+            wait_for_packet=AsyncMock(side_effect=TimeoutError),
+        )
+        containers = Containers(stream, None, None)
+        opened = ContainerWindow(5, "TRADE", None, 42)
+        containers.window = opened
+        try:
+            with self.assertRaises(TimeoutError):
+                await containers.wait_for_close(timeout=0.01)
+            self.assertIs(containers.window, opened)
+            stream.send.assert_not_awaited()
+        finally:
+            containers.close()

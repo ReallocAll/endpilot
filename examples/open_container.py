@@ -62,19 +62,10 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
                 "inventory_count": bot.inventory_count(int(slots[0].id)),
             }), flush=True)
         if expect_server_close:
-            binding = bot.packets.protocol.binding
-
-            def matches(raw):
-                packet = bot.packets.protocol.decode(raw)
-                return int(packet.container_id) == window.container_id
-
-            pending = asyncio.create_task(bot.packets.wait_for_packet(
-                binding.ContainerClosePacket.ID, timeout=15, match=matches,
-            ))
+            pending = asyncio.create_task(bot.wait_for_container_close(timeout=15))
             await asyncio.sleep(0)
             print("server_close_watch_ready", flush=True)
-            closed_packet = bot.packets.protocol.decode(await pending)
-            await asyncio.sleep(0)
+            closed_packet = await pending
             print("server_container_closed=" + json.dumps({
                 "id": int(closed_packet.container_id),
                 "server_initiated": bool(closed_packet.server_initiated_close),
