@@ -91,9 +91,10 @@ async def run_two_input(bot: Bot, offers) -> None:
 
 
 async def run(url: str, *, interrupt: bool = False, two_input: bool = False,
-              server_interrupt: bool = False) -> None:
+              server_interrupt: bool = False, reconnect: bool = False) -> None:
     bot = Bot("EndPilotTest")
-    try:
+
+    async def join():
         if url.startswith("raknet://"):
             host, sep, port = url.removeprefix("raknet://").rpartition(":")
             if not sep:
@@ -101,6 +102,9 @@ async def run(url: str, *, interrupt: bool = False, two_input: bool = False,
             await bot.join_raknet(host, int(port))
         else:
             await bot.join_nethernet(url)
+
+    try:
+        await join()
         print("spawned EndPilotTest", flush=True)
         recipes = await bot.wait_for_recipes()
         sample = next(
@@ -190,6 +194,34 @@ async def run(url: str, *, interrupt: bool = False, two_input: bool = False,
                 "staging_result": reply.result.name,
                 "exchange_submitted": False,
             }), flush=True)
+            if reconnect:
+                # Disconnect is not a refund. A new session must observe BDS's
+                # persisted inventory before a script decides whether to retry.
+                await bot.close()
+                await asyncio.to_thread(sys.stdin.readline)
+                await join()
+                deadline = asyncio.get_running_loop().time() + 15
+                while len(bot.inventory_slots) < 9:
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise TimeoutError("no fresh player inventory snapshot after rejoin")
+                    await asyncio.sleep(0.05)
+                if bot.open_window is not None:
+                    raise AssertionError("rejoined player inherited the old trade window")
+                try:
+                    await bot.execute_trade(selected.recipe_net_id, 9)
+                except RuntimeError as error:
+                    if "no matching trade window" not in str(error):
+                        raise
+                else:
+                    raise AssertionError("rejoined player accepted a stale trade quote")
+                print("trade_reconnected=" + json.dumps({
+                    "item_id": int(source.id),
+                    "expected_count": before,
+                    "observed_count": bot.inventory_count(int(source.id)),
+                    "observed_slots": len(bot.inventory_slots),
+                    "open_window": bot.open_window is not None,
+                    "stale_exchange_blocked": True,
+                }), flush=True)
         elif interrupt:
             # A villager's death does not necessarily close the trade UI on BDS.
             # Explicitly cancel this staged exchange and await the server close reply.
@@ -301,7 +333,7 @@ async def run(url: str, *, interrupt: bool = False, two_input: bool = False,
                 raise AssertionError("BDS did not acknowledge the trade window close")
             print("trade_window_closed=" + str(closed.container_id), flush=True)
 
-        if not server_interrupt:
+        if not server_interrupt or reconnect:
             await asyncio.to_thread(sys.stdin.readline)
     finally:
         await bot.close()
@@ -315,6 +347,10 @@ if __name__ == "__main__":
     parser.add_argument("--two-input", action="store_true", help="exchange a quote requiring both villager inputs")
     parser.add_argument("--server-interrupt", action="store_true",
                         help="observe a BDS kick after confirmed trade ingredient staging")
+    parser.add_argument("--reconnect", action="store_true",
+                        help="rejoin after a server-interrupted trade and inspect fresh inventory")
     args = parser.parse_args()
+    if args.reconnect and not args.server_interrupt:
+        parser.error("--reconnect requires --server-interrupt")
     asyncio.run(run(args.url, interrupt=args.interrupt, two_input=args.two_input,
-                    server_interrupt=args.server_interrupt))
+                    server_interrupt=args.server_interrupt, reconnect=args.reconnect))
