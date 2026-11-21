@@ -166,6 +166,117 @@ class ArmorEquipTests(unittest.IsolatedAsyncioTestCase):
             inventory.close()
         self.assertEqual(callbacks, [])
 
+    async def test_unequip_into_empty_inventory_uses_take_and_server_slots(self):
+        codec = Protocol(2193)
+        b = codec.binding
+        callbacks = []
+        reply = SimpleNamespace(
+            client_request_id=SimpleNamespace(raw_id=-1),
+            result=SimpleNamespace(name="SUCCESS"),
+            containers=[
+                response_container("ARMOR_CONTAINER", corrected_slot(0, 0)),
+                response_container(
+                    "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER",
+                    corrected_slot(2, 1, 103),
+                ),
+            ],
+        )
+        raw = RawPacket(b.ItemStackResponsePacket.ID, b"reply")
+        stream = SimpleNamespace(
+            protocol=SimpleNamespace(
+                binding=b, decode=lambda packet:
+                SimpleNamespace(responses=[reply]) if packet.body == b"reply"
+                else codec.decode(packet),
+            ),
+            subscribe_raw=lambda cb: callbacks.append(cb)
+            or (lambda: callbacks.remove(cb)),
+            send=AsyncMock(),
+            wait_for_packet=AsyncMock(return_value=raw),
+        )
+        inventory = Inventory(stream, 7)
+        try:
+            inventory._armor_slots[0] = item(b, 42, 1, 102)
+            response = await inventory.unequip_armor(0, 2)
+            self.assertIs(response, reply)
+            sent = codec.decode(codec.encode(stream.send.await_args.args[0]))
+            request = sent.requests[0]
+            action = request.actions[0]
+            self.assertEqual(int(request.client_request_id.raw_id), -1)
+            self.assertIsInstance(action, b.ItemStackRequestCereal.TakeActionData)
+            self.assertEqual(int(action.amount), 1)
+            self.assertEqual(action.source.full_container_name.name, b.ContainerEnumName.ARMOR_CONTAINER)
+            self.assertEqual(action.destination.full_container_name.name,
+                             b.ContainerEnumName.COMBINED_HOTBAR_AND_INVENTORY_CONTAINER)
+            self.assertEqual(int(action.source.slot), 0)
+            self.assertEqual(int(action.destination.slot), 2)
+            self.assertEqual(int(action.source.net_id_variant), 102)
+            self.assertEqual(int(action.destination.net_id_variant), 0)
+            self.assertEqual(int(inventory.armor_slots[0].id), 0)
+            self.assertEqual(int(inventory.item_or_empty(2).id), 42)
+            self.assertEqual(int(inventory.item_or_empty(2).net_id_variant), 103)
+            self.assertEqual(inventory._allocate_request_id(), -3)
+        finally:
+            inventory.close()
+        self.assertEqual(callbacks, [])
+
+    async def test_unequip_occupied_destination_swaps_and_rejection_preserves_items(self):
+        codec = Protocol(2193)
+        b = codec.binding
+        callbacks = []
+        replies = [
+            SimpleNamespace(
+                client_request_id=SimpleNamespace(raw_id=-1),
+                result=SimpleNamespace(name="SUCCESS"),
+                containers=[
+                    response_container("ARMOR_CONTAINER", corrected_slot(0, 1, 201)),
+                    response_container("INVENTORY_CONTAINER", corrected_slot(2, 1, 202)),
+                ],
+            ),
+            SimpleNamespace(
+                client_request_id=SimpleNamespace(raw_id=-1),
+                result=SimpleNamespace(name="ERROR"),
+                containers=[
+                    response_container("ARMOR_CONTAINER", corrected_slot(0, 1, 102)),
+                    response_container("INVENTORY_CONTAINER", corrected_slot(2, 1, 200)),
+                ],
+            ),
+        ]
+        for reply in replies:
+            with self.subTest(result=reply.result.name):
+                raw = RawPacket(b.ItemStackResponsePacket.ID, b"reply")
+                stream = SimpleNamespace(
+                    protocol=SimpleNamespace(
+                        binding=b, decode=lambda packet:
+                        SimpleNamespace(responses=[reply]) if packet.body == b"reply"
+                        else codec.decode(packet),
+                    ),
+                    subscribe_raw=lambda cb: callbacks.append(cb)
+                    or (lambda: callbacks.remove(cb)),
+                    send=AsyncMock(),
+                    wait_for_packet=AsyncMock(return_value=raw),
+                )
+                inventory = Inventory(stream, 7)
+                try:
+                    inventory._armor_slots[0] = item(b, 42, 1, 102)
+                    inventory._set_slot(2, item(b, 50, 1, 200))
+                    self.assertIs(await inventory.unequip_armor(0, 2), reply)
+                    sent = codec.decode(codec.encode(stream.send.await_args.args[0]))
+                    action = sent.requests[0].actions[0]
+                    self.assertIsInstance(action, b.ItemStackRequestCereal.SwapActionData)
+                    self.assertEqual(int(action.source.net_id_variant), 102)
+                    self.assertEqual(int(action.destination.net_id_variant), 200)
+                    if reply.result.name == "SUCCESS":
+                        self.assertEqual(int(inventory.armor_slots[0].id), 50)
+                        self.assertEqual(int(inventory.armor_slots[0].net_id_variant), 201)
+                        self.assertEqual(int(inventory.item_or_empty(2).id), 42)
+                        self.assertEqual(int(inventory.item_or_empty(2).net_id_variant), 202)
+                    else:
+                        self.assertEqual(int(inventory.armor_slots[0].id), 42)
+                        self.assertEqual(int(inventory.item_or_empty(2).id), 50)
+                finally:
+                    inventory.close()
+        self.assertEqual(callbacks, [])
+
     async def test_server_armor_updates_and_minimal_validations(self):
         codec = Protocol(2193)
         b = codec.binding
@@ -214,6 +325,9 @@ class ArmorEquipTests(unittest.IsolatedAsyncioTestCase):
                     await inventory.equip_armor(src, dst)
             with self.assertRaises(ValueError):
                 await inventory.equip_armor(0, 0)
+            for armor, dst in ((-1, 2), (4, 2), (0, -1), (0, 256), (0, 2)):
+                with self.assertRaises(ValueError):
+                    await inventory.unequip_armor(armor, dst)
             stream.send.assert_not_awaited()
         finally:
             inventory.close()
