@@ -59,7 +59,7 @@ class Bot:
         self._player_state = PlayerState(session.packets, session.player_id)
         self._recipes = Recipes(
             session.packets, session.item_names, session.crafting_data_packets,
-            inventory=self._inventory,
+            inventory=self._inventory, containers=self._containers,
         )
         session.crafting_data_packets.clear()
         self._trading = Trading(
@@ -103,6 +103,21 @@ class Bot:
         return await self._recipes.craft_auto(
             recipe_id, destination_slot, times=times, timeout=timeout,
         )
+
+    async def stage_crafting_ingredient(self, source_slot: int, grid_slot: int = 28,
+                                        amount: int = 1, *, timeout: float = 15):
+        """Place inventory material in the player 2x2 grid; return BDS's verdict."""
+        if self._recipes is None:
+            raise RuntimeError("player has not joined")
+        return await self._recipes.stage_grid(source_slot, grid_slot, amount, timeout=timeout)
+
+    async def craft_recipe_grid(self, recipe_id: str | int, destination_slot: int, *,
+                                times: int = 1, timeout: float = 15):
+        """Craft from server-observed grid inputs; return BDS's item-stack verdict."""
+        if self._recipes is None:
+            raise RuntimeError("player has not joined")
+        return await self._recipes.craft_grid(recipe_id, destination_slot,
+                                              times=times, timeout=timeout)
 
     @property
     def player_id(self) -> int:

@@ -158,3 +158,127 @@ class CraftingTests(unittest.IsolatedAsyncioTestCase):
                 await recipes.craft_auto("missing", 2)
         finally:
             recipes.close()
+
+    async def test_grid_staging_then_craft_reconciles_server_corrections(self):
+        b = Protocol(2193).binding
+        from unittest.mock import AsyncMock, Mock
+
+        slots = {0: item(b, 1, 2, 23), 8: item(b, 0, 0, 0)}
+        inventory = SimpleNamespace(
+            slots=slots,
+            item_or_empty=lambda index: slots.get(index, item(b, 0, 0, 0)),
+            _allocate_request_id=Mock(side_effect=[-1, -3]),
+            _set_slot=lambda index, value: slots.__setitem__(index, value),
+        )
+        window = SimpleNamespace(container_id=2, container_type="INVENTORY")
+        def response_slot(index, amount, net_id):
+            return SimpleNamespace(
+                slot=index, amount=amount,
+                item_stack_net_id=SimpleNamespace(raw_id=net_id) if net_id else None,
+            )
+        def response_container(name, *slots):
+            return SimpleNamespace(
+                full_container_name=SimpleNamespace(name=b.ContainerEnumName[name]),
+                slots=slots,
+            )
+        staged = SimpleNamespace(
+            client_request_id=SimpleNamespace(raw_id=-1),
+            result=SimpleNamespace(name="SUCCESS"),
+            containers=[
+                response_container("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER",
+                                   response_slot(0, 1, 44)),
+                response_container("CRAFTING_INPUT_CONTAINER", response_slot(28, 1, 50)),
+            ],
+        )
+        crafted = SimpleNamespace(
+            client_request_id=SimpleNamespace(raw_id=-3),
+            result=SimpleNamespace(name="SUCCESS"),
+            containers=[
+                response_container("CRAFTING_INPUT_CONTAINER", response_slot(28, 0, None)),
+                response_container("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER",
+                                   response_slot(8, 4, 51)),
+            ],
+        )
+        other = SimpleNamespace(client_request_id=SimpleNamespace(raw_id=-5))
+        raws = [
+            RawPacket(b.ItemStackResponsePacket.ID, b"stage"),
+            RawPacket(b.ItemStackResponsePacket.ID, b"craft"),
+        ]
+        decoded = {
+            b"stage": SimpleNamespace(responses=[other, staged]),
+            b"craft": SimpleNamespace(responses=[other, crafted]),
+            b"other": SimpleNamespace(responses=[other]),
+        }
+        pending = iter(raws)
+        async def wait(packet_id, *, timeout, match):
+            self.assertEqual(packet_id, b.ItemStackResponsePacket.ID)
+            self.assertEqual(timeout, 3)
+            self.assertFalse(match(RawPacket(packet_id, b"other")))
+            raw = next(pending)
+            self.assertTrue(match(raw))
+            return raw
+        packets = SimpleNamespace(
+            protocol=SimpleNamespace(binding=b, decode=lambda raw: decoded[raw.body]),
+            subscribe_raw=lambda cb: lambda: None,
+            wait_for_packet=wait, send=AsyncMock(),
+        )
+        recipes = Recipes(
+            packets, {1: "minecraft:oak_log", 2: "minecraft:oak_planks"},
+            inventory=inventory, containers=SimpleNamespace(window=window),
+        )
+        recipes.load(SimpleNamespace(
+            clear_recipes=True, shapeless_recipes=[server_recipe()],
+        ))
+        try:
+            self.assertIs(await recipes.stage_grid(0, 28, timeout=3), staged)
+            stage_action = packets.send.await_args.args[0].requests[0].actions[0]
+            self.assertEqual(type(stage_action).__name__, "PlaceActionData")
+            self.assertEqual(stage_action.source.net_id_variant, 23)
+            self.assertEqual((stage_action.destination.slot,
+                              stage_action.destination.full_container_name.name.name),
+                             (28, "CRAFTING_INPUT_CONTAINER"))
+            self.assertEqual((slots[0].stack_size, recipes._grid_slots[28].stack_size,
+                              recipes._grid_slots[28].net_id_variant), (1, 1, 50))
+
+            self.assertIs(await recipes.craft_grid(19, 8, timeout=3), crafted)
+            actions = packets.send.await_args.args[0].requests[0].actions
+            self.assertEqual([type(action).__name__ for action in actions], [
+                "CraftRecipeActionData", "CraftResultsActionData",
+                "ConsumeActionData", "PlaceActionData",
+            ])
+            self.assertEqual((actions[0].recipe_net_id, actions[0].num_crafts), (19, 1))
+            self.assertEqual((actions[2].source.slot, actions[2].source.net_id_variant),
+                             (28, 50))
+            self.assertEqual((actions[3].source.slot, actions[3].source.net_id_variant),
+                             (50, -3))
+            self.assertEqual((slots[8].id, slots[8].stack_size, slots[8].net_id_variant),
+                             (2, 4, 51))
+            self.assertEqual(recipes._grid_slots[28].stack_size, 0)
+        finally:
+            recipes.close()
+
+    async def test_grid_action_requires_open_inventory_and_observed_ingredient(self):
+        b = Protocol(2193).binding
+        from unittest.mock import AsyncMock
+        packets = SimpleNamespace(
+            protocol=SimpleNamespace(binding=b),
+            subscribe_raw=lambda cb: lambda: None,
+            send=AsyncMock(),
+        )
+        slots = {0: item(b, 1, 1, 23)}
+        inventory = SimpleNamespace(slots=slots)
+        containers = SimpleNamespace(window=None)
+        recipes = Recipes(packets, {1: "minecraft:oak_log"}, inventory=inventory,
+                          containers=containers)
+        recipes.load(SimpleNamespace(clear_recipes=True, shapeless_recipes=[server_recipe()]))
+        try:
+            with self.assertRaisesRegex(RuntimeError, "open the inventory screen"):
+                await recipes.stage_grid(0, 28)
+            containers.window = SimpleNamespace(container_type="INVENTORY")
+            with self.assertRaisesRegex(ValueError, "slots are 28 through 31"):
+                await recipes.stage_grid(0, 32)
+            with self.assertRaisesRegex(ValueError, "no observed crafting ingredients"):
+                await recipes.craft_grid(19, 8)
+            packets.send.assert_not_awaited()
+        finally:
+            recipes.close()
