@@ -195,6 +195,25 @@ class Containers:
                 pending.cancel()
                 await asyncio.gather(pending, return_exceptions=True)
 
+    async def wait_for_close(self, *, timeout: float = 15):
+        """Await the active window's server close packet, without requesting a close.
+
+        Register the waiter before the server action. Returns a typed
+        ContainerClosePacket, including its server_initiated_close flag.
+        """
+        window = self.window
+        if window is None:
+            raise RuntimeError("no container window is open")
+        b = self.packets.protocol.binding
+
+        def matches(raw):
+            return int(self.packets.protocol.decode(raw).container_id) == window.container_id
+
+        raw = await self.packets.wait_for_packet(
+            b.ContainerClosePacket.ID, timeout=timeout, match=matches,
+        )
+        return self.packets.protocol.decode(raw)
+
     async def close_window(self, *, timeout: float = 15) -> ContainerWindow | None:
         """Request close; return after the same window's server close packet."""
         window = self.window
@@ -202,12 +221,7 @@ class Containers:
             return None
         b = self.packets.protocol.binding
 
-        def matches(raw):
-            return int(self.packets.protocol.decode(raw).container_id) == window.container_id
-
-        pending = asyncio.create_task(self.packets.wait_for_packet(
-            b.ContainerClosePacket.ID, timeout=timeout, match=matches,
-        ))
+        pending = asyncio.create_task(self.wait_for_close(timeout=timeout))
         try:
             # Register the observer before sending; BDS may reply immediately.
             await asyncio.sleep(0)
