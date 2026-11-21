@@ -1,4 +1,4 @@
-"""Craft a wooden pickaxe using a BDS workbench recipe, optionally storing it."""
+"""Craft a wooden pickaxe using a BDS workbench recipe, optionally equipping or storing it."""
 
 import argparse
 import asyncio
@@ -8,7 +8,7 @@ import sys
 from endpilot import Bot
 
 
-async def run(url: str, *, store: bool = False) -> None:
+async def run(url: str, *, store: bool = False, equip: bool = False) -> None:
     bot = Bot("EndPilotTest")
     try:
         if url.startswith("raknet://"):
@@ -107,6 +107,17 @@ async def run(url: str, *, store: bool = False) -> None:
             raise AssertionError(f"unexpected pickaxe craft response: {record}")
 
         await bot.close_container()
+        if equip:
+            # Selecting is only an outgoing request. The Testbed checks BDS's
+            # actual mainhand independently before allowing storage to proceed.
+            held = bot.inventory_slots[destination_slot]
+            if int(held.id) != output.item_id or int(held.stack_size) != output.count:
+                raise AssertionError("crafted pickaxe is missing from the destination slot")
+            await bot.select_hotbar(destination_slot)
+            print("equipped_selection=" + json.dumps({
+                "slot": destination_slot, "item_id": int(held.id),
+                "count": int(held.stack_size),
+            }), flush=True)
         if store:
             # Reuse the normal server-confirmed container transfer; no crafting
             # special case is needed for items once they reach the inventory.
@@ -160,5 +171,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("url", help="NetherNet HTTP URL or raknet://host:port")
     parser.add_argument("--store", action="store_true", help="store the crafted pickaxe in a chest")
+    parser.add_argument("--equip", action="store_true", help="select the crafted pickaxe as the mainhand item")
     args = parser.parse_args()
-    asyncio.run(run(args.url, store=args.store))
+    asyncio.run(run(args.url, store=args.store, equip=args.equip))
