@@ -29,23 +29,28 @@ class TradeOffers:
     offers: tuple[TradeOffer, ...]
 
 
+def _lookup(compound, key: str):
+    # Native CompoundTag supports indexing and membership, but not dict.get.
+    return compound[key] if key in compound else None
+
+
 def _number(compound, key: str) -> int | None:
-    value = compound.get(key)
+    value = _lookup(compound, key)
     return None if value is None else int(value.value)
 
 
 def _item(compound, key: str) -> TradeItem | None:
-    value = compound.get(key)
+    value = _lookup(compound, key)
     if value is None:
         return None
-    name, count = value.get("Name"), value.get("Count")
+    name, count = _lookup(value, "Name"), _lookup(value, "Count")
     if name is None or count is None:
         return None
     return TradeItem(str(name.value), int(count.value))
 
 
 def _read_offers(packet) -> TradeOffers:
-    recipes = packet.data.get("Recipes")
+    recipes = _lookup(packet.data, "Recipes")
     offers = tuple(
         TradeOffer(
             _number(recipe, "netId"),
