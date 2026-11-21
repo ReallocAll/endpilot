@@ -38,6 +38,12 @@ async def run(url: str) -> None:
         print(f"diagonal_right_ticks={await bot.walk_forward_right(18)}", flush=True)
 
         await asyncio.to_thread(sys.stdin.readline)
+        print(f"backward_diagonal_left_ticks={await bot.walk_backward_left(18)}", flush=True)
+
+        await asyncio.to_thread(sys.stdin.readline)
+        print(f"backward_diagonal_right_ticks={await bot.walk_backward_right(18)}", flush=True)
+
+        await asyncio.to_thread(sys.stdin.readline)
         print(f"sprint_key_tick={await bot.set_sprinting(True)}", flush=True)
         print(f"sprint_ticks={await bot.walk_forward(18)}", flush=True)
         print(f"sprint_release_tick={await bot.set_sprinting(False)}", flush=True)

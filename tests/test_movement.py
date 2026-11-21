@@ -475,6 +475,38 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(movement.position, (0.5, 101.62, 0.5))
         movement.close()
 
+    async def test_backward_diagonal_frames_normalize_and_release(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        flags = b.PlayerAuthInputPacket.InputData
+        sink = PacketSink(protocol)
+        movement = Movement(sink, 1)
+        movement.position = movement._input_position = (0.5, 101.62, 0.5)
+
+        self.assertEqual(await movement.walk_backward_left(2), 2)
+        self.assertEqual(await movement.walk_backward_right(2), 2)
+        self.assertEqual([p.client_tick for p in sink.sent], list(range(1, 9)))
+        self.assertEqual([list(p.input_data) for p in sink.sent], [
+            [flags.DOWN, flags.LEFT], [flags.DOWN, flags.LEFT], [], [],
+            [flags.DOWN, flags.RIGHT], [flags.DOWN, flags.RIGHT], [], [],
+        ])
+        self.assertEqual([(p.move.x, p.move.y) for p in sink.sent], [
+            (1.0, -1.0), (1.0, -1.0), (0.0, 0.0), (0.0, 0.0),
+            (-1.0, -1.0), (-1.0, -1.0), (0.0, 0.0), (0.0, 0.0),
+        ])
+        step = 0.09 / 2**0.5
+        self.assertAlmostEqual(sink.sent[0].pos_delta.x, step)
+        self.assertAlmostEqual(sink.sent[0].pos_delta.z, -step)
+        self.assertAlmostEqual(sink.sent[1].pos.x, 0.5 + 2 * step)
+        self.assertAlmostEqual(sink.sent[1].pos.z, 0.5 - 2 * step)
+        self.assertAlmostEqual(sink.sent[5].pos.x, 0.5)
+        self.assertAlmostEqual(sink.sent[5].pos.z, 0.5 - 4 * step)
+        self.assertTrue(all(p.analog_move_vector.x == p.move.x
+                            and p.raw_move_vector.y == p.move.y for p in sink.sent))
+        self.assertTrue(all(p.rot.y == 0.0 for p in sink.sent))
+        self.assertEqual(movement.position, (0.5, 101.62, 0.5))
+        movement.close()
+
     async def test_strafe_does_not_start_held_sprint(self):
         protocol = Protocol(2193)
         flags = protocol.binding.PlayerAuthInputPacket.InputData
