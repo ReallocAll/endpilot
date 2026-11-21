@@ -63,7 +63,8 @@ class Bot:
         )
         session.crafting_data_packets.clear()
         self._trading = Trading(
-            session.packets, self._entities, self._movement, self._inventory, self._containers
+            session.packets, self._entities, self._movement, self._inventory, self._containers,
+            item_names=session.item_names,
         )
         self._session = session
         self._entities.start()
@@ -420,6 +421,12 @@ class Bot:
         if self._trading is None:
             raise RuntimeError("player has not joined")
         return await self._trading.open(runtime_id, timeout=timeout)
+
+    async def execute_trade(self, recipe_net_id: int, destination_slot: int, *, timeout: float = 15):
+        """Submit a quoted villager exchange and await the matching server response."""
+        if self._trading is None:
+            raise RuntimeError("player has not joined")
+        return await self._trading.exchange(recipe_net_id, destination_slot, timeout=timeout)
 
     async def stage_trade_ingredient(
         self, source_slot: int, amount: int, *, ingredient: int = 1,

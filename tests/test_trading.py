@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, Mock
 
 from endpilot.containers import Containers
 from endpilot.protocol import Protocol, RawPacket
-from endpilot.trading import TradeItem, TradeOffers, Trading
+from endpilot.trading import TradeItem, TradeOffer, TradeOffers, Trading
 
 
 def tag(value):
@@ -206,6 +206,89 @@ class TradingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(action.destination.full_container_name.name.name,
                          "TRADE_INGREDIENT_2_CONTAINER")
         inventory._set_slot.assert_not_called()
+
+    async def test_trade_exchange_matches_reply_and_uses_confirmed_input_id(self):
+        b = Protocol(2193).binding
+        empty = b.SerializedNetworkItemStackDescriptor(
+            id=0, stack_size=0, aux_value=0, net_id_variant=None,
+            block_runtime_id=0, user_data_buffer=b"",
+        )
+        updated = []
+        inventory = SimpleNamespace(
+            _allocate_request_id=Mock(return_value=-3),
+            item_or_empty=lambda slot: empty,
+            _set_slot=lambda slot, item: updated.append((slot, item)),
+        )
+        reply = SimpleNamespace(
+            client_request_id=SimpleNamespace(raw_id=-3),
+            result=SimpleNamespace(name="SUCCESS"),
+            containers=[
+                SimpleNamespace(full_container_name=SimpleNamespace(
+                    name=b.ContainerEnumName.TRADE2_INGREDIENT_1_CONTAINER,
+                ), slots=[SimpleNamespace(slot=4, amount=0, item_stack_net_id=None)]),
+                SimpleNamespace(full_container_name=SimpleNamespace(
+                    name=b.ContainerEnumName.COMBINED_HOTBAR_AND_INVENTORY_CONTAINER,
+                ), slots=[SimpleNamespace(
+                    slot=9, amount=1,
+                    item_stack_net_id=SimpleNamespace(raw_id=501),
+                )]),
+            ],
+        )
+        raw = RawPacket(b.ItemStackResponsePacket.ID, b"exchange")
+        packets = SimpleNamespace(
+            protocol=SimpleNamespace(
+                binding=b, decode=lambda _: SimpleNamespace(responses=[reply]),
+            ),
+            wait_for_packet=AsyncMock(return_value=raw), send=AsyncMock(),
+        )
+        trading = Trading(
+            packets, None, None, inventory,
+            SimpleNamespace(window=SimpleNamespace(
+                container_type="TRADE", container_id=2, entity_unique_id=42,
+            )), item_names={42: "minecraft:emerald", 43: "minecraft:wheat"},
+        )
+        trading.offers = TradeOffers(2, 42, "Farmer", 1, True, (
+            TradeOffer(123, TradeItem("minecraft:wheat", 3), None,
+                       TradeItem("minecraft:emerald", 1), 0, 16),
+        ))
+        with self.assertRaisesRegex(RuntimeError, "confirmed staged stack"):
+            await trading.exchange(123, 9)
+        trading._inputs[1] = ("minecraft:wheat", 3, 301)
+        self.assertIs(await trading.exchange(123, 9), reply)
+        actions = packets.send.await_args.args[0].requests[0].actions
+        self.assertEqual(len(actions), 4)
+        self.assertEqual((actions[0].recipe_net_id, actions[0].num_crafts), (123, 1))
+        self.assertEqual(actions[1].craft_results[0].item_descriptor.full_name,
+                         "minecraft:emerald")
+        self.assertEqual((actions[2].amount, actions[2].source.slot,
+                          actions[2].source.net_id_variant), (3, 4, 301))
+        self.assertEqual((actions[3].source.slot, actions[3].source.net_id_variant,
+                          actions[3].destination.slot), (50, -3, 9))
+        self.assertNotIn(1, trading._inputs)
+        self.assertEqual(len(updated), 1)
+        self.assertEqual(updated[0][0], 9)
+        self.assertEqual((int(updated[0][1].id), int(updated[0][1].stack_size),
+                          int(updated[0][1].net_id_variant)), (42, 1, 501))
+
+        # A full server InventorySlot may have supplied richer item data first.
+        observed = b.SerializedNetworkItemStackDescriptor(
+            id=42, stack_size=2, aux_value=7, net_id_variant=700,
+            block_runtime_id=99, user_data_buffer=b"observed",
+        )
+        inventory.item_or_empty = lambda slot: observed
+        inventory._allocate_request_id = Mock(return_value=-5)
+        reply.client_request_id.raw_id = -5
+        reply.containers[1].slots[0].amount = 3
+        reply.containers[1].slots[0].item_stack_net_id = SimpleNamespace(raw_id=777)
+        trading._inputs[1] = ("minecraft:wheat", 3, 301)
+        updated.clear()
+        await trading.exchange(123, 9)
+        self.assertEqual(len(updated), 1)
+        corrected = updated[0][1]
+        self.assertEqual((int(corrected.id), int(corrected.stack_size),
+                          int(corrected.net_id_variant)), (42, 3, 777))
+        self.assertEqual((int(corrected.aux_value), int(corrected.block_runtime_id),
+                          corrected.user_data_buffer), (7, 99, b"observed"))
 
     async def test_update_trade_opens_and_closes_container_window(self):
         b = Protocol(2193).binding

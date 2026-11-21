@@ -90,6 +90,28 @@ async def run(url: str) -> None:
             raise AssertionError(f"BDS rejected trade ingredient: {reply.result.name}")
         if record["after"] != before - selected.buy_a.count:
             raise AssertionError(f"BDS inventory count mismatch: {record}")
+        output_slot = 9
+        existing = bot.inventory_slots.get(output_slot)
+        if existing is not None and int(existing.id) != 0:
+            raise AssertionError("trade output slot is not empty")
+        exchanged = await bot.execute_trade(selected.recipe_net_id, output_slot)
+        output = bot.inventory_slots.get(output_slot)
+        exchange_record = {
+            "result": exchanged.result.name,
+            "request_id": int(exchanged.client_request_id.raw_id),
+            "output_slot": output_slot,
+            "output_id": None if output is None else int(output.id),
+            "output_count": None if output is None else int(output.stack_size),
+            "containers": [
+                {"name": c.full_container_name.name.name,
+                 "slots": [{"slot": int(p.slot), "amount": int(p.amount)} for p in c.slots]}
+                for c in exchanged.containers or ()
+            ],
+        }
+        print("trade_exchange_result=" + json.dumps(exchange_record), flush=True)
+        if (exchange_record["result"] != "SUCCESS" or output is None
+                or int(output.id) == 0 or int(output.stack_size) != selected.sell.count):
+            raise AssertionError(f"trade output not accepted: {exchange_record}")
         closed = await bot.close_container()
         if closed is None or closed.container_id != offers.window_id:
             raise AssertionError("BDS did not acknowledge the trade window close")

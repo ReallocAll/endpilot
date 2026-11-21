@@ -73,13 +73,15 @@ def _read_offers(packet) -> TradeOffers:
 
 
 class Trading:
-    def __init__(self, packets, entities, movement, inventory, containers):
+    def __init__(self, packets, entities, movement, inventory, containers, item_names=None):
         self.packets = packets
         self.entities = entities
         self.movement = movement
         self.inventory = inventory
         self.containers = containers
+        self.item_names = item_names or {}
         self.offers: TradeOffers | None = None
+        self._inputs = {}  # ingredient number -> (name, amount, confirmed net ID)
 
     async def open(self, runtime_id: int, *, timeout: float = 15) -> TradeOffers:
         """Interact and await a matching server UpdateTrade; not a completed exchange."""
@@ -101,6 +103,7 @@ class Trading:
             await self.entities.interact(self.movement, self.inventory, runtime_id)
             offers = _read_offers(self.packets.protocol.decode(await pending))
             self.offers = offers
+            self._inputs.clear()
             return offers
         finally:
             if not pending.done():
@@ -193,7 +196,148 @@ class Trading:
                         self.inventory._set_slot(
                             source_slot, _response_item(b, current, source, slot)
                         )
+            if response.result.name == "SUCCESS":
+                physical_slot = ingredient + 3 if offers.use_new_trade_screen else 0
+                self._inputs.pop(ingredient, None)
+                for container in response.containers or ():
+                    if container.full_container_name.name.name != destination_name:
+                        continue
+                    for slot in container.slots:
+                        if int(slot.slot) != physical_slot:
+                            continue
+                        net_id = slot.item_stack_net_id
+                        name = self.item_names.get(int(source.id))
+                        if int(slot.amount) and net_id is not None and name is not None:
+                            self._inputs[ingredient] = (
+                                name, int(slot.amount), int(net_id.raw_id),
+                            )
             return response
+        finally:
+            if not pending.done():
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+
+    async def exchange(self, recipe_net_id: int, destination_slot: int, *, timeout: float = 15):
+        """Submit a quoted exchange and return the matching BDS ItemStackResponse.
+
+        Only server-reported response slots update the observed input and output state.
+        """
+        offers, window = self.offers, self.containers.window
+        if (offers is None or window is None or window.container_type != "TRADE"
+                or window.container_id != offers.window_id
+                or window.entity_unique_id != offers.trader_unique_id):
+            raise RuntimeError("no matching trade window is open")
+        if not 0 <= destination_slot <= 255:
+            raise ValueError("destination slot must fit in a byte")
+        offer = next((o for o in offers.offers if o.recipe_net_id == recipe_net_id), None)
+        if offer is None or offer.buy_a is None or offer.sell is None:
+            raise ValueError("no complete server quote for this recipe net ID")
+        if not 1 <= offer.sell.count <= 255:
+            raise ValueError("quoted output amount must fit in a byte")
+
+        b = self.packets.protocol.binding
+        cereal = b.ItemStackRequestCereal
+
+        def slot_info(name, slot, net_id):
+            return cereal.SlotInfoData(
+                full_container_name=b.FullContainerName(
+                    name=b.ContainerEnumName[name], dynamic_id=None,
+                ), slot=slot, net_id_variant=net_id,
+            )
+
+        consumes = []
+        input_slots = {}
+        for number, item in enumerate((offer.buy_a, offer.buy_b), start=1):
+            if item is None:
+                continue
+            staged = self._inputs.get(number)
+            if (staged is None or staged[0] != item.name
+                    or staged[1] < item.count or staged[2] <= 0):
+                raise RuntimeError(f"trade ingredient {number} lacks a confirmed staged stack")
+            name = (f"TRADE2_INGREDIENT_{number}_CONTAINER"
+                    if offers.use_new_trade_screen else f"TRADE_INGREDIENT_{number}_CONTAINER")
+            slot = number + 3 if offers.use_new_trade_screen else 0
+            consumes.append(cereal.ConsumeActionData(
+                amount=item.count, source=slot_info(name, slot, staged[2]),
+            ))
+            input_slots[(name, slot)] = (number, staged[0])
+
+        request_id = self.inventory._allocate_request_id()
+        destination = self.inventory.item_or_empty(destination_slot)
+        output_id = next(
+            (id for id, name in self.item_names.items() if name == offer.sell.name), None
+        )
+        request = b.ItemStackRequestPacketData.RequestData(
+            client_request_id=b.ItemStackRequestId(raw_id=request_id),
+            actions=[
+                cereal.CraftRecipeActionData(recipe_net_id=recipe_net_id, num_crafts=1),
+                cereal.CraftResultsActionData(
+                    craft_results=[cereal.NetworkItemInstanceDescriptorData(
+                        item_descriptor=cereal.ItemNameDescriptorData(
+                            full_name=offer.sell.name, aux_value=0,
+                        ),
+                        stack_size=offer.sell.count, block_runtime_id=0,
+                        user_data_buffer=b"\0" * 10,
+                    )], num_crafts=1,
+                ),
+                *consumes,
+                cereal.PlaceActionData(
+                    amount=offer.sell.count,
+                    source=slot_info("CREATED_OUTPUT_CONTAINER", 50, request_id),
+                    destination=slot_info(
+                        "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER",
+                        destination_slot, int(destination.net_id_variant or 0),
+                    ),
+                ),
+            ],
+            strings_to_filter=[],
+            strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
+        )
+
+        def matches(raw):
+            packet = self.packets.protocol.decode(raw)
+            return any(int(reply.client_request_id.raw_id) == request_id
+                       for reply in packet.responses)
+
+        pending = asyncio.create_task(self.packets.wait_for_packet(
+            b.ItemStackResponsePacket.ID, timeout=timeout, match=matches,
+        ))
+        try:
+            await asyncio.sleep(0)
+            await self.packets.send(b.ItemStackRequestPacket(requests=[request]))
+            packet = self.packets.protocol.decode(await pending)
+            reply = next(reply for reply in packet.responses
+                         if int(reply.client_request_id.raw_id) == request_id)
+            for container in reply.containers or ():
+                name = container.full_container_name.name.name
+                for slot in container.slots:
+                    index = int(slot.slot)
+                    input_info = input_slots.get((name, index))
+                    if input_info is not None:
+                        number, item_name = input_info
+                        net_id = slot.item_stack_net_id
+                        if int(slot.amount) == 0:
+                            self._inputs.pop(number, None)
+                        elif net_id is not None:
+                            self._inputs[number] = (
+                                item_name, int(slot.amount), int(net_id.raw_id),
+                            )
+                    elif (name in ("HOTBAR_CONTAINER", "INVENTORY_CONTAINER",
+                                   "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER")
+                          and index == destination_slot):
+                        current = self.inventory.item_or_empty(index)
+                        if (reply.result.name == "SUCCESS" and output_id is not None
+                                and int(current.id) != output_id):
+                            current = b.SerializedNetworkItemStackDescriptor(
+                                id=output_id, stack_size=offer.sell.count,
+                                aux_value=0, net_id_variant=None,
+                                block_runtime_id=0, user_data_buffer=b"\0" * 10,
+                            )
+                        if int(current.id) != 0 or int(slot.amount) == 0:
+                            self.inventory._set_slot(
+                                index, _response_item(b, current, current, slot)
+                            )
+            return reply
         finally:
             if not pending.done():
                 pending.cancel()
