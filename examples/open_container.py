@@ -363,6 +363,8 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
                     "armor_count": None if remaining is None else int(remaining.stack_size),
                 }), flush=True)
                 if swap_armor_after_unequip:
+                    print("armor_reequip_ready", flush=True)
+                    await asyncio.to_thread(sys.stdin.readline)  # Testbed checks returned slot.
                     reequip = await bot.equip_armor(destination_slot, equip_armor_slot)
                     reequipped = bot.armor_slots.get(equip_armor_slot)
                     print("armor_reequip_response=" + json.dumps({
