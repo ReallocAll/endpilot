@@ -188,6 +188,40 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(movement.position, (0.5, 101.62, 0.5))
         movement.close()
 
+    async def test_lateral_jump_combines_strafe_and_jump_then_releases_both(self):
+        protocol = Protocol(2193)
+        flags = protocol.binding.PlayerAuthInputPacket.InputData
+
+        for direction, sign, lateral_flag in (
+            ("left", 1, flags.LEFT), ("right", -1, flags.RIGHT),
+        ):
+            with self.subTest(direction=direction):
+                sink = PacketSink(protocol)
+                movement = Movement(sink, 1)
+                movement.position = movement._input_position = (0.5, 101.62, 0.5)
+
+                self.assertEqual(await getattr(movement, f"jump_{direction}")(4), 4)
+                self.assertEqual([p.client_tick for p in sink.sent], list(range(1, 7)))
+                for packet in sink.sent[:4]:
+                    self.assertIn(lateral_flag, packet.input_data)
+                    self.assertEqual(packet.move.x, sign)
+                    self.assertEqual(packet.move.y, 0.0)
+                    self.assertAlmostEqual(packet.pos_delta.x, sign * 0.09, places=5)
+                    self.assertAlmostEqual(packet.pos_delta.z, 0.0, places=5)
+                    self.assertEqual(packet.raw_move_vector.x, sign)
+                    self.assertEqual(packet.analog_move_vector.x, sign)
+                self.assertIn(flags.START_JUMPING, sink.sent[0].input_data)
+                self.assertIn(flags.JUMPING, sink.sent[0].input_data)
+                self.assertIn(flags.JUMP_RELEASED_RAW, sink.sent[1].input_data)
+                self.assertTrue(all(flags.JUMPING not in p.input_data
+                                    for p in sink.sent[1:]))
+                self.assertTrue(all(lateral_flag not in p.input_data
+                                    for p in sink.sent[4:]))
+                self.assertEqual([p.move.x for p in sink.sent[4:]], [0.0, 0.0])
+                self.assertGreater(max(p.pos.y for p in sink.sent), 102.0)
+                self.assertEqual(movement.position, (0.5, 101.62, 0.5))
+                movement.close()
+
     async def test_server_teleport_interrupts_jump_prediction(self):
         protocol = Protocol(2193)
         b = protocol.binding
