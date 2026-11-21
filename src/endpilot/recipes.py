@@ -23,6 +23,9 @@ class RecipeResult:
     item_id: int
     name: str | None
     count: int
+    aux_value: int
+    block_runtime_id: int
+    user_data_buffer: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,7 +65,12 @@ class Recipes:
                 if recipe_id is None or net_id is None:
                     continue  # A multi-recipe has only a UUID and network ID.
                 ingredients = []
-                for ingredient in getattr(entry, "ingredients", ()) or ():
+                source_ingredients = getattr(entry, "ingredients", None)
+                if source_ingredients is None and kind.startswith("smithing_"):
+                    source_ingredients = (
+                        entry.template_ingredient, entry.base_ingredient, entry.addition_ingredient
+                    )
+                for ingredient in source_ingredients or ():
                     if int(ingredient.stack_size) <= 0:
                         continue
                     descriptor = ingredient.descriptor or {}
@@ -70,13 +78,26 @@ class Recipes:
                         descriptor.get("name"), descriptor.get("item_tag"),
                         int(ingredient.stack_size),
                     ))
+                source_results = getattr(entry, "results", None)
+                if source_results is None and kind == "smithing_transform_recipes":
+                    source_results = (entry.result,)
                 results = tuple(
-                    RecipeResult(int(item.id), self.item_names.get(int(item.id)),
-                                 int(item.stack_size))
-                    for item in getattr(entry, "results", ()) or ()
+                    RecipeResult(
+                        int(item.id), self.item_names.get(int(item.id)),
+                        int(item.stack_size), int(item.aux_value),
+                        int(item.block_runtime_id), bytes(item.user_data_buffer),
+                    )
+                    for item in source_results or ()
                 )
                 recipe = Recipe(str(recipe_id), int(net_id), kind, tuple(ingredients),
                                 results, str(getattr(entry, "tag", "")))
+                # An incremental update may replace either ID. Keep both indexes consistent.
+                old_id = self._by_id.get(recipe.recipe_id)
+                if old_id is not None:
+                    self._by_net_id.pop(old_id.net_id, None)
+                old_net = self._by_net_id.get(recipe.net_id)
+                if old_net is not None:
+                    self._by_id.pop(old_net.recipe_id, None)
                 self._by_id[recipe.recipe_id] = recipe
                 self._by_net_id[recipe.net_id] = recipe
         self._loaded.set()
