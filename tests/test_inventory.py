@@ -279,3 +279,119 @@ class InventoryTests(unittest.IsolatedAsyncioTestCase):
             packets.send.assert_not_awaited()
         finally:
             inventory.close()
+
+    async def test_move_item_splits_stack_from_matching_server_response(self):
+        from endpilot.protocol import RawPacket
+
+        codec = Protocol(2193)
+        b = codec.binding
+        callbacks = []
+        other = SimpleNamespace(client_request_id=SimpleNamespace(raw_id=-3))
+        reply = SimpleNamespace(
+            client_request_id=SimpleNamespace(raw_id=-1),
+            result=SimpleNamespace(name="SUCCESS"),
+            containers=[SimpleNamespace(
+                full_container_name=SimpleNamespace(
+                    name=b.ContainerEnumName.COMBINED_HOTBAR_AND_INVENTORY_CONTAINER,
+                ),
+                slots=[
+                    SimpleNamespace(slot=2, amount=1,
+                                    item_stack_net_id=SimpleNamespace(raw_id=51)),
+                    SimpleNamespace(slot=3, amount=1,
+                                    item_stack_net_id=SimpleNamespace(raw_id=52)),
+                    SimpleNamespace(slot=9, amount=99,
+                                    item_stack_net_id=SimpleNamespace(raw_id=99)),
+                ],
+            )],
+        )
+        matching = RawPacket(b.ItemStackResponsePacket.ID, b"matched")
+        unrelated = RawPacket(b.ItemStackResponsePacket.ID, b"unrelated")
+        decoded = {
+            b"matched": SimpleNamespace(responses=[other, reply]),
+            b"unrelated": SimpleNamespace(responses=[other]),
+        }
+        packets = SimpleNamespace(
+            protocol=SimpleNamespace(binding=b, decode=lambda raw: decoded[raw.body]),
+            subscribe_raw=lambda cb: callbacks.append(cb)
+            or (lambda: callbacks.remove(cb)),
+            send=AsyncMock(),
+        )
+
+        async def wait(packet_id, *, timeout, match):
+            self.assertEqual(packet_id, b.ItemStackResponsePacket.ID)
+            self.assertEqual(timeout, 4)
+            self.assertFalse(match(unrelated))
+            self.assertTrue(match(matching))
+            return matching
+
+        packets.wait_for_packet = wait
+        inventory = Inventory(packets, 7)
+        try:
+            item = b.SerializedNetworkItemStackDescriptor(
+                id=42, stack_size=2, aux_value=0, net_id_variant=50,
+                block_runtime_id=0, user_data_buffer=b"",
+            )
+            inventory._set_slot(2, item)
+            received = await inventory.move_item(2, 3, 1, timeout=4)
+            self.assertIs(received, reply)
+            sent = packets.send.await_args.args[0]
+            action = sent.requests[0].actions[0]
+            self.assertIsInstance(action, b.ItemStackRequestCereal.PlaceActionData)
+            self.assertEqual(int(sent.requests[0].client_request_id.raw_id), -1)
+            self.assertEqual(int(action.amount), 1)
+            self.assertEqual((int(action.source.slot), int(action.source.net_id_variant)), (2, 50))
+            self.assertEqual((int(action.destination.slot), int(action.destination.net_id_variant)), (3, 0))
+            self.assertEqual(action.source.full_container_name.name,
+                             b.ContainerEnumName.COMBINED_HOTBAR_AND_INVENTORY_CONTAINER)
+            self.assertEqual(action.destination.full_container_name.name,
+                             b.ContainerEnumName.COMBINED_HOTBAR_AND_INVENTORY_CONTAINER)
+            self.assertEqual((int(inventory.slots[2].id), int(inventory.slots[2].stack_size),
+                              int(inventory.slots[2].net_id_variant)), (42, 1, 51))
+            self.assertEqual((int(inventory.slots[3].id), int(inventory.slots[3].stack_size),
+                              int(inventory.slots[3].net_id_variant)), (42, 1, 52))
+            self.assertNotIn(9, inventory.slots)
+            self.assertEqual(inventory._allocate_request_id(), -3)
+        finally:
+            inventory.close()
+        self.assertEqual(callbacks, [])
+
+    async def test_move_item_keeps_state_on_rejection_and_invalid_source(self):
+        from endpilot.protocol import RawPacket
+
+        codec = Protocol(2193)
+        b = codec.binding
+        callbacks = []
+        error = SimpleNamespace(
+            client_request_id=SimpleNamespace(raw_id=-1),
+            result=SimpleNamespace(name="CANNOT_PLACE_ITEM"),
+            containers=[],
+        )
+        packets = SimpleNamespace(
+            protocol=SimpleNamespace(
+                binding=b,
+                decode=lambda _: SimpleNamespace(responses=[error]),
+            ),
+            subscribe_raw=lambda cb: callbacks.append(cb)
+            or (lambda: callbacks.remove(cb)),
+            wait_for_packet=AsyncMock(return_value=RawPacket(b.ItemStackResponsePacket.ID, b"")),
+            send=AsyncMock(),
+        )
+        inventory = Inventory(packets, 7)
+        try:
+            for source, destination, amount in ((-1, 2, 1), (0, 256, 1),
+                                                 (0, 1, 0), (0, 1, 256),
+                                                 (0, 1, 1)):
+                with self.assertRaises(ValueError):
+                    await inventory.move_item(source, destination, amount)
+            packets.send.assert_not_awaited()
+            item = b.SerializedNetworkItemStackDescriptor(
+                id=42, stack_size=2, aux_value=0, net_id_variant=50,
+                block_runtime_id=0, user_data_buffer=b"",
+            )
+            inventory._set_slot(0, item)
+            self.assertIs(await inventory.move_item(0, 1), error)
+            self.assertIs(inventory.slots[0], item)
+            self.assertNotIn(1, inventory.slots)
+        finally:
+            inventory.close()
+        self.assertEqual(callbacks, [])
