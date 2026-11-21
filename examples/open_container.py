@@ -10,7 +10,10 @@ from endpilot import Bot
 async def run(url: str, take_count: int = 0, destination_slot: int = 0,
               put_back_count: int = 0, equip_armor_slot: int | None = None,
               expect_server_close: bool = False, drop_count: int = 0,
-              split_slot: int | None = None, chat_during_take: bool = False) -> None:
+              split_slot: int | None = None, chat_during_take: bool = False,
+              server_grant_during_take: bool = False) -> None:
+    if server_grant_during_take and not chat_during_take:
+        raise ValueError("server grant scenario requires --chat-during-take")
     bot = Bot("EndPilotTest")
     target = (1, 100, 0)
     try:
@@ -94,6 +97,9 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
                         raise AssertionError(
                             "the matching item-stack response arrived during chat submission"
                         )
+                    if server_grant_during_take:
+                        print("server_grant_after_request_sent", flush=True)
+                        await asyncio.to_thread(sys.stdin.readline)
                     response = await taking
                     print("chat_during_take=" + json.dumps({
                         "message": "endpilot-container-interleave",
@@ -107,6 +113,18 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
                         await asyncio.gather(taking, return_exceptions=True)
             else:
                 response = await bot.take_from_container(0, destination_slot, take_count)
+            if server_grant_during_take:
+                count = await bot.wait_for_inventory_item_count(
+                    int(slots[0].id), take_count + 1, timeout=15
+                )
+                granted = bot.inventory_slots.get(4)
+                if (granted is None or int(granted.id) != int(slots[0].id)
+                        or int(granted.stack_size) != 1):
+                    raise AssertionError(f"unexpected server-granted slot 4: {granted}")
+                print("server_grant_observed=" + json.dumps({
+                    "slot": 4, "stack_size": int(granted.stack_size),
+                    "item_id": int(granted.id), "inventory_count": count,
+                }), flush=True)
             print("container_take_response=" + json.dumps({
                 "request_id": int(response.client_request_id.raw_id),
                 "result": response.result.name,
@@ -246,7 +264,10 @@ if __name__ == "__main__":
                         help="after closing the chest, split one item into this inventory slot")
     parser.add_argument("--chat-during-take", action="store_true",
                         help="send player chat without blocking on the chest item response")
+    parser.add_argument("--server-grant-during-take", action="store_true",
+                        help="Testbed independently grants inventory after the stack request is sent")
     args = parser.parse_args()
     asyncio.run(run(args.url, args.take_count, args.destination_slot,
                     args.put_back_count, args.equip_armor_slot, args.expect_server_close,
-                    args.drop_count, args.split_slot, args.chat_during_take))
+                    args.drop_count, args.split_slot, args.chat_during_take,
+                    args.server_grant_during_take))
