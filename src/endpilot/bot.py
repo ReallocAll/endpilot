@@ -248,6 +248,15 @@ class Bot:
         return await self._inventory.equip_armor(source_slot, armor_slot, timeout=timeout)
 
 
+    async def unequip_armor(self, armor_slot: int, destination_slot: int, *, timeout: float = 15):
+        """Take equipped armor back into inventory; return BDS's stack verdict."""
+        if self._inventory is None:
+            raise RuntimeError("bot is not joined")
+        return await self._inventory.unequip_armor(
+            armor_slot, destination_slot, timeout=timeout,
+        )
+
+
     async def drop_inventory_item(self, slot: int, amount: int = 1, *, timeout: float = 15):
         """Return BDS's verdict for dropping an observed inventory stack."""
         if self._inventory is None:
