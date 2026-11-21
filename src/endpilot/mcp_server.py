@@ -11,6 +11,7 @@ class MCPPlayer:
         self.bot: Bot | None = None
         self._pending: dict[tuple[tuple[int, int, int], int], asyncio.Task[BlockUpdate]] = {}
         self._observed: dict[tuple[tuple[int, int, int], int], BlockUpdate] = {}
+        self._reading: set[asyncio.Task] = set()
         self._walk: asyncio.Task[int] | None = None
 
     def _joined(self) -> Bot:
@@ -59,9 +60,14 @@ class MCPPlayer:
         task = self._pending.pop(key, None)
         if task is None:
             raise RuntimeError("watch_block must be called before read_block")
-        update = await task
-        self._observed[key] = update
-        return {"position": list(update.position), "runtime_id": update.runtime_id, "layer": update.layer}
+        reader = asyncio.current_task()
+        self._reading.add(reader)
+        try:
+            update = await task
+            self._observed[key] = update
+            return {"position": list(update.position), "runtime_id": update.runtime_id, "layer": update.layer}
+        finally:
+            self._reading.discard(reader)
 
     async def place_against(self, x: int, y: int, z: int, face: int = 1, slot: int = 0) -> dict:
         """Submit an item-use frame against a server-observed support; not placement acceptance."""
@@ -114,18 +120,36 @@ class MCPPlayer:
         return {"state": "stopped" if was_running else "finished",
                 "submitted_frames": frames, "server_position": bot.position}
 
+    async def _cancel_block_watchers(self) -> None:
+        tasks = [*self._pending.values(), *self._reading]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._pending.clear()
+        self._reading.clear()
+        self._observed.clear()
+
+    async def handoff(self) -> Bot:
+        """Return the live Bot to Python code in this process, without reconnecting.
+
+        This is a Python ownership transfer, not an MCP stdio tool: Bot objects
+        cannot be serialized into a different process.
+        """
+        bot = self._joined()
+        if self._walk is not None:
+            await self.stop_walk()
+        await self._cancel_block_watchers()
+        self.bot = None
+        return bot
+
     async def disconnect(self) -> dict:
         bot, self.bot = self.bot, None
         if self._walk is not None:
             self._walk.cancel()
             await asyncio.gather(self._walk, return_exceptions=True)
             self._walk = None
-        for task in self._pending.values():
-            task.cancel()
-        if self._pending:
-            await asyncio.gather(*self._pending.values(), return_exceptions=True)
-        self._pending.clear()
-        self._observed.clear()
+        await self._cancel_block_watchers()
         if bot is not None:
             await bot.close()
         return {"disconnected": bot is not None}

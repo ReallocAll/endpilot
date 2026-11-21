@@ -132,3 +132,60 @@ class MCPPlayerTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(bot.closed)
             self.assertTrue(bot.walk_stopped.is_set())
             self.assertIsNone(player._walk)
+
+    async def test_handoff_stops_walk_and_returns_same_live_bot(self):
+        with patch("endpilot.mcp_server.Bot", FakeBot):
+            player = MCPPlayer()
+            await player.connect("http://localhost:19132")
+            bot = player.bot
+            await player.watch_block(2, 99, 0)
+            await player.start_walk(100)
+            await asyncio.sleep(0.02)
+            handed = await player.handoff()
+            self.assertIs(handed, bot)
+            self.assertIsNone(player.bot)
+            self.assertIsNone(player._walk)
+            self.assertEqual(player._pending, {})
+            self.assertTrue(bot.walk_stopped.is_set())
+            self.assertFalse(bot.closed)
+            self.assertEqual(await bot.walk_forward(2), 2)
+            self.assertEqual(await player.disconnect(), {"disconnected": False})
+            self.assertFalse(bot.closed)
+            await bot.close()
+            self.assertTrue(bot.closed)
+
+    async def test_handoff_cancels_in_flight_block_read(self):
+        with patch("endpilot.mcp_server.Bot", FakeBot):
+            player = MCPPlayer()
+            await player.connect("http://localhost:19132")
+            bot = player.bot
+            await player.watch_block(2, 99, 0)
+            read_task = asyncio.create_task(player.read_block(2, 99, 0))
+            await asyncio.sleep(0)
+            self.assertEqual(player._pending, {})
+            self.assertFalse(read_task.done())
+
+            self.assertIs(await player.handoff(), bot)
+            self.assertTrue(read_task.cancelled())
+            bot.updated.set()
+            await asyncio.sleep(0)
+            self.assertEqual(player._observed, {})
+            self.assertFalse(bot.closed)
+            await bot.close()
+
+    async def test_disconnect_cancels_in_flight_block_read(self):
+        with patch("endpilot.mcp_server.Bot", FakeBot):
+            player = MCPPlayer()
+            await player.connect("http://localhost:19132")
+            await player.watch_block(2, 99, 0)
+            read_task = asyncio.create_task(player.read_block(2, 99, 0))
+            await asyncio.sleep(0)
+            self.assertEqual(player._pending, {})
+
+            self.assertEqual(await player.disconnect(), {"disconnected": True})
+            self.assertTrue(read_task.cancelled())
+            self.assertEqual(player._observed, {})
+
+    async def test_handoff_requires_connected_player(self):
+        with self.assertRaisesRegex(RuntimeError, "connect a player"):
+            await MCPPlayer().handoff()
