@@ -8,7 +8,7 @@ import sys
 from endpilot import Bot
 
 
-async def run(url: str) -> None:
+async def run(url: str, *, times: int = 1) -> None:
     bot = Bot("EndPilotTest")
     try:
         if url.startswith("raknet://"):
@@ -38,6 +38,7 @@ async def run(url: str) -> None:
         print("recipe_selected=" + json.dumps({
             "id": recipe.recipe_id, "net_id": recipe.net_id,
             "ingredient": "minecraft:iron_ingot", "ingredient_count": 9,
+            "crafts": times,
             "output": output.name, "output_count": output.count,
             "output_id": output.item_id,
         }), flush=True)
@@ -46,11 +47,11 @@ async def run(url: str) -> None:
         deadline = asyncio.get_running_loop().time() + 15
         while True:
             occupied = [(slot, item) for slot, item in bot.inventory_slots.items()
-                        if int(item.id) != 0 and int(item.stack_size) >= 9]
+                        if int(item.id) != 0 and int(item.stack_size) >= 9 * times]
             if occupied:
                 break
             if asyncio.get_running_loop().time() >= deadline:
-                raise TimeoutError("BDS did not deliver nine iron ingots")
+                raise TimeoutError("BDS did not deliver enough iron ingots for the requested crafts")
             await asyncio.sleep(0.1)
         source_slot, source = occupied[0]
         before = int(source.stack_size)
@@ -66,7 +67,7 @@ async def run(url: str) -> None:
 
         stages = []
         for slot in range(32, 41):
-            reply = await bot.stage_crafting_ingredient(source_slot, slot)
+            reply = await bot.stage_crafting_ingredient(source_slot, slot, amount=times)
             remaining = int(bot.inventory_slots[source_slot].stack_size)
             stage = {
                 "grid_slot": slot, "result": reply.result.name,
@@ -74,11 +75,11 @@ async def run(url: str) -> None:
                 "source_after": remaining,
             }
             stages.append(stage)
-            if stage["result"] != "SUCCESS" or remaining != before - (slot - 31):
+            if stage["result"] != "SUCCESS" or remaining != before - (slot - 31) * times:
                 raise AssertionError(f"BDS rejected workbench staging: {stage}")
         print("grid_stages=" + json.dumps(stages), flush=True)
 
-        reply = await bot.craft_recipe_grid(recipe.net_id, destination_slot)
+        reply = await bot.craft_recipe_grid(recipe.net_id, destination_slot, times=times)
         destination = bot.inventory_slots.get(destination_slot)
         record = {
             "result": reply.result.name,
@@ -92,7 +93,7 @@ async def run(url: str) -> None:
         print("craft_result=" + json.dumps(record), flush=True)
         if record["result"] != "SUCCESS":
             raise AssertionError(f"BDS rejected workbench craft: {record}")
-        if record["output_id"] != output.item_id or record["output_count"] != output.count:
+        if record["output_id"] != output.item_id or record["output_count"] != output.count * times:
             raise AssertionError(f"unexpected workbench output: {record}")
 
         await bot.close_container()
@@ -105,4 +106,6 @@ async def run(url: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("url", help="NetherNet HTTP URL or raknet://host:port")
-    asyncio.run(run(parser.parse_args().url))
+    parser.add_argument("--times", type=int, default=1, help="craft this many iron blocks in one request")
+    args = parser.parse_args()
+    asyncio.run(run(args.url, times=args.times))
