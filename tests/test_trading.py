@@ -129,6 +129,12 @@ class TradingTests(unittest.IsolatedAsyncioTestCase):
             containers._slots = {0: object()}
             observers[0](RawPacket(b.UpdateTradePacket.ID, b"trade"))
             self.assertEqual(len(containers.slots), 1)
+            # ContainerOpen carries an actual position that UpdateTrade lacks.
+            known = containers.window
+            containers.window = type(known)(5, "TRADE", (2, 100, 0), 42)
+            observers[0](RawPacket(b.UpdateTradePacket.ID, b"trade"))
+            self.assertEqual(containers.window.position, (2, 100, 0))
+            self.assertEqual(len(containers.slots), 1)
             observers[0](RawPacket(b.ContainerClosePacket.ID, b"close"))
             self.assertIsNone(containers.window)
         finally:
