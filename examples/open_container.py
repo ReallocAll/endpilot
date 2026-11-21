@@ -9,7 +9,8 @@ from endpilot import Bot
 
 async def run(url: str, take_count: int = 0, destination_slot: int = 0,
               put_back_count: int = 0, equip_armor_slot: int | None = None,
-              expect_server_close: bool = False, drop_count: int = 0) -> None:
+              expect_server_close: bool = False, drop_count: int = 0,
+              split_slot: int | None = None) -> None:
     bot = Bot("EndPilotTest")
     target = (1, 100, 0)
     try:
@@ -84,6 +85,29 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
             closed = await bot.close_container()
             print("container_closed=" + json.dumps({
                 "id": None if closed is None else closed.container_id,
+                "open_window": bot.open_window is not None,
+            }), flush=True)
+        if split_slot is not None:
+            screen = await bot.open_inventory_screen()
+            print("player_inventory_opened=" + json.dumps({
+                "id": screen.container_id, "type": screen.container_type,
+            }), flush=True)
+            source = bot.inventory_slots[destination_slot]
+            response = await bot.move_inventory_item(destination_slot, split_slot, 1)
+            source_after = bot.inventory_slots[destination_slot]
+            target_after = bot.inventory_slots[split_slot]
+            print("inventory_split_response=" + json.dumps({
+                "request_id": int(response.client_request_id.raw_id),
+                "result": response.result.name,
+                "source_before": int(source.stack_size),
+                "source_after": int(source_after.stack_size),
+                "target_count": int(target_after.stack_size),
+                "source_item_id": int(source_after.id),
+                "target_item_id": int(target_after.id),
+            }), flush=True)
+            screen_closed = await bot.close_container()
+            print("player_inventory_closed=" + json.dumps({
+                "id": None if screen_closed is None else screen_closed.container_id,
                 "open_window": bot.open_window is not None,
             }), flush=True)
         if drop_count:
@@ -165,7 +189,9 @@ if __name__ == "__main__":
                         help="after closing chest, drop from the destination inventory slot")
     parser.add_argument("--expect-server-close", action="store_true",
                         help="observe server-initiated window close instead of requesting it")
+    parser.add_argument("--split-slot", type=int, default=None,
+                        help="after closing the chest, split one item into this inventory slot")
     args = parser.parse_args()
     asyncio.run(run(args.url, args.take_count, args.destination_slot,
                     args.put_back_count, args.equip_armor_slot, args.expect_server_close,
-                    args.drop_count))
+                    args.drop_count, args.split_slot))
