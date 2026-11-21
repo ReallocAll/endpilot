@@ -96,7 +96,7 @@ class SwapInventoryTests(unittest.IsolatedAsyncioTestCase):
         finally:
             inventory.close()
 
-async def test_same_slot_server_update_does_not_restore_stale_item_identity(self):
+    async def test_same_slot_server_update_does_not_restore_stale_item_identity(self):
         codec = Protocol(2193)
         b = codec.binding
 
