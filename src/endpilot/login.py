@@ -64,6 +64,7 @@ class JoinSession:
         self.block_network_ids_are_hashes = False
         self.item_names: dict[int, str] = {}
         self.crafting_data_packets = []
+        self.inventory_packets = []
 
     @classmethod
     async def connect_nethernet(
@@ -149,6 +150,10 @@ class JoinSession:
             elif raw.packet_id == binding.CraftingDataPacket.ID:
                 # Login's direct reader must not discard recipes sent before spawn.
                 self.crafting_data_packets.append(raw)
+            elif raw.packet_id in (binding.InventoryContentPacket.ID, binding.InventorySlotPacket.ID):
+                # Initial inventory can arrive before PlayStatus spawn; hand it
+                # to Inventory in the original wire order after joining.
+                self.inventory_packets.append(raw)
             elif raw.packet_id == binding.ItemRegistryPacket.ID:
                 registry = self.packets.protocol.decode(raw)
                 self.item_names = {int(item.id): str(item.name) for item in registry.items}
