@@ -411,3 +411,40 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await queued_walk
         self.assertEqual([list(p.input_data) for p in stream.sent[-2:]], [[], []])
+
+    async def test_held_sprint_starts_only_forward_and_stops_on_release_or_sneak(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        flags = b.PlayerAuthInputPacket.InputData
+        sink = PacketSink(protocol)
+        movement = Movement(sink, 1)
+        movement._input_position = (0.5, 101.62, 0.5)
+        movement.position = movement._input_position
+
+        self.assertEqual(await movement.set_sprinting(True), 1)
+        self.assertEqual(set(sink.sent[-1].input_data), {flags.SPRINT_DOWN})
+        await movement._send_input(True)
+        self.assertEqual(set(sink.sent[-1].input_data), {
+            flags.UP, flags.SPRINTING, flags.SPRINT_DOWN, flags.START_SPRINTING,
+        })
+        self.assertAlmostEqual(sink.sent[-1].pos.z, 0.617, places=5)
+        await movement._send_input(True)
+        self.assertEqual(set(sink.sent[-1].input_data), {
+            flags.UP, flags.SPRINTING, flags.SPRINT_DOWN,
+        })
+        await movement._send_input(False)
+        self.assertEqual(set(sink.sent[-1].input_data), {
+            flags.SPRINT_DOWN, flags.STOP_SPRINTING,
+        })
+
+        await movement.set_sneaking(True)
+        await movement._send_input(True)
+        self.assertNotIn(flags.START_SPRINTING, sink.sent[-1].input_data)
+        self.assertNotIn(flags.SPRINTING, sink.sent[-1].input_data)
+        await movement.set_sneaking(False)
+        await movement._send_input(True)
+        self.assertIn(flags.START_SPRINTING, sink.sent[-1].input_data)
+        await movement._send_input(False)
+        await movement.set_sprinting(False)
+        self.assertEqual(list(sink.sent[-1].input_data), [])
+        movement.close()

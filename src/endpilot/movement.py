@@ -15,6 +15,8 @@ class Movement:
         self._tick = 1
         self._teleport_pending = False
         self._sneaking = False
+        self._sprint_key = False
+        self._sprinting = False
         self._jump_floor_y: float | None = None
         self._jump_velocity = 0.0
         self._jump_was_pressed = False
@@ -84,9 +86,12 @@ class Movement:
         pitch, yaw = self._rotation
         y_rad = math.radians(yaw)
         p_rad = math.radians(pitch)
-        # Mirror the upstream client's held sneak input scaling.
+        # Sprint key is held; the sprint state starts only during forward movement.
+        sprinting = self._sprint_key and forward and not self._sneaking
+        sprint_changed = sprinting != self._sprinting
+        self._sprinting = sprinting
         scale = 0.3 if self._sneaking else 1.0
-        step = 0.09 * scale if forward else 0.0
+        step = 0.09 * scale * (1.3 if sprinting else 1.0) if forward else 0.0
         dx, dz = -math.sin(y_rad) * step, math.cos(y_rad) * step
         # Grounded jump follows the upstream client's vertical travel:
         # 0.42 launch velocity, then gravity 0.08 and vertical drag 0.98.
@@ -112,6 +117,15 @@ class Movement:
                 b.PlayerAuthInputPacket.InputData.SNEAK_CURRENT_RAW,
                 b.PlayerAuthInputPacket.InputData.WANT_DOWN,
             ))
+        if self._sprinting:
+            flags.append(b.PlayerAuthInputPacket.InputData.SPRINTING)
+        if self._sprint_key:
+            flags.append(b.PlayerAuthInputPacket.InputData.SPRINT_DOWN)
+        if sprint_changed:
+            flags.append(
+                b.PlayerAuthInputPacket.InputData.START_SPRINTING
+                if sprinting else b.PlayerAuthInputPacket.InputData.STOP_SPRINTING
+            )
         if jump_pressed:
             flags.extend((
                 b.PlayerAuthInputPacket.InputData.JUMPING,
@@ -198,6 +212,18 @@ class Movement:
             changed = self._sneaking != sneaking
             self._sneaking = sneaking
             return await self._send_input(False, sneak_changed=changed)
+
+    async def set_sprinting(self, sprinting: bool) -> int:
+        """Hold or release sprint input for subsequent forward-moving frames.
+
+        Sprinting begins only with forward movement and ends when movement stops
+        or sneaking starts. Return the submitted tick, not BDS acceptance.
+        """
+        async with self._action_lock:
+            if self._input_position is None:
+                await self.wait_for_position_sync()
+            self._sprint_key = sprinting
+            return await self._send_input(False)
 
     async def jump(self) -> int:
         """Submit a one-tick jump press and predicted vertical motion.
