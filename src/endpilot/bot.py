@@ -300,6 +300,16 @@ class Bot:
             source_slot, destination_slot, amount, timeout=timeout
         )
 
+    async def swap_inventory_items(
+        self, source_slot: int, destination_slot: int, *, timeout: float = 15
+    ):
+        """Swap player slots; return the matching BDS item-stack verdict."""
+        if self._inventory is None:
+            raise RuntimeError("player has not joined")
+        return await self._inventory.swap_items(
+            source_slot, destination_slot, timeout=timeout
+        )
+
     async def put_into_container(
         self, source_slot: int, destination_slot: int, amount: int = 1, *, timeout: float = 15
     ):
