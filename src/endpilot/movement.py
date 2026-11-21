@@ -278,6 +278,14 @@ class Movement:
         """Submit simultaneous forward/right input; return submitted frames."""
         return await self._walk(ticks, forward=True, strafe=-1)
 
+    async def walk_backward_left(self, ticks: int = 24) -> int:
+        """Submit simultaneous backward/left input; return submitted frames."""
+        return await self._walk(ticks, backward=True, strafe=1)
+
+    async def walk_backward_right(self, ticks: int = 24) -> int:
+        """Submit simultaneous backward/right input; return submitted frames."""
+        return await self._walk(ticks, backward=True, strafe=-1)
+
     async def _walk(self, ticks: int, *, forward: bool = False,
                     backward: bool = False, strafe: int = 0) -> int:
         async with self._action_lock:
