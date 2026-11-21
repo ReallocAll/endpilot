@@ -282,3 +282,93 @@ class CraftingTests(unittest.IsolatedAsyncioTestCase):
             packets.send.assert_not_awaited()
         finally:
             recipes.close()
+
+    async def test_workbench_uses_large_grid_slots_and_reconciles_each_input(self):
+        b = Protocol(2193).binding
+        slots = {0: item(b, 1, 2, 21), 8: item(b, 0, 0, 0)}
+        inventory = SimpleNamespace(
+            slots=slots,
+            item_or_empty=lambda index: slots.get(index, item(b, 0, 0, 0)),
+            _allocate_request_id=Mock(side_effect=[-1, -3]),
+            _set_slot=lambda index, value: slots.__setitem__(index, value),
+        )
+
+        def response_slot(index, amount, net_id=None):
+            return SimpleNamespace(
+                slot=index, amount=amount,
+                item_stack_net_id=(SimpleNamespace(raw_id=net_id) if net_id is not None else None),
+            )
+
+        def response_container(name, *contents):
+            return SimpleNamespace(
+                full_container_name=SimpleNamespace(name=b.ContainerEnumName[name]),
+                slots=contents,
+            )
+
+        stage = SimpleNamespace(
+            client_request_id=SimpleNamespace(raw_id=-1),
+            result=SimpleNamespace(name="SUCCESS"),
+            containers=[
+                response_container("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER",
+                                   response_slot(0, 1, 22)),
+                response_container("CRAFTING_INPUT_CONTAINER", response_slot(40, 1, 54)),
+            ],
+        )
+        craft = SimpleNamespace(
+            client_request_id=SimpleNamespace(raw_id=-3),
+            result=SimpleNamespace(name="SUCCESS"),
+            containers=[
+                response_container("CRAFTING_INPUT_CONTAINER",
+                                   response_slot(32, 0), response_slot(40, 0)),
+                response_container("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER",
+                                   response_slot(8, 4, 59)),
+            ],
+        )
+        responses = iter([stage, craft])
+        packets = SimpleNamespace(
+            protocol=SimpleNamespace(
+                binding=b,
+                decode=lambda raw: SimpleNamespace(responses=[raw.reply]),
+            ),
+            subscribe_raw=lambda cb: lambda: None,
+            wait_for_packet=AsyncMock(side_effect=lambda *a, **k: RawPacket(0, b"")),
+            send=AsyncMock(),
+        )
+
+        async def wait_for_response(packet_id, *, timeout, match):
+            reply = next(responses)
+            raw = SimpleNamespace(reply=reply)
+            self.assertTrue(match(raw))
+            return raw
+
+        packets.wait_for_packet = wait_for_response
+        recipes = Recipes(
+            packets, {1: "minecraft:oak_log", 2: "minecraft:oak_planks"},
+            inventory=inventory,
+            containers=SimpleNamespace(window=SimpleNamespace(container_type="WORKBENCH")),
+        )
+        entry = server_recipe()
+        entry.results[0].block_runtime_id = -939070369  # Signed catalog view of a u32.
+        recipes.load(SimpleNamespace(clear_recipes=True, shaped_recipes=[entry]))
+        recipes._grid_slots[32] = item(b, 1, 1, 53)
+        recipes._grid_slots[28] = item(b, 1, 1, 52)  # Inactive 2x2 input.
+        try:
+            with self.assertRaisesRegex(ValueError, "32 through 40"):
+                await recipes.stage_grid(0, 31)
+            self.assertIs(await recipes.stage_grid(0, 40, timeout=3), stage)
+            staged_action = packets.send.await_args.args[0].requests[0].actions[0]
+            self.assertEqual(staged_action.destination.slot, 40)
+            self.assertEqual(recipes._grid_slots[40].net_id_variant, 54)
+
+            self.assertIs(await recipes.craft_grid(19, 8, timeout=3), craft)
+            actions = packets.send.await_args.args[0].requests[0].actions
+            self.assertEqual([a.source.slot for a in actions if type(a).__name__ == "ConsumeActionData"],
+                             [32, 40])
+            self.assertEqual(actions[1].craft_results[0].block_runtime_id, 3355896927)
+            self.assertEqual((slots[8].id, slots[8].stack_size, slots[8].net_id_variant),
+                             (2, 4, 59))
+            self.assertEqual(recipes._grid_slots[32].stack_size, 0)
+            self.assertEqual(recipes._grid_slots[40].stack_size, 0)
+            self.assertEqual(recipes._grid_slots[28].stack_size, 1)
+        finally:
+            recipes.close()
