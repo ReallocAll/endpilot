@@ -66,10 +66,11 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
 
                 async def send_and_signal(packet):
                     nonlocal request_id
-                    if isinstance(packet, binding.ItemStackRequestPacket):
+                    is_request = isinstance(packet, binding.ItemStackRequestPacket)
+                    if is_request:
                         request_id = int(packet.requests[0].client_request_id.raw_id)
                     await send(packet)
-                    if request_id is not None:
+                    if is_request:
                         request_sent.set()
 
                 packets.send = send_and_signal
