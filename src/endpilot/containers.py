@@ -45,6 +45,17 @@ class Containers:
             self.window = self._decode_open(raw)
             self._slots = None
             self._slots_updated.set()
+        elif raw.packet_id == b.UpdateTradePacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            window = ContainerWindow(
+                int(packet.container_id), "TRADE", (0, 0, 0),
+                int(packet.entity_unique_id),
+            )
+            # UpdateTrade also opens the trade screen; a quote refresh is not a new window.
+            if self.window != window:
+                self.window = window
+                self._slots = None
+                self._slots_updated.set()
         elif raw.packet_id == b.InventoryContentPacket.ID:
             packet = self.packets.protocol.decode(raw)
             if self.window is not None and int(packet.inventory_id) == self.window.container_id:
