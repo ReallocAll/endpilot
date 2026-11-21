@@ -9,7 +9,88 @@ from dataclasses import asdict
 from endpilot import Bot
 
 
-async def run(url: str, *, interrupt: bool = False) -> None:
+async def run_two_input(bot: Bot, offers) -> None:
+    """Complete a server-quoted two-input trade through public SDK calls."""
+    selected = next((
+        offer for offer in offers.offers
+        if offer.buy_a is not None and offer.buy_b is not None
+        and offer.sell is not None and offer.recipe_net_id is not None
+        and offer.uses is not None and offer.max_uses is not None
+        and offer.uses < offer.max_uses
+    ), None)
+    if selected is None:
+        raise AssertionError("villager has no available two-input server quote")
+    print("two_input_offer=" + json.dumps(asdict(selected)), flush=True)
+
+    previous_request = 0
+    for number, item in enumerate((selected.buy_a, selected.buy_b), start=1):
+        await asyncio.to_thread(sys.stdin.readline)  # Testbed supplies this input.
+        deadline = asyncio.get_running_loop().time() + 15
+        while True:
+            filled = [
+                (slot, stack) for slot, stack in bot.inventory_slots.items()
+                if int(stack.id) != 0
+            ]
+            if filled:
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError(f"BDS did not supply trade ingredient {number}")
+            await asyncio.sleep(0.1)
+        source_slot, source = filled[0]
+        before = int(source.stack_size)
+        reply = await bot.stage_trade_ingredient(
+            source_slot, item.count, ingredient=number
+        )
+        corrected = bot.inventory_slots.get(source_slot)
+        after = 0 if corrected is None else int(corrected.stack_size)
+        record = {
+            "ingredient": number, "name": item.name, "amount": item.count,
+            "result": reply.result.name,
+            "request_id": int(reply.client_request_id.raw_id),
+            "source_slot": source_slot, "before": before, "after": after,
+            "input_containers": [
+                {
+                    "name": c.full_container_name.name.name,
+                    "slots": [{"slot": int(p.slot), "amount": int(p.amount)}
+                              for p in c.slots],
+                } for c in reply.containers or ()
+            ],
+        }
+        print(f"trade_input_{number}_result=" + json.dumps(record), flush=True)
+        if (reply.result.name != "SUCCESS" or after != before - item.count
+                or record["request_id"] >= previous_request):
+            raise AssertionError(f"BDS rejected trade input {number}: {record}")
+        previous_request = record["request_id"]
+
+    output_slot = 9
+    exchanged = await bot.execute_trade(selected.recipe_net_id, output_slot)
+    output = bot.inventory_slots.get(output_slot)
+    record = {
+        "result": exchanged.result.name,
+        "request_id": int(exchanged.client_request_id.raw_id),
+        "output_slot": output_slot,
+        "output_id": None if output is None else int(output.id),
+        "output_count": None if output is None else int(output.stack_size),
+        "containers": [
+            {
+                "name": c.full_container_name.name.name,
+                "slots": [{"slot": int(p.slot), "amount": int(p.amount)}
+                          for p in c.slots],
+            } for c in exchanged.containers or ()
+        ],
+    }
+    print("trade_exchange_result=" + json.dumps(record), flush=True)
+    if (record["result"] != "SUCCESS" or record["request_id"] >= previous_request
+            or output is None or int(output.id) == 0
+            or int(output.stack_size) != selected.sell.count):
+        raise AssertionError(f"BDS rejected two-input exchange: {record}")
+    closed = await bot.close_container()
+    if closed is None or closed.container_id != offers.window_id:
+        raise AssertionError("BDS did not acknowledge the two-input trade close")
+    print("trade_window_closed=" + str(closed.container_id), flush=True)
+
+
+async def run(url: str, *, interrupt: bool = False, two_input: bool = False) -> None:
     bot = Bot("EndPilotTest")
     try:
         if url.startswith("raknet://"):
@@ -45,6 +126,10 @@ async def run(url: str, *, interrupt: bool = False) -> None:
         await asyncio.sleep(0.3)
         offers = await bot.open_trade(villager.runtime_id)
         print("villager_quotes=" + json.dumps(asdict(offers)), flush=True)
+        if two_input:
+            await run_two_input(bot, offers)
+            await asyncio.to_thread(sys.stdin.readline)
+            return
         window = bot.open_window
         if window is None or window.container_id != offers.window_id:
             raise AssertionError("trade response did not open the matching window")
@@ -204,12 +289,13 @@ async def run(url: str, *, interrupt: bool = False) -> None:
         await asyncio.to_thread(sys.stdin.readline)
     finally:
         await bot.close()
-    print("disconnected EndPilotTest", flush=True)
+        print("disconnected EndPilotTest", flush=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("url", help="NetherNet HTTP URL or raknet://host:port")
     parser.add_argument("--interrupt", action="store_true", help="cancel a staged trade and inspect returned inventory")
+    parser.add_argument("--two-input", action="store_true", help="exchange a quote requiring both villager inputs")
     args = parser.parse_args()
-    asyncio.run(run(args.url, interrupt=args.interrupt))
+    asyncio.run(run(args.url, interrupt=args.interrupt, two_input=args.two_input))
