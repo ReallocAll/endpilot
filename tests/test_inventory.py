@@ -355,6 +355,95 @@ class InventoryTests(unittest.IsolatedAsyncioTestCase):
             inventory.close()
         self.assertEqual(callbacks, [])
 
+    async def test_move_item_respects_newer_server_slot_during_response(self):
+        from endpilot.protocol import RawPacket
+
+        codec = Protocol(2193)
+        b = codec.binding
+
+        def item(item_id, count, net_id):
+            return b.SerializedNetworkItemStackDescriptor(
+                id=item_id, stack_size=count, aux_value=0,
+                net_id_variant=net_id, block_runtime_id=0,
+                user_data_buffer=b"",
+            )
+
+        # A slot update can precede the matching response, or reach the
+        # dispatcher after it matches but before the move waiter resumes.
+        for update_before, response_net_id, expected_id in (
+            (True, 404, 57), (True, 505, None), (False, 505, 57)
+        ):
+            with self.subTest(update_before=update_before,
+                              response_net_id=response_net_id):
+                source = item(42, 2, 50)
+                grant = item(57, 1, 404)
+                reply = SimpleNamespace(
+                    client_request_id=SimpleNamespace(raw_id=-1),
+                    result=SimpleNamespace(name="SUCCESS"),
+                    containers=[SimpleNamespace(
+                        full_container_name=SimpleNamespace(
+                            name=SimpleNamespace(
+                                name="COMBINED_HOTBAR_AND_INVENTORY_CONTAINER"
+                            ),
+                        ),
+                        slots=[
+                            SimpleNamespace(slot=2, amount=1,
+                                            item_stack_net_id=SimpleNamespace(raw_id=51)),
+                            SimpleNamespace(slot=3, amount=1,
+                                            item_stack_net_id=SimpleNamespace(
+                                                raw_id=response_net_id
+                                            )),
+                        ],
+                    )],
+                )
+                decoded = {
+                    b"grant": SimpleNamespace(
+                        inventory_id=b.ContainerID.INVENTORY,
+                        slot=3, item=grant,
+                    ),
+                    b"response": SimpleNamespace(responses=[reply]),
+                }
+                inventory = None
+
+                async def wait(packet_id, *, timeout, match):
+                    self.assertEqual(packet_id, b.ItemStackResponsePacket.ID)
+                    response = RawPacket(packet_id, b"response")
+                    update = RawPacket(b.InventorySlotPacket.ID, b"grant")
+                    if update_before:
+                        inventory._on_packet(update)
+                    self.assertTrue(match(response))
+                    if not update_before:
+                        inventory._on_packet(update)
+                    return response
+
+                stream = SimpleNamespace(
+                    protocol=SimpleNamespace(
+                        binding=b, decode=lambda raw: decoded[raw.body]
+                    ),
+                    subscribe_raw=lambda cb: lambda: None,
+                    wait_for_packet=wait,
+                    send=AsyncMock(),
+                )
+                inventory = Inventory(stream, 1)
+                try:
+                    inventory._set_slot(2, source)
+                    self.assertIs(await inventory.move_item(2, 3, 1), reply)
+                    self.assertEqual(
+                        (int(inventory.slots[2].id),
+                         int(inventory.slots[2].stack_size)), (42, 1)
+                    )
+                    observed = inventory.slots.get(3)
+                    if expected_id is None:
+                        self.assertIsNone(observed)
+                    else:
+                        self.assertEqual(
+                            (int(observed.id), int(observed.stack_size),
+                             int(observed.net_id_variant)),
+                            (expected_id, 1, 404),
+                        )
+                finally:
+                    inventory.close()
+
     async def test_move_item_keeps_state_on_rejection_and_invalid_source(self):
         from endpilot.protocol import RawPacket
 
