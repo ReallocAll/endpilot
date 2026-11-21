@@ -10,6 +10,7 @@ from .inventory import Inventory
 from .login import JoinSession
 from .movement import Movement
 from .player_state import PlayerState
+from .recipes import Recipe, Recipes
 from .trading import Trading, TradeOffers
 from .protocol import Protocol
 
@@ -28,6 +29,7 @@ class Bot:
         self._entities: Entities | None = None
         self._player_state: PlayerState | None = None
         self._trading: Trading | None = None
+        self._recipes: Recipes | None = None
 
     async def join_nethernet(self, url: str, *, timeout: float = 30, server_key_sha256: str | None = None) -> None:
         if self._session is not None:
@@ -55,6 +57,8 @@ class Bot:
         self._commands = Commands(session.packets, self.identity.uuid, session.player_unique_id)
         self._entities = Entities(session.packets, item_names=session.item_names)
         self._player_state = PlayerState(session.packets, session.player_id)
+        self._recipes = Recipes(session.packets, session.item_names, session.crafting_data_packets)
+        session.crafting_data_packets.clear()
         self._trading = Trading(
             session.packets, self._entities, self._movement, self._inventory, self._containers
         )
@@ -62,6 +66,25 @@ class Bot:
         self._entities.start()
         self._blocks.start()
         self._movement.start()
+
+    @property
+    def recipes(self) -> tuple[Recipe, ...]:
+        """Current server-issued recipes, not locally assumed vanilla recipes."""
+        if self._recipes is None:
+            raise RuntimeError("player has not joined")
+        return self._recipes.snapshot()
+
+    def get_recipe(self, recipe_id: str | int) -> Recipe | None:
+        """Find a server-issued recipe by string ID or network ID."""
+        if self._recipes is None:
+            raise RuntimeError("player has not joined")
+        return self._recipes.get(recipe_id)
+
+    async def wait_for_recipes(self, *, timeout: float = 15) -> tuple[Recipe, ...]:
+        """Wait for the first CraftingData from BDS, which may be an empty catalog."""
+        if self._recipes is None:
+            raise RuntimeError("player has not joined")
+        return await self._recipes.wait_loaded(timeout=timeout)
 
     @property
     def player_id(self) -> int:
@@ -424,6 +447,9 @@ class Bot:
         entities, self._entities = self._entities, None
         player_state, self._player_state = self._player_state, None
         self._trading = None
+        recipes, self._recipes = self._recipes, None
+        if recipes is not None:
+            recipes.close()
         if player_state is not None:
             player_state.close()
         if entities is not None:

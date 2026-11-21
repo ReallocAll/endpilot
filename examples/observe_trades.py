@@ -20,6 +20,19 @@ async def run(url: str) -> None:
         else:
             await bot.join_nethernet(url)
         print("spawned EndPilotTest", flush=True)
+        recipes = await bot.wait_for_recipes()
+        sample = next(
+            (recipe for recipe in recipes if recipe.results and recipe.ingredients), None
+        )
+        if sample is None or bot.get_recipe(sample.recipe_id) != sample or bot.get_recipe(sample.net_id) != sample:
+            raise AssertionError("server recipes are missing or cannot be looked up by both IDs")
+        print("server_recipe_catalog=" + json.dumps({
+            "count": len(recipes), "recipe_id": sample.recipe_id, "net_id": sample.net_id,
+            "kind": sample.kind,
+            "first_result_id": sample.results[0].item_id,
+            "first_result_count": sample.results[0].count,
+            "first_ingredient_count": sample.ingredients[0].count,
+        }), flush=True)
         await asyncio.to_thread(sys.stdin.readline)  # Wait for Testbed world setup.
         waiting = asyncio.create_task(bot.wait_for_entity_spawn(actor_type="minecraft:villager_v2"))
         await asyncio.sleep(0)
