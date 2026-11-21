@@ -350,6 +350,8 @@ class Inventory:
         if not 0 <= source_slot <= 255 or not 0 <= destination_slot <= 255:
             raise ValueError("inventory slots must fit in a byte")
 
+        source_observed = self._slots.get(source_slot)
+        destination_observed = self._slots.get(destination_slot)
         source = self.item_or_empty(source_slot)
         destination = self.item_or_empty(destination_slot)
         b = self.packets.protocol.binding
@@ -408,10 +410,23 @@ class Inventory:
                         item = source if success else destination
                     else:
                         continue
-                    # ItemStackResponse omits item types. Never assign an
-                    # invented identity to an unknown nonempty correction.
+                    # A newer InventorySlot/Content update may supersede the
+                    # captured identity. A response has amounts/net IDs only.
+                    original = (
+                        source_observed if index == source_slot else destination_observed
+                    )
+                    current = self._slots.get(index)
+                    if current is not original:
+                        net_id = slot.item_stack_net_id
+                        item = (
+                            current if current is not None and int(current.id) != 0
+                            and net_id is not None
+                            and int(current.net_id_variant or 0) == int(net_id.raw_id)
+                            else None
+                        )
                     self._set_slot(
-                        index, None if int(slot.amount) > 0 and int(item.id) == 0
+                        index, None if int(slot.amount) > 0
+                        and (item is None or int(item.id) == 0)
                         else _response_item(b, item, item, slot)
                     )
             return response
