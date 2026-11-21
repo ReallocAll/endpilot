@@ -326,7 +326,8 @@ class Trading:
                                    "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER")
                           and index == destination_slot):
                         current = self.inventory.item_or_empty(index)
-                        if reply.result.name == "SUCCESS" and output_id is not None:
+                        if (reply.result.name == "SUCCESS" and output_id is not None
+                                and int(current.id) != output_id):
                             current = b.SerializedNetworkItemStackDescriptor(
                                 id=output_id, stack_size=offer.sell.count,
                                 aux_value=0, net_id_variant=None,
