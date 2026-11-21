@@ -114,6 +114,24 @@ class MCPPlayer:
         return {"state": "stopped" if was_running else "finished",
                 "submitted_frames": frames, "server_position": bot.position}
 
+    async def handoff(self) -> Bot:
+        """Return the live Bot to Python code in this process, without reconnecting.
+
+        This is a Python ownership transfer, not an MCP stdio tool: Bot objects
+        cannot be serialized into a different process.
+        """
+        bot = self._joined()
+        if self._walk is not None:
+            await self.stop_walk()
+        for task in self._pending.values():
+            task.cancel()
+        if self._pending:
+            await asyncio.gather(*self._pending.values(), return_exceptions=True)
+        self._pending.clear()
+        self._observed.clear()
+        self.bot = None
+        return bot
+
     async def disconnect(self) -> dict:
         bot, self.bot = self.bot, None
         if self._walk is not None:
