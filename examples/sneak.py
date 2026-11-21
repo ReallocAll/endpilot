@@ -16,8 +16,9 @@ async def run(url: str) -> None:
             await bot.join_raknet(host, int(port))
         else:
             await bot.join_nethernet(url)
-        await bot.wait_for_position_sync()
         print("spawned EndPilotTest", flush=True)
+        # Testbed teleports after this signal; that supplies the first live position.
+        await bot.wait_for_position_sync()
 
         await asyncio.to_thread(sys.stdin.readline)
         print(f"sneak_on_tick={await bot.set_sneaking(True)}", flush=True)
