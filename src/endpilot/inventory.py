@@ -377,12 +377,20 @@ class Inventory:
             strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
         )
 
+        response_arrival_slots = {}
+
         def matches(raw):
             packet = self.packets.protocol.decode(raw)
-            return any(
+            matched = any(
                 int(reply.client_request_id.raw_id) == request_id
                 for reply in packet.responses
             )
+            if matched:
+                response_arrival_slots.update({
+                    source_slot: self._slots.get(source_slot),
+                    destination_slot: self._slots.get(destination_slot),
+                })
+            return matched
 
         pending = asyncio.create_task(self.packets.wait_for_packet(
             b.ItemStackResponsePacket.ID, timeout=timeout, match=matches,
@@ -404,6 +412,10 @@ class Inventory:
                     continue
                 for slot in container.slots:
                     index = int(slot.slot)
+                    # Packet dispatch can update a slot after the response
+                    # arrived but before the response waiter resumes.
+                    if self._slots.get(index) is not response_arrival_slots[index]:
+                        continue
                     if index == source_slot:
                         item = destination if success else source
                     elif index == destination_slot:
