@@ -131,6 +131,41 @@ class ArmorEquipTests(unittest.IsolatedAsyncioTestCase):
         finally:
             inventory.close()
 
+    async def test_rejected_unknown_armor_correction_does_not_invent_item(self):
+        codec = Protocol(2193)
+        b = codec.binding
+        reply = SimpleNamespace(
+            client_request_id=SimpleNamespace(raw_id=-1),
+            result=SimpleNamespace(name="ERROR"),
+            containers=[response_container(
+                "ARMOR_CONTAINER", corrected_slot(0, 1, 55),
+            )],
+        )
+        raw = RawPacket(b.ItemStackResponsePacket.ID, b"reply")
+        callbacks = []
+        stream = SimpleNamespace(
+            protocol=SimpleNamespace(
+                binding=b, decode=lambda packet:
+                SimpleNamespace(responses=[reply]) if packet.body == b"reply"
+                else codec.decode(packet),
+            ),
+            subscribe_raw=lambda cb: callbacks.append(cb)
+            or (lambda: callbacks.remove(cb)),
+            send=AsyncMock(),
+            wait_for_packet=AsyncMock(return_value=raw),
+        )
+        inventory = Inventory(stream, 7)
+        try:
+            inventory._set_slot(2, item(b, 42, 1, 44))
+            result = await inventory.equip_armor(2, 0)
+            self.assertEqual(result.result.name, "ERROR")
+            self.assertNotIn(0, inventory.armor_slots)
+            self.assertEqual(int(inventory.item_or_empty(2).id), 42)
+            self.assertEqual(int(inventory.item_or_empty(2).stack_size), 1)
+        finally:
+            inventory.close()
+        self.assertEqual(callbacks, [])
+
     async def test_server_armor_updates_and_minimal_validations(self):
         codec = Protocol(2193)
         b = codec.binding
