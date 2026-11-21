@@ -107,8 +107,10 @@ class SwapInventoryTests(unittest.IsolatedAsyncioTestCase):
                 user_data_buffer=b"",
             )
 
-        for response_net_id, expected_id in ((404, 57), (505, None)):
-            with self.subTest(response_net_id=response_net_id):
+        for update_before, response_net_id, expected_id in (
+            (True, 404, 57), (True, 505, None), (False, 505, 57)
+        ):
+            with self.subTest(update_before=update_before, response_net_id=response_net_id):
                 old_source = item(3, 2, 101)
                 old_destination = item(1, 1, 202)
                 server_grant = item(57, 1, 404)
@@ -144,11 +146,14 @@ class SwapInventoryTests(unittest.IsolatedAsyncioTestCase):
 
                 async def wait(packet_id, *, timeout, match):
                     raw = RawPacket(packet_id, b"response")
+                    update = RawPacket(b.InventorySlotPacket.ID, b"server_update")
+                    if update_before:
+                        inventory._on_packet(update)
                     self.assertTrue(match(raw))
-                    # Server update arrives while the swap reply is pending.
-                    inventory._on_packet(RawPacket(
-                        b.InventorySlotPacket.ID, b"server_update"
-                    ))
+                    if not update_before:
+                        # A later server packet must win even if the awaiting
+                        # coroutine has not resumed yet.
+                        inventory._on_packet(update)
                     return raw
 
                 stream = SimpleNamespace(
