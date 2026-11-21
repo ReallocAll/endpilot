@@ -9,7 +9,7 @@ from dataclasses import asdict
 from endpilot import Bot
 
 
-async def run(url: str) -> None:
+async def run(url: str, *, interrupt: bool = False) -> None:
     bot = Bot("EndPilotTest")
     try:
         if url.startswith("raknet://"):
@@ -90,32 +90,73 @@ async def run(url: str) -> None:
             raise AssertionError(f"BDS rejected trade ingredient: {reply.result.name}")
         if record["after"] != before - selected.buy_a.count:
             raise AssertionError(f"BDS inventory count mismatch: {record}")
-        output_slot = 9
-        existing = bot.inventory_slots.get(output_slot)
-        if existing is not None and int(existing.id) != 0:
-            raise AssertionError("trade output slot is not empty")
-        exchanged = await bot.execute_trade(selected.recipe_net_id, output_slot)
-        output = bot.inventory_slots.get(output_slot)
-        exchange_record = {
-            "result": exchanged.result.name,
-            "request_id": int(exchanged.client_request_id.raw_id),
-            "output_slot": output_slot,
-            "output_id": None if output is None else int(output.id),
-            "output_count": None if output is None else int(output.stack_size),
-            "containers": [
-                {"name": c.full_container_name.name.name,
-                 "slots": [{"slot": int(p.slot), "amount": int(p.amount)} for p in c.slots]}
-                for c in exchanged.containers or ()
-            ],
-        }
-        print("trade_exchange_result=" + json.dumps(exchange_record), flush=True)
-        if (exchange_record["result"] != "SUCCESS" or output is None
-                or int(output.id) == 0 or int(output.stack_size) != selected.sell.count):
-            raise AssertionError(f"trade output not accepted: {exchange_record}")
-        closed = await bot.close_container()
-        if closed is None or closed.container_id != offers.window_id:
-            raise AssertionError("BDS did not acknowledge the trade window close")
-        print("trade_window_closed=" + str(closed.container_id), flush=True)
+        if interrupt:
+            # Arm before Testbed removes the villager; the close is server-originated.
+            close_waiter = asyncio.create_task(bot.wait_for_container_close(timeout=15))
+            try:
+                await asyncio.sleep(0)
+                print("trade_interrupt_watch_ready", flush=True)
+                await asyncio.to_thread(sys.stdin.readline)
+                closed = await close_waiter
+            finally:
+                if not close_waiter.done():
+                    close_waiter.cancel()
+                    await asyncio.gather(close_waiter, return_exceptions=True)
+            if (not closed.server_initiated_close
+                    or int(closed.container_id) != offers.window_id
+                    or bot.open_window is not None):
+                raise AssertionError("BDS did not close the active trade window")
+
+            # A stale recipe must not submit another stack request after the close.
+            try:
+                await bot.execute_trade(selected.recipe_net_id, 9)
+            except RuntimeError as error:
+                if "no matching trade window" not in str(error):
+                    raise
+            else:
+                raise AssertionError("the closed trade accepted another exchange")
+            deadline = asyncio.get_running_loop().time() + 15
+            while bot.inventory_count(int(source.id)) < before:
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise AssertionError("the interrupted ingredient was not returned")
+                await asyncio.sleep(0.1)
+            print("trade_interrupted=" + json.dumps({
+                "window_id": int(closed.container_id),
+                "server_initiated": bool(closed.server_initiated_close),
+                "open_window": bot.open_window is not None,
+                "item_id": int(source.id),
+                "restored_count": bot.inventory_count(int(source.id)),
+                "expected_count": before,
+                "stale_exchange_blocked": True,
+            }), flush=True)
+        else:
+            output_slot = 9
+            existing = bot.inventory_slots.get(output_slot)
+            if existing is not None and int(existing.id) != 0:
+                raise AssertionError("trade output slot is not empty")
+            exchanged = await bot.execute_trade(selected.recipe_net_id, output_slot)
+            output = bot.inventory_slots.get(output_slot)
+            exchange_record = {
+                "result": exchanged.result.name,
+                "request_id": int(exchanged.client_request_id.raw_id),
+                "output_slot": output_slot,
+                "output_id": None if output is None else int(output.id),
+                "output_count": None if output is None else int(output.stack_size),
+                "containers": [
+                    {"name": c.full_container_name.name.name,
+                     "slots": [{"slot": int(p.slot), "amount": int(p.amount)} for p in c.slots]}
+                    for c in exchanged.containers or ()
+                ],
+            }
+            print("trade_exchange_result=" + json.dumps(exchange_record), flush=True)
+            if (exchange_record["result"] != "SUCCESS" or output is None
+                    or int(output.id) == 0 or int(output.stack_size) != selected.sell.count):
+                raise AssertionError(f"trade output not accepted: {exchange_record}")
+            closed = await bot.close_container()
+            if closed is None or closed.container_id != offers.window_id:
+                raise AssertionError("BDS did not acknowledge the trade window close")
+            print("trade_window_closed=" + str(closed.container_id), flush=True)
+
         await asyncio.to_thread(sys.stdin.readline)
     finally:
         await bot.close()
@@ -125,4 +166,6 @@ async def run(url: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("url", help="NetherNet HTTP URL or raknet://host:port")
-    asyncio.run(run(parser.parse_args().url))
+    parser.add_argument("--interrupt", action="store_true", help="inspect a BDS-interrupted trade")
+    args = parser.parse_args()
+    asyncio.run(run(args.url, interrupt=args.interrupt))
