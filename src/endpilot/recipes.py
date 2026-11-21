@@ -112,7 +112,7 @@ class Recipes:
                     RecipeResult(
                         int(item.id), self.item_names.get(int(item.id)),
                         int(item.stack_size), int(item.aux_value),
-                        int(item.block_runtime_id) & 0xFFFFFFFF, bytes(item.user_data_buffer),
+                        int(item.block_runtime_id), bytes(item.user_data_buffer),
                     )
                     for item in source_results or ()
                 )
@@ -219,10 +219,11 @@ class Recipes:
                 raise ValueError(f"not enough {ingredient.name} to craft {recipe.recipe_id}")
 
         request_id = inventory._allocate_request_id()
+        # Recipe data can expose this unsigned runtime ID as a signed int32.
         output_descriptor = b.SerializedNetworkItemStackDescriptor(
             id=output.item_id, stack_size=output.count * times,
             aux_value=output.aux_value, net_id_variant=None,
-            block_runtime_id=output.block_runtime_id,
+            block_runtime_id=output.block_runtime_id & 0xFFFFFFFF,
             user_data_buffer=output.user_data_buffer,
         )
         result_items = [
@@ -231,7 +232,7 @@ class Recipes:
                     full_name=output.name or "", aux_value=output.aux_value,
                 ),
                 stack_size=output.count,
-                block_runtime_id=output.block_runtime_id,
+                block_runtime_id=output.block_runtime_id & 0xFFFFFFFF,
                 user_data_buffer=output.user_data_buffer,
             )
         ]
@@ -430,7 +431,7 @@ class Recipes:
         output_descriptor = b.SerializedNetworkItemStackDescriptor(
             id=output.item_id, stack_size=output.count * times,
             aux_value=output.aux_value, net_id_variant=None,
-            block_runtime_id=output.block_runtime_id,
+            block_runtime_id=output.block_runtime_id & 0xFFFFFFFF,
             user_data_buffer=output.user_data_buffer,
         )
         actions = [
@@ -441,7 +442,7 @@ class Recipes:
                         full_name=output.name or "", aux_value=output.aux_value,
                     ),
                     stack_size=output.count,
-                    block_runtime_id=output.block_runtime_id,
+                    block_runtime_id=output.block_runtime_id & 0xFFFFFFFF,
                     user_data_buffer=output.user_data_buffer,
                 )], num_crafts=times,
             ),
