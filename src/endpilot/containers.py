@@ -51,8 +51,12 @@ class Containers:
                 int(packet.container_id), "TRADE", (0, 0, 0),
                 int(packet.entity_unique_id),
             )
-            # UpdateTrade also opens the trade screen; a quote refresh is not a new window.
-            if self.window != window:
+            # Do not replace a matching ContainerOpen window's actual position
+            # or initial slots when its server quote arrives or refreshes.
+            current = self.window
+            if (current is None or current.container_id != window.container_id
+                    or current.container_type != "TRADE"
+                    or current.entity_unique_id != window.entity_unique_id):
                 self.window = window
                 self._slots = None
                 self._slots_updated.set()
