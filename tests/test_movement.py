@@ -113,6 +113,63 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(movement.position, (0.5, 101.62, 0.5))
         movement.close()
 
+
+    async def test_jump_has_client_flags_vertical_prediction_and_landing(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        stream = PacketSink(protocol)
+        movement = Movement(stream, 1)
+        movement.position = (0.5, 101.62, 0.5)
+        movement._input_position = movement.position
+        flags = b.PlayerAuthInputPacket.InputData
+
+        self.assertEqual(await movement.jump(), 1)
+        first = stream.sent[-1]
+        self.assertEqual(set(first.input_data), {
+            flags.JUMPING, flags.JUMP_DOWN, flags.JUMP_CURRENT_RAW,
+            flags.WANT_UP, flags.JUMP_PRESSED_RAW, flags.START_JUMPING,
+        })
+        self.assertAlmostEqual(first.pos_delta.y, 0.42, places=5)
+        self.assertAlmostEqual(first.pos.y, 102.04, places=5)
+
+        for _ in range(14):
+            await movement._send_input(False)
+        self.assertEqual(list(stream.sent[1].input_data), [flags.JUMP_RELEASED_RAW])
+        self.assertTrue(all(not p.input_data for p in stream.sent[2:]))
+        self.assertGreater(max(p.pos.y for p in stream.sent), 102.6)
+        self.assertAlmostEqual(stream.sent[-1].pos.y, 101.62, places=5)
+        self.assertEqual([p.client_tick for p in stream.sent], list(range(1, 16)))
+        self.assertEqual(movement.position, (0.5, 101.62, 0.5))
+        movement.close()
+
+    async def test_server_teleport_interrupts_jump_prediction(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        stream = PacketSink(protocol)
+        movement = Movement(stream, 1)
+        movement.position = movement._input_position = (0.5, 101.62, 0.5)
+        await movement.jump()
+
+        teleport = b.MovePlayerPacket()
+        teleport.player_id = 1
+        teleport.pos = b.Vec3(x=4.5, y=80.0, z=4.5)
+        teleport.rot = b.Vec2(x=0.0, y=0.0)
+        teleport.y_head_rot = 0.0
+        teleport.riding_id = 0
+        teleport.reset_position = 2
+        teleport.teleport_data = None
+        teleport.tick = 0
+        movement._on_packet(protocol.encode(teleport))
+        await movement._send_input(False)
+        self.assertEqual(
+            set(stream.sent[-1].input_data),
+            {b.PlayerAuthInputPacket.InputData.HANDLED_TELEPORT,
+             b.PlayerAuthInputPacket.InputData.JUMP_RELEASED_RAW},
+        )
+        self.assertAlmostEqual(stream.sent[-1].pos.y, 80.0)
+        self.assertAlmostEqual(stream.sent[-1].pos_delta.y, 0.0)
+        movement.close()
+
     async def test_teleport_while_sending_rebases_next_frame(self):
         protocol = Protocol(2193)
         b = protocol.binding
