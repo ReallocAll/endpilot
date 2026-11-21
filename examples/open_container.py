@@ -12,7 +12,8 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
               expect_server_close: bool = False, drop_count: int = 0,
               split_slot: int | None = None, chat_during_take: bool = False,
               server_grant_during_take: bool = False,
-              swap_slot: int | None = None, swap_late_grant: bool = False) -> None:
+              swap_slot: int | None = None, swap_late_grant: bool = False,
+              split_late_grant: bool = False) -> None:
     if server_grant_during_take and not chat_during_take:
         raise ValueError("server grant scenario requires --chat-during-take")
     bot = Bot("EndPilotTest")
@@ -165,7 +166,46 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
                 "id": screen.container_id, "type": screen.container_type,
             }), flush=True)
             source = bot.inventory_slots[destination_slot]
-            response = await bot.move_inventory_item(destination_slot, split_slot, 1)
+            if split_late_grant:
+                packets = bot.packets
+                wait_for_packet = packets.wait_for_packet
+                reply_received = asyncio.Event()
+                release_reply = asyncio.Event()
+
+                async def delayed_wait(packet_id, *, timeout, match=None):
+                    raw = await wait_for_packet(packet_id, timeout=timeout, match=match)
+                    if packet_id == bot.protocol.binding.ItemStackResponsePacket.ID:
+                        reply_received.set()
+                        await release_reply.wait()
+                    return raw
+
+                packets.wait_for_packet = delayed_wait
+                pending_split = asyncio.create_task(
+                    bot.move_inventory_item(destination_slot, split_slot, 1)
+                )
+                try:
+                    async with asyncio.timeout(15):
+                        await reply_received.wait()
+                    print("split_reply_received_before_grant", flush=True)
+                    await asyncio.to_thread(sys.stdin.readline)
+                    async with asyncio.timeout(15):
+                        while True:
+                            current = bot.inventory_slots.get(split_slot)
+                            if (current is not None
+                                    and int(current.id) != int(source.id)
+                                    and int(current.id) != 0):
+                                break
+                            await asyncio.sleep(0.05)
+                    release_reply.set()
+                    response = await pending_split
+                finally:
+                    release_reply.set()
+                    packets.wait_for_packet = wait_for_packet
+                    if not pending_split.done():
+                        pending_split.cancel()
+                        await asyncio.gather(pending_split, return_exceptions=True)
+            else:
+                response = await bot.move_inventory_item(destination_slot, split_slot, 1)
             source_after = bot.inventory_slots[destination_slot]
             target_after = bot.inventory_slots[split_slot]
             print("inventory_split_response=" + json.dumps({
@@ -333,6 +373,8 @@ if __name__ == "__main__":
                         help="observe server-initiated window close instead of requesting it")
     parser.add_argument("--split-slot", type=int, default=None,
                         help="after closing the chest, split one item into this inventory slot")
+    parser.add_argument("--split-late-grant", action="store_true",
+                        help="Testbed: hold the split reply until a newer server slot update")
     parser.add_argument("--chat-during-take", action="store_true",
                         help="send player chat without blocking on the chest item response")
     parser.add_argument("--server-grant-during-take", action="store_true",
@@ -346,4 +388,4 @@ if __name__ == "__main__":
                     args.put_back_count, args.equip_armor_slot, args.expect_server_close,
                     args.drop_count, args.split_slot, args.chat_during_take,
                     args.server_grant_during_take, args.swap_slot,
-                    args.swap_late_grant))
+                    args.swap_late_grant, args.split_late_grant))

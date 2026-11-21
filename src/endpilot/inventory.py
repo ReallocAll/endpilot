@@ -277,6 +277,7 @@ class Inventory:
         source = self._slots.get(source_slot)
         if source is None or int(source.id) == 0:
             raise ValueError("source slot has no observed item")
+        destination_observed = self._slots.get(destination_slot)
         destination = self.item_or_empty(destination_slot)
 
         b = self.packets.protocol.binding
@@ -303,10 +304,18 @@ class Inventory:
             strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
         )
 
+        response_arrival_slots = {}
+
         def matches(raw):
             packet = self.packets.protocol.decode(raw)
-            return any(int(reply.client_request_id.raw_id) == request_id
-                       for reply in packet.responses)
+            matched = any(int(reply.client_request_id.raw_id) == request_id
+                          for reply in packet.responses)
+            if matched:
+                response_arrival_slots.update({
+                    source_slot: self._slots.get(source_slot),
+                    destination_slot: self._slots.get(destination_slot),
+                })
+            return matched
 
         pending = asyncio.create_task(self.packets.wait_for_packet(
             b.ItemStackResponsePacket.ID, timeout=timeout, match=matches,
@@ -325,14 +334,35 @@ class Inventory:
                     continue
                 for slot in container.slots:
                     index = int(slot.slot)
-                    if index == source_slot:
-                        before, fallback = source, source
-                    elif index == destination_slot:
+                    if index not in (source_slot, destination_slot):
+                        continue
+                    # A newer server packet can arrive after the matched reply
+                    # but before this coroutine resumes.
+                    current = self._slots.get(index)
+                    if current is not response_arrival_slots[index]:
+                        continue
+                    original = source if index == source_slot else destination_observed
+                    if current is not original:
+                        # The response contains counts and net IDs, not item
+                        # identities. Reuse only a matching newer observation.
+                        net_id = slot.item_stack_net_id
+                        if (current is not None and int(current.id) != 0
+                                and net_id is not None
+                                and int(current.net_id_variant or 0) == int(net_id.raw_id)):
+                            before = fallback = current
+                        else:
+                            before = fallback = self.item_or_empty(-1)
+                    elif index == source_slot:
+                        before = fallback = source
+                    else:
                         before = destination
                         fallback = source if response.result.name == "SUCCESS" else destination
-                    else:
-                        continue
-                    self._set_slot(index, _response_item(b, before, fallback, slot))
+                    updated = (
+                        None if int(slot.amount) > 0
+                        and int(before.id) == int(fallback.id) == 0
+                        else _response_item(b, before, fallback, slot)
+                    )
+                    self._set_slot(index, updated)
             return response
         finally:
             if not pending.done():
