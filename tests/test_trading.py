@@ -322,7 +322,11 @@ class TradingTests(unittest.IsolatedAsyncioTestCase):
         ))
         with self.assertRaisesRegex(RuntimeError, "confirmed staged stack"):
             await trading.exchange(123, 9)
-        trading._inputs[1] = ("minecraft:wheat", 3, 301)
+        observed_source = b.SerializedNetworkItemStackDescriptor(
+            id=43, stack_size=3, aux_value=0, net_id_variant=301,
+            block_runtime_id=0, user_data_buffer=b"",
+        )
+        trading._inputs[1] = ("minecraft:wheat", 3, 301, observed_source)
         self.assertIs(await trading.exchange(123, 9), reply)
         actions = packets.send.await_args.args[0].requests[0].actions
         self.assertEqual(len(actions), 4)
@@ -349,7 +353,7 @@ class TradingTests(unittest.IsolatedAsyncioTestCase):
         reply.client_request_id.raw_id = -5
         reply.containers[1].slots[0].amount = 3
         reply.containers[1].slots[0].item_stack_net_id = SimpleNamespace(raw_id=777)
-        trading._inputs[1] = ("minecraft:wheat", 3, 301)
+        trading._inputs[1] = ("minecraft:wheat", 3, 301, observed_source)
         updated.clear()
         await trading.exchange(123, 9)
         self.assertEqual(len(updated), 1)
