@@ -240,7 +240,11 @@ class Inventory:
                     index = int(slot.slot)
                     if name == "ARMOR_CONTAINER" and index == armor_slot:
                         item = source if success else destination
-                        self._armor_slots[index] = _response_item(b, item, item, slot)
+                        if not success and int(item.id) == 0 and int(slot.amount) > 0:
+                            # Response slots have no item type: do not invent one.
+                            self._armor_slots.pop(index, None)
+                        else:
+                            self._armor_slots[index] = _response_item(b, item, item, slot)
                     elif name in (
                         "HOTBAR_CONTAINER", "INVENTORY_CONTAINER",
                         "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER",
