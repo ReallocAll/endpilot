@@ -226,6 +226,18 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._movement.jump_backward(ticks)
 
+    async def jump_left(self, ticks: int = 24) -> int:
+        """Jump once while strafing left; return submitted moving frames."""
+        if self._movement is None:
+            raise RuntimeError("player has not joined")
+        return await self._movement.jump_left(ticks)
+
+    async def jump_right(self, ticks: int = 24) -> int:
+        """Jump once while strafing right; return submitted moving frames."""
+        if self._movement is None:
+            raise RuntimeError("player has not joined")
+        return await self._movement.jump_right(ticks)
+
     async def stop_moving(self) -> None:
         """Stop an active walk/follow, waiting for its input to be released."""
         if self._movement is None:
