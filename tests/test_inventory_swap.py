@@ -176,7 +176,7 @@ class SwapInventoryTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(
                             (int(observed.id), int(observed.stack_size),
                              int(observed.net_id_variant)),
-                            (expected_id, 1, response_net_id),
+                            (expected_id, 1, response_net_id if update_before else 404),
                         )
                     self.assertEqual(
                         (int(inventory.slots[3].id), int(inventory.slots[3].stack_size)),
