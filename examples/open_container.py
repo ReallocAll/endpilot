@@ -10,7 +10,7 @@ from endpilot import Bot
 async def run(url: str, take_count: int = 0, destination_slot: int = 0,
               put_back_count: int = 0, equip_armor_slot: int | None = None,
               expect_server_close: bool = False, drop_count: int = 0,
-              split_slot: int | None = None) -> None:
+              split_slot: int | None = None, chat_during_take: bool = False) -> None:
     bot = Bot("EndPilotTest")
     target = (1, 100, 0)
     try:
@@ -44,7 +44,69 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
             ],
         }), flush=True)
         if take_count:
-            response = await bot.take_from_container(0, destination_slot, take_count)
+            if chat_during_take:
+                packets = bot.packets
+                send = packets.send
+                binding = bot.protocol.binding
+                request_sent = asyncio.Event()
+                response_received = asyncio.Event()
+                request_id = None
+
+                def observe_response(raw):
+                    if request_id is None or raw.packet_id != binding.ItemStackResponsePacket.ID:
+                        return
+                    packet = bot.protocol.decode(raw)
+                    if any(
+                        int(reply.client_request_id.raw_id) == request_id
+                        for reply in packet.responses
+                    ):
+                        response_received.set()
+
+                unsubscribe = packets.subscribe_raw(observe_response)
+
+                async def send_and_signal(packet):
+                    nonlocal request_id
+                    is_request = isinstance(packet, binding.ItemStackRequestPacket)
+                    if is_request:
+                        request_id = int(packet.requests[0].client_request_id.raw_id)
+                    await send(packet)
+                    if is_request:
+                        request_sent.set()
+
+                packets.send = send_and_signal
+                taking = asyncio.create_task(
+                    bot.take_from_container(0, destination_slot, take_count)
+                )
+                taking.add_done_callback(lambda _: request_sent.set())
+                try:
+                    # Confirm the request reached the transport before sending chat.
+                    await request_sent.wait()
+                    packets.send = send
+                    if taking.done() or response_received.is_set():
+                        await taking
+                        raise AssertionError(
+                            "the matching item-stack response arrived before chat submission"
+                        )
+                    await bot.send_chat("endpilot-container-interleave")
+                    pending_at_chat = not taking.done() and not response_received.is_set()
+                    if not pending_at_chat:
+                        await taking
+                        raise AssertionError(
+                            "the matching item-stack response arrived during chat submission"
+                        )
+                    response = await taking
+                    print("chat_during_take=" + json.dumps({
+                        "message": "endpilot-container-interleave",
+                        "item_request_pending_at_chat": pending_at_chat,
+                    }), flush=True)
+                finally:
+                    packets.send = send
+                    unsubscribe()
+                    if not taking.done():
+                        taking.cancel()
+                        await asyncio.gather(taking, return_exceptions=True)
+            else:
+                response = await bot.take_from_container(0, destination_slot, take_count)
             print("container_take_response=" + json.dumps({
                 "request_id": int(response.client_request_id.raw_id),
                 "result": response.result.name,
@@ -182,7 +244,9 @@ if __name__ == "__main__":
                         help="observe server-initiated window close instead of requesting it")
     parser.add_argument("--split-slot", type=int, default=None,
                         help="after closing the chest, split one item into this inventory slot")
+    parser.add_argument("--chat-during-take", action="store_true",
+                        help="send player chat without blocking on the chest item response")
     args = parser.parse_args()
     asyncio.run(run(args.url, args.take_count, args.destination_slot,
                     args.put_back_count, args.equip_armor_slot, args.expect_server_close,
-                    args.drop_count, args.split_slot))
+                    args.drop_count, args.split_slot, args.chat_during_take))
