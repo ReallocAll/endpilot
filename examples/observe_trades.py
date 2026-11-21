@@ -129,6 +129,50 @@ async def run(url: str, *, interrupt: bool = False) -> None:
                 "original_count": before,
                 "stale_exchange_blocked": True,
             }), flush=True)
+            # Reopen from a fresh server quote after Testbed checks the refund.
+            await asyncio.to_thread(sys.stdin.readline)
+            reopened = await bot.open_trade(villager.runtime_id)
+            retry_offer = next((
+                offer for offer in reopened.offers
+                if offer.buy_a == selected.buy_a and offer.buy_b is None
+                and offer.sell == selected.sell and offer.recipe_net_id is not None
+                and offer.uses is not None and offer.max_uses is not None
+                and offer.uses < offer.max_uses
+            ), None)
+            if retry_offer is None or retry_offer.uses != selected.uses:
+                raise AssertionError("cancelled trade has no fresh, unchanged server quote")
+            if bot.open_window is None or bot.open_window.container_id != reopened.window_id:
+                raise AssertionError("retry did not open a matching trade window")
+            if bot.inventory_count(int(source.id)) < retry_offer.buy_a.count:
+                raise AssertionError("returned ingredients are unavailable for retry")
+
+            retry_stage = await bot.stage_trade_ingredient(source_slot, retry_offer.buy_a.count)
+            if retry_stage.result.name != "SUCCESS":
+                raise AssertionError(f"BDS rejected retry staging: {retry_stage.result.name}")
+            retry_reply = await bot.execute_trade(retry_offer.recipe_net_id, 9)
+            retry_output = bot.inventory_slots.get(9)
+            if (retry_reply.result.name != "SUCCESS" or retry_output is None
+                    or int(retry_output.id) == 0
+                    or int(retry_output.stack_size) != retry_offer.sell.count):
+                raise AssertionError(f"BDS rejected retried trade: {retry_reply.result.name}")
+            retry_closed = await bot.close_container()
+            if retry_closed is None or retry_closed.container_id != reopened.window_id:
+                raise AssertionError("BDS did not acknowledge the retried trade close")
+            print("trade_retry_result=" + json.dumps({
+                "reopened_window": reopened.window_id,
+                "recipe_net_id": retry_offer.recipe_net_id,
+                "uses_before": selected.uses,
+                "uses_after_reopen": retry_offer.uses,
+                "stage_result": retry_stage.result.name,
+                "stage_request_id": int(retry_stage.client_request_id.raw_id),
+                "result": retry_reply.result.name,
+                "request_id": int(retry_reply.client_request_id.raw_id),
+                "output_slot": 9,
+                "output_id": int(retry_output.id),
+                "output_count": int(retry_output.stack_size),
+                "ingredient_after": bot.inventory_count(int(source.id)),
+                "closed_window": retry_closed.container_id,
+            }), flush=True)
         else:
             output_slot = 9
             existing = bot.inventory_slots.get(output_slot)
