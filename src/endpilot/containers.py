@@ -20,6 +20,21 @@ class ContainerWindow:
     entity_unique_id: int
 
 
+_FURNACE_SLOTS = (
+    "FURNACE_INGREDIENT_CONTAINER",
+    "FURNACE_FUEL_CONTAINER",
+    "FURNACE_RESULT_CONTAINER",
+)
+
+
+def _container_slot_name(window: ContainerWindow, slot: int) -> str:
+    if window.container_type == "FURNACE":
+        if not 0 <= slot < len(_FURNACE_SLOTS):
+            raise ValueError("furnace slots are 0=ingredient, 1=fuel, 2=result")
+        return _FURNACE_SLOTS[slot]
+    return "LEVEL_ENTITY_CONTAINER"
+
+
 class Containers:
     def __init__(self, packets, movement, inventory):
         self.packets = packets
@@ -215,7 +230,7 @@ class Containers:
     async def take_from_container(
         self, source_slot: int, destination_slot: int, amount: int = 1, *, timeout: float = 15
     ):
-        """Take chest items into inventory; return the matching server verdict."""
+        """Take an observed container item; return the matching server verdict."""
         return await self._transfer(
             source_slot, destination_slot, amount, into_container=False, timeout=timeout
         )
@@ -223,7 +238,7 @@ class Containers:
     async def put_into_container(
         self, source_slot: int, destination_slot: int, amount: int = 1, *, timeout: float = 15
     ):
-        """Place inventory items into the open chest; return the matching server verdict."""
+        """Place an item into the open container; return the matching server verdict."""
         return await self._transfer(
             source_slot, destination_slot, amount, into_container=True, timeout=timeout
         )
@@ -243,17 +258,16 @@ class Containers:
         b = self.packets.protocol.binding
         cereal = b.ItemStackRequestCereal
         player_name = "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER"
-        chest_name = "LEVEL_ENTITY_CONTAINER"
         if into_container:
             source = self.inventory.item_or_empty(source_slot)
             destination = self._slots.get(destination_slot) or self.inventory.item_or_empty(-1)
-            source_name, destination_name = player_name, chest_name
+            source_name, destination_name = player_name, _container_slot_name(window, destination_slot)
             action_type = cereal.PlaceActionData
             chest_slot, player_slot = destination_slot, source_slot
         else:
             source = self._slots.get(source_slot)
             destination = self.inventory.item_or_empty(destination_slot)
-            source_name, destination_name = chest_name, player_name
+            source_name, destination_name = _container_slot_name(window, source_slot), player_name
             action_type = cereal.TakeActionData
             chest_slot, player_slot = source_slot, destination_slot
         if source is None or int(source.id) == 0:
@@ -304,7 +318,7 @@ class Containers:
                 name = container.full_container_name.name.name
                 for slot in container.slots:
                     index = int(slot.slot)
-                    if (name == chest_name and index == chest_slot
+                    if (name == _container_slot_name(window, chest_slot) and index == chest_slot
                             and self.window is window and self._slots is not None):
                         previous = self._slots.get(index) or self.inventory.item_or_empty(-1)
                         self._slots[index] = _response_item(b, previous, source, slot)
