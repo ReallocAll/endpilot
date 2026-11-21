@@ -1,4 +1,4 @@
-"""Compare forward, backward, lateral and sprint movement through the public SDK."""
+"""Compare cardinal, diagonal and sprint movement through the public SDK."""
 
 import asyncio
 import sys
@@ -30,6 +30,12 @@ async def run(url: str) -> None:
 
         await asyncio.to_thread(sys.stdin.readline)
         print(f"right_ticks={await bot.strafe_right(18)}", flush=True)
+
+        await asyncio.to_thread(sys.stdin.readline)
+        print(f"diagonal_left_ticks={await bot.walk_forward_left(18)}", flush=True)
+
+        await asyncio.to_thread(sys.stdin.readline)
+        print(f"diagonal_right_ticks={await bot.walk_forward_right(18)}", flush=True)
 
         await asyncio.to_thread(sys.stdin.readline)
         print(f"sprint_key_tick={await bot.set_sprinting(True)}", flush=True)
