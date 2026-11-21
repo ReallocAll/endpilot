@@ -94,6 +94,9 @@ class Movement:
         scale = 0.3 if self._sneaking else 1.0
         direction = 1 if forward else -1 if backward else 0
         step = 0.09 * scale * (1.3 if sprinting else 1.0)
+        # As in client travel(), diagonal full-strength input is normalized
+        # for motion, while the packet still carries both raw key values.
+        step /= max(1.0, math.hypot(scale * strafe, scale * direction))
         dx = step * (strafe * math.cos(y_rad) - direction * math.sin(y_rad))
         dz = step * (direction * math.cos(y_rad) + strafe * math.sin(y_rad))
         # Grounded jump follows the upstream client's vertical travel:
@@ -253,7 +256,7 @@ class Movement:
 
     async def walk_forward(self, ticks: int = 24) -> int:
         """Submit forward input at 20 Hz, then release it. Return submitted moving frames."""
-        return await self._walk(ticks, backward=False)
+        return await self._walk(ticks, forward=True)
 
     async def walk_backward(self, ticks: int = 24) -> int:
         """Submit backward input at 20 Hz without turning; return submitted frames."""
@@ -261,13 +264,22 @@ class Movement:
 
     async def strafe_left(self, ticks: int = 24) -> int:
         """Submit leftward input without turning; return submitted frames."""
-        return await self._walk(ticks, backward=False, strafe=1)
+        return await self._walk(ticks, strafe=1)
 
     async def strafe_right(self, ticks: int = 24) -> int:
         """Submit rightward input without turning; return submitted frames."""
-        return await self._walk(ticks, backward=False, strafe=-1)
+        return await self._walk(ticks, strafe=-1)
 
-    async def _walk(self, ticks: int, *, backward: bool, strafe: int = 0) -> int:
+    async def walk_forward_left(self, ticks: int = 24) -> int:
+        """Submit simultaneous forward/left input; return submitted frames."""
+        return await self._walk(ticks, forward=True, strafe=1)
+
+    async def walk_forward_right(self, ticks: int = 24) -> int:
+        """Submit simultaneous forward/right input; return submitted frames."""
+        return await self._walk(ticks, forward=True, strafe=-1)
+
+    async def _walk(self, ticks: int, *, forward: bool = False,
+                    backward: bool = False, strafe: int = 0) -> int:
         async with self._action_lock:
             self._stop_requested = False
             done = self._active_done = asyncio.Event()
@@ -278,8 +290,7 @@ class Movement:
                 for _ in range(ticks):
                     if self._stop_requested:
                         break
-                    await self._send_input(not backward and not strafe,
-                                           backward=backward, strafe=strafe)
+                    await self._send_input(forward, backward=backward, strafe=strafe)
                     submitted += 1
                     await asyncio.sleep(0.05)
                 return submitted
