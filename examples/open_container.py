@@ -8,7 +8,8 @@ from endpilot import Bot
 
 
 async def run(url: str, take_count: int = 0, destination_slot: int = 0,
-              put_back_count: int = 0, equip_armor_slot: int | None = None) -> None:
+              put_back_count: int = 0, equip_armor_slot: int | None = None,
+              expect_server_close: bool = False) -> None:
     bot = Bot("EndPilotTest")
     target = (1, 100, 0)
     try:
@@ -59,12 +60,32 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
                 "chest_slot_count": int(bot.container_slots[0].stack_size),
                 "inventory_count": bot.inventory_count(int(slots[0].id)),
             }), flush=True)
-        await asyncio.to_thread(sys.stdin.readline)
-        closed = await bot.close_container()
-        print("container_closed=" + json.dumps({
-            "id": None if closed is None else closed.container_id,
-            "open_window": bot.open_window is not None,
-        }), flush=True)
+        if expect_server_close:
+            binding = bot.packets.protocol.binding
+
+            def matches(raw):
+                packet = bot.packets.protocol.decode(raw)
+                return int(packet.container_id) == window.container_id
+
+            pending = asyncio.create_task(bot.packets.wait_for_packet(
+                binding.ContainerClosePacket.ID, timeout=15, match=matches,
+            ))
+            await asyncio.sleep(0)
+            print("server_close_watch_ready", flush=True)
+            closed_packet = bot.packets.protocol.decode(await pending)
+            await asyncio.sleep(0)
+            print("server_container_closed=" + json.dumps({
+                "id": int(closed_packet.container_id),
+                "server_initiated": bool(closed_packet.server_initiated_close),
+                "open_window": bot.open_window is not None,
+            }), flush=True)
+        else:
+            await asyncio.to_thread(sys.stdin.readline)
+            closed = await bot.close_container()
+            print("container_closed=" + json.dumps({
+                "id": None if closed is None else closed.container_id,
+                "open_window": bot.open_window is not None,
+            }), flush=True)
         if equip_armor_slot is not None:
             inventory_window = await bot.open_inventory_screen()
             print("player_inventory_opened=" + json.dumps({
@@ -109,6 +130,8 @@ if __name__ == "__main__":
                         help="return this many items from destination slot to chest slot 0")
     parser.add_argument("--equip-armor-slot", type=int, default=None,
                         help="after closing the chest, equip the taken item into armor slot 0-3")
+    parser.add_argument("--expect-server-close", action="store_true",
+                        help="observe server-initiated window close instead of requesting it")
     args = parser.parse_args()
     asyncio.run(run(args.url, args.take_count, args.destination_slot,
-                    args.put_back_count, args.equip_armor_slot))
+                    args.put_back_count, args.equip_armor_slot, args.expect_server_close))
