@@ -81,7 +81,7 @@ class Trading:
         self.containers = containers
         self.item_names = item_names or {}
         self.offers: TradeOffers | None = None
-        self._inputs = {}  # ingredient number -> (name, amount, confirmed net ID)
+        self._inputs = {}  # number -> (name, amount, confirmed net ID, original item)
 
     async def open(self, runtime_id: int, *, timeout: float = 15) -> TradeOffers:
         """Interact and await a matching server UpdateTrade; not a completed exchange."""
@@ -209,9 +209,98 @@ class Trading:
                         name = self.item_names.get(int(source.id))
                         if int(slot.amount) and net_id is not None and name is not None:
                             self._inputs[ingredient] = (
-                                name, int(slot.amount), int(net_id.raw_id),
+                                name, int(slot.amount), int(net_id.raw_id), source,
                             )
             return response
+        finally:
+            if not pending.done():
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+
+    async def unstage_ingredient(
+        self, destination_slot: int, *, ingredient: int = 1, timeout: float = 15
+    ):
+        """Return a server-confirmed trade input to inventory before closing the window.
+
+        BDS 1.26.52 does not refund staged inputs merely because the trade window
+        closes. Do not report success until its ItemStackResponse accepts the move.
+        """
+        offers, window = self.offers, self.containers.window
+        if (offers is None or window is None or window.container_type != "TRADE"
+                or window.container_id != offers.window_id
+                or window.entity_unique_id != offers.trader_unique_id):
+            raise RuntimeError("no matching trade window is open")
+        if not 0 <= destination_slot <= 255:
+            raise ValueError("destination slot must fit in a byte")
+        if ingredient not in (1, 2):
+            raise ValueError("ingredient must be 1 or 2")
+        staged = self._inputs.get(ingredient)
+        if staged is None:
+            raise RuntimeError("trade ingredient lacks a confirmed staged stack")
+        name, amount, net_id, original = staged
+        b = self.packets.protocol.binding
+        cereal = b.ItemStackRequestCereal
+        container_name = (f"TRADE2_INGREDIENT_{ingredient}_CONTAINER"
+                          if offers.use_new_trade_screen else
+                          f"TRADE_INGREDIENT_{ingredient}_CONTAINER")
+        physical_slot = ingredient + 3 if offers.use_new_trade_screen else 0
+        destination = self.inventory.item_or_empty(destination_slot)
+
+        def slot_info(container, slot, net):
+            return cereal.SlotInfoData(
+                full_container_name=b.FullContainerName(
+                    name=b.ContainerEnumName[container], dynamic_id=None,
+                ), slot=slot, net_id_variant=net,
+            )
+
+        request_id = self.inventory._allocate_request_id()
+        request = b.ItemStackRequestPacketData.RequestData(
+            client_request_id=b.ItemStackRequestId(raw_id=request_id),
+            actions=[cereal.PlaceActionData(
+                amount=amount,
+                source=slot_info(container_name, physical_slot, net_id),
+                destination=slot_info(
+                    "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", destination_slot,
+                    int(destination.net_id_variant or 0),
+                ),
+            )],
+            strings_to_filter=[],
+            strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
+        )
+
+        def matches(raw):
+            packet = self.packets.protocol.decode(raw)
+            return any(int(reply.client_request_id.raw_id) == request_id
+                       for reply in packet.responses)
+
+        pending = asyncio.create_task(self.packets.wait_for_packet(
+            b.ItemStackResponsePacket.ID, timeout=timeout, match=matches,
+        ))
+        try:
+            await asyncio.sleep(0)
+            await self.packets.send(b.ItemStackRequestPacket(requests=[request]))
+            packet = self.packets.protocol.decode(await pending)
+            reply = next(reply for reply in packet.responses
+                         if int(reply.client_request_id.raw_id) == request_id)
+            for container in reply.containers or ():
+                cname = container.full_container_name.name.name
+                for slot in container.slots:
+                    if cname == container_name and int(slot.slot) == physical_slot:
+                        net = slot.item_stack_net_id
+                        if int(slot.amount) == 0:
+                            self._inputs.pop(ingredient, None)
+                        elif net is not None:
+                            self._inputs[ingredient] = (
+                                name, int(slot.amount), int(net.raw_id), original,
+                            )
+                    elif (cname in ("HOTBAR_CONTAINER", "INVENTORY_CONTAINER",
+                                    "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER")
+                          and int(slot.slot) == destination_slot):
+                        current = self.inventory.item_or_empty(destination_slot)
+                        self.inventory._set_slot(
+                            destination_slot, _response_item(b, current, original, slot)
+                        )
+            return reply
         finally:
             if not pending.done():
                 pending.cancel()
@@ -319,8 +408,10 @@ class Trading:
                         if int(slot.amount) == 0:
                             self._inputs.pop(number, None)
                         elif net_id is not None:
+                            previous = self._inputs[number]
                             self._inputs[number] = (
                                 item_name, int(slot.amount), int(net_id.raw_id),
+                                previous[3],
                             )
                     elif (name in ("HOTBAR_CONTAINER", "INVENTORY_CONTAINER",
                                    "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER")
