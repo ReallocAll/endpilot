@@ -63,6 +63,7 @@ class JoinSession:
         self.spawned = False
         self.block_network_ids_are_hashes = False
         self.item_names: dict[int, str] = {}
+        self.crafting_data_packets = []
 
     @classmethod
     async def connect_nethernet(
@@ -145,6 +146,9 @@ class JoinSession:
                 response = binding.ResourcePackClientResponsePacket()
                 response.response = binding.ResourcePackClientResponsePacket.ResourcePackStackFinished()
                 await self.packets.send(response)
+            elif raw.packet_id == binding.CraftingDataPacket.ID:
+                # Login's direct reader must not discard recipes sent before spawn.
+                self.crafting_data_packets.append(raw)
             elif raw.packet_id == binding.ItemRegistryPacket.ID:
                 registry = self.packets.protocol.decode(raw)
                 self.item_names = {int(item.id): str(item.name) for item in registry.items}
