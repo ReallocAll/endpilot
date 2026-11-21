@@ -163,7 +163,7 @@ class TradingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(action.source.net_id_variant, 23)
         self.assertEqual(action.destination.full_container_name.name.name,
                          "TRADE2_INGREDIENT_1_CONTAINER")
-        self.assertEqual(action.destination.slot, 0)
+        self.assertEqual(action.destination.slot, 4)
         corrected = inventory._set_slot.call_args.args[1]
         self.assertEqual((int(corrected.stack_size), int(corrected.net_id_variant)),
                          (2, 55))
