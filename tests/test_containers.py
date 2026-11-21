@@ -66,7 +66,7 @@ class ContainerTests(unittest.IsolatedAsyncioTestCase):
             callbacks[1](raw)
             self.assertEqual(containers.window, opened)
             # Server close should clear only the same window, not a different ID.
-            close = SimpleNamespace(container_id=5)
+            close = SimpleNamespace(container_id=5, server_initiated_close=False)
             stream.protocol.decode = lambda packet: close
             callbacks[1](RawPacket(b.ContainerClosePacket.ID, b"close"))
             self.assertIsNone(containers.window)
@@ -75,13 +75,71 @@ class ContainerTests(unittest.IsolatedAsyncioTestCase):
             inventory.close()
         self.assertEqual(callbacks, [])
 
+    async def test_server_initiated_close_acknowledges_only_active_window(self):
+        codec = Protocol(2193)
+        b = codec.binding
+        callbacks = []
+        close_packets = {
+            b"other": SimpleNamespace(
+                container_id=9, container_type=b.ContainerType.CONTAINER,
+                server_initiated_close=True,
+            ),
+            b"server": SimpleNamespace(
+                container_id=5, container_type=b.ContainerType.CONTAINER,
+                server_initiated_close=True,
+            ),
+            b"client": SimpleNamespace(
+                container_id=5, container_type=b.ContainerType.CONTAINER,
+                server_initiated_close=False,
+            ),
+        }
+        stream = SimpleNamespace(
+            protocol=SimpleNamespace(
+                binding=b, decode=lambda raw: close_packets[raw.body],
+            ),
+            subscribe_raw=lambda cb: callbacks.append(cb) or (lambda: callbacks.remove(cb)),
+            send=AsyncMock(),
+        )
+        containers = Containers(stream, None, None)
+        opened = ContainerWindow(5, "CONTAINER", (1, 100, 0), -1)
+        try:
+            containers.window = opened
+            callbacks[0](RawPacket(b.ContainerClosePacket.ID, b"other"))
+            self.assertEqual(containers.window, opened)
+            await asyncio.sleep(0)
+            stream.send.assert_not_awaited()
+
+            callbacks[0](RawPacket(b.ContainerClosePacket.ID, b"server"))
+            self.assertIsNone(containers.window)
+            self.assertIsNone(containers.slots)
+            await asyncio.sleep(0)
+            self.assertEqual(stream.send.await_count, 1)
+            sent = codec.decode(codec.encode(stream.send.await_args.args[0]))
+            self.assertIsInstance(sent, b.ContainerClosePacket)
+            self.assertEqual(int(sent.container_id), 5)
+            self.assertEqual(sent.container_type, b.ContainerType.CONTAINER)
+            self.assertTrue(sent.server_initiated_close)
+
+            callbacks[0](RawPacket(b.ContainerClosePacket.ID, b"server"))
+            await asyncio.sleep(0)
+            self.assertEqual(stream.send.await_count, 1)
+
+            containers.window = opened
+            callbacks[0](RawPacket(b.ContainerClosePacket.ID, b"client"))
+            self.assertIsNone(containers.window)
+            await asyncio.sleep(0)
+            self.assertEqual(stream.send.await_count, 1)
+        finally:
+            containers.close()
+        self.assertEqual(callbacks, [])
+
     async def test_close_waits_for_matching_server_window_and_serializes_fields(self):
         codec = Protocol(2193)
         b = codec.binding
         callbacks = []
         close_raw = RawPacket(b.ContainerClosePacket.ID, b"close")
         different_raw = RawPacket(b.ContainerClosePacket.ID, b"other")
-        response = SimpleNamespace(container_id=5)
+        response = SimpleNamespace(container_id=5, server_initiated_close=False)
         other = SimpleNamespace(container_id=9)
         protocol = SimpleNamespace(
             binding=b, encode=codec.encode,
@@ -151,7 +209,7 @@ class ContainerTests(unittest.IsolatedAsyncioTestCase):
                     slot=0, to_item_descriptor=transacted,
                 )]),
             )),
-            b"close": SimpleNamespace(container_id=5),
+            b"close": SimpleNamespace(container_id=5, server_initiated_close=False),
         }
         packets = SimpleNamespace(
             protocol=SimpleNamespace(binding=b, decode=lambda raw: messages[raw.body]),
