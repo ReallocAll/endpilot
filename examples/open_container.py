@@ -10,7 +10,7 @@ from endpilot import Bot
 async def run(url: str, take_count: int = 0, destination_slot: int = 0,
               put_back_count: int = 0, equip_armor_slot: int | None = None,
               expect_server_close: bool = False, drop_count: int = 0,
-              split_slot: int | None = None) -> None:
+              split_slot: int | None = None, chat_during_take: bool = False) -> None:
     bot = Bot("EndPilotTest")
     target = (1, 100, 0)
     try:
@@ -44,7 +44,27 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
             ],
         }), flush=True)
         if take_count:
-            response = await bot.take_from_container(0, destination_slot, take_count)
+            if chat_during_take:
+                taking = asyncio.create_task(
+                    bot.take_from_container(0, destination_slot, take_count)
+                )
+                try:
+                    # Let the item request start, then submit an unrelated
+                    # player action without awaiting its matching response.
+                    await asyncio.sleep(0)
+                    pending_at_chat = not taking.done()
+                    await bot.send_chat("endpilot-container-interleave")
+                    response = await taking
+                    print("chat_during_take=" + json.dumps({
+                        "message": "endpilot-container-interleave",
+                        "item_request_pending_at_chat": pending_at_chat,
+                    }), flush=True)
+                finally:
+                    if not taking.done():
+                        taking.cancel()
+                        await asyncio.gather(taking, return_exceptions=True)
+            else:
+                response = await bot.take_from_container(0, destination_slot, take_count)
             print("container_take_response=" + json.dumps({
                 "request_id": int(response.client_request_id.raw_id),
                 "result": response.result.name,
@@ -182,7 +202,9 @@ if __name__ == "__main__":
                         help="observe server-initiated window close instead of requesting it")
     parser.add_argument("--split-slot", type=int, default=None,
                         help="after closing the chest, split one item into this inventory slot")
+    parser.add_argument("--chat-during-take", action="store_true",
+                        help="send player chat without blocking on the chest item response")
     args = parser.parse_args()
     asyncio.run(run(args.url, args.take_count, args.destination_slot,
                     args.put_back_count, args.equip_armor_slot, args.expect_server_close,
-                    args.drop_count, args.split_slot))
+                    args.drop_count, args.split_slot, args.chat_during_take))
