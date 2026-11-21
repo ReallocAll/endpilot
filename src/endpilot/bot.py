@@ -57,7 +57,10 @@ class Bot:
         self._commands = Commands(session.packets, self.identity.uuid, session.player_unique_id)
         self._entities = Entities(session.packets, item_names=session.item_names)
         self._player_state = PlayerState(session.packets, session.player_id)
-        self._recipes = Recipes(session.packets, session.item_names, session.crafting_data_packets)
+        self._recipes = Recipes(
+            session.packets, session.item_names, session.crafting_data_packets,
+            inventory=self._inventory,
+        )
         session.crafting_data_packets.clear()
         self._trading = Trading(
             session.packets, self._entities, self._movement, self._inventory, self._containers
@@ -85,6 +88,17 @@ class Bot:
         if self._recipes is None:
             raise RuntimeError("player has not joined")
         return await self._recipes.wait_loaded(timeout=timeout)
+
+    async def craft_recipe_auto(
+        self, recipe_id: str | int, destination_slot: int, *,
+        times: int = 1, timeout: float = 15,
+    ):
+        """Craft directly from inventory; return the matching server verdict."""
+        if self._recipes is None:
+            raise RuntimeError("player has not joined")
+        return await self._recipes.craft_auto(
+            recipe_id, destination_slot, times=times, timeout=timeout,
+        )
 
     @property
     def player_id(self) -> int:
