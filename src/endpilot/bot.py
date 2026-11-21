@@ -154,6 +154,12 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._movement.walk_forward(ticks)
 
+    async def set_sneaking(self, sneaking: bool) -> int:
+        """Submit the held sneak state and return the client tick, not BDS acceptance."""
+        if self._movement is None:
+            raise RuntimeError("player has not joined")
+        return await self._movement.set_sneaking(sneaking)
+
     async def stop_moving(self) -> None:
         """Stop an active walk/follow, waiting for its input to be released."""
         if self._movement is None:

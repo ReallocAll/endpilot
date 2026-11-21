@@ -14,6 +14,7 @@ class Movement:
         self._rotation = (0.0, 0.0)  # pitch, yaw in degrees
         self._tick = 1
         self._teleport_pending = False
+        self._sneaking = False
         self._updated = asyncio.Event()
         self._unsubscribe = None
         self._action_lock = asyncio.Lock()
@@ -68,18 +69,36 @@ class Movement:
         self._rotation = (pitch, yaw)
         return self._rotation
 
-    async def _send_input(self, forward: bool, item_use_transaction=None, block_actions=()):
+    async def _send_input(self, forward: bool, item_use_transaction=None, block_actions=(),
+                          sneak_changed: bool = False):
         """Submit one predicted frame; only a later server observation proves acceptance."""
         b = self.packets.protocol.binding
         x, y, z = self._input_position
         pitch, yaw = self._rotation
         y_rad = math.radians(yaw)
         p_rad = math.radians(pitch)
-        step = 0.09 if forward else 0.0
+        # Mirror the upstream client's held sneak input scaling.
+        scale = 0.3 if self._sneaking else 1.0
+        step = 0.09 * scale if forward else 0.0
         dx, dz = -math.sin(y_rad) * step, math.cos(y_rad) * step
         next_pos = (x + dx, y, z + dz)
-        movement = b.Vec2(x=0.0, y=1.0 if forward else 0.0)
+        movement = b.Vec2(x=0.0, y=scale if forward else 0.0)
         flags = [b.PlayerAuthInputPacket.InputData.UP] if forward else []
+        if self._sneaking:
+            flags.extend((
+                b.PlayerAuthInputPacket.InputData.SNEAKING,
+                b.PlayerAuthInputPacket.InputData.SNEAK_DOWN,
+                b.PlayerAuthInputPacket.InputData.SNEAK_CURRENT_RAW,
+                b.PlayerAuthInputPacket.InputData.WANT_DOWN,
+            ))
+        if sneak_changed:
+            flags.extend((
+                (b.PlayerAuthInputPacket.InputData.START_SNEAKING,
+                 b.PlayerAuthInputPacket.InputData.SNEAK_PRESSED_RAW)
+                if self._sneaking else
+                (b.PlayerAuthInputPacket.InputData.STOP_SNEAKING,
+                 b.PlayerAuthInputPacket.InputData.SNEAK_RELEASED_RAW)
+            ))
         if item_use_transaction is not None:
             flags.append(b.PlayerAuthInputPacket.InputData.PERFORM_ITEM_INTERACTION)
         if block_actions:
@@ -132,6 +151,19 @@ class Movement:
             async with self._action_lock:
                 await self._send_input(False)
             await asyncio.sleep(0.05)
+
+    async def set_sneaking(self, sneaking: bool) -> int:
+        """Submit a held sneak/stand state; return the submitted client tick.
+
+        This does not imply that BDS accepted the state. Subsequent input
+        frames keep the same held state until another call changes it.
+        """
+        async with self._action_lock:
+            if self._input_position is None:
+                await self.wait_for_position_sync()
+            changed = self._sneaking != sneaking
+            self._sneaking = sneaking
+            return await self._send_input(False, sneak_changed=changed)
 
     async def stop_moving(self) -> None:
         """Stop the currently active walk/follow and wait for its release frames."""
