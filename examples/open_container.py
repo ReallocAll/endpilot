@@ -13,7 +13,8 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
               split_slot: int | None = None, chat_during_take: bool = False,
               server_grant_during_take: bool = False,
               swap_slot: int | None = None, swap_late_grant: bool = False,
-              split_late_grant: bool = False) -> None:
+              split_late_grant: bool = False,
+              unequip_after_equip: bool = False) -> None:
     if server_grant_during_take and not chat_during_take:
         raise ValueError("server grant scenario requires --chat-during-take")
     bot = Bot("EndPilotTest")
@@ -346,6 +347,20 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
                 "armor_count": None if armor is None else int(armor.stack_size),
                 "inventory_count": bot.inventory_count(int(slots[0].id)),
             }), flush=True)
+            if unequip_after_equip:
+                print("armor_unequip_ready", flush=True)
+                await asyncio.to_thread(sys.stdin.readline)  # Testbed checks equipped BDS slot.
+                retrieved = await bot.unequip_armor(equip_armor_slot, destination_slot)
+                returned = bot.inventory_slots.get(destination_slot)
+                remaining = bot.armor_slots.get(equip_armor_slot)
+                print("armor_unequip_response=" + json.dumps({
+                    "request_id": int(retrieved.client_request_id.raw_id),
+                    "result": retrieved.result.name,
+                    "inventory_item_id": None if returned is None else int(returned.id),
+                    "inventory_count": None if returned is None else int(returned.stack_size),
+                    "armor_item_id": None if remaining is None else int(remaining.id),
+                    "armor_count": None if remaining is None else int(remaining.stack_size),
+                }), flush=True)
             inventory_closed = await bot.close_container()
             print("player_inventory_closed=" + json.dumps({
                 "id": None if inventory_closed is None else inventory_closed.container_id,
@@ -367,6 +382,8 @@ if __name__ == "__main__":
                         help="return this many items from destination slot to chest slot 0")
     parser.add_argument("--equip-armor-slot", type=int, default=None,
                         help="after closing the chest, equip the taken item into armor slot 0-3")
+    parser.add_argument("--unequip-after-equip", action="store_true",
+                        help="take the helmet back into inventory after an equip")
     parser.add_argument("--drop-count", type=int, default=0,
                         help="after closing chest, drop from the destination inventory slot")
     parser.add_argument("--expect-server-close", action="store_true",
@@ -388,4 +405,5 @@ if __name__ == "__main__":
                     args.put_back_count, args.equip_armor_slot, args.expect_server_close,
                     args.drop_count, args.split_slot, args.chat_during_take,
                     args.server_grant_during_take, args.swap_slot,
-                    args.swap_late_grant, args.split_late_grant))
+                    args.swap_late_grant, args.split_late_grant,
+                    args.unequip_after_equip))
