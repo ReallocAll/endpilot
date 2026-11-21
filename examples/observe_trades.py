@@ -90,8 +90,91 @@ async def run_two_input(bot: Bot, offers) -> None:
     print("trade_window_closed=" + str(closed.container_id), flush=True)
 
 
+
+async def run_original_trader_retry(bot: Bot, original, old_offer, item_id: int) -> None:
+    """Use a fresh quote from the same villager and only post-kick inventory."""
+    print("trade_original_watch_ready", flush=True)
+    await asyncio.to_thread(sys.stdin.readline)  # Testbed can teleport the rejoined player.
+    deadline = asyncio.get_running_loop().time() + 15
+    trader = None
+    while asyncio.get_running_loop().time() < deadline:
+        trader = next((
+            actor for actor in bot.observed_entities
+            if actor.entity_id == original.entity_id
+            and actor.actor_type == original.actor_type
+        ), None)
+        if trader is not None:
+            break
+        await asyncio.sleep(0.1)
+    if trader is None:
+        raise AssertionError("original villager was not observed after reconnect")
+
+    await bot.look_at((trader.position[0], trader.position[1] + 1, trader.position[2]))
+    await asyncio.sleep(0.3)
+    fresh = await bot.open_trade(trader.runtime_id)
+    if (fresh.trader_unique_id != original.entity_id or bot.open_window is None
+            or bot.open_window.container_id != fresh.window_id):
+        raise AssertionError("original villager did not issue a new trade window")
+    offer = next((
+        quote for quote in fresh.offers
+        if quote.buy_a == old_offer.buy_a and quote.buy_b == old_offer.buy_b
+        and quote.sell == old_offer.sell and quote.recipe_net_id is not None
+        and quote.uses is not None and quote.max_uses is not None
+        and quote.uses < quote.max_uses
+    ), None)
+    if offer is None or offer.uses != old_offer.uses:
+        raise AssertionError("original villager did not preserve the unspent quote")
+
+    # No give/top-up follows the kick. Read the fresh session's slot and net ID.
+    initial_count = bot.inventory_count(item_id)
+    source = next((
+        (slot, stack) for slot, stack in bot.inventory_slots.items()
+        if int(stack.id) == item_id and int(stack.stack_size) >= offer.buy_a.count
+    ), None)
+    if source is None or initial_count < offer.buy_a.count:
+        raise AssertionError("persisted player inventory cannot fund original trade")
+    source_slot, _ = source
+    if int(bot.inventory_slots.get(9).id) != 0:
+        raise AssertionError("original retry output slot is occupied")
+    staged = await bot.stage_trade_ingredient(source_slot, offer.buy_a.count)
+    if staged.result.name != "SUCCESS":
+        raise AssertionError("BDS refused original-trader ingredient staging")
+    after_staging = bot.inventory_count(item_id)
+    if after_staging != initial_count - offer.buy_a.count:
+        raise AssertionError("original-trader staging did not consume observed input")
+    exchanged = await bot.execute_trade(offer.recipe_net_id, 9)
+    output = bot.inventory_slots.get(9)
+    if (exchanged.result.name != "SUCCESS" or output is None
+            or int(output.id) == 0 or int(output.stack_size) != offer.sell.count):
+        raise AssertionError("BDS refused original-trader exchange")
+    closed = await bot.close_container()
+    if closed is None or closed.container_id != fresh.window_id:
+        raise AssertionError("original-trader trade window did not close")
+    print("trade_original_retry_result=" + json.dumps({
+        "trader_unique_id": fresh.trader_unique_id,
+        "window_id": fresh.window_id,
+        "original_uses": old_offer.uses,
+        "reopened_uses": offer.uses,
+        "ingredient_name": offer.buy_a.name,
+        "ingredient_count": offer.buy_a.count,
+        "ingredient_before": initial_count,
+        "ingredient_after": after_staging,
+        "source_slot": source_slot,
+        "stage_result": staged.result.name,
+        "stage_request_id": int(staged.client_request_id.raw_id),
+        "result": exchanged.result.name,
+        "request_id": int(exchanged.client_request_id.raw_id),
+        "output_name": offer.sell.name,
+        "output_slot": 9,
+        "output_id": int(output.id),
+        "output_count": int(output.stack_size),
+        "closed_window": closed.container_id,
+    }), flush=True)
+
+
 async def run(url: str, *, interrupt: bool = False, two_input: bool = False,
-              server_interrupt: bool = False, reconnect: bool = False) -> None:
+              server_interrupt: bool = False, reconnect: bool = False,
+              original_trader: bool = False) -> None:
     bot = Bot("EndPilotTest")
 
     async def join():
@@ -222,92 +305,95 @@ async def run(url: str, *, interrupt: bool = False, two_input: bool = False,
                     "open_window": bot.open_window is not None,
                     "stale_exchange_blocked": True,
                 }), flush=True)
-                # Retry is a new, server-quoted operation, not a replay of the
-                # old request or old entity reference from the kicked session.
-                waiting = asyncio.create_task(
-                    bot.wait_for_entity_spawn(actor_type="minecraft:villager_v2")
-                )
-                await asyncio.sleep(0)
-                print("trade_retry_watch_ready", flush=True)
-                trader = await waiting
-                print("trade_retry_spawn=" + json.dumps(asdict(trader)), flush=True)
-                await asyncio.to_thread(sys.stdin.readline)
-                await bot.look_at((
-                    trader.position[0], trader.position[1] + 1, trader.position[2]
-                ))
-                await asyncio.sleep(0.3)
-                fresh = await bot.open_trade(trader.runtime_id)
-                if (fresh.trader_unique_id != trader.entity_id
-                        or bot.open_window is None
-                        or bot.open_window.container_id != fresh.window_id):
-                    raise AssertionError("reconnected player did not open the new trade")
-                retry_offer = next((
-                    offer for offer in fresh.offers
-                    if offer.buy_a is not None and offer.buy_b is None
-                    and offer.sell is not None and offer.recipe_net_id is not None
-                    and offer.uses is not None and offer.max_uses is not None
-                    and offer.uses < offer.max_uses
-                ), None)
-                if retry_offer is None:
-                    raise AssertionError("new villager has no usable server quote")
-                print("trade_retry_offer=" + json.dumps({
-                    "trader_unique_id": fresh.trader_unique_id,
-                    "window_id": fresh.window_id,
-                    "offer": asdict(retry_offer),
-                }), flush=True)
-                # Testbed grants the newly quoted ingredient. Choose the slot
-                # from its observed inventory change, not a pre-kick slot index.
-                previous = {
-                    slot: (int(item.id), int(item.stack_size))
-                    for slot, item in bot.inventory_slots.items()
-                }
-                await asyncio.to_thread(sys.stdin.readline)
-                deadline = asyncio.get_running_loop().time() + 15
-                while True:
-                    received = next((
-                        (slot, item) for slot, item in bot.inventory_slots.items()
-                        if int(item.id) != 0
-                        and int(item.stack_size) >= retry_offer.buy_a.count
-                        and previous.get(slot) != (int(item.id), int(item.stack_size))
+                if original_trader:
+                    await run_original_trader_retry(bot, villager, selected, int(source.id))
+                else:
+                    # Retry is a new, server-quoted operation, not a replay of the
+                    # old request or old entity reference from the kicked session.
+                    waiting = asyncio.create_task(
+                        bot.wait_for_entity_spawn(actor_type="minecraft:villager_v2")
+                    )
+                    await asyncio.sleep(0)
+                    print("trade_retry_watch_ready", flush=True)
+                    trader = await waiting
+                    print("trade_retry_spawn=" + json.dumps(asdict(trader)), flush=True)
+                    await asyncio.to_thread(sys.stdin.readline)
+                    await bot.look_at((
+                        trader.position[0], trader.position[1] + 1, trader.position[2]
+                    ))
+                    await asyncio.sleep(0.3)
+                    fresh = await bot.open_trade(trader.runtime_id)
+                    if (fresh.trader_unique_id != trader.entity_id
+                            or bot.open_window is None
+                            or bot.open_window.container_id != fresh.window_id):
+                        raise AssertionError("reconnected player did not open the new trade")
+                    retry_offer = next((
+                        offer for offer in fresh.offers
+                        if offer.buy_a is not None and offer.buy_b is None
+                        and offer.sell is not None and offer.recipe_net_id is not None
+                        and offer.uses is not None and offer.max_uses is not None
+                        and offer.uses < offer.max_uses
                     ), None)
-                    if received is not None:
-                        break
-                    if asyncio.get_running_loop().time() >= deadline:
-                        raise TimeoutError("BDS did not deliver the new quote ingredient")
-                    await asyncio.sleep(0.1)
-                fresh_slot, fresh_item = received
-                initial_count = int(fresh_item.stack_size)
-                staged_again = await bot.stage_trade_ingredient(
-                    fresh_slot, retry_offer.buy_a.count
-                )
-                if staged_again.result.name != "SUCCESS":
-                    raise AssertionError("BDS rejected new trade ingredient staging")
-                exchange_again = await bot.execute_trade(retry_offer.recipe_net_id, 9)
-                output_again = bot.inventory_slots.get(9)
-                if (exchange_again.result.name != "SUCCESS" or output_again is None
-                        or int(output_again.id) == 0
-                        or int(output_again.stack_size) != retry_offer.sell.count):
-                    raise AssertionError("BDS rejected new trade exchange")
-                closed_again = await bot.close_container()
-                if closed_again is None or closed_again.container_id != fresh.window_id:
-                    raise AssertionError("BDS did not close the new trade window")
-                print("trade_reconnect_retry_result=" + json.dumps({
-                    "trader_unique_id": trader.entity_id,
-                    "window_id": fresh.window_id,
-                    "ingredient_name": retry_offer.buy_a.name,
-                    "ingredient_count": retry_offer.buy_a.count,
-                    "ingredient_before": initial_count,
-                    "ingredient_after": int(bot.inventory_slots[fresh_slot].stack_size),
-                    "stage_result": staged_again.result.name,
-                    "stage_request_id": int(staged_again.client_request_id.raw_id),
-                    "result": exchange_again.result.name,
-                    "request_id": int(exchange_again.client_request_id.raw_id),
-                    "output_name": retry_offer.sell.name,
-                    "output_slot": 9,
-                    "output_id": int(output_again.id),
-                    "output_count": int(output_again.stack_size),
-                    "closed_window": closed_again.container_id,
-                }), flush=True)
+                    if retry_offer is None:
+                        raise AssertionError("new villager has no usable server quote")
+                    print("trade_retry_offer=" + json.dumps({
+                        "trader_unique_id": fresh.trader_unique_id,
+                        "window_id": fresh.window_id,
+                        "offer": asdict(retry_offer),
+                    }), flush=True)
+                    # Testbed grants the newly quoted ingredient. Choose the slot
+                    # from its observed inventory change, not a pre-kick slot index.
+                    previous = {
+                        slot: (int(item.id), int(item.stack_size))
+                        for slot, item in bot.inventory_slots.items()
+                    }
+                    await asyncio.to_thread(sys.stdin.readline)
+                    deadline = asyncio.get_running_loop().time() + 15
+                    while True:
+                        received = next((
+                            (slot, item) for slot, item in bot.inventory_slots.items()
+                            if int(item.id) != 0
+                            and int(item.stack_size) >= retry_offer.buy_a.count
+                            and previous.get(slot) != (int(item.id), int(item.stack_size))
+                        ), None)
+                        if received is not None:
+                            break
+                        if asyncio.get_running_loop().time() >= deadline:
+                            raise TimeoutError("BDS did not deliver the new quote ingredient")
+                        await asyncio.sleep(0.1)
+                    fresh_slot, fresh_item = received
+                    initial_count = int(fresh_item.stack_size)
+                    staged_again = await bot.stage_trade_ingredient(
+                        fresh_slot, retry_offer.buy_a.count
+                    )
+                    if staged_again.result.name != "SUCCESS":
+                        raise AssertionError("BDS rejected new trade ingredient staging")
+                    exchange_again = await bot.execute_trade(retry_offer.recipe_net_id, 9)
+                    output_again = bot.inventory_slots.get(9)
+                    if (exchange_again.result.name != "SUCCESS" or output_again is None
+                            or int(output_again.id) == 0
+                            or int(output_again.stack_size) != retry_offer.sell.count):
+                        raise AssertionError("BDS rejected new trade exchange")
+                    closed_again = await bot.close_container()
+                    if closed_again is None or closed_again.container_id != fresh.window_id:
+                        raise AssertionError("BDS did not close the new trade window")
+                    print("trade_reconnect_retry_result=" + json.dumps({
+                        "trader_unique_id": trader.entity_id,
+                        "window_id": fresh.window_id,
+                        "ingredient_name": retry_offer.buy_a.name,
+                        "ingredient_count": retry_offer.buy_a.count,
+                        "ingredient_before": initial_count,
+                        "ingredient_after": int(bot.inventory_slots[fresh_slot].stack_size),
+                        "stage_result": staged_again.result.name,
+                        "stage_request_id": int(staged_again.client_request_id.raw_id),
+                        "result": exchange_again.result.name,
+                        "request_id": int(exchange_again.client_request_id.raw_id),
+                        "output_name": retry_offer.sell.name,
+                        "output_slot": 9,
+                        "output_id": int(output_again.id),
+                        "output_count": int(output_again.stack_size),
+                        "closed_window": closed_again.container_id,
+                    }), flush=True)
         elif interrupt:
             # A villager's death does not necessarily close the trade UI on BDS.
             # Explicitly cancel this staged exchange and await the server close reply.
@@ -435,8 +521,13 @@ if __name__ == "__main__":
                         help="observe a BDS kick after confirmed trade ingredient staging")
     parser.add_argument("--reconnect", action="store_true",
                         help="rejoin after server interruption, inspect inventory and execute a fresh trade")
+    parser.add_argument("--original-trader", action="store_true",
+                        help="after kick, use the same villager and inventory without top-up")
     args = parser.parse_args()
     if args.reconnect and not args.server_interrupt:
         parser.error("--reconnect requires --server-interrupt")
+    if args.original_trader and not args.reconnect:
+        parser.error("--original-trader requires --reconnect")
     asyncio.run(run(args.url, interrupt=args.interrupt, two_input=args.two_input,
-                    server_interrupt=args.server_interrupt, reconnect=args.reconnect))
+                    server_interrupt=args.server_interrupt, reconnect=args.reconnect,
+                    original_trader=args.original_trader))
