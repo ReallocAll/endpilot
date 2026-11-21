@@ -347,7 +347,9 @@ class CraftingTests(unittest.IsolatedAsyncioTestCase):
             inventory=inventory,
             containers=SimpleNamespace(window=SimpleNamespace(container_type="WORKBENCH")),
         )
-        recipes.load(SimpleNamespace(clear_recipes=True, shaped_recipes=[server_recipe()]))
+        entry = server_recipe()
+        entry.results[0].block_runtime_id = -939070369  # Signed catalog view of a u32.
+        recipes.load(SimpleNamespace(clear_recipes=True, shaped_recipes=[entry]))
         recipes._grid_slots[32] = item(b, 1, 1, 53)
         recipes._grid_slots[28] = item(b, 1, 1, 52)  # Inactive 2x2 input.
         try:
@@ -362,6 +364,7 @@ class CraftingTests(unittest.IsolatedAsyncioTestCase):
             actions = packets.send.await_args.args[0].requests[0].actions
             self.assertEqual([a.source.slot for a in actions if type(a).__name__ == "ConsumeActionData"],
                              [32, 40])
+            self.assertEqual(actions[1].craft_results[0].block_runtime_id, 3355896927)
             self.assertEqual((slots[8].id, slots[8].stack_size, slots[8].net_id_variant),
                              (2, 4, 59))
             self.assertEqual(recipes._grid_slots[32].stack_size, 0)
