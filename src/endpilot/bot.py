@@ -160,6 +160,12 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._movement.set_sneaking(sneaking)
 
+    async def set_sprinting(self, sprinting: bool) -> int:
+        """Hold the sprint key for later forward input; return a submitted tick."""
+        if self._movement is None:
+            raise RuntimeError("player has not joined")
+        return await self._movement.set_sprinting(sprinting)
+
     async def jump(self) -> int:
         """Submit a jump press; return its tick, not confirmed server movement."""
         if self._movement is None:
