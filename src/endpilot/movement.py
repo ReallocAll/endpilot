@@ -286,8 +286,13 @@ class Movement:
         """Submit simultaneous backward/right input; return submitted frames."""
         return await self._walk(ticks, backward=True, strafe=-1)
 
+    async def jump_forward(self, ticks: int = 24) -> int:
+        """Jump once while walking forward, then release forward input."""
+        return await self._walk(ticks, forward=True, jump_first=True)
+
     async def _walk(self, ticks: int, *, forward: bool = False,
-                    backward: bool = False, strafe: int = 0) -> int:
+                    backward: bool = False, strafe: int = 0,
+                    jump_first: bool = False) -> int:
         async with self._action_lock:
             self._stop_requested = False
             done = self._active_done = asyncio.Event()
@@ -295,10 +300,13 @@ class Movement:
             try:
                 if self._input_position is None:
                     await self.wait_for_position_sync()
-                for _ in range(ticks):
+                for frame in range(ticks):
                     if self._stop_requested:
                         break
-                    await self._send_input(forward, backward=backward, strafe=strafe)
+                    await self._send_input(
+                        forward, backward=backward, strafe=strafe,
+                        jump_pressed=jump_first and frame == 0,
+                    )
                     submitted += 1
                     await asyncio.sleep(0.05)
                 return submitted

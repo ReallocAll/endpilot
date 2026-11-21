@@ -142,6 +142,29 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(movement.position, (0.5, 101.62, 0.5))
         movement.close()
 
+    async def test_jump_forward_keeps_forward_input_through_jump_and_releases(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        flags = b.PlayerAuthInputPacket.InputData
+        sink = PacketSink(protocol)
+        movement = Movement(sink, 1)
+        movement.position = movement._input_position = (0.5, 101.62, 0.5)
+
+        self.assertEqual(await movement.jump_forward(4), 4)
+        self.assertEqual([p.client_tick for p in sink.sent], list(range(1, 7)))
+        self.assertTrue(all(flags.UP in p.input_data for p in sink.sent[:4]))
+        self.assertTrue(all(p.move.y == 1.0 for p in sink.sent[:4]))
+        self.assertTrue(all(p.pos_delta.z > 0 for p in sink.sent[:4]))
+        self.assertIn(flags.START_JUMPING, sink.sent[0].input_data)
+        self.assertIn(flags.JUMPING, sink.sent[0].input_data)
+        self.assertIn(flags.JUMP_RELEASED_RAW, sink.sent[1].input_data)
+        self.assertTrue(all(flags.JUMPING not in p.input_data for p in sink.sent[1:]))
+        self.assertTrue(all(flags.UP not in p.input_data for p in sink.sent[4:]))
+        self.assertEqual([p.move.y for p in sink.sent[4:]], [0.0, 0.0])
+        self.assertGreater(max(p.pos.y for p in sink.sent), 102.0)
+        self.assertEqual(movement.position, (0.5, 101.62, 0.5))
+        movement.close()
+
     async def test_server_teleport_interrupts_jump_prediction(self):
         protocol = Protocol(2193)
         b = protocol.binding
