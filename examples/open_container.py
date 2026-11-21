@@ -47,12 +47,29 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
             if chat_during_take:
                 packets = bot.packets
                 send = packets.send
+                binding = bot.protocol.binding
                 request_sent = asyncio.Event()
-                request_type = bot.protocol.binding.ItemStackRequestPacket
+                response_received = asyncio.Event()
+                request_id = None
+
+                def observe_response(raw):
+                    if request_id is None or raw.packet_id != binding.ItemStackResponsePacket.ID:
+                        return
+                    packet = bot.protocol.decode(raw)
+                    if any(
+                        int(reply.client_request_id.raw_id) == request_id
+                        for reply in packet.responses
+                    ):
+                        response_received.set()
+
+                unsubscribe = packets.subscribe_raw(observe_response)
 
                 async def send_and_signal(packet):
+                    nonlocal request_id
+                    if isinstance(packet, binding.ItemStackRequestPacket):
+                        request_id = int(packet.requests[0].client_request_id.raw_id)
                     await send(packet)
-                    if isinstance(packet, request_type):
+                    if request_id is not None:
                         request_sent.set()
 
                 packets.send = send_and_signal
@@ -61,20 +78,20 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
                 )
                 taking.add_done_callback(lambda _: request_sent.set())
                 try:
-                    # Observe the actual request send, not merely a started task.
+                    # Confirm the request reached the transport before sending chat.
                     await request_sent.wait()
                     packets.send = send
-                    if taking.done():
+                    if taking.done() or response_received.is_set():
                         await taking
                         raise AssertionError(
-                            "the item-stack response completed before chat submission"
+                            "the matching item-stack response arrived before chat submission"
                         )
                     await bot.send_chat("endpilot-container-interleave")
-                    pending_at_chat = not taking.done()
+                    pending_at_chat = not taking.done() and not response_received.is_set()
                     if not pending_at_chat:
                         await taking
                         raise AssertionError(
-                            "the item-stack response completed during chat submission"
+                            "the matching item-stack response arrived during chat submission"
                         )
                     response = await taking
                     print("chat_during_take=" + json.dumps({
@@ -83,6 +100,7 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
                     }), flush=True)
                 finally:
                     packets.send = send
+                    unsubscribe()
                     if not taking.done():
                         taking.cancel()
                         await asyncio.gather(taking, return_exceptions=True)
