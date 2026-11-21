@@ -57,6 +57,25 @@ class FormExtensionTests(unittest.IsolatedAsyncioTestCase):
             await answer_next_action_form(bot, 1)
         packets.send.assert_not_awaited()
 
+    async def test_modern_action_form_elements_count_only_buttons(self):
+        protocol = Protocol(2193)
+        raw = protocol.encode(protocol.binding.ModalFormRequestPacket(
+            form_id=5,
+            form_json=json.dumps({"type": "form", "title": "Modern", "elements": [
+                {"type": "label", "text": "Info"},
+                {"type": "button", "text": "A"},
+                {"type": "button", "text": "B"},
+            ]}),
+        ))
+        packets = SimpleNamespace(
+            wait_for_packet=AsyncMock(return_value=raw), send=AsyncMock(),
+        )
+        bot = SimpleNamespace(protocol=protocol, packets=packets)
+        result = await answer_next_action_form(bot, 1)
+        self.assertEqual(result["button_index"], 1)
+        returned = protocol.decode(protocol.encode(packets.send.await_args.args[0]))
+        self.assertEqual(returned.json_response, "1")
+
     async def test_out_of_range_button_does_not_send(self):
         protocol = Protocol(2193)
         raw = protocol.encode(protocol.binding.ModalFormRequestPacket(
