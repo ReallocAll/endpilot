@@ -339,6 +339,87 @@ class Inventory:
                 pending.cancel()
                 await asyncio.gather(pending, return_exceptions=True)
 
+    async def swap_items(
+        self, source_slot: int, destination_slot: int, *, timeout: float = 15
+    ):
+        """Swap two inventory slots; reconcile only the matching BDS response slots.
+
+        Both occupied and empty destinations are legal. A response without slot
+        corrections is a verdict, not an independently observed item swap.
+        """
+        if not 0 <= source_slot <= 255 or not 0 <= destination_slot <= 255:
+            raise ValueError("inventory slots must fit in a byte")
+
+        source = self.item_or_empty(source_slot)
+        destination = self.item_or_empty(destination_slot)
+        b = self.packets.protocol.binding
+        cereal = b.ItemStackRequestCereal
+
+        def slot_info(index, item):
+            return cereal.SlotInfoData(
+                full_container_name=b.FullContainerName(
+                    name=b.ContainerEnumName.COMBINED_HOTBAR_AND_INVENTORY_CONTAINER,
+                    dynamic_id=None,
+                ),
+                slot=index, net_id_variant=int(item.net_id_variant or 0),
+            )
+
+        request_id = self._allocate_request_id()
+        request = b.ItemStackRequestPacketData.RequestData(
+            client_request_id=b.ItemStackRequestId(raw_id=request_id),
+            actions=[cereal.SwapActionData(
+                source=slot_info(source_slot, source),
+                destination=slot_info(destination_slot, destination),
+            )],
+            strings_to_filter=[],
+            strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
+        )
+
+        def matches(raw):
+            packet = self.packets.protocol.decode(raw)
+            return any(
+                int(reply.client_request_id.raw_id) == request_id
+                for reply in packet.responses
+            )
+
+        pending = asyncio.create_task(self.packets.wait_for_packet(
+            b.ItemStackResponsePacket.ID, timeout=timeout, match=matches,
+        ))
+        try:
+            await asyncio.sleep(0)
+            await self.packets.send(b.ItemStackRequestPacket(requests=[request]))
+            packet = self.packets.protocol.decode(await pending)
+            response = next(
+                reply for reply in packet.responses
+                if int(reply.client_request_id.raw_id) == request_id
+            )
+            success = response.result.name == "SUCCESS"
+            for container in response.containers or ():
+                if container.full_container_name.name.name not in (
+                    "HOTBAR_CONTAINER", "INVENTORY_CONTAINER",
+                    "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER",
+                ):
+                    continue
+                for slot in container.slots:
+                    index = int(slot.slot)
+                    if index == source_slot:
+                        item = destination if success else source
+                    elif index == destination_slot:
+                        item = source if success else destination
+                    else:
+                        continue
+                    # ItemStackResponse omits item types. Never assign an
+                    # invented identity to an unknown nonempty correction.
+                    self._set_slot(
+                        index, None if int(slot.amount) > 0 and int(item.id) == 0
+                        else _response_item(b, item, item, slot)
+                    )
+            return response
+        finally:
+            if not pending.done():
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+
     async def drop_item(self, slot: int, amount: int = 1, *, timeout: float = 15):
         """Drop part of an observed inventory stack; return the matching BDS verdict.
 
