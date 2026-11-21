@@ -124,6 +124,7 @@ class Recipes:
 
         Match the upstream client's CraftRecipeAuto/CraftResults/Consume/Place
         sequence. Only response slots, not a local prediction, update inventory.
+        BDS 1.26.52 requires an open player inventory window for this action.
         This entry point currently requires named ingredients and one output stack.
         """
         recipe = self.get(recipe_id)
