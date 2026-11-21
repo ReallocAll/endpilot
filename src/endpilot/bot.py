@@ -93,7 +93,11 @@ class Bot:
         self, recipe_id: str | int, destination_slot: int, *,
         times: int = 1, timeout: float = 15,
     ):
-        """Craft directly from inventory; return the matching server verdict."""
+        """Craft using the open player-inventory screen; return the BDS verdict.
+
+        Open the inventory screen first with open_inventory_screen(). BDS 1.26.52
+        rejects a recipe-book request without that active window.
+        """
         if self._recipes is None:
             raise RuntimeError("player has not joined")
         return await self._recipes.craft_auto(
