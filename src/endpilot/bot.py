@@ -106,7 +106,7 @@ class Bot:
 
     async def stage_crafting_ingredient(self, source_slot: int, grid_slot: int = 28,
                                         amount: int = 1, *, timeout: float = 15):
-        """Place inventory material in the player 2x2 grid; return BDS's verdict."""
+        """Place inventory material in the active 2x2 or workbench 3x3 grid."""
         if self._recipes is None:
             raise RuntimeError("player has not joined")
         return await self._recipes.stage_grid(source_slot, grid_slot, amount, timeout=timeout)
