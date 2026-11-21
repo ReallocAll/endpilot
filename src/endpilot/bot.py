@@ -55,7 +55,9 @@ class Bot:
         self._commands = Commands(session.packets, self.identity.uuid, session.player_unique_id)
         self._entities = Entities(session.packets, item_names=session.item_names)
         self._player_state = PlayerState(session.packets, session.player_id)
-        self._trading = Trading(session.packets, self._entities, self._movement, self._inventory)
+        self._trading = Trading(
+            session.packets, self._entities, self._movement, self._inventory, self._containers
+        )
         self._session = session
         self._entities.start()
         self._blocks.start()
@@ -345,6 +347,17 @@ class Bot:
         if self._trading is None:
             raise RuntimeError("player has not joined")
         return await self._trading.open(runtime_id, timeout=timeout)
+
+    async def stage_trade_ingredient(
+        self, source_slot: int, amount: int, *, ingredient: int = 1,
+        timeout: float = 15,
+    ):
+        """Place an inventory stack into an open trade input; await BDS's response."""
+        if self._trading is None:
+            raise RuntimeError("player has not joined")
+        return await self._trading.stage_ingredient(
+            source_slot, amount, ingredient=ingredient, timeout=timeout
+        )
 
     async def collect_drop(
         self, runtime_id: int, *, ticks: int = 120, timeout: float = 15
