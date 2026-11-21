@@ -71,6 +71,9 @@ class Bot:
         )
         self._session = session
         self._entities.start()
+        for raw in session.entity_packets:
+            self._entities._on_packet(raw)
+        session.entity_packets.clear()
         self._blocks.start()
         self._movement.start()
 

@@ -137,6 +137,32 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session.spawned)
         self.assertEqual(session.inventory_packets, initial)
 
+    async def test_pre_spawn_actor_notifications_survive_login(self):
+        protocol = Protocol(2193)
+        binding = protocol.binding
+        initial = [
+            RawPacket(binding.AddActorPacket.ID, b"spawn"),
+            RawPacket(binding.MoveActorAbsolutePacket.ID, b"move"),
+            RawPacket(binding.RemoveActorPacket.ID, b"remove"),
+        ]
+
+        class PreSpawnPackets:
+            def __init__(self):
+                self.protocol = protocol
+                self.received = iter(initial + [RawPacket(binding.PlayStatusPacket.ID, b"ready")])
+
+            async def recv_raw(self):
+                return next(self.received)
+
+            async def send(self, packet):
+                pass
+
+        with patch.object(protocol, "decode", return_value=SimpleNamespace(status=3)):
+            session = JoinSession(PreSpawnPackets(), OfflineIdentity("EndPilotTest"), "")
+            await session.join()
+        self.assertTrue(session.spawned)
+        self.assertEqual(session.entity_packets, initial)
+
     async def test_compressed_typed_raw_roundtrip(self):
         protocol = Protocol(2193)
         settings = protocol.binding.NetworkSettingsPacket()
