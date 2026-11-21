@@ -316,6 +316,15 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._containers.close_window(timeout=timeout)
 
+    async def wait_for_container_close(self, *, timeout: float = 15):
+        """Observe the active window closing; return BDS's typed close packet.
+
+        Does not send a close request. Arm before a possible server-initiated close.
+        """
+        if self._containers is None:
+            raise RuntimeError("player has not joined")
+        return await self._containers.wait_for_close(timeout=timeout)
+
     async def open_container(
         self, position: tuple[int, int, int], *, face: int = 1, timeout: float = 15
     ) -> ContainerWindow:
