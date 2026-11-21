@@ -48,6 +48,9 @@ class Bot:
     def _start_session(self, session: JoinSession) -> None:
         self._movement = Movement(session.packets, session.player_id)
         self._inventory = Inventory(session.packets, session.player_id)
+        for raw in session.inventory_packets:
+            self._inventory._on_packet(raw)
+        session.inventory_packets.clear()
         self._containers = Containers(session.packets, self._movement, self._inventory)
         self._blocks = Blocks(
             session.packets, self._movement, self._inventory,

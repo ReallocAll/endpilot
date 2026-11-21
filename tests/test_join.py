@@ -112,6 +112,31 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
              int(binding.ServerboundLoadingScreenPacketType.END_LOADING_SCREEN)],
         )
 
+    async def test_pre_spawn_inventory_packets_survive_login(self):
+        protocol = Protocol(2193)
+        binding = protocol.binding
+        initial = [
+            RawPacket(binding.InventoryContentPacket.ID, b"inventory"),
+            RawPacket(binding.InventorySlotPacket.ID, b"updated-slot"),
+        ]
+
+        class PreSpawnPackets:
+            def __init__(self):
+                self.protocol = protocol
+                self.received = iter(initial + [RawPacket(binding.PlayStatusPacket.ID, b"spawn")])
+
+            async def recv_raw(self):
+                return next(self.received)
+
+            async def send(self, packet):
+                pass
+
+        with patch.object(protocol, "decode", return_value=SimpleNamespace(status=3)):
+            session = JoinSession(PreSpawnPackets(), OfflineIdentity("EndPilotTest"), "")
+            await session.join()
+        self.assertTrue(session.spawned)
+        self.assertEqual(session.inventory_packets, initial)
+
     async def test_compressed_typed_raw_roundtrip(self):
         protocol = Protocol(2193)
         settings = protocol.binding.NetworkSettingsPacket()
