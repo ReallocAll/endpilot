@@ -28,7 +28,6 @@ class Containers:
         self.window: ContainerWindow | None = None
         self._slots: dict[int, object] | None = None
         self._slots_updated = asyncio.Event()
-        self._next_request_id = -1
         self._unsubscribe = packets.subscribe_raw(self._on_packet)
 
     def _decode_open(self, raw) -> ContainerWindow:
@@ -139,6 +138,25 @@ class Containers:
                 pending.cancel()
                 await asyncio.gather(pending, return_exceptions=True)
 
+    async def open_inventory_screen(self, *, timeout: float = 15) -> ContainerWindow:
+        """Open the player inventory UI and await BDS's ContainerOpen response."""
+        b = self.packets.protocol.binding
+        pending = asyncio.create_task(self.packets.wait_for_packet(
+            b.ContainerOpenPacket.ID, timeout=timeout, match=lambda raw: True,
+        ))
+        try:
+            await asyncio.sleep(0)
+            await self.packets.send(b.InteractPacket(
+                action=b.InteractPacket.Action.OPEN_INVENTORY,
+                target_id=self.inventory.player_id,
+                pos=None,
+            ))
+            return self._decode_open(await pending)
+        finally:
+            if not pending.done():
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+
     async def close_window(self, *, timeout: float = 15) -> ContainerWindow | None:
         """Request close; return after the same window's server close packet."""
         window = self.window
@@ -227,8 +245,7 @@ class Containers:
                 net_id_variant=int(item.net_id_variant or 0),
             )
 
-        request_id = self._next_request_id
-        self._next_request_id -= 2
+        request_id = self.inventory._allocate_request_id()
         request = b.ItemStackRequestPacketData.RequestData(
             client_request_id=b.ItemStackRequestId(raw_id=request_id),
             actions=[action_type(

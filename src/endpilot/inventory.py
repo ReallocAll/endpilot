@@ -26,6 +26,8 @@ class Inventory:
         self.packets = packets
         self.player_id = int(player_id)
         self._slots = {}
+        self._armor_slots = {}
+        self._next_request_id = -1
         self._selected_slot = 0
         self._events = {}
         self._changed = asyncio.Event()
@@ -42,7 +44,11 @@ class Inventory:
         b = self.packets.protocol.binding
         if raw.packet_id == b.InventoryContentPacket.ID:
             packet = self.packets.protocol.decode(raw)
-            if int(packet.inventory_id) != int(b.ContainerID.INVENTORY):
+            inventory_id = int(packet.inventory_id)
+            if inventory_id == int(b.ContainerID.ARMOR):
+                self._armor_slots = dict(enumerate(packet.slots))
+                return
+            if inventory_id != int(b.ContainerID.INVENTORY):
                 return
             self._slots = dict(enumerate(packet.slots))
             for event in self._events.values():
@@ -52,6 +58,8 @@ class Inventory:
             packet = self.packets.protocol.decode(raw)
             if int(packet.inventory_id) == int(b.ContainerID.INVENTORY):
                 self._set_slot(packet.slot, packet.item)
+            elif int(packet.inventory_id) == int(b.ContainerID.ARMOR):
+                self._armor_slots[int(packet.slot)] = packet.item
         elif raw.packet_id == b.InventoryTransactionPacket.ID:
             packet = self.packets.protocol.decode(raw)
             # Server-initiated inventory changes, including automatic pickup.
@@ -59,10 +67,29 @@ class Inventory:
             transaction = getattr(packet.variant_transaction, "transaction", None)
             for action in getattr(transaction, "actions", ()):
                 source = action.source
-                if (source.type.name == "CONTAINER_INVENTORY"
-                        and source.container_id is not None
-                        and int(source.container_id) == int(b.ContainerID.INVENTORY)):
+                if source.type.name != "CONTAINER_INVENTORY" or source.container_id is None:
+                    continue
+                inventory_id = int(source.container_id)
+                if inventory_id == int(b.ContainerID.INVENTORY):
                     self._set_slot(action.slot, action.to_item_descriptor)
+                elif inventory_id == int(b.ContainerID.ARMOR):
+                    self._armor_slots[int(action.slot)] = action.to_item_descriptor
+
+    @property
+    def slots(self) -> dict[int, object]:
+        """Latest server-described inventory slots; missing slots are unknown."""
+        return dict(self._slots)
+
+    @property
+    def armor_slots(self) -> dict[int, object]:
+        """Latest server-described armor slots; missing slots are not observations."""
+        return dict(self._armor_slots)
+
+    def _allocate_request_id(self) -> int:
+        # One request ID space for armor and open-container operations.
+        request_id = self._next_request_id
+        self._next_request_id -= 2
+        return request_id
 
     def count_item(self, item_id: int) -> int:
         """Sum the latest server-described inventory slots for a numeric item ID."""
@@ -136,6 +163,99 @@ class Inventory:
         ))
         self._selected_slot = slot
 
+
+
+    async def equip_armor(self, source_slot: int, armor_slot: int, *, timeout: float = 15):
+        """Swap a player inventory item with armor slot 0=head, 1=chest, 2=legs, 3=feet.
+
+        Return the matching ItemStackResponse; only server-provided response slots
+        (or later inventory packets) update the observed inventory and armor state.
+        """
+        if not 0 <= source_slot <= 255:
+            raise ValueError("source slot must fit in a byte")
+        if not 0 <= armor_slot < 4:
+            raise ValueError("armor slot must be between 0 and 3")
+        source = self._slots.get(source_slot)
+        if source is None or int(source.id) == 0:
+            raise ValueError("source slot has no observed item")
+
+        b = self.packets.protocol.binding
+        destination = self._armor_slots.get(armor_slot) or self.item_or_empty(-1)
+        cereal = b.ItemStackRequestCereal
+
+        def slot_info(name, slot, item):
+            return cereal.SlotInfoData(
+                full_container_name=b.FullContainerName(
+                    name=b.ContainerEnumName[name], dynamic_id=None,
+                ),
+                slot=slot,
+                net_id_variant=int(item.net_id_variant or 0),
+            )
+
+        source_info = slot_info(
+            "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", source_slot, source,
+        )
+        destination_info = slot_info("ARMOR_CONTAINER", armor_slot, destination)
+        # Match client item-stack actions: place into an empty armor slot,
+        # swap when replacing an already equipped item.
+        placing = int(destination.id) == 0
+        action = (
+            cereal.PlaceActionData(
+                amount=1, source=source_info, destination=destination_info,
+            )
+            if placing else cereal.SwapActionData(
+                source=source_info, destination=destination_info,
+            )
+        )
+        request_id = self._allocate_request_id()
+        request = b.ItemStackRequestPacketData.RequestData(
+            client_request_id=b.ItemStackRequestId(raw_id=request_id),
+            actions=[action],
+            strings_to_filter=[],
+            strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
+        )
+
+        def matches(raw):
+            packet = self.packets.protocol.decode(raw)
+            return any(
+                int(reply.client_request_id.raw_id) == request_id
+                for reply in packet.responses
+            )
+
+        pending = asyncio.create_task(self.packets.wait_for_packet(
+            b.ItemStackResponsePacket.ID, timeout=timeout, match=matches,
+        ))
+        try:
+            await asyncio.sleep(0)
+            await self.packets.send(b.ItemStackRequestPacket(requests=[request]))
+            packet = self.packets.protocol.decode(await pending)
+            response = next(
+                reply for reply in packet.responses
+                if int(reply.client_request_id.raw_id) == request_id
+            )
+            success = response.result.name == "SUCCESS"
+            for container in response.containers or ():
+                name = container.full_container_name.name.name
+                for slot in container.slots:
+                    index = int(slot.slot)
+                    if name == "ARMOR_CONTAINER" and index == armor_slot:
+                        item = source if success else destination
+                        if not success and int(item.id) == 0 and int(slot.amount) > 0:
+                            # Response slots have no item type: do not invent one.
+                            self._armor_slots.pop(index, None)
+                        else:
+                            self._armor_slots[index] = _response_item(b, item, item, slot)
+                    elif name in (
+                        "HOTBAR_CONTAINER", "INVENTORY_CONTAINER",
+                        "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER",
+                    ) and index == source_slot:
+                        item = (source if placing else destination) if success else source
+                        self._set_slot(index, _response_item(b, item, item, slot))
+            return response
+        finally:
+            if not pending.done():
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
 
     async def use_item(self, movement) -> None:
         """Submit one use-in-air transaction; server effects are observed separately."""
