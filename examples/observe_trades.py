@@ -95,6 +95,14 @@ async def run(url: str, *, interrupt: bool = False) -> None:
             # Explicitly cancel this staged exchange and await the server close reply.
             print("trade_abort_ready", flush=True)
             await asyncio.to_thread(sys.stdin.readline)
+            returned = await bot.unstage_trade_ingredient(source_slot)
+            print("trade_unstage_result=" + json.dumps({
+                "result": returned.result.name,
+                "request_id": int(returned.client_request_id.raw_id),
+                "observed_count": bot.inventory_count(int(source.id)),
+            }), flush=True)
+            if returned.result.name != "SUCCESS":
+                raise AssertionError(f"BDS rejected trade input return: {returned.result.name}")
             closed = await bot.close_container()
             if (closed is None or closed.container_id != offers.window_id
                     or bot.open_window is not None):
