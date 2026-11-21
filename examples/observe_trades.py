@@ -90,7 +90,8 @@ async def run_two_input(bot: Bot, offers) -> None:
     print("trade_window_closed=" + str(closed.container_id), flush=True)
 
 
-async def run(url: str, *, interrupt: bool = False, two_input: bool = False) -> None:
+async def run(url: str, *, interrupt: bool = False, two_input: bool = False,
+              server_interrupt: bool = False) -> None:
     bot = Bot("EndPilotTest")
     try:
         if url.startswith("raknet://"):
@@ -175,7 +176,21 @@ async def run(url: str, *, interrupt: bool = False, two_input: bool = False) -> 
             raise AssertionError(f"BDS rejected trade ingredient: {reply.result.name}")
         if record["after"] != before - selected.buy_a.count:
             raise AssertionError(f"BDS inventory count mismatch: {record}")
-        if interrupt:
+        if server_interrupt:
+            # The server interrupts the session after BDS has accepted staging.
+            # A DisconnectPacket is not an exchange verdict or an item refund.
+            pending = asyncio.create_task(bot.wait_for_server_disconnect(timeout=15))
+            await asyncio.sleep(0)
+            print("trade_server_interrupt_ready", flush=True)
+            disconnected = await pending
+            print("trade_server_interrupted=" + json.dumps({
+                "packet": type(disconnected).__name__,
+                "window_id": offers.window_id,
+                "staging_request_id": int(reply.client_request_id.raw_id),
+                "staging_result": reply.result.name,
+                "exchange_submitted": False,
+            }), flush=True)
+        elif interrupt:
             # A villager's death does not necessarily close the trade UI on BDS.
             # Explicitly cancel this staged exchange and await the server close reply.
             print("trade_abort_ready", flush=True)
@@ -286,7 +301,8 @@ async def run(url: str, *, interrupt: bool = False, two_input: bool = False) -> 
                 raise AssertionError("BDS did not acknowledge the trade window close")
             print("trade_window_closed=" + str(closed.container_id), flush=True)
 
-        await asyncio.to_thread(sys.stdin.readline)
+        if not server_interrupt:
+            await asyncio.to_thread(sys.stdin.readline)
     finally:
         await bot.close()
         print("disconnected EndPilotTest", flush=True)
@@ -297,5 +313,8 @@ if __name__ == "__main__":
     parser.add_argument("url", help="NetherNet HTTP URL or raknet://host:port")
     parser.add_argument("--interrupt", action="store_true", help="cancel a staged trade and inspect returned inventory")
     parser.add_argument("--two-input", action="store_true", help="exchange a quote requiring both villager inputs")
+    parser.add_argument("--server-interrupt", action="store_true",
+                        help="observe a BDS kick after confirmed trade ingredient staging")
     args = parser.parse_args()
-    asyncio.run(run(args.url, interrupt=args.interrupt, two_input=args.two_input))
+    asyncio.run(run(args.url, interrupt=args.interrupt, two_input=args.two_input,
+                    server_interrupt=args.server_interrupt))
