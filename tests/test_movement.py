@@ -81,6 +81,38 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(movement.position[2], 0.5)
         movement.close()
 
+    async def test_sneak_input_transition_is_held_then_released(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        stream = PacketSink(protocol)
+        movement = Movement(stream, 1)
+        movement._input_position = (0.5, 101.62, 0.5)
+        movement.position = movement._input_position
+        flags = b.PlayerAuthInputPacket.InputData
+
+        self.assertEqual(await movement.set_sneaking(True), 1)
+        self.assertEqual(set(stream.sent[-1].input_data), {
+            flags.SNEAKING, flags.SNEAK_DOWN, flags.SNEAK_CURRENT_RAW,
+            flags.WANT_DOWN, flags.START_SNEAKING, flags.SNEAK_PRESSED_RAW,
+        })
+        self.assertEqual(await movement.set_sneaking(True), 2)
+        self.assertEqual(set(stream.sent[-1].input_data), {
+            flags.SNEAKING, flags.SNEAK_DOWN, flags.SNEAK_CURRENT_RAW, flags.WANT_DOWN,
+        })
+        await movement._send_input(True)
+        self.assertIn(flags.UP, stream.sent[-1].input_data)
+        self.assertAlmostEqual(stream.sent[-1].move.y, 0.3)
+        self.assertAlmostEqual(stream.sent[-1].pos.z, 0.527, places=5)
+
+        self.assertEqual(await movement.set_sneaking(False), 4)
+        self.assertEqual(set(stream.sent[-1].input_data), {
+            flags.STOP_SNEAKING, flags.SNEAK_RELEASED_RAW,
+        })
+        await movement._send_input(False)
+        self.assertEqual(list(stream.sent[-1].input_data), [])
+        self.assertEqual(movement.position, (0.5, 101.62, 0.5))
+        movement.close()
+
     async def test_teleport_while_sending_rebases_next_frame(self):
         protocol = Protocol(2193)
         b = protocol.binding
