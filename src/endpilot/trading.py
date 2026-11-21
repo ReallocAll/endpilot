@@ -235,7 +235,7 @@ class Trading:
         if ingredient not in (1, 2):
             raise ValueError("ingredient must be 1 or 2")
         staged = self._inputs.get(ingredient)
-        if staged is None or len(staged) < 4 or staged[3] is None:
+        if staged is None:
             raise RuntimeError("trade ingredient lacks a confirmed staged stack")
         name, amount, net_id, original = staged
         b = self.packets.protocol.binding
@@ -411,7 +411,7 @@ class Trading:
                             previous = self._inputs[number]
                             self._inputs[number] = (
                                 item_name, int(slot.amount), int(net_id.raw_id),
-                                previous[3] if len(previous) > 3 else None,
+                                previous[3],
                             )
                     elif (name in ("HOTBAR_CONTAINER", "INVENTORY_CONTAINER",
                                    "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER")
