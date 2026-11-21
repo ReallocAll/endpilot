@@ -12,7 +12,7 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
               expect_server_close: bool = False, drop_count: int = 0,
               split_slot: int | None = None, chat_during_take: bool = False,
               server_grant_during_take: bool = False,
-              swap_slot: int | None = None) -> None:
+              swap_slot: int | None = None, swap_late_grant: bool = False) -> None:
     if server_grant_during_take and not chat_during_take:
         raise ValueError("server grant scenario requires --chat-during-take")
     bot = Bot("EndPilotTest")
@@ -195,7 +195,49 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
             opened = await bot.open_inventory_screen()
             before_source = bot.inventory_slots[destination_slot]
             before_target = bot.inventory_slots[swap_slot]
-            response = await bot.swap_inventory_items(destination_slot, swap_slot)
+            if swap_late_grant:
+                # Testbed gates only the local waiter; BDS receives the actual
+                # request and sends its real reply before granting a newer item.
+                packets = bot.packets
+                wait_for_packet = packets.wait_for_packet
+                reply_received = asyncio.Event()
+                release_reply = asyncio.Event()
+
+                async def delayed_wait(packet_id, *, timeout, match=None):
+                    raw = await wait_for_packet(packet_id, timeout=timeout, match=match)
+                    if packet_id == bot.protocol.binding.ItemStackResponsePacket.ID:
+                        reply_received.set()
+                        await release_reply.wait()
+                    return raw
+
+                packets.wait_for_packet = delayed_wait
+                pending_swap = asyncio.create_task(
+                    bot.swap_inventory_items(destination_slot, swap_slot)
+                )
+                try:
+                    async with asyncio.timeout(15):
+                        await reply_received.wait()
+                    print("swap_reply_received_before_grant", flush=True)
+                    await asyncio.to_thread(sys.stdin.readline)
+                    async with asyncio.timeout(15):
+                        while True:
+                            current = bot.inventory_slots.get(destination_slot)
+                            if (current is not None
+                                    and int(current.id) not in (
+                                        int(before_source.id), int(before_target.id)
+                                    )):
+                                break
+                            await asyncio.sleep(0.05)
+                    release_reply.set()
+                    response = await pending_swap
+                finally:
+                    release_reply.set()
+                    packets.wait_for_packet = wait_for_packet
+                    if not pending_swap.done():
+                        pending_swap.cancel()
+                        await asyncio.gather(pending_swap, return_exceptions=True)
+            else:
+                response = await bot.swap_inventory_items(destination_slot, swap_slot)
             current_source = bot.inventory_slots.get(destination_slot)
             current_target = bot.inventory_slots.get(swap_slot)
             print("inventory_swap_response=" + json.dumps({
@@ -297,8 +339,11 @@ if __name__ == "__main__":
                         help="Testbed independently grants inventory after the stack request is sent")
     parser.add_argument("--swap-slot", type=int, default=None,
                         help="swap the taken chest stack with a Testbed-granted inventory item")
+    parser.add_argument("--swap-late-grant", action="store_true",
+                        help="Testbed: hold the swap reply until a newer server slot update")
     args = parser.parse_args()
     asyncio.run(run(args.url, args.take_count, args.destination_slot,
                     args.put_back_count, args.equip_armor_slot, args.expect_server_close,
                     args.drop_count, args.split_slot, args.chat_during_take,
-                    args.server_grant_during_take, args.swap_slot))
+                    args.server_grant_during_take, args.swap_slot,
+                    args.swap_late_grant))
