@@ -270,6 +270,26 @@ class TradingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((int(updated[0][1].id), int(updated[0][1].stack_size),
                           int(updated[0][1].net_id_variant)), (42, 1, 501))
 
+        # A full server InventorySlot may have supplied richer item data first.
+        observed = b.SerializedNetworkItemStackDescriptor(
+            id=42, stack_size=2, aux_value=7, net_id_variant=700,
+            block_runtime_id=99, user_data_buffer=b"observed",
+        )
+        inventory.item_or_empty = lambda slot: observed
+        inventory._allocate_request_id = Mock(return_value=-5)
+        reply.client_request_id.raw_id = -5
+        reply.containers[1].slots[0].amount = 3
+        reply.containers[1].slots[0].item_stack_net_id = SimpleNamespace(raw_id=777)
+        trading._inputs[1] = ("minecraft:wheat", 3, 301)
+        updated.clear()
+        await trading.exchange(123, 9)
+        self.assertEqual(len(updated), 1)
+        corrected = updated[0][1]
+        self.assertEqual((int(corrected.id), int(corrected.stack_size),
+                          int(corrected.net_id_variant)), (42, 3, 777))
+        self.assertEqual((int(corrected.aux_value), int(corrected.block_runtime_id),
+                          corrected.user_data_buffer), (7, 99, b"observed"))
+
     async def test_update_trade_opens_and_closes_container_window(self):
         b = Protocol(2193).binding
         observers = []
