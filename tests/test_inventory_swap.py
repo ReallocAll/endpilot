@@ -61,7 +61,9 @@ class SwapInventoryTests(unittest.IsolatedAsyncioTestCase):
             )
 
         try:
-            success = response("SUCCESS", [slot(2, 4, 204), slot(3, 2, 103)])
+            # ItemStackResponse may also carry corrections for unrelated slots.
+            success = response("SUCCESS", [slot(2, 4, 204), slot(3, 2, 103),
+                                            slot(4, 1, 303)])
             replies[b"reply"] = SimpleNamespace(responses=[success])
             self.assertIs(await inventory.swap_items(2, 3, timeout=3), success)
             request = codec.decode(codec.encode(stream.send.await_args.args[0]))
