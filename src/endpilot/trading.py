@@ -153,7 +153,9 @@ class Trading:
                     "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER",
                     source_slot, int(source.net_id_variant or 0),
                 ),
-                destination=slot_info(destination_name, 0, 0),
+                destination=slot_info(
+                    destination_name, ingredient + 3 if offers.use_new_trade_screen else 0, 0
+                ),
             )],
             strings_to_filter=[],
             strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
