@@ -1,7 +1,7 @@
-"""Smelt raw iron using coal in a real BDS furnace through the public SDK.
+"""Smelt raw iron, take its ingot and optionally store it in a chest.
 
-The companion Testbed controls staging through stdin. The recipe result is
-observed in the server window before it is taken into player inventory.
+The companion Testbed controls staging through stdin. BDS responses and fresh
+window contents distinguish accepted transfers from observed storage.
 """
 import argparse
 import asyncio
@@ -15,7 +15,7 @@ def report(marker, **values):
     print(marker + json.dumps(values), flush=True)
 
 
-async def run(url: str):
+async def run(url: str, *, store: bool = False):
     bot = Bot("EndPilotTest")
     target = (1, 100, 0)
     try:
@@ -81,6 +81,51 @@ async def run(url: str):
         closed = await bot.close_container()
         report("furnace_closed=", id=closed.container_id,
                open_window=bot.open_window is not None)
+        if store:
+            # The Testbed replaces the furnace with a chest only after the
+            # client has subscribed for this block update.
+            pending = asyncio.create_task(bot.wait_for_block_update(target))
+            await asyncio.sleep(0)
+            print("furnace_storage_watch_ready", flush=True)
+            await pending
+            chest = await bot.open_container(target, face=4)
+            if chest.container_type != "CONTAINER":
+                raise AssertionError(f"unexpected storage window: {chest}")
+            chest_slots = await bot.wait_for_container_slots()
+            if int(chest_slots[0].id) != 0:
+                raise AssertionError("expected an empty chest destination")
+            response = await bot.put_into_container(2, 0)
+            if response.result.name != "SUCCESS":
+                raise AssertionError(f"BDS rejected smelted-output storage: {response.result.name}")
+            confirmed = bot.container_slots[0]
+            remaining = bot.inventory_count(int(carried.id))
+            await bot.close_container()
+
+            # Reopen to observe a fresh server InventoryContent, not just the
+            # ItemStackResponse correction from the earlier request.
+            reopened = await bot.open_container(target, face=4)
+            observed = (await bot.wait_for_container_slots())[0]
+            await bot.close_container()
+            stored = {
+                "request_id": int(response.client_request_id.raw_id),
+                "result": response.result.name,
+                "first_window": chest.container_id,
+                "reopened_window": reopened.container_id,
+                "response_chest_id": int(confirmed.id),
+                "response_chest_count": int(confirmed.stack_size),
+                "reopened_chest_id": int(observed.id),
+                "reopened_chest_count": int(observed.stack_size),
+                "inventory_count": remaining,
+                "open_window": bot.open_window is not None,
+            }
+            report("furnace_storage=", **stored)
+            if (stored["response_chest_id"] != int(carried.id)
+                    or stored["response_chest_count"] != 1
+                    or stored["reopened_chest_id"] != int(carried.id)
+                    or stored["reopened_chest_count"] != 1
+                    or stored["inventory_count"] != 0
+                    or stored["open_window"]):
+                raise AssertionError(f"furnace output was not stored: {stored}")
         await asyncio.to_thread(sys.stdin.readline)
     finally:
         await bot.close()
@@ -90,4 +135,7 @@ async def run(url: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("url")
-    asyncio.run(run(parser.parse_args().url))
+    parser.add_argument("--store", action="store_true",
+                        help="store the resulting iron ingot in a chest")
+    args = parser.parse_args()
+    asyncio.run(run(args.url, store=args.store))
