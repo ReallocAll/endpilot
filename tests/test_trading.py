@@ -126,6 +126,7 @@ class TradingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(containers.window.container_type, "TRADE")
             self.assertEqual(containers.window.entity_unique_id, 42)
             self.assertEqual(containers.window.container_id, 5)
+            self.assertIsNone(containers.window.position)
             containers._slots = {0: object()}
             observers[0](RawPacket(b.UpdateTradePacket.ID, b"trade"))
             self.assertEqual(len(containers.slots), 1)
