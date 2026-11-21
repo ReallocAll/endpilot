@@ -112,7 +112,7 @@ class Recipes:
                     RecipeResult(
                         int(item.id), self.item_names.get(int(item.id)),
                         int(item.stack_size), int(item.aux_value),
-                        int(item.block_runtime_id), bytes(item.user_data_buffer),
+                        int(item.block_runtime_id) & 0xFFFFFFFF, bytes(item.user_data_buffer),
                     )
                     for item in source_results or ()
                 )
