@@ -192,3 +192,90 @@ class InventoryTests(unittest.IsolatedAsyncioTestCase):
         finally:
             inventory.close()
         self.assertEqual(callbacks, [])
+
+    async def test_drop_item_sends_native_action_and_reconciles_server_slot(self):
+        from endpilot.protocol import RawPacket
+
+        codec = Protocol(2193)
+        b = codec.binding
+        callbacks = []
+        response = SimpleNamespace(
+            client_request_id=SimpleNamespace(raw_id=-1),
+            result=SimpleNamespace(name="SUCCESS"),
+            containers=[SimpleNamespace(
+                full_container_name=SimpleNamespace(
+                    name=SimpleNamespace(name="COMBINED_HOTBAR_AND_INVENTORY_CONTAINER"),
+                ),
+                slots=[SimpleNamespace(
+                    slot=2, amount=1,
+                    item_stack_net_id=SimpleNamespace(raw_id=105),
+                )],
+            )],
+        )
+        raw = RawPacket(b.ItemStackResponsePacket.ID, b"server")
+        packets = SimpleNamespace(
+            protocol=SimpleNamespace(
+                binding=b,
+                decode=lambda packet: SimpleNamespace(responses=[response])
+                if packet.body == b"server" else codec.decode(packet),
+            ),
+            subscribe_raw=lambda cb: callbacks.append(cb)
+            or (lambda: callbacks.remove(cb)),
+            send=AsyncMock(),
+        )
+
+        async def wait(packet_id, *, timeout, match):
+            self.assertEqual(packet_id, b.ItemStackResponsePacket.ID)
+            self.assertEqual(timeout, 4)
+            self.assertTrue(match(raw))
+            return raw
+
+        packets.wait_for_packet = wait
+        inventory = Inventory(packets, 7)
+        try:
+            item = b.SerializedNetworkItemStackDescriptor(
+                id=42, stack_size=2, aux_value=0, net_id_variant=104,
+                block_runtime_id=0, user_data_buffer=b"",
+            )
+            inventory._set_slot(2, item)
+            result = await inventory.drop_item(2, 1, timeout=4)
+            self.assertIs(result, response)
+            wire = codec.decode(codec.encode(packets.send.await_args.args[0]))
+            self.assertIsInstance(wire, b.ItemStackRequestPacket)
+            request = wire.requests[0]
+            self.assertEqual(int(request.client_request_id.raw_id), -1)
+            action = request.actions[0]
+            self.assertIsInstance(action, b.ItemStackRequestCereal.DropActionData)
+            self.assertEqual(int(action.amount), 1)
+            self.assertEqual(int(action.source.slot), 2)
+            self.assertEqual(int(action.source.net_id_variant), 104)
+            self.assertEqual(
+                action.source.full_container_name.name,
+                b.ContainerEnumName.COMBINED_HOTBAR_AND_INVENTORY_CONTAINER,
+            )
+            self.assertFalse(action.randomly)
+            self.assertEqual(int(inventory.slots[2].id), 42)
+            self.assertEqual(int(inventory.slots[2].stack_size), 1)
+            self.assertEqual(int(inventory.slots[2].net_id_variant), 105)
+            self.assertEqual(inventory._allocate_request_id(), -3)
+        finally:
+            inventory.close()
+        self.assertEqual(callbacks, [])
+
+    async def test_drop_item_rejects_only_invalid_slot_amount_and_unknown_source(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        callbacks = []
+        packets = SimpleNamespace(
+            protocol=protocol, send=AsyncMock(),
+            subscribe_raw=lambda cb: callbacks.append(cb)
+            or (lambda: callbacks.remove(cb)),
+        )
+        inventory = Inventory(packets, 7)
+        try:
+            for slot, amount in ((-1, 1), (256, 1), (0, 0), (0, 256), (0, 1)):
+                with self.assertRaises(ValueError):
+                    await inventory.drop_item(slot, amount)
+            packets.send.assert_not_awaited()
+        finally:
+            inventory.close()

@@ -225,6 +225,13 @@ class Bot:
             raise RuntimeError("bot is not joined")
         return await self._inventory.equip_armor(source_slot, armor_slot, timeout=timeout)
 
+
+    async def drop_inventory_item(self, slot: int, amount: int = 1, *, timeout: float = 15):
+        """Return BDS's verdict for dropping an observed inventory stack."""
+        if self._inventory is None:
+            raise RuntimeError("player has not joined")
+        return await self._inventory.drop_item(slot, amount, timeout=timeout)
+
     async def use_item(self) -> None:
         """Use the selected item in air; await BDS observations to confirm its effect."""
         if self._inventory is None or self._movement is None:

@@ -9,7 +9,7 @@ from endpilot import Bot
 
 async def run(url: str, take_count: int = 0, destination_slot: int = 0,
               put_back_count: int = 0, equip_armor_slot: int | None = None,
-              expect_server_close: bool = False) -> None:
+              expect_server_close: bool = False, drop_count: int = 0) -> None:
     bot = Bot("EndPilotTest")
     target = (1, 100, 0)
     try:
@@ -86,6 +86,37 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
                 "id": None if closed is None else closed.container_id,
                 "open_window": bot.open_window is not None,
             }), flush=True)
+        if drop_count:
+            screen = await bot.open_inventory_screen()
+            print("player_inventory_opened=" + json.dumps({
+                "id": screen.container_id, "type": screen.container_type,
+            }), flush=True)
+            drop_waiter = asyncio.create_task(bot.wait_for_item_drop(timeout=15))
+            try:
+                await asyncio.sleep(0)
+                response = await bot.drop_inventory_item(destination_slot, drop_count)
+                if response.result.name != "SUCCESS":
+                    raise AssertionError(f"BDS rejected inventory drop: {response.result.name}")
+                drop = await drop_waiter
+            finally:
+                if not drop_waiter.done():
+                    drop_waiter.cancel()
+                    await asyncio.gather(drop_waiter, return_exceptions=True)
+            source = bot.inventory_slots.get(destination_slot)
+            print("inventory_drop_response=" + json.dumps({
+                "request_id": int(response.client_request_id.raw_id),
+                "result": response.result.name,
+                "inventory_count": None if source is None else int(source.stack_size),
+                "item_id": None if source is None else int(source.id),
+                "drop_item_id": drop.item_id,
+                "drop_count": drop.item_count,
+                "drop_runtime_id": drop.runtime_id,
+            }), flush=True)
+            screen_closed = await bot.close_container()
+            print("player_inventory_closed=" + json.dumps({
+                "id": None if screen_closed is None else screen_closed.container_id,
+                "open_window": bot.open_window is not None,
+            }), flush=True)
         if equip_armor_slot is not None:
             inventory_window = await bot.open_inventory_screen()
             print("player_inventory_opened=" + json.dumps({
@@ -130,8 +161,11 @@ if __name__ == "__main__":
                         help="return this many items from destination slot to chest slot 0")
     parser.add_argument("--equip-armor-slot", type=int, default=None,
                         help="after closing the chest, equip the taken item into armor slot 0-3")
+    parser.add_argument("--drop-count", type=int, default=0,
+                        help="after closing chest, drop from the destination inventory slot")
     parser.add_argument("--expect-server-close", action="store_true",
                         help="observe server-initiated window close instead of requesting it")
     args = parser.parse_args()
     asyncio.run(run(args.url, args.take_count, args.destination_slot,
-                    args.put_back_count, args.equip_armor_slot, args.expect_server_close))
+                    args.put_back_count, args.equip_armor_slot, args.expect_server_close,
+                    args.drop_count))
