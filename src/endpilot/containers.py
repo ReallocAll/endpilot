@@ -88,6 +88,14 @@ class Containers:
                 self.window = None
                 self._slots = None
                 self._slots_updated.set()
+                if packet.server_initiated_close:
+                    # A server-originated close is acknowledged with the same
+                    # window ID/type and flag, as in EndstoneMC/client.
+                    asyncio.create_task(self.packets.send(b.ContainerClosePacket(
+                        container_id=packet.container_id,
+                        container_type=packet.container_type,
+                        server_initiated_close=True,
+                    )))
 
     @property
     def slots(self) -> dict[int, object] | None:
