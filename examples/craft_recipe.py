@@ -57,6 +57,10 @@ async def run(url: str) -> None:
         source_slot, source = filled[0]
         destination_slot = 8 if source_slot != 8 else 7
         before = int(source.stack_size)
+        window = await bot.open_inventory_screen()
+        print("crafting_window=" + json.dumps({
+            "id": window.container_id, "type": window.container_type,
+        }), flush=True)
         response = await bot.craft_recipe_auto(recipe.net_id, destination_slot)
         after = bot.inventory_slots.get(source_slot)
         destination = bot.inventory_slots.get(destination_slot)
@@ -76,6 +80,7 @@ async def run(url: str) -> None:
             raise AssertionError(f"source correction did not match: {record}")
         if record["output_id"] != output.item_id or record["output_count"] != output.count:
             raise AssertionError(f"output correction did not match: {record}")
+        await bot.close_container()
         await asyncio.to_thread(sys.stdin.readline)
     finally:
         await bot.close()
