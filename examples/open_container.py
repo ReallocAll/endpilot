@@ -45,21 +45,44 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
         }), flush=True)
         if take_count:
             if chat_during_take:
+                packets = bot.packets
+                send = packets.send
+                request_sent = asyncio.Event()
+                request_type = bot.protocol.binding.ItemStackRequestPacket
+
+                async def send_and_signal(packet):
+                    await send(packet)
+                    if isinstance(packet, request_type):
+                        request_sent.set()
+
+                packets.send = send_and_signal
                 taking = asyncio.create_task(
                     bot.take_from_container(0, destination_slot, take_count)
                 )
+                taking.add_done_callback(lambda _: request_sent.set())
                 try:
-                    # Let the item request start, then submit an unrelated
-                    # player action without awaiting its matching response.
-                    await asyncio.sleep(0)
-                    pending_at_chat = not taking.done()
+                    # Observe the actual request send, not merely a started task.
+                    await request_sent.wait()
+                    packets.send = send
+                    if taking.done():
+                        await taking
+                        raise AssertionError(
+                            "the item-stack response completed before chat submission"
+                        )
                     await bot.send_chat("endpilot-container-interleave")
+                    pending_at_chat = not taking.done()
+                    if not pending_at_chat:
+                        await taking
+                        raise AssertionError(
+                            "the item-stack response completed during chat submission"
+                        )
                     response = await taking
                     print("chat_during_take=" + json.dumps({
                         "message": "endpilot-container-interleave",
                         "item_request_pending_at_chat": pending_at_chat,
                     }), flush=True)
                 finally:
+                    packets.send = send
                     if not taking.done():
                         taking.cancel()
                         await asyncio.gather(taking, return_exceptions=True)
