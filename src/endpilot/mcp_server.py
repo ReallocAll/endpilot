@@ -11,6 +11,7 @@ class MCPPlayer:
         self.bot: Bot | None = None
         self._pending: dict[tuple[tuple[int, int, int], int], asyncio.Task[BlockUpdate]] = {}
         self._observed: dict[tuple[tuple[int, int, int], int], BlockUpdate] = {}
+        self._walk: asyncio.Task[int] | None = None
 
     def _joined(self) -> Bot:
         if self.bot is None:
@@ -71,8 +72,54 @@ class MCPPlayer:
         tick = await bot.place_against(against, face=face, slot=slot)
         return {"submitted_tick": tick, "against": list(against.position)}
 
+
+    async def start_walk(self, ticks: int = 160) -> dict:
+        """Start a bounded walk without blocking the MCP client."""
+        bot = self._joined()
+        if self._walk is not None:
+            raise RuntimeError("observe or stop the previous walk first")
+        self._walk = asyncio.create_task(bot.walk_forward(ticks))
+        await asyncio.sleep(0)
+        return {"started": True, "requested_frames": ticks}
+
+    async def observe_walk(self) -> dict:
+        """Report progress and the last server-reported position."""
+        bot = self._joined()
+        task = self._walk
+        if task is None:
+            raise RuntimeError("start_walk must be called first")
+        if not task.done():
+            return {"state": "running", "server_position": bot.position}
+        self._walk = None
+        return {"state": "finished", "submitted_frames": await task,
+                "server_position": bot.position}
+
+    async def stop_walk(self) -> dict:
+        """Stop a running walk and wait for release of the movement input."""
+        bot = self._joined()
+        task = self._walk
+        if task is None:
+            raise RuntimeError("start_walk must be called first")
+        was_running = not task.done()
+        if was_running:
+            await bot.stop_moving()
+            if not task.done():
+                task.cancel()
+        self._walk = None
+        try:
+            frames = await task
+        except asyncio.CancelledError:
+            return {"state": "cancelled", "submitted_frames": None,
+                    "server_position": bot.position}
+        return {"state": "stopped" if was_running else "finished",
+                "submitted_frames": frames, "server_position": bot.position}
+
     async def disconnect(self) -> dict:
         bot, self.bot = self.bot, None
+        if self._walk is not None:
+            self._walk.cancel()
+            await asyncio.gather(self._walk, return_exceptions=True)
+            self._walk = None
         for task in self._pending.values():
             task.cancel()
         if self._pending:
@@ -93,6 +140,9 @@ def create_server():
     server.tool()(player.watch_block)
     server.tool()(player.read_block)
     server.tool()(player.place_against)
+    server.tool()(player.start_walk)
+    server.tool()(player.observe_walk)
+    server.tool()(player.stop_walk)
     server.tool()(player.disconnect)
     return server
 
