@@ -34,7 +34,10 @@ class Inventory:
         self._unsubscribe = packets.subscribe_raw(self._on_packet)
 
     def _set_slot(self, slot, item):
-        self._slots[int(slot)] = item
+        if item is None:
+            self._slots.pop(int(slot), None)
+        else:
+            self._slots[int(slot)] = item
         event = self._events.get(int(slot))
         if event is not None:
             event.set()

@@ -43,6 +43,11 @@ class FurnaceTransferTests(unittest.IsolatedAsyncioTestCase):
                             player_slot, player_count, 60 if player_count else None),
                 ],
             )])
+        # A single ingredient response may also correct other furnace slots.
+        replies[b"ore"].responses[0].containers.extend([
+            changed("FURNACE_FUEL_CONTAINER", 1, 2, 51),
+            changed("FURNACE_RESULT_CONTAINER", 2, 2, 52),
+        ])
         replies[b"other"] = SimpleNamespace(responses=[
             SimpleNamespace(client_request_id=SimpleNamespace(raw_id=-99))
         ])
@@ -72,6 +77,10 @@ class FurnaceTransferTests(unittest.IsolatedAsyncioTestCase):
         try:
             self.assertEqual((await containers.put_into_container(0, 0, timeout=3)).result.name,
                              "SUCCESS")
+            # The fuel identity was initially empty; do not invent its item type.
+            self.assertNotIn(1, containers.slots)
+            self.assertEqual((int(containers.slots[2].stack_size),
+                              int(containers.slots[2].net_id_variant)), (2, 52))
             self.assertEqual((await containers.put_into_container(1, 1, timeout=3)).result.name,
                              "SUCCESS")
             self.assertEqual((await containers.take_from_container(2, 2, timeout=3)).result.name,
