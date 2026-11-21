@@ -15,10 +15,10 @@ async def main(url: str):
         async with ClientSession(reader, writer) as session:
             await session.initialize()
 
-            async def call(name, **args):
-                result = await session.call_tool(name, arguments=args)
+            async def call(tool, **args):
+                result = await session.call_tool(tool, arguments=args)
                 if result.is_error:
-                    raise RuntimeError(f"MCP {name}: {result.content}")
+                    raise RuntimeError(f"MCP {tool}: {result.content}")
                 return result.structured_content or json.loads(result.content[0].text)
 
             try:
