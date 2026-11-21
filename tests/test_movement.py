@@ -412,6 +412,54 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
             await queued_walk
         self.assertEqual([list(p.input_data) for p in stream.sent[-2:]], [[], []])
 
+    async def test_strafe_frames_match_client_vector_and_release(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        sink = PacketSink(protocol)
+        movement = Movement(sink, 1)
+        movement.position = movement._input_position = (0.5, 101.62, 0.5)
+        flags = b.PlayerAuthInputPacket.InputData
+
+        self.assertEqual(await movement.strafe_left(2), 2)
+        self.assertEqual(await movement.strafe_right(2), 2)
+        self.assertEqual([p.client_tick for p in sink.sent], list(range(1, 9)))
+        self.assertEqual([list(p.input_data) for p in sink.sent], [
+            [flags.LEFT], [flags.LEFT], [], [],
+            [flags.RIGHT], [flags.RIGHT], [], [],
+        ])
+        self.assertEqual([p.move.x for p in sink.sent],
+                         [1.0, 1.0, 0.0, 0.0, -1.0, -1.0, 0.0, 0.0])
+        self.assertTrue(all(p.move.y == 0 and p.rot.y == 0 for p in sink.sent))
+        self.assertAlmostEqual(sink.sent[1].pos.x, 0.68, places=5)
+        self.assertAlmostEqual(sink.sent[5].pos.x, 0.5, places=5)
+        self.assertAlmostEqual(sink.sent[0].pos_delta.x, 0.09, places=5)
+        self.assertAlmostEqual(sink.sent[4].pos_delta.x, -0.09, places=5)
+        self.assertTrue(all(p.analog_move_vector.x == p.move.x
+                            and p.raw_move_vector.x == p.move.x for p in sink.sent))
+        self.assertEqual(movement.position, (0.5, 101.62, 0.5))
+
+        await movement.look_at((-10, 101.62, 0.5))
+        await movement._send_input(False, strafe=1)
+        self.assertAlmostEqual(sink.sent[-1].rot.y, 90.0, places=5)
+        self.assertAlmostEqual(sink.sent[-1].pos_delta.z, 0.09, places=5)
+        self.assertIn(flags.LEFT, sink.sent[-1].input_data)
+        movement.close()
+
+    async def test_strafe_does_not_start_held_sprint(self):
+        protocol = Protocol(2193)
+        flags = protocol.binding.PlayerAuthInputPacket.InputData
+        sink = PacketSink(protocol)
+        movement = Movement(sink, 1)
+        movement.position = movement._input_position = (0.5, 101.62, 0.5)
+        await movement.set_sprinting(True)
+        self.assertEqual(await movement.strafe_left(1), 1)
+        self.assertEqual(set(sink.sent[1].input_data),
+                         {flags.LEFT, flags.SPRINT_DOWN})
+        self.assertNotIn(flags.START_SPRINTING, sink.sent[1].input_data)
+        self.assertNotIn(flags.SPRINTING, sink.sent[1].input_data)
+        self.assertEqual(list(sink.sent[-1].input_data), [flags.SPRINT_DOWN])
+        movement.close()
+
     async def test_backward_frames_keep_facing_and_release_input(self):
         protocol = Protocol(2193)
         b = protocol.binding
