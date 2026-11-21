@@ -412,6 +412,8 @@ class Inventory:
                     continue
                 for slot in container.slots:
                     index = int(slot.slot)
+                    if index not in (source_slot, destination_slot):
+                        continue
                     # Packet dispatch can update a slot after the response
                     # arrived but before the response waiter resumes.
                     if self._slots.get(index) is not response_arrival_slots[index]:
