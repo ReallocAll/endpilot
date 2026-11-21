@@ -262,6 +262,96 @@ class Inventory:
 
 
 
+    async def unequip_armor(self, armor_slot: int, destination_slot: int, *, timeout: float = 15):
+        """Take equipped armor back into inventory (swap if the destination is occupied).
+
+        Return the matching ItemStackResponse, not a prediction of BDS acceptance.
+        Apply only the server-corrected armor and inventory slots.
+        """
+        if not 0 <= armor_slot < 4:
+            raise ValueError("armor slot must be between 0 and 3")
+        if not 0 <= destination_slot <= 255:
+            raise ValueError("destination slot must fit in a byte")
+        source = self._armor_slots.get(armor_slot)
+        if source is None or int(source.id) == 0:
+            raise ValueError("armor slot has no observed item")
+        destination = self._slots.get(destination_slot) or self.item_or_empty(destination_slot)
+
+        b = self.packets.protocol.binding
+        cereal = b.ItemStackRequestCereal
+
+        def slot_info(name, slot, item):
+            return cereal.SlotInfoData(
+                full_container_name=b.FullContainerName(
+                    name=b.ContainerEnumName[name], dynamic_id=None,
+                ), slot=slot, net_id_variant=int(item.net_id_variant or 0),
+            )
+
+        armor_info = slot_info("ARMOR_CONTAINER", armor_slot, source)
+        inventory_info = slot_info(
+            "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", destination_slot, destination,
+        )
+        taking = int(destination.id) == 0
+        action = (
+            cereal.TakeActionData(
+                amount=1, source=armor_info, destination=inventory_info,
+            )
+            if taking else cereal.SwapActionData(
+                source=armor_info, destination=inventory_info,
+            )
+        )
+        request_id = self._allocate_request_id()
+        request = b.ItemStackRequestPacketData.RequestData(
+            client_request_id=b.ItemStackRequestId(raw_id=request_id),
+            actions=[action], strings_to_filter=[],
+            strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
+        )
+
+        def matches(raw):
+            packet = self.packets.protocol.decode(raw)
+            return any(int(reply.client_request_id.raw_id) == request_id
+                       for reply in packet.responses)
+
+        pending = asyncio.create_task(self.packets.wait_for_packet(
+            b.ItemStackResponsePacket.ID, timeout=timeout, match=matches,
+        ))
+        try:
+            await asyncio.sleep(0)
+            await self.packets.send(b.ItemStackRequestPacket(requests=[request]))
+            packet = self.packets.protocol.decode(await pending)
+            response = next(reply for reply in packet.responses
+                            if int(reply.client_request_id.raw_id) == request_id)
+            success = response.result.name == "SUCCESS"
+            for container in response.containers or ():
+                name = container.full_container_name.name.name
+                for slot in container.slots:
+                    index = int(slot.slot)
+                    if name == "ARMOR_CONTAINER" and index == armor_slot:
+                        expected = (destination if not taking else self.item_or_empty(-1)
+                                    ) if success else source
+                        if int(expected.id) == 0 and int(slot.amount) > 0:
+                            # A correction carries count/net ID, not the item type.
+                            self._armor_slots.pop(index, None)
+                        else:
+                            self._armor_slots[index] = _response_item(
+                                b, expected, expected, slot,
+                            )
+                    elif (name in (
+                        "HOTBAR_CONTAINER", "INVENTORY_CONTAINER",
+                        "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER",
+                    ) and index == destination_slot):
+                        expected = source if success else destination
+                        if int(expected.id) == 0 and int(slot.amount) > 0:
+                            self._set_slot(index, None)
+                        else:
+                            self._set_slot(index, _response_item(b, expected, expected, slot))
+            return response
+        finally:
+            if not pending.done():
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+
+
     async def move_item(
         self, source_slot: int, destination_slot: int, amount: int = 1, *, timeout: float = 15
     ):
