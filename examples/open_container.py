@@ -11,7 +11,8 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
               put_back_count: int = 0, equip_armor_slot: int | None = None,
               expect_server_close: bool = False, drop_count: int = 0,
               split_slot: int | None = None, chat_during_take: bool = False,
-              server_grant_during_take: bool = False) -> None:
+              server_grant_during_take: bool = False,
+              swap_slot: int | None = None) -> None:
     if server_grant_during_take and not chat_during_take:
         raise ValueError("server grant scenario requires --chat-during-take")
     bot = Bot("EndPilotTest")
@@ -181,6 +182,34 @@ async def run(url: str, take_count: int = 0, destination_slot: int = 0,
                 "id": None if screen_closed is None else screen_closed.container_id,
                 "open_window": bot.open_window is not None,
             }), flush=True)
+        if swap_slot is not None:
+            # The Testbed grants a second kind of item in a different slot.
+            print("swap_ready", flush=True)
+            await asyncio.to_thread(sys.stdin.readline)
+            async with asyncio.timeout(15):
+                while True:
+                    other = bot.inventory_slots.get(swap_slot)
+                    if other is not None and int(other.id) != 0:
+                        break
+                    await asyncio.sleep(0.05)
+            opened = await bot.open_inventory_screen()
+            before_source = bot.inventory_slots[destination_slot]
+            before_target = bot.inventory_slots[swap_slot]
+            response = await bot.swap_inventory_items(destination_slot, swap_slot)
+            current_source = bot.inventory_slots.get(destination_slot)
+            current_target = bot.inventory_slots.get(swap_slot)
+            print("inventory_swap_response=" + json.dumps({
+                "request_id": int(response.client_request_id.raw_id),
+                "result": response.result.name,
+                "source_before": [int(before_source.id), int(before_source.stack_size)],
+                "target_before": [int(before_target.id), int(before_target.stack_size)],
+                "source_after": None if current_source is None else
+                [int(current_source.id), int(current_source.stack_size)],
+                "target_after": None if current_target is None else
+                [int(current_target.id), int(current_target.stack_size)],
+                "window_id": opened.container_id,
+            }), flush=True)
+            await bot.close_container()
         if drop_count:
             screen = await bot.open_inventory_screen()
             print("player_inventory_opened=" + json.dumps({
@@ -266,8 +295,10 @@ if __name__ == "__main__":
                         help="send player chat without blocking on the chest item response")
     parser.add_argument("--server-grant-during-take", action="store_true",
                         help="Testbed independently grants inventory after the stack request is sent")
+    parser.add_argument("--swap-slot", type=int, default=None,
+                        help="swap the taken chest stack with a Testbed-granted inventory item")
     args = parser.parse_args()
     asyncio.run(run(args.url, args.take_count, args.destination_slot,
                     args.put_back_count, args.equip_armor_slot, args.expect_server_close,
                     args.drop_count, args.split_slot, args.chat_during_take,
-                    args.server_grant_during_take))
+                    args.server_grant_during_take, args.swap_slot))
