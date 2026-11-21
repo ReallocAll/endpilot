@@ -79,7 +79,8 @@ class Movement:
         return self._rotation
 
     async def _send_input(self, forward: bool, item_use_transaction=None, block_actions=(),
-                          sneak_changed: bool = False, jump_pressed: bool = False):
+                          sneak_changed: bool = False, jump_pressed: bool = False,
+                          backward: bool = False):
         """Submit one predicted frame; only a later server observation proves acceptance."""
         b = self.packets.protocol.binding
         x, y, z = self._input_position
@@ -91,7 +92,8 @@ class Movement:
         sprint_changed = sprinting != self._sprinting
         self._sprinting = sprinting
         scale = 0.3 if self._sneaking else 1.0
-        step = 0.09 * scale * (1.3 if sprinting else 1.0) if forward else 0.0
+        direction = 1 if forward else -1 if backward else 0
+        step = 0.09 * scale * (1.3 if sprinting else 1.0) * direction
         dx, dz = -math.sin(y_rad) * step, math.cos(y_rad) * step
         # Grounded jump follows the upstream client's vertical travel:
         # 0.42 launch velocity, then gravity 0.08 and vertical drag 0.98.
@@ -108,8 +110,9 @@ class Movement:
                 self._jump_velocity = (self._jump_velocity - 0.08) * 0.98
         dy = next_y - y
         next_pos = (x + dx, next_y, z + dz)
-        movement = b.Vec2(x=0.0, y=scale if forward else 0.0)
-        flags = [b.PlayerAuthInputPacket.InputData.UP] if forward else []
+        movement = b.Vec2(x=0.0, y=scale * direction)
+        flags = ([b.PlayerAuthInputPacket.InputData.UP] if forward else
+                 [b.PlayerAuthInputPacket.InputData.DOWN] if backward else [])
         if self._sneaking:
             flags.extend((
                 b.PlayerAuthInputPacket.InputData.SNEAKING,
@@ -245,6 +248,13 @@ class Movement:
 
     async def walk_forward(self, ticks: int = 24) -> int:
         """Submit forward input at 20 Hz, then release it. Return submitted moving frames."""
+        return await self._walk(ticks, backward=False)
+
+    async def walk_backward(self, ticks: int = 24) -> int:
+        """Submit backward input at 20 Hz without turning; return submitted frames."""
+        return await self._walk(ticks, backward=True)
+
+    async def _walk(self, ticks: int, *, backward: bool) -> int:
         async with self._action_lock:
             self._stop_requested = False
             done = self._active_done = asyncio.Event()
@@ -255,7 +265,7 @@ class Movement:
                 for _ in range(ticks):
                     if self._stop_requested:
                         break
-                    await self._send_input(True)
+                    await self._send_input(not backward, backward=backward)
                     submitted += 1
                     await asyncio.sleep(0.05)
                 return submitted

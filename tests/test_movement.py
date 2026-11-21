@@ -412,6 +412,46 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
             await queued_walk
         self.assertEqual([list(p.input_data) for p in stream.sent[-2:]], [[], []])
 
+    async def test_backward_frames_keep_facing_and_release_input(self):
+        protocol = Protocol(2193)
+        b = protocol.binding
+        sink = PacketSink(protocol)
+        movement = Movement(sink, 1)
+        movement._input_position = (0.5, 101.62, 0.5)
+        movement.position = movement._input_position
+        flags = b.PlayerAuthInputPacket.InputData
+
+        self.assertEqual(await movement.walk_backward(2), 2)
+        self.assertEqual([p.client_tick for p in sink.sent], [1, 2, 3, 4])
+        self.assertEqual([list(p.input_data) for p in sink.sent],
+                         [[flags.DOWN], [flags.DOWN], [], []])
+        self.assertEqual([p.move.y for p in sink.sent], [-1.0, -1.0, 0.0, 0.0])
+        self.assertTrue(all(p.rot.y == 0.0 for p in sink.sent))
+        self.assertAlmostEqual(sink.sent[1].pos.z, 0.32, places=5)
+        self.assertAlmostEqual(sink.sent[1].pos_delta.z, -0.09, places=5)
+        self.assertEqual(movement.position, (0.5, 101.62, 0.5))
+
+        await movement.look_at((-10, 101.62, 0.32))
+        await movement._send_input(False, backward=True)
+        self.assertAlmostEqual(sink.sent[-1].rot.y, 90.0, places=5)
+        self.assertAlmostEqual(sink.sent[-1].pos_delta.x, 0.09, places=5)
+        self.assertIn(flags.DOWN, sink.sent[-1].input_data)
+        movement.close()
+
+    async def test_backward_input_does_not_engage_held_sprint(self):
+        protocol = Protocol(2193)
+        flags = protocol.binding.PlayerAuthInputPacket.InputData
+        sink = PacketSink(protocol)
+        movement = Movement(sink, 1)
+        movement.position = movement._input_position = (0.5, 101.62, 0.5)
+        await movement.set_sprinting(True)
+        self.assertEqual(await movement.walk_backward(1), 1)
+        self.assertEqual(set(sink.sent[1].input_data),
+                         {flags.DOWN, flags.SPRINT_DOWN})
+        self.assertNotIn(flags.SPRINTING, sink.sent[1].input_data)
+        self.assertEqual(list(sink.sent[-1].input_data), [flags.SPRINT_DOWN])
+        movement.close()
+
     async def test_held_sprint_starts_only_forward_and_stops_on_release_or_sneak(self):
         protocol = Protocol(2193)
         b = protocol.binding
