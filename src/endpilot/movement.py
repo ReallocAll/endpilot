@@ -290,6 +290,10 @@ class Movement:
         """Jump once while walking forward, then release forward input."""
         return await self._walk(ticks, forward=True, jump_first=True)
 
+    async def jump_backward(self, ticks: int = 24) -> int:
+        """Jump once while walking backward, then release backward input."""
+        return await self._walk(ticks, backward=True, jump_first=True)
+
     async def _walk(self, ticks: int, *, forward: bool = False,
                     backward: bool = False, strafe: int = 0,
                     jump_first: bool = False) -> int:
