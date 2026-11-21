@@ -16,7 +16,7 @@ _FACE_OFFSETS = {
 class ContainerWindow:
     container_id: int
     container_type: str
-    position: tuple[int, int, int]
+    position: tuple[int, int, int] | None  # Absent in UpdateTradePacket.
     entity_unique_id: int
 
 
@@ -48,7 +48,7 @@ class Containers:
         elif raw.packet_id == b.UpdateTradePacket.ID:
             packet = self.packets.protocol.decode(raw)
             window = ContainerWindow(
-                int(packet.container_id), "TRADE", (0, 0, 0),
+                int(packet.container_id), "TRADE", None,
                 int(packet.entity_unique_id),
             )
             # Do not replace a matching ContainerOpen window's actual position
