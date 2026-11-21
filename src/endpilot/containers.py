@@ -335,7 +335,12 @@ class Containers:
                 name = container.full_container_name.name.name
                 for slot in container.slots:
                     index = int(slot.slot)
-                    if name == container_name and self.window is window and self._slots is not None:
+                    # Furnace response containers name each physical slot separately.
+                    matches_window = (
+                        0 <= index < len(_FURNACE_SLOTS) and name == _FURNACE_SLOTS[index]
+                        if window.container_type == "FURNACE" else name == container_name
+                    )
+                    if matches_window and self.window is window and self._slots is not None:
                         previous = self._slots.get(index) or empty
                         fallback = source if index == chest_slot else previous
                         if int(slot.amount) > 0 and int(previous.id) == int(fallback.id) == 0:
