@@ -200,7 +200,7 @@ class JoinSession:
         self.creative_packets = []
         self.inventory_packets = []
         self.player_state_packets = []
-        self.command_catalog_packet: RawPacket | None = None
+        self.command_catalog_packets: list[RawPacket] = []
         self.commands_enabled: bool | None = None
         self.movement_packets = []
         self.entity_packets = []
@@ -457,8 +457,10 @@ class JoinSession:
                 # The target can only be checked once StartGame announces our unique ID.
                 self.player_state_packets.append(raw)
             elif raw.packet_id == binding.AvailableCommandsPacket.ID:
-                # Advertisements replace the whole directory, including during login.
-                self.command_catalog_packet = raw
+                # A fresh advertisement supersedes the catalog and earlier enum updates.
+                self.command_catalog_packets = [raw]
+            elif raw.packet_id == binding.UpdateSoftEnumPacket.ID and self.command_catalog_packets:
+                self.command_catalog_packets.append(raw)
             elif raw.packet_id == binding.SetCommandsEnabledPacket.ID:
                 self.commands_enabled = bool(protocol.decode(raw).commands_enabled)
             elif raw.packet_id == binding.UpdateAttributesPacket.ID:

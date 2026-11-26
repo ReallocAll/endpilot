@@ -32,6 +32,29 @@ inclusive cursor to `timeline.received(name, since=cursor)`. For commands,
 server text. A server disconnect received before that text raises
 `ConnectionError`. The text carries no request ID. Verify the intended effect
 from a separate world, inventory, or server observation.
+
+The synchronous `bot.complete_command(text)` reads the current command
+advertisement and live soft-enum updates without sending packets or executing
+a command. Pass the text with an optional leading slash. Completion matches
+the current token by case-sensitive prefix. Trailing whitespace starts a new
+token.
+
+The result is a tuple of advertised command names or aliases for the first
+token. For arguments, completion covers unquoted, whitespace-separated values
+from positional hard or soft enums, including optional enum parameters. Every
+earlier position in the same overload must contain a matching enum value. The
+method returns `None` before the first advertisement and an empty tuple when
+there are no supported matches.
+Use `bot.complete_command_name(prefix)` to complete just the first command word.
+
+```python
+bot.complete_command('/packstack cl')
+bot.complete_command('/scoreboard objectives remove ep_')
+```
+
+The first call can return `("client",)` when the server advertises that choice.
+The second can include `"ep_alpha"` while that objective is advertised.
+
 [Timeline tests](../../tests/test_qa.py) · [Command tests](../../tests/test_commands.py) · [Session tests](../../tests/test_session_termination.py)
 
 ## Run the MCP server

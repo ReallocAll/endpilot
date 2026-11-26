@@ -366,9 +366,10 @@ class Bot:
         self._titles = Titles(session.packets, session._end_state)
         self._commands = Commands(
             session.packets, session.identity.uuid, session.player_unique_id,
-            initial_catalog=session.command_catalog_packet, initial_commands_enabled=session.commands_enabled,
+            initial_catalog_packets=session.command_catalog_packets,
+            initial_commands_enabled=session.commands_enabled,
         )
-        session.command_catalog_packet = None
+        session.command_catalog_packets.clear()
         self._commands.start()
         self._block_collector = _BlockCollector(
             self._blocks, self._movement, self._entities, self._harvest_tools,
@@ -2388,6 +2389,14 @@ class Bot:
         """Complete the first command word from the current advertisement."""
         commands = self._commands
         return None if commands is None else commands.complete_name(prefix)
+
+    def complete_command(self, text: str) -> tuple[str, ...] | None:
+        """Suggest advertised names, aliases, and positional hard or soft enum tokens.
+
+        Return None when no catalog is available. This method sends no packets.
+        """
+        commands = self._commands
+        return None if commands is None else commands.complete_command(text)
 
     async def send_command(self, command: str) -> None:
         """Submit a player command, accepting an optional leading slash."""

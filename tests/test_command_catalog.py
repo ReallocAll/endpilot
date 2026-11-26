@@ -25,6 +25,16 @@ class CommandCatalogTests(unittest.IsolatedAsyncioTestCase):
             enums=[packet.EnumData(name=name, values=indexes) for name, indexes in enums],
         )
 
+    def overload(self, *symbols, optional_from=None, chaining=False):
+        packet = self.b.AvailableCommandsPacket
+        return packet.OverloadData(
+            is_chaining=chaining,
+            params=[
+                packet.ParamData(parse_symbol=symbol, optional=optional_from is not None and index >= optional_from)
+                for index, symbol in enumerate(symbols)
+            ],
+        )
+
     def push_batch(self, *packets):
         self.wire.incoming.put_nowait(write_batch(self.bot.protocol.encode(packet) for packet in packets))
 
@@ -114,6 +124,133 @@ class CommandCatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(self.bot.commands_enabled, False)
         self.assertEqual(self.bot.complete_command_name("next"), ())
         self.assertEqual(self.bot.complete_command_name(""), ())
+
+    async def test_completes_only_matching_positional_enum_overloads(self):
+        packet = self.b.AvailableCommandsPacket
+        start, stop = 0x00300001, 0x00300002
+        hidden = 0x00300006
+        await self.join(packet(
+            enum_values=("cfg", "Start", "Stop", "fast", "shared", "slow", "safe", "hidden", "unused", "confirm"),
+            enums=[
+                packet.EnumData(name=name, values=indexes)
+                for name, indexes in (
+                    ("Alias", (0,)), ("Start", (1,)), ("Stop", (2,)),
+                    ("FirstMode", (3, 4, 3)), ("SecondMode", (4, 5)), ("StopMode", (6,)),
+                    ("Hidden", (7,)), ("BadValue", (255,)), ("Confirm", (9,)),
+                )
+            ],
+            postfixes=("postfix",),
+            commands=[packet.CommandData(name="configure", alias_enum=0, overloads=[
+                self.overload(start, 0x00300003, 0x00300008, optional_from=1),
+                self.overload(start, 0x00300004),
+                self.overload(stop, 0x00300005),
+                self.overload(start, hidden, chaining=True),
+                self.overload(0x00100001, hidden),
+                self.overload(0x01000000, hidden),
+                self.overload(0x00300009, hidden),
+                self.overload(0x04100001, hidden),
+                self.overload(start, 0x00300007),
+            ])],
+        ))
+        sent = list(self.wire.sent)
+        for text, expected in (
+            ("/c", ("configure", "cfg")),
+            ("configure ", ("Start", "Stop")),
+            ("/cfg Start\t", ("fast", "shared", "slow")),
+            ("cfg Start s", ("shared", "slow")),
+            ("cfg Stop ", ("safe",)),
+            ("cfg Start fast c", ("confirm",)),
+            ("cfg Start c", ()),
+            ("cfg Start F", ()),
+            ("cfg start ", ()),
+            ("cfg Star ", ()),
+            ("cfg anything ", ()),
+            ("cfg postfix ", ()),
+            ("cfg confirm ", ()),
+            ("cfg Start fast confirm ", ()),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.bot.complete_command(text), expected)
+        self.assertEqual(self.bot.complete_command_name("/c"), ("configure", "cfg"))
+        with self.assertRaisesRegex(ValueError, "whitespace"):
+            self.bot.complete_command_name("cfg Start ")
+        self.assertEqual(self.wire.sent, sent)
+
+    async def test_hard_enum_reference_can_exceed_16_bits(self):
+        packet = self.b.AvailableCommandsPacket
+        low = packet.EnumData(name="LowIndex", values=(0,))
+        high = packet.EnumData(name="HighIndex", values=(1,))
+        await self.join(packet(
+            enum_values=("low-value", "high-value"),
+            enums=[low] * 65_536 + [high],
+            commands=[packet.CommandData(
+                name="configure", alias_enum=-1, overloads=[self.overload(0x00310000)],
+            )],
+        ))
+        self.assertEqual(self.bot.complete_command("configure "), ("high-value",))
+
+    async def test_soft_enum_updates_follow_catalog_and_spawn_in_wire_order(self):
+        packet = self.b.AvailableCommandsPacket
+        enum_name = "ScoreboardObjectives"
+        update_type = self.b.SoftEnumUpdateType
+        query = "/scoreboard objectives remove "
+
+        def catalog(*values):
+            return packet(
+                enum_values=("objectives", "remove", "inspect", "hard-only", "confirm"),
+                enums=[
+                    packet.EnumData(name=name, values=(index,))
+                    for index, name in enumerate(("Category", "Remove", "Inspect", enum_name, "Confirm"))
+                ],
+                soft_enums=[packet.SoftEnumData(name=enum_name, values=values)],
+                commands=[packet.CommandData(name="scoreboard", alias_enum=-1, overloads=[
+                    self.overload(0x00300000, 0x00300001, 0x04100000, 0x00300004),
+                    self.overload(0x00300000, 0x00300002, 0x00300003),
+                ])],
+            )
+
+        def update(operation, *values, name=enum_name):
+            return self.b.UpdateSoftEnumPacket(enum_name=name, values=values, type=operation)
+
+        for transport in ("nethernet", "raknet"):
+            with self.subTest(transport=transport):
+                try:
+                    self.assertIsNone(self.bot.complete_command(query))
+                    await self.join(
+                        update(update_type.ADD, "before"),
+                        catalog("first"),
+                        update(update_type.ADD, "old"),
+                        catalog("base"),
+                        update(update_type.ADD, "kept", "base", "kept"),
+                        after_spawn=(update(update_type.REMOVE, "base"),),
+                        transport=transport,
+                    )
+                    sent = list(self.wire.sent)
+                    self.assertEqual(self.bot.complete_command(query), ("base", "kept"))
+
+                    await self.deliver()
+                    self.assertEqual(self.bot.complete_command(query), ("kept",))
+                    await self.deliver(
+                        update(update_type.REPLACE, "wrong-case", name=enum_name.lower()),
+                        update(update_type.ADD, "later", "kept"),
+                    )
+                    self.assertEqual(self.bot.complete_command(query), ("kept", "later"))
+                    self.assertEqual(self.bot.complete_command(query + "l"), ("later",))
+                    self.assertEqual(self.bot.complete_command(query + "kept c"), ("confirm",))
+                    self.assertEqual(self.bot.complete_command(query + "Kept c"), ())
+
+                    await self.deliver(update(update_type.REPLACE, "fresh", "first", "fresh"))
+                    self.assertEqual(self.bot.complete_command(query), ("fresh", "first"))
+                    self.assertEqual(self.bot.complete_command("/scoreboard objectives inspect "), ("hard-only",))
+                    await self.deliver(catalog())
+                    self.assertEqual(self.bot.complete_command(query), ())
+                    self.assertEqual(self.bot.complete_command("/scoreb"), ("scoreboard",))
+
+                    await self.deliver(self.b.DisconnectPacket(), update(update_type.ADD, "late"))
+                    self.assertIsNone(self.bot.complete_command(query))
+                    self.assertEqual(self.wire.sent, sent)
+                finally:
+                    await self.bot.close()
 
     async def test_disconnect_clears_lookup_and_rejoin_rebuilds_it(self):
         await self.join(self.catalog((("visible", -1),)))

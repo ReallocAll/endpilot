@@ -1,6 +1,7 @@
 """Published commands, player command feedback and command block edits."""
 
 import asyncio
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from math import isfinite
 import uuid
@@ -35,6 +36,76 @@ class CommandCatalog:
     """An independent snapshot of one server command advertisement."""
 
     commands: tuple[CommandCatalogEntry, ...]
+
+
+# A parameter holds hard enum values or an index into the live soft enums.
+type _EnumOverload = tuple[tuple[str, ...] | int, ...]
+
+
+@dataclass(slots=True)
+class _CommandAdvertisement:
+    catalog: CommandCatalog
+    overloads: dict[str, tuple[_EnumOverload, ...]]
+    soft_enums: list[tuple[str, tuple[str, ...]]]
+
+    def update_soft_enum(self, packet, update_type) -> None:
+        name, operation = packet.enum_name, packet.type
+        values = packet.values
+        for index, (enum_name, current) in enumerate(self.soft_enums):
+            if enum_name != name:
+                continue
+            if operation == update_type.ADD:
+                updated = tuple(dict.fromkeys((*current, *values)))
+            elif operation == update_type.REMOVE:
+                removed = set(values)
+                updated = tuple(value for value in current if value not in removed)
+            elif operation == update_type.REPLACE:
+                updated = tuple(dict.fromkeys(values))
+            else:
+                return
+            self.soft_enums[index] = (name, updated)
+
+
+def _enum_prefix(params, hard_enums: tuple[tuple[str, ...], ...], soft_enum_count: int) -> _EnumOverload:
+    result = []
+    for param in params:
+        symbol = param.parse_symbol
+        # Command registry enum symbols use the low 20 bits for the index.
+        kind, index = symbol & 0xFFF00000, symbol & 0xFFFFF
+        if kind == 0x00300000 and index < len(hard_enums):
+            result.append(hard_enums[index])
+        elif kind == 0x04100000 and index < soft_enum_count:
+            result.append(index)
+        else:
+            # Later parameters cannot be reached through an unsupported parameter.
+            break
+    return tuple(result)
+
+
+def _command_advertisement(packet) -> _CommandAdvertisement:
+    values = packet.enum_values
+    hard_enums = tuple(
+        tuple(dict.fromkeys(values[index] for index in enum.values if 0 <= index < len(values)))
+        for enum in packet.enums
+    )
+    soft_enums = [(enum.name, tuple(dict.fromkeys(enum.values))) for enum in packet.soft_enums]
+    commands = []
+    overloads = {}
+    for record in packet.commands:
+        alias_enum = record.alias_enum
+        aliases = hard_enums[alias_enum] if 0 <= alias_enum < len(hard_enums) else ()
+        commands.append(CommandCatalogEntry(record.name, aliases))
+        prefixes = tuple(
+            prefix for overload in record.overloads
+            if not overload.is_chaining and (prefix := _enum_prefix(overload.params, hard_enums, len(soft_enums)))
+        )
+        if prefixes:
+            for name in dict.fromkeys((record.name, *aliases)):
+                if name:
+                    overloads.setdefault(name, []).extend(prefixes)
+    return _CommandAdvertisement(
+        CommandCatalog(tuple(commands)), {name: tuple(items) for name, items in overloads.items()}, soft_enums,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +156,7 @@ def _command_block_snapshot(
 class Commands:
     def __init__(
         self, packets, player_uuid: uuid.UUID, player_unique_id: int, *,
-        initial_catalog: RawPacket | None = None, initial_commands_enabled: bool | None = None,
+        initial_catalog_packets: Iterable[RawPacket] = (), initial_commands_enabled: bool | None = None,
     ):
         self.packets = packets
         self.player_uuid = player_uuid
@@ -95,11 +166,11 @@ class Commands:
         self._server_disconnected = False
         self._closed = False
         self._command_block_edits: set[asyncio.Future[Exception]] = set()
-        self._catalog: CommandCatalog | None = None
+        self._advertisement: _CommandAdvertisement | None = None
         self._commands_enabled = initial_commands_enabled
         self._subscriptions = ()
-        if initial_catalog is not None:
-            self._on_packet(initial_catalog)
+        for raw in initial_catalog_packets:
+            self._on_packet(raw)
 
     def start(self) -> None:
         if not self._subscriptions:
@@ -114,7 +185,7 @@ class Commands:
         for unsubscribe in self._subscriptions:
             unsubscribe()
         self._subscriptions = ()
-        self._catalog = None
+        self._advertisement = None
         self._commands_enabled = None
 
     def _on_reader_end(self, _cause) -> None:
@@ -127,7 +198,7 @@ class Commands:
 
     @property
     def command_catalog(self) -> CommandCatalog | None:
-        return self._catalog
+        return None if self._advertisement is None else self._advertisement.catalog
 
     @property
     def commands_enabled(self) -> bool | None:
@@ -135,7 +206,7 @@ class Commands:
 
     def complete_name(self, prefix: str) -> tuple[str, ...] | None:
         """Match advertised names and aliases in their original spelling."""
-        catalog = self._catalog
+        catalog = self.command_catalog
         if catalog is None:
             return None
         if any(character.isspace() for character in prefix):
@@ -146,22 +217,42 @@ class Commands:
             if name and name.startswith(token)
         ))
 
+    def complete_command(self, text: str) -> tuple[str, ...] | None:
+        """Match the current name or advertised enum argument at the end of text."""
+        advertisement = self._advertisement
+        if advertisement is None:
+            return None
+        tokens = text.split()
+        if not tokens:
+            return self.complete_name("")
+        if not text[-1].isspace():
+            if len(tokens) == 1:
+                return self.complete_name(tokens[0])
+            prefix = tokens.pop()
+        else:
+            prefix = ""
+        command, *arguments = tokens
+        position = len(arguments)
+        matches = []
+        for overload in advertisement.overloads.get(command.removeprefix("/"), ()):
+            if position >= len(overload):
+                continue
+            choices = tuple(
+                advertisement.soft_enums[ref][1] if isinstance(ref, int) else ref
+                for ref in overload[:position + 1]
+            )
+            if all(argument in values for argument, values in zip(arguments, choices)):
+                matches.extend(value for value in choices[-1] if value.startswith(prefix))
+        return tuple(dict.fromkeys(matches))
+
     def _on_packet(self, raw: RawPacket) -> None:
         protocol = self.packets.protocol
         binding = protocol.binding
         if raw.packet_id == binding.AvailableCommandsPacket.ID:
-            packet = protocol.decode(raw)
-            values, enums = packet.enum_values, packet.enums
-            commands = []
-            for record in packet.commands:
-                aliases = ()
-                alias_enum = record.alias_enum
-                if 0 <= alias_enum < len(enums):
-                    # The global string table also includes unrelated argument values.
-                    aliases = tuple(dict.fromkeys(values[index] for index in enums[alias_enum].values
-                                                  if 0 <= index < len(values)))
-                commands.append(CommandCatalogEntry(record.name, aliases))
-            self._catalog = CommandCatalog(tuple(commands))
+            self._advertisement = _command_advertisement(protocol.decode(raw))
+        elif raw.packet_id == binding.UpdateSoftEnumPacket.ID:
+            if self._advertisement is not None:
+                self._advertisement.update_soft_enum(protocol.decode(raw), binding.SoftEnumUpdateType)
         elif raw.packet_id == binding.SetCommandsEnabledPacket.ID:
             self._commands_enabled = bool(protocol.decode(raw).commands_enabled)
         elif raw.packet_id == binding.DisconnectPacket.ID:
