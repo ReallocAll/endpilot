@@ -372,6 +372,7 @@ class Entities:
         self._cursor_bodies: dict[int, _CursorBody] = {}
         self._player_equipment: dict[int, PlayerEquipmentSnapshot] = {}
         self._equipment_waiters: dict[int, set[asyncio.Future[PlayerEquipmentSnapshot]]] = {}
+        self._equipment_observers: list[_EntityObserver[PlayerEquipmentSnapshot]] = []
         self._swing_observers: list[_EntityObserver[EntitySwing]] = []
         self._health_observers: list[_EntityObserver[EntityHealthEvent]] = []
         self._glide_observers: list[Callable[[EntityState], None]] = []
@@ -627,13 +628,22 @@ class Entities:
         self._sync_reader_end()
         return self._player_equipment.get(runtime_id)
 
+    def _require_equipment_target(self, runtime_id: int) -> None:
+        self._require_live()
+        if runtime_id not in self._player_equipment:
+            raise LookupError("remote player is not currently observed")
+
+    def subscribe_player_equipment_changes(
+        self, callback: Callable[[PlayerEquipmentSnapshot], None], *, runtime_id: int,
+    ) -> Callable[[], None]:
+        self._require_equipment_target(runtime_id)
+        return self.packets._subscribe(self._equipment_observers, _EntityObserver(runtime_id, callback))
+
     async def wait_for_player_equipment_change(
         self, runtime_id: int, *, timeout: float | None = 15,
     ) -> PlayerEquipmentSnapshot:
         """Wait for the next equipment change on this visible player instance."""
-        self._require_live()
-        if runtime_id not in self._player_equipment:
-            raise LookupError("remote player is not currently observed")
+        self._require_equipment_target(runtime_id)
         future = asyncio.get_running_loop().create_future()
         waiters = self._equipment_waiters.setdefault(runtime_id, set())
         waiters.add(future)
@@ -645,12 +655,16 @@ class Entities:
             if not waiters and self._equipment_waiters.get(runtime_id) is waiters:
                 self._equipment_waiters.pop(runtime_id)
 
-    def _publish_player_equipment(self, previous, current):
+    def _publish_player_equipment(
+        self, previous: PlayerEquipmentSnapshot, current: PlayerEquipmentSnapshot,
+    ) -> None:
         if current != previous:
             self._player_equipment[current.runtime_id] = current
             for waiter in self._equipment_waiters.pop(current.runtime_id, ()):
                 if not waiter.done():
                     waiter.set_result(current)
+            self._notify_entity_observers(self._equipment_observers, current, current.runtime_id,
+                                          "player equipment observer failed")
 
     def _fail_equipment_waiters(self, runtime_id, error_type, message, cause=None):
         for waiter in self._equipment_waiters.pop(runtime_id, ()):
@@ -666,9 +680,11 @@ class Entities:
             self._unlisted_player_runtime_by_id.pop(equipment.entity_id)
         self._unidentified_equipment_since.pop(runtime_id, None)
         self._fail_equipment_waiters(runtime_id, LookupError, "remote player is no longer observed")
+        self._forget_entity_observers(self._equipment_observers, runtime_id)
 
     def _clear_player_equipment(self, error_type, message, cause=None):
         self._player_equipment.clear()
+        self._equipment_observers.clear()
         self._unidentified_equipment_since.clear()
         self._unlisted_player_runtime_by_id.clear()
         self._equipment_removals.clear()

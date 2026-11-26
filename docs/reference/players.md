@@ -80,8 +80,7 @@ holds the most recent offhand stack received for that visible remote player
 instance. The field is `None` until an offhand description arrives. A stack
 with item ID and count zero represents a received empty offhand. The server
 can omit updates during play, so even a new snapshot can contain a stale
-stack. `wait_for_player_equipment_change` reports selected-slot, main-hand
-and armor changes.
+stack.
 
 Each listed player has a `uuid`, `name`, and `entity_id` from the server. The
 `entity_id` is the unique actor ID. Use `uuid` to match player-list entries
@@ -114,6 +113,28 @@ Run `python examples/observe_player_list.py URL --action add`, then join the
 same server from a second client with a different name after
 `player_list_watcher_ready` appears.
 [Player list example](../../examples/observe_player_list.py)
+
+## Observe remote player equipment
+
+`bot.observed_player_equipment(runtime_id)` reads the latest immutable
+`PlayerEquipmentSnapshot` for a visible remote player. It returns `None`
+when the player has no observed equipment snapshot.
+
+`bot.subscribe_player_equipment_changes(callback, runtime_id=runtime_id)`
+calls a synchronous callback with the updated snapshot for each observed
+change to the selected slot, main hand, or armor. Each armor packet applies
+all four armor slots before the callback runs. Use the query to read the
+initial state. The subscription sends no packets.
+
+The subscription returns an idempotent unsubscribe function and ends when
+the current player instance leaves view or is replaced, the dimension
+changes, or the session ends. Register again to observe a new instance,
+even if it has the same runtime ID. Registration raises `LookupError` for
+the local player or a target without observed equipment, `RuntimeError`
+when the bot has no joined session, and `ConnectionError` when the joined
+session has lost its connection.
+
+Use `await bot.wait_for_player_equipment_change(runtime_id)` for one change.
 
 ## Find a nearby or targeted entity
 

@@ -2509,6 +2509,18 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._entities.wait_for_player_equipment_change(runtime_id, timeout=timeout)
 
+    def subscribe_player_equipment_changes(
+        self, callback: Callable[[PlayerEquipmentSnapshot], None], *, runtime_id: int,
+    ) -> Callable[[], None]:
+        """Observe changes to a visible remote player's equipment via a synchronous callback.
+
+        Returns an idempotent unsubscribe function. The subscription ends when
+        the current player instance leaves view, the dimension changes, or the session ends.
+        """
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return self._entities.subscribe_player_equipment_changes(callback, runtime_id=runtime_id)
+
     async def wait_for_player_list_update(
         self, *, action: Literal["add", "remove"] | None = None,
         player_uuid: UUID | None = None, timeout: float = 15,

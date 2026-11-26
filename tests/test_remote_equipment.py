@@ -88,6 +88,9 @@ class RemoteEquipmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.entities.get(9).last_observed_offhand)
         with self.assertRaises(LookupError):
             await self.entities.wait_for_player_equipment_change(9)
+        for target in (7, 9, 10):
+            with self.subTest(target=target), self.assertRaises(LookupError):
+                self.entities.subscribe_player_equipment_changes(self.fail, runtime_id=target)
         with self.assertRaises(FrozenInstanceError):
             snapshot.selected_slot = 1
         with self.assertRaises(FrozenInstanceError):
@@ -96,6 +99,9 @@ class RemoteEquipmentTests(unittest.IsolatedAsyncioTestCase):
     async def test_atomic_four_slot_armour_and_actual_empty_slots(self):
         await self.deliver(self.player())
         unknown = self.entities.player_equipment(8)
+        snapshots = []
+        self.entities.subscribe_player_equipment_changes(snapshots.append, runtime_id=8)
+        self.assertEqual(snapshots, [])
         pending = await self.wait()
         await self.deliver(self.armor(head=10, chest=11, legs=12), self.armor(head=15))
         first = await pending
@@ -105,13 +111,23 @@ class RemoteEquipmentTests(unittest.IsolatedAsyncioTestCase):
         newest = self.entities.player_equipment(8)
         self.assertEqual((newest.head.item_id, newest.chest.item_id, newest.legs.item_id, newest.feet.item_id), (15, 0, 0, 0))
         self.assertEqual(first.main_hand, newest.main_hand)
+        self.assertEqual(snapshots, [first, newest])
 
     async def test_repeat_same_slot_and_descriptor_ignored_but_distinct_slot_and_empty_are_changes(self):
         await self.deliver(self.player(), self.held(3, 1), self.armor(head=6))
+        observed = []
+
+        def observe(snapshot):
+            observed.append((snapshot, self.entities.player_equipment(8)))
+
+        unsubscribe = self.entities.subscribe_player_equipment_changes(observe, runtime_id=8)
         pending = await self.wait()
-        await self.deliver(self.held(3, 1), self.held(10, 2, container=self.b.ContainerID.OFFHAND),
+        await self.deliver(self.player(runtime=10, uuid=10, unique=110), self.held(11, 2, runtime=10),
+                           self.held(11, 2, runtime=7), self.held(11, 2, runtime=9),
+                           self.held(3, 1), self.held(10, 2, container=self.b.ContainerID.OFFHAND),
                            self.armor(head=6, body=11))
         self.assertFalse(pending.done())
+        self.assertEqual(observed, [])
         self.assertEqual(self.entities.get(8).last_observed_offhand.item_id, 10)
         equipment = self.entities.player_equipment(8)
         self.assertEqual((equipment.selected_slot, equipment.main_hand.item_id), (1, 3))
@@ -120,6 +136,36 @@ class RemoteEquipmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((moved.selected_slot, moved.main_hand.item_id), (2, 3))
         now = self.entities.player_equipment(8)
         self.assertEqual((now.selected_slot, now.main_hand.item_id, now.main_hand.count), (3, 0, 0))
+        self.assertEqual(observed, [(moved, moved), (now, now)])
+        unsubscribe()
+        unsubscribe()
+        await self.deliver(self.held(12, 4))
+        self.assertEqual(len(observed), 2)
+        self.assertEqual(self.entities.player_equipment(8).main_hand.item_id, 12)
+        self.assertEqual(self.wire.sent, [])
+
+    async def test_subscription_errors_do_not_interrupt_subscribers_or_later_packets(self):
+        await self.deliver(self.player())
+        loop = asyncio.get_running_loop()
+        errors = []
+        self.addCleanup(loop.set_exception_handler, loop.get_exception_handler())
+        loop.set_exception_handler(lambda _, context: errors.append(context))
+
+        def fail(_):
+            raise ValueError("handler failed")
+
+        def cancel(_):
+            raise asyncio.CancelledError("handler cancelled")
+
+        self.entities.subscribe_player_equipment_changes(fail, runtime_id=8)
+        self.entities.subscribe_player_equipment_changes(cancel, runtime_id=8)
+        snapshots = []
+        self.entities.subscribe_player_equipment_changes(snapshots.append, runtime_id=8)
+        await self.deliver(self.held(4, 1), self.held(5, 2))
+        self.assertEqual([snapshot.main_hand.item_id for snapshot in snapshots], [4, 5])
+        self.assertEqual([context["callback"] for context in errors], [fail, cancel, fail, cancel])
+        self.assertEqual([type(context["exception"]) for context in errors],
+                         [ValueError, asyncio.CancelledError, ValueError, asyncio.CancelledError])
 
     async def test_offhand_survives_motion_and_updates_to_an_observed_empty_stack(self):
         b = self.b
@@ -148,15 +194,19 @@ class RemoteEquipmentTests(unittest.IsolatedAsyncioTestCase):
                            self.held(10, 0, container=self.b.ContainerID.OFFHAND))
         self.assertIsNone(self.entities.player_equipment(8).entity_id)
         instance = self.entities._actor_instance(8)
+        snapshots = []
+        self.entities.subscribe_player_equipment_changes(snapshots.append, runtime_id=8)
         pending = await self.wait()
         await self.deliver(self.b.RemoveActorPacket(entity_id=909), self.listed())
         self.assertIs(instance, self.entities._actor_instance(8))
         self.assertFalse(pending.done())
+        self.assertEqual(snapshots, [])
         self.assertEqual(self.entities.player_equipment(8).head.item_id, 6)
         self.assertEqual(self.entities.get(8).last_observed_offhand.item_id, 10)
         await self.deliver(self.held(12, 1))
         changed = await pending
         self.assertEqual((changed.entity_id, changed.main_hand.item_id, changed.head.item_id), (108, 12, 6))
+        self.assertEqual(snapshots, [changed])
 
     async def test_conflicting_roster_identity_discards_prior_offhand(self):
         offhand = self.b.ContainerID.OFFHAND
@@ -211,6 +261,9 @@ class RemoteEquipmentTests(unittest.IsolatedAsyncioTestCase):
         b = self.b
         offhand = b.ContainerID.OFFHAND
         await self.deliver(self.player(), self.armor(head=6), self.held(10, 0, container=offhand))
+        snapshots = []
+        callback = snapshots.append
+        removed = self.entities.subscribe_player_equipment_changes(callback, runtime_id=8)
         pending = await self.wait()
         await self.deliver(b.RemoveActorPacket(entity_id=108), self.held(99, 0),
                            self.held(11, 0, container=offhand), self.listed())
@@ -222,6 +275,11 @@ class RemoteEquipmentTests(unittest.IsolatedAsyncioTestCase):
         current = self.entities.player_equipment(8)
         self.assertEqual((current.entity_id, current.main_hand.item_id, current.head), (109, 15, None))
         self.assertIsNone(self.entities.get(8).last_observed_offhand)
+        await self.deliver(self.held(4, 1))
+        self.assertEqual(snapshots, [])
+        self.entities.subscribe_player_equipment_changes(callback, runtime_id=8)
+        removed()
+        await self.deliver(self.held(5, 1))
         replacement = await self.wait()
         await self.deliver(self.held(12, 0, container=offhand), self.player(uuid=10, unique=110, carried=16),
                            self.armor(head=7))
@@ -230,9 +288,20 @@ class RemoteEquipmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.entities.player_equipment(8).name, self.entities.player_equipment(8).head.item_id),
                          ("Remote10", 7))
         self.assertIsNone(self.entities.get(8).last_observed_offhand)
+        self.assertEqual([(snapshot.entity_id, snapshot.main_hand.item_id) for snapshot in snapshots], [(109, 5)])
+
+    async def test_repeated_spawn_with_same_ids_ends_subscription(self):
+        await self.deliver(self.player())
+        snapshots = []
+        self.entities.subscribe_player_equipment_changes(snapshots.append, runtime_id=8)
+        await self.deliver(self.player(carried=4), self.held(5, 1))
+        self.assertEqual(snapshots, [])
+        self.assertEqual(self.entities.player_equipment(8).main_hand.item_id, 5)
 
     async def test_dimension_departure_and_return_preserve_roster_only(self):
         await self.deliver(self.listed(), self.player(), self.armor(head=6))
+        snapshots = []
+        self.entities.subscribe_player_equipment_changes(snapshots.append, runtime_id=8)
         waiting = await self.wait()
         await self.deliver(self.b.ChangeDimensionPacket(dimension_id=1), self.held(9, 1))
         self.assertEqual(self.entities.player_list()[0].entity_id, 108)
@@ -242,6 +311,7 @@ class RemoteEquipmentTests(unittest.IsolatedAsyncioTestCase):
         await self.deliver(self.player(carried=8), self.armor(head=9))
         now = self.entities.player_equipment(8)
         self.assertEqual((now.main_hand.item_id, now.head.item_id), (8, 9))
+        self.assertEqual(snapshots, [])
 
     async def test_timeout_cancel_and_session_close(self):
         await self.deliver(self.player())
@@ -264,17 +334,27 @@ class RemoteEquipmentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_disconnect_ignores_trailing_equipment(self):
         await self.deliver(self.player())
+        snapshots = []
+        unsubscribe = self.entities.subscribe_player_equipment_changes(snapshots.append, runtime_id=8)
         pending = await self.wait()
         await self.deliver(self.b.DisconnectPacket(), self.armor(head=11))
         with self.assertRaises(ConnectionError):
             await pending
         self.assertIsNone(self.entities.player_equipment(8))
+        self.assertEqual(snapshots, [])
+        unsubscribe()
+        unsubscribe()
+        with self.assertRaises(ConnectionError):
+            self.entities.subscribe_player_equipment_changes(snapshots.append, runtime_id=8)
 
 
 class RemoteEquipmentStartupTests(unittest.IsolatedAsyncioTestCase):
     async def test_login_packets_preserve_wire_order_and_own_hotbar(self):
         bot = Bot("GearObserver", protocol=2225)
         self.addAsyncCleanup(bot.close)
+        snapshots = []
+        with self.assertRaises(RuntimeError):
+            bot.subscribe_player_equipment_changes(snapshots.append, runtime_id=1)
         protocol = bot.protocol
         b = protocol.binding
         wire = Wire(protocol)
@@ -321,3 +401,13 @@ class RemoteEquipmentStartupTests(unittest.IsolatedAsyncioTestCase):
             358, 1, 0, None, 0,
             bytes.fromhex("ffff010a000003060044616d616765000000000000000000000000000000000000000000"),
         ))
+
+        unsubscribe = bot.subscribe_player_equipment_changes(snapshots.append, runtime_id=1)
+        self.assertEqual(snapshots, [])
+        pending = asyncio.create_task(bot.wait_for_player_equipment_change(1, timeout=1))
+        await asyncio.sleep(0)
+        deliver(held(1, 6, 4))
+        changed = await pending
+        self.assertEqual((changed.selected_slot, changed.main_hand.item_id), (4, 6))
+        self.assertEqual(snapshots, [changed])
+        unsubscribe()
