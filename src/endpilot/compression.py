@@ -167,6 +167,9 @@ class PacketConnection:
             raise ConnectionError("packet reader stopped while waiting")
         finally:
             unsubscribe()
+            # Cancellation can win after the matcher has already failed.
+            if received.done() and not received.cancelled():
+                received.exception()
 
     def start_receiving(self, *, _before_dispatch=None):
         """Start or return the one reader that serves all packet observers."""

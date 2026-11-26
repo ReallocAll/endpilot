@@ -9,6 +9,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from bedrock_protocol import GeneratorType, nbt
+from bedrock_protocol.v712 import CommandOutputPacket
 
 from ._join_address import _parse_join_address
 from .anvil import AnvilPreview
@@ -2412,6 +2413,19 @@ class Bot:
         if self._commands is None:
             raise RuntimeError("player has not joined")
         return await self._commands.execute(command, timeout=timeout)
+
+    async def execute_command_output(self, command: str, *, timeout: float = 15) -> CommandOutputPacket:
+        """Submit a player command and return its matching native output on protocol 2225.
+
+        A leading slash is optional. The timeout covers waiting to send, the send,
+        and receiving the output. A server-reported success count of zero is returned
+        in the packet. A timeout can occur after the server receives the command.
+        """
+        if self.protocol.number != 2225:
+            raise NotImplementedError("typed command output is supported on protocol 2225")
+        if self._commands is None:
+            raise ConnectionError("player is not connected")
+        return await self._commands.execute_output(command, timeout=timeout)
 
     async def set_command_block(
         self, position: tuple[int, int, int], command: str, *, timeout: float = 15,

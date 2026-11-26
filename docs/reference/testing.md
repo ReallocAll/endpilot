@@ -30,8 +30,27 @@ inclusive cursor to `timeline.received(name, since=cursor)`. For commands,
 `await bot.send_command(command)` completes after submission.
 `await bot.execute_command(command)` also waits for the next command-style
 server text. A server disconnect received before that text raises
-`ConnectionError`. The text carries no request ID. Verify the intended effect
-from a separate world, inventory, or server observation.
+`ConnectionError`. The text carries no request ID.
+
+On protocol 2225, `await bot.execute_command_output(command, timeout=...)`
+returns the native `CommandOutputPacket`. It matches a reply with the
+`PLAYER` origin and the unique request UUID echoed by BDS. The timeout
+covers waiting to submit the request, sending it, and waiting for the reply.
+The SDK makes at most one send attempt per call. Replies reporting syntax
+errors or rejections are returned as packets, including when the success
+count is zero.
+
+On servers that support `/packstack client`, read the success count and
+messages from the reply.
+
+```python
+reply = await bot.execute_command_output('/packstack client')
+print(reply.output.success_count)
+print(reply.output.messages)
+```
+
+Verify the intended effect of either command call from a separate world,
+inventory, or server observation.
 
 The synchronous `bot.complete_command(text)` reads the current command
 advertisement and live soft-enum updates without sending packets or executing

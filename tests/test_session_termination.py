@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import unittest
 import zlib
 from dataclasses import FrozenInstanceError
@@ -68,10 +69,28 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
                     xuid="", platform_id="", filtered_message=None)
 
     def command_requests(self, wire):
-        return [packet.command for packet in wire.sent if isinstance(packet, self.b.CommandRequestPacket)]
+        return [packet.command for packet in self.sent_command_packets(wire)]
 
-    def command_task(self, command):
-        executing = asyncio.create_task(self.bot.execute_command(command, timeout=10))
+    def sent_command_packets(self, wire):
+        return [packet for packet in wire.sent if isinstance(packet, self.b.CommandRequestPacket)]
+
+    def command_output(self, request_uuid, *, origin=None, request_id="", syntax_error=False):
+        b = self.b
+        return b.CommandOutputPacket(
+            origin_data=b.CommandOriginData(type=b.CommandOriginType.PLAYER if origin is None else origin,
+                                            uuid=request_uuid, request_id=request_id, player_id=0),
+            output=b.CommandOutput(
+                type=b.CommandOutputType.ALL_OUTPUT, success_count=0 if syntax_error else 1,
+                messages=[b.CommandOutputMessage(
+                    message_id="commands.generic.syntax" if syntax_error else "Minecraft Texture Pack (0.0.1)\n",
+                    successful=not syntax_error, params=["packstack ", "bogus", " verbose"] if syntax_error else [],
+                )],
+            ),
+        )
+
+    def command_task(self, command, *, typed=False, timeout=10):
+        execute = self.bot.execute_command_output if typed else self.bot.execute_command
+        executing = asyncio.create_task(execute(command, timeout=timeout))
 
         async def drain():
             executing.cancel()
@@ -80,7 +99,7 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(drain)
         return executing
 
-    async def start_command(self, command):
+    async def start_command(self, command, *, typed=False):
         sent = asyncio.Event()
 
         def observe_send(packet_id):
@@ -89,11 +108,23 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
 
         unsubscribe = self.bot.packets.subscribe_sent(observe_send)
         try:
-            executing = self.command_task(command)
+            executing = self.command_task(command, typed=typed)
             await asyncio.wait_for(sent.wait(), 1)
         finally:
             unsubscribe()
         self.assertFalse(executing.done())
+        return executing
+
+    async def start_blocked_command_output(self, wire, *, timeout=10):
+        sending = asyncio.Event()
+
+        async def hold_send():
+            sending.set()
+            await asyncio.Future()
+
+        wire.before_send = hold_send
+        executing = self.command_task("/packstack client", typed=True, timeout=timeout)
+        await asyncio.wait_for(sending.wait(), 1)
         return executing
 
     async def test_command_feedback_ends_on_kick_with_live_reader_and_same_bot_can_rejoin(self):
@@ -214,6 +245,161 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(EOFError) as closing:
                         await self.bot.close()
                     self.assertIs(closing.exception, eof)
+
+    async def test_command_output_ignores_late_and_uncorrelated_packets_and_returns_syntax_error(self):
+        wire = self.wire()
+        await self.connect(wire)
+        cancelled = await self.start_command("/packstack client", typed=True)
+        previous, = self.sent_command_packets(wire)
+        cancelled.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled
+
+        send = wire.send
+
+        async def reply_during_send(batch):
+            await send(batch)
+            request = wire.sent[-1]
+            if not isinstance(request, self.b.CommandRequestPacket):
+                return
+            request_uuid = request.origin.uuid
+            for reply in (
+                self.command_text(TextPacketType.TEXT_OBJECT, '{"rawtext":[{"text":"unrelated feedback"}]}'),
+                self.command_output(previous.origin.uuid),
+                self.command_output(self.bot.identity.uuid, request_id=request.origin.request_id),
+                self.command_output(request_uuid, origin=self.b.CommandOriginType.DEDICATED_SERVER),
+                self.command_output(request_uuid, syntax_error=True),
+                self.b.SetTimePacket(time=42),
+            ):
+                wire.push(reply)
+            # Ensure the reader observes the reply before the transport send returns.
+            await self.bot.packets.wait_for_packet(self.b.SetTimePacket.ID, timeout=1)
+
+        with patch.object(wire, "send", side_effect=reply_during_send):
+            feedback = await self.bot.execute_command_output("packstack bogus verbose", timeout=1)
+
+        first, request = self.sent_command_packets(wire)
+        self.assertEqual((first.command, request.command), ("/packstack client", "/packstack bogus verbose"))
+        self.assertEqual(len({self.bot.identity.uuid, first.origin.uuid, request.origin.uuid}), 3)
+        for sent in (first, request):
+            self.assertEqual((sent.origin.type, sent.origin.player_id), (self.b.CommandOriginType.PLAYER, 41))
+            self.assertEqual(sent.version, self.b.CurrentCmdVersion.LATEST)
+            self.assertFalse(sent.internal_source)
+            self.assertTrue(sent.origin.request_id)
+        self.assertNotEqual(first.origin.request_id, request.origin.request_id)
+        self.assertIsInstance(feedback, self.b.CommandOutputPacket)
+        self.assertEqual(self.bot.protocol.encode(feedback),
+                         self.bot.protocol.encode(self.command_output(request.origin.uuid, syntax_error=True)))
+        self.assertIsNone(self.bot.session_end)
+        self.assertFalse(wire.closed)
+
+    async def test_command_output_cancellation_during_malformed_reply_reports_no_loop_error(self):
+        wire = self.wire()
+        await self.connect(wire)
+        executing = await self.start_command("/packstack client", typed=True)
+        packets = self.bot.packets
+        malformed = RawPacket(self.b.CommandOutputPacket.ID, b"")
+        loop = asyncio.get_running_loop()
+        reports = []
+        self.addCleanup(loop.set_exception_handler, loop.get_exception_handler())
+        loop.set_exception_handler(lambda _, context: reports.append(context["message"]))
+
+        def cancel_after_decode(raw):
+            if raw.packet_id == malformed.packet_id:
+                executing.cancel()
+
+        # Subscribe after the command waiter so its matcher sees the malformed packet first.
+        self.addCleanup(packets.subscribe_raw(cancel_after_decode))
+        wire.incoming.put_nowait(write_batch([malformed]))
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(executing, 1)
+
+        marker = self.b.SetTimePacket(time=42)
+        wire.push(marker)
+        self.assertEqual(await packets.wait_for_packet(marker.ID, timeout=1), wire.protocol.encode(marker))
+        # The decode traceback can retain the failed future until cyclic collection.
+        gc.collect()
+        self.assertEqual(reports, [])
+
+    async def test_first_matching_command_output_or_kick_wins_in_same_batch(self):
+        for output_first in (True, False):
+            with self.subTest(output_first=output_first):
+                wire = self.wire()
+                await self.connect(wire)
+                executing = await self.start_command("/packstack client", typed=True)
+                request, = self.sent_command_packets(wire)
+                output = self.command_output(request.origin.uuid)
+                kick = self.disconnect("Kicked in the output batch")
+                ordered = (output, kick) if output_first else (kick, output)
+                wire.incoming.put_nowait(write_batch(wire.protocol.encode(packet) for packet in ordered))
+
+                ended = await self.bot.wait_for_session_end(timeout=1)
+                self.assertEqual(ended.reason_name, "KICKED")
+                if output_first:
+                    feedback = await asyncio.wait_for(executing, 1)
+                    self.assertIsInstance(feedback, self.b.CommandOutputPacket)
+                    self.assertEqual(feedback.output.success_count, 1)
+                else:
+                    with self.assertRaises(ConnectionError):
+                        await asyncio.wait_for(executing, 1)
+                self.assertFalse(self.bot.packets._reader_task.done())
+                self.assertFalse(wire.closed)
+                self.assertEqual(self.command_requests(wire), ["/packstack client"])
+                await self.bot.close()
+
+    async def test_command_output_ends_on_peer_eof_during_transport_send(self):
+        wire = self.wire()
+        await self.connect(wire)
+        executing = await self.start_blocked_command_output(wire)
+        eof = EOFError("peer ended the receive stream")
+        wire.incoming.put_nowait(eof)
+
+        with self.assertRaises(ConnectionError) as raised:
+            await asyncio.wait_for(executing, 1)
+        self.assertIs(raised.exception.__cause__, eof)
+        self.assertEqual(await self.bot.wait_for_session_end(timeout=1),
+                         SessionEnd("reader_end", error_type="EOFError"))
+        self.assertEqual(self.command_requests(wire), [])
+        self.assertFalse(wire.closed)
+        with self.assertRaises(EOFError) as closing:
+            await self.bot.close()
+        self.assertIs(closing.exception, eof)
+
+    async def test_command_output_nonpositive_timeout_does_not_send(self):
+        wire = self.wire()
+        await self.connect(wire)
+
+        for timeout in (0, -1):
+            with self.subTest(timeout=timeout), self.assertRaises(TimeoutError):
+                await self.bot.execute_command_output("/packstack client", timeout=timeout)
+        self.assertEqual(self.command_requests(wire), [])
+
+    async def test_command_output_timeout_includes_waiting_for_text_command(self):
+        wire = self.wire()
+        await self.connect(wire)
+        executing = await self.start_command("/say first")
+        queued = self.command_task("/packstack client", typed=True, timeout=0.05)
+
+        _, pending = await asyncio.wait((queued,), timeout=1)
+        self.assertFalse(pending)
+        with self.assertRaises(TimeoutError):
+            await queued
+        self.assertFalse(executing.done())
+        wire.push(self.command_text(TextPacketType.TEXT_OBJECT, '{"rawtext":[{"text":"first"}]}'))
+        await asyncio.wait_for(executing, 1)
+        self.assertEqual(self.command_requests(wire), ["/say first"])
+
+    async def test_command_output_timeout_includes_transport_send(self):
+        wire = self.wire()
+        await self.connect(wire)
+        executing = await self.start_blocked_command_output(wire, timeout=0.05)
+        _, pending = await asyncio.wait((executing,), timeout=1)
+        self.assertFalse(pending)
+        with self.assertRaises(TimeoutError):
+            await executing
+        self.assertEqual(self.command_requests(wire), [])
+        self.assertFalse(self.bot.packets._reader_task.done())
+        self.assertFalse(wire.closed)
 
     def placement_block(self, pos, runtime_id):
         b = self.b
