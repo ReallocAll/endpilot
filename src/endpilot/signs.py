@@ -289,7 +289,8 @@ class Signs:
             raise RuntimeError("no sign editor is open at the requested position")
         await self._submit_editor_text(editor, front_text, back_text)
 
-    async def _submit_editor_text(self, editor: _SignEditor, front: str | None, back: str | None) -> None:
+    async def _submit_editor_text(self, editor: _SignEditor, front: str | None, back: str | None,
+                                  *, _before_submit=None) -> None:
         editing = self._editing
         root = self._editor_data(editor)
         data = nbt.CompoundTag(root)
@@ -300,6 +301,8 @@ class Signs:
                 data[key] = side
 
         def before_send():
+            if _before_submit is not None:
+                _before_submit()
             if self._editing is not editing or self._editor_data(editor) is not root:
                 raise RuntimeError("sign data changed before submission")
             self._editor = None
@@ -336,16 +339,14 @@ class Signs:
             raise RuntimeError("sign target changed during edit")
 
     async def _edit(self, target: _EditTarget, text, face, timeout, epoch) -> SignSide:
-        protocol = self.packets.protocol
+        packets = self.packets
+        protocol = packets.protocol
         b = protocol.binding
         position = target.position
         px, py, pz = position
         dx, dy, dz = FACE_OFFSETS[face]
         pos = b.BlockPos(x=px, y=py, z=pz)
         adjacent = b.BlockPos(x=px + dx, y=py + dy, z=pz + dz)
-        x, y, z = await self.movement.wait_for_position_sync(timeout)
-        await self.movement.look_at((px + 0.5, py + 0.75, pz + 0.5))
-
         opened: _SignEditor | None = None
 
         def matches(raw):
@@ -361,67 +362,110 @@ class Signs:
             opened = self._editor
             return True
 
-        pending = asyncio.create_task(self.packets.wait_for_packet(
-            (b.OpenSignPacket.ID, b.ChangeDimensionPacket.ID, b.RespawnPacket.ID), timeout=timeout, match=matches,
-        ))
+        budget = asyncio.timeout(timeout)
+        pending = None
         started = False
         failure = None
-        try:
-            await asyncio.sleep(0)
-            self._check_edit_target(target, epoch)
-            self._editable_sign(position)
-            block = self.blocks.observed_block(position)
-            if block is None or block.runtime_id is None or block.is_air:
-                raise LookupError(f"no current server block at {position}")
-            target.runtime_id = block.runtime_id
+
+        def check_deadline():
+            deadline = budget.when()
+            if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("sign edit timed out before submission")
+
+        def before_start():
+            nonlocal started
+            check_deadline()
             started = True
-            await self.packets.send(b.PlayerActionPacket(
-                runtime_id=self.player_id, action=b.PlayerActionType.START_ITEM_USE_ON,
-                pos=pos, result_pos=adjacent, face=face,
-            ))
-            await self.packets.send(b.AnimatePacket(
-                runtime_id=self.player_id, action=b.AnimatePacket.Action.SWING,
-                data=0.0, swing_source=b.ActorSwingSource.INTERACT,
-            ))
-            self._check_edit_target(target, epoch)
-            slot = self.inventory.selected_slot
-            transaction = b.ItemUseInventoryTransaction(
-                transaction=b.InventoryTransaction(actions=[]),
-                action_type=b.ItemUseInventoryTransaction.ActionType.PLACE,
-                trigger_type=b.ItemUseInventoryTransaction.TriggerType.PLAYER_INPUT,
-                pos=pos, face=face, slot=slot, hand=b.HandSlot.MAINHAND,
-                item=self.inventory.item_or_empty(slot), from_pos=b.Vec3(x=x, y=y, z=z),
-                click_pos=b.Vec3(x=0.5 + dx * 0.25, y=0.75 + dy * 0.20, z=0.5 + dz * 0.25),
-                target_block_id=block.runtime_id,
-                client_predicted_result=b.ItemUseInventoryTransaction.PredictedResult.SUCCESS,
-                client_cooldown_state=b.ItemUseInventoryTransaction.ClientCooldownState.OFF,
-            )
-            await self.packets.send(b.InventoryTransactionPacket(
-                legacy_request_id=b.ItemStackLegacyRequestId(raw_id=0),
-                legacy_set_item_slots=None, variant_transaction=transaction,
-            ))
-            await pending
-            self._check_edit_target(target, epoch)
-            if opened is None:
-                raise RuntimeError("sign editor changed during edit")
-            front, back = (text, None) if opened.is_front else (None, text)
-            await self._submit_editor_text(opened, front, back)
-            return "front" if opened.is_front else "back"
+
+        try:
+            async with budget:
+                check_deadline()
+                x, y, z = await self.movement.wait_for_position_sync(timeout=None)
+                await self.movement.look_at((px + 0.5, py + 0.75, pz + 0.5))
+                pending = asyncio.create_task(packets.wait_for_packet(
+                    (b.OpenSignPacket.ID, b.ChangeDimensionPacket.ID, b.RespawnPacket.ID),
+                    timeout=None, match=matches,
+                ))
+                await asyncio.sleep(0)
+                self._check_edit_target(target, epoch)
+                self._editable_sign(position)
+                block = self.blocks.observed_block(position)
+                if block is None or block.runtime_id is None or block.is_air:
+                    raise LookupError(f"no current server block at {position}")
+                target.runtime_id = block.runtime_id
+                await packets.send(b.PlayerActionPacket(
+                    runtime_id=self.player_id, action=b.PlayerActionType.START_ITEM_USE_ON,
+                    pos=pos, result_pos=adjacent, face=face,
+                ), _before_send=before_start)
+                await packets.send(b.AnimatePacket(
+                    runtime_id=self.player_id, action=b.AnimatePacket.Action.SWING,
+                    data=0.0, swing_source=b.ActorSwingSource.INTERACT,
+                ), _before_send=check_deadline)
+                self._check_edit_target(target, epoch)
+                slot = self.inventory.selected_slot
+                transaction = b.ItemUseInventoryTransaction(
+                    transaction=b.InventoryTransaction(actions=[]),
+                    action_type=b.ItemUseInventoryTransaction.ActionType.PLACE,
+                    trigger_type=b.ItemUseInventoryTransaction.TriggerType.PLAYER_INPUT,
+                    pos=pos, face=face, slot=slot, hand=b.HandSlot.MAINHAND,
+                    item=self.inventory.item_or_empty(slot), from_pos=b.Vec3(x=x, y=y, z=z),
+                    click_pos=b.Vec3(x=0.5 + dx * 0.25, y=0.75 + dy * 0.20, z=0.5 + dz * 0.25),
+                    target_block_id=block.runtime_id,
+                    client_predicted_result=b.ItemUseInventoryTransaction.PredictedResult.SUCCESS,
+                    client_cooldown_state=b.ItemUseInventoryTransaction.ClientCooldownState.OFF,
+                )
+                await packets.send(b.InventoryTransactionPacket(
+                    legacy_request_id=b.ItemStackLegacyRequestId(raw_id=0),
+                    legacy_set_item_slots=None, variant_transaction=transaction,
+                ), _before_send=check_deadline)
+                await pending
+                self._check_edit_target(target, epoch)
+                if opened is None:
+                    raise RuntimeError("sign editor changed during edit")
+                front, back = (text, None) if opened.is_front else (None, text)
+                await self._submit_editor_text(opened, front, back, _before_submit=check_deadline)
+                return "front" if opened.is_front else "back"
         except BaseException as error:
             failure = error
             raise
         finally:
             if opened is not None and self._editor is opened:
                 self._editor = None
-            pending.cancel()
-            await asyncio.gather(pending, return_exceptions=True)
-            if started and self._dimension_epoch == epoch:
+            cleanup_cancellation = None
+            if pending is not None:
+                pending.cancel()
                 try:
-                    await self.packets.send(b.PlayerActionPacket(
-                        runtime_id=self.player_id, action=b.PlayerActionType.STOP_ITEM_USE_ON,
-                        pos=adjacent, result_pos=b.BlockPos(x=0, y=0, z=0), face=0,
-                    ))
-                except (Exception, asyncio.CancelledError) as error:
+                    await asyncio.gather(pending, return_exceptions=True)
+                except asyncio.CancelledError as error:
                     if failure is None:
-                        raise
-                    failure.add_note(f"sign edit cleanup failed: {error!r}")
+                        cleanup_cancellation = failure = error
+                    else:
+                        failure.add_note(f"sign edit waiter cleanup cancelled: {error!r}")
+
+            def can_stop():
+                return self.packets is packets and not self._closed and self._dimension_epoch == epoch
+
+            if started and can_stop():
+                # A failed edit can still release input, but must not wait on a blocked writer.
+                cleanup = asyncio.timeout(0) if failure is not None else asyncio.timeout_at(budget.when())
+                stop_invalidated = RuntimeError("sign interaction changed before cleanup")
+
+                def before_stop():
+                    if not can_stop():
+                        raise stop_invalidated
+
+                try:
+                    async with cleanup:
+                        await packets.send(b.PlayerActionPacket(
+                            runtime_id=self.player_id, action=b.PlayerActionType.STOP_ITEM_USE_ON,
+                            pos=adjacent, result_pos=b.BlockPos(x=0, y=0, z=0), face=0,
+                        ), _before_send=before_stop)
+                except (Exception, asyncio.CancelledError) as error:
+                    if error is not stop_invalidated:
+                        if failure is not None:
+                            failure.add_note(f"sign edit cleanup failed: {error!r}")
+                        elif not (isinstance(error, TimeoutError) and cleanup.expired()):
+                            raise
+                        # A cleanup deadline cannot make the submitted sign write unsent.
+            if cleanup_cancellation is not None:
+                raise cleanup_cancellation

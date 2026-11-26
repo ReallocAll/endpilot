@@ -1,5 +1,7 @@
 import asyncio
 from dataclasses import FrozenInstanceError, replace
+from sys import exception
+from time import sleep
 import unittest
 from unittest.mock import patch
 
@@ -620,6 +622,182 @@ class SignTests(unittest.IsolatedAsyncioTestCase):
             if isinstance(packet, self.b.PlayerActionPacket):
                 actions.append(packet.action)
         return actions
+
+    async def test_expired_edit_budget_does_not_click(self):
+        await self.observe_sign()
+        with self.assertRaises(TimeoutError):
+            await self.bot.edit_sign(POSITION, "too late", face=2, timeout=0)
+        self.assert_only_idle_input_sent()
+
+    async def test_edit_deadline_or_cancellation_bounds_a_blocked_click_and_stop(self):
+        b = self.b
+        send = self.transport.send
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                blocked, entered = asyncio.Event(), asyncio.Event()
+                attempted = []
+
+                async def hold_actions(frame):
+                    raw = next(read_batch(frame[1:]))
+                    if raw.packet_id == b.PlayerActionPacket.ID:
+                        attempted.append(self.bot.protocol.decode(raw).action)
+                        entered.set()
+                        await blocked.wait()
+                    await send(frame)
+
+                await self.observe_sign()
+                with patch.object(self.transport, "send", side_effect=hold_actions):
+                    edit = asyncio.create_task(self.bot.edit_sign(
+                        POSITION, "transport blocked", face=2, timeout=2 if cancel else 0.05,
+                    ))
+                    self.addAsyncCleanup(self.cancel_wait, edit)
+                    try:
+                        await asyncio.wait_for(entered.wait(), 0.5)
+                        if cancel:
+                            edit.cancel("caller cancelled")
+                        done, _ = await asyncio.wait((edit,), timeout=0.5)
+                        self.assertIn(edit, done)
+                        with self.assertRaises(asyncio.CancelledError if cancel else TimeoutError) as caught:
+                            await edit
+                        self.assertTrue(any("cleanup failed" in note for note in caught.exception.__notes__))
+                        self.assertEqual(
+                            attempted, [b.PlayerActionType.START_ITEM_USE_ON, b.PlayerActionType.STOP_ITEM_USE_ON],
+                        )
+                        self.assert_only_idle_input_sent()
+                    finally:
+                        blocked.set()
+
+    async def test_edit_checks_deadline_after_click_or_text_encoding(self):
+        b = self.b
+        encode = self.bot.protocol.encode
+        for delayed in (b.InventoryTransactionPacket, b.BlockActorDataPacket):
+            with self.subTest(packet=delayed.__name__):
+                await self.observe_sign()
+
+                def delay(packet):
+                    if isinstance(packet, delayed):
+                        # The event loop cannot interrupt synchronous encoding.
+                        sleep(0.18)
+                    return encode(packet)
+
+                with patch.object(self.bot.protocol, "encode", side_effect=delay):
+                    edit = asyncio.create_task(self.bot.edit_sign(POSITION, "late", face=2, timeout=0.15))
+                    self.addAsyncCleanup(self.cancel_wait, edit)
+                    if delayed is b.BlockActorDataPacket:
+                        await self.sent(b.InventoryTransactionPacket)
+                        self.deliver(b.OpenSignPacket(pos=self.pos, is_front_side=False))
+                    with self.assertRaises(TimeoutError):
+                        await edit
+                    self.assertFalse(any(isinstance(p, delayed) for p in self.queued_packets()))
+                self.assertEqual(self.bot.observed_sign(POSITION).back_text, "back")
+
+    async def test_stop_deadline_does_not_mask_the_submitted_side(self):
+        b = self.b
+        send = self.transport.send
+        stopping = asyncio.Event()
+
+        async def hold_stop(frame):
+            raw = next(read_batch(frame[1:]))
+            if (raw.packet_id == b.PlayerActionPacket.ID
+                    and self.bot.protocol.decode(raw).action == b.PlayerActionType.STOP_ITEM_USE_ON):
+                stopping.set()
+                await asyncio.Event().wait()
+            await send(frame)
+
+        await self.observe_sign()
+        with patch.object(self.transport, "send", side_effect=hold_stop):
+            edit = asyncio.create_task(self.bot.edit_sign(POSITION, "saved", face=2, timeout=0.15))
+            self.addAsyncCleanup(self.cancel_wait, edit)
+            await self.sent(b.InventoryTransactionPacket)
+            self.deliver(b.OpenSignPacket(pos=self.pos, is_front_side=False))
+            saved = await self.sent(b.BlockActorDataPacket)
+            self.assertEqual(saved.data["BackText"]["Text"].value, "saved")
+            self.assertEqual(await asyncio.wait_for(edit, 0.8), "back")
+            self.assertTrue(stopping.is_set())
+
+    async def test_waiter_cleanup_cancellation_keeps_the_first_edit_failure_and_stops(self):
+        b = self.b
+        send = self.transport.send
+        gather = asyncio.gather
+        for first in ("send", "deadline", "caller"):
+            with self.subTest(first=first):
+                await self.observe_sign()
+                original_error = OSError("click write failed")
+                before_cleanup, actions = [], []
+
+                async def observe_send(frame):
+                    raw = next(read_batch(frame[1:]))
+                    if raw.packet_id == b.PlayerActionPacket.ID:
+                        actions.append(self.bot.protocol.decode(raw).action)
+                    if first == "send" and raw.packet_id == b.InventoryTransactionPacket.ID:
+                        raise original_error
+                    await send(frame)
+
+                async def cancel_in_cleanup(*pending, **options):
+                    waiting = gather(*pending, **options)
+                    if asyncio.current_task() is edit and not before_cleanup:
+                        before_cleanup.append(exception())
+                        asyncio.get_running_loop().call_soon(edit.cancel, "cleanup cancellation")
+                        # Keep the cleanup await cancellable even when its packet waiter is already done.
+                        await asyncio.sleep(0)
+                    return await waiting
+
+                with patch.object(self.transport, "send", side_effect=observe_send), \
+                        patch.object(asyncio, "gather", side_effect=cancel_in_cleanup):
+                    edit = asyncio.create_task(self.bot.edit_sign(
+                        POSITION, "not submitted", face=2, timeout=0.15 if first == "deadline" else 2,
+                    ))
+                    self.addAsyncCleanup(self.cancel_wait, edit)
+                    if first == "caller":
+                        await self.sent(b.InventoryTransactionPacket)
+                        edit.cancel("first caller cancellation")
+                    try:
+                        await edit
+                    except (Exception, asyncio.CancelledError) as error:
+                        received = error
+                    else:
+                        self.fail("sign edit unexpectedly completed")
+
+                self.stop_actions_without_write()
+                self.assertEqual(len(before_cleanup), 1)
+                self.assertIs(received, before_cleanup[0])
+                if first == "send":
+                    self.assertIs(received, original_error)
+                elif first == "deadline":
+                    self.assertIsInstance(received, TimeoutError)
+                else:
+                    self.assertIsInstance(received, asyncio.CancelledError)
+                    self.assertEqual(received.args, ("first caller cancellation",))
+                self.assertEqual(actions, [b.PlayerActionType.START_ITEM_USE_ON, b.PlayerActionType.STOP_ITEM_USE_ON])
+
+    async def test_cleanup_stop_does_not_cross_a_dimension_change_at_send(self):
+        b = self.b
+        packets = self.bot.packets
+        send = packets.send
+        entered, resume = asyncio.Event(), asyncio.Event()
+
+        async def pause_stop(packet, **options):
+            if isinstance(packet, b.PlayerActionPacket) and packet.action == b.PlayerActionType.STOP_ITEM_USE_ON:
+                entered.set()
+                await resume.wait()
+            await send(packet, **options)
+
+        await self.observe_sign()
+        with patch.object(packets, "send", side_effect=pause_stop):
+            edit = asyncio.create_task(self.bot.edit_sign(POSITION, "submitted", face=2, timeout=1))
+            self.addAsyncCleanup(self.cancel_wait, edit)
+            await self.sent(b.InventoryTransactionPacket)
+            self.deliver(b.OpenSignPacket(pos=self.pos, is_front_side=False))
+            saved = await self.sent(b.BlockActorDataPacket)
+            self.assertEqual(saved.data["BackText"]["Text"].value, "submitted")
+            await asyncio.wait_for(entered.wait(), 0.5)
+            changed = asyncio.create_task(packets.wait_for_packet(b.ChangeDimensionPacket.ID, timeout=0.5))
+            await asyncio.sleep(0)
+            self.deliver(b.ChangeDimensionPacket(dimension_id=1))
+            await changed
+            resume.set()
+            self.assertEqual(await edit, "back")
+        self.assertEqual(self.stop_actions_without_write(), [])
 
     async def test_stop_failure_preserves_timeout_and_cancellation(self):
         b = self.b
