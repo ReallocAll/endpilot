@@ -51,7 +51,7 @@ from .login import (
 )
 from .movement import BlockApproach, FlightResult, ForwardInput, Movement, MovementState
 from .navigation import NavigationGoal, NavigationPlan, NavigationResult, NavigationRules
-from .placement import PlacementResult, observe_placement
+from .placement import BoatPlacementResult, PlacementResult, observe_boat_placement, observe_placement
 from .player_state import DeathEvent, GlideBoostEvent, PlayerAbilities, PlayerEffect, PlayerState, PlayerVitals
 from .qa import PacketTimeline
 from .qa_terrain import _TerrainObserver
@@ -1933,6 +1933,23 @@ class Bot:
             containers, blocks, creative, against,
             face=face, expected_runtime_id=expected_runtime_id, expected_block_name=expected_block_name,
             replace=replace, click_pos=click_pos, timeout=timeout,
+        )
+
+    async def place_oak_boat(
+        self, position: tuple[int, int, int], *, timeout: float = 15,
+    ) -> BoatPlacementResult:
+        """Click observed source water once while holding an oak boat in Survival.
+
+        The result reports a new boat spawn at the click point and a one-item
+        decrease in the selected slot, when each is observed after submission.
+        These server observations carry no request ID linking them to the click.
+        """
+        session = self._session
+        containers, blocks, creative, entities = self._containers, self._blocks, self._creative, self._entities
+        if session is None or containers is None or blocks is None or creative is None or entities is None:
+            raise RuntimeError("player has not joined")
+        return await observe_boat_placement(
+            containers, blocks, creative, entities, lambda: session.item_registry, position, timeout=timeout,
         )
 
     async def open_container(

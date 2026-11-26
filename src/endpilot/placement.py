@@ -1,6 +1,7 @@
 """Submit an ordinary survival placement and observe its world and inventory context."""
 
 import asyncio
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from math import isfinite
 from typing import Literal
@@ -8,7 +9,10 @@ from typing import Literal
 from .blocks import FACE_OFFSETS, BlockChange, Blocks
 from .containers import Containers
 from .creative_inventory import CreativeInventory
-from .inventory import HeldItemStack
+from .entities import Entities, EntitySpawn
+from .inventory import HeldItemStack, InventorySlotChange
+from .item_registry import ItemRegistrySnapshot
+from .protocol import RawPacket
 
 
 _PlacementReason = Literal[
@@ -38,12 +42,58 @@ class PlacementResult:
     inventory_change: PlacementInventoryChange | None
 
 
+@dataclass(frozen=True, slots=True)
+class BoatPlacementResult:
+    """Local submission and independent server observations for an oak boat click."""
+
+    dimension_id: int
+    position: tuple[int, int, int]
+    slot: int
+    submitted: bool | None
+    reason: _PlacementReason
+    spawn: EntitySpawn | None
+    inventory_change: PlacementInventoryChange | None
+
+
 class _PreconditionChanged(Exception):
     pass
 
 
 def _item_identity(stack: HeldItemStack) -> tuple[int, int, int, bytes]:
     return stack.item_id, stack.aux_value, stack.block_runtime_id, stack.user_data_buffer
+
+
+def _one_item_decrease(before: HeldItemStack, after: HeldItemStack | None) -> bool:
+    return (after is not None and after.count == before.count - 1
+            and (after.item_id == 0 if before.count == 1 else _item_identity(after) == _item_identity(before)))
+
+
+async def _wait_for_placement[Result](
+    submit: Coroutine[None, None, _PlacementReason | None],
+    finished: asyncio.Future[_PlacementReason],
+    timeout: float,
+    result: Callable[[_PlacementReason], Result],
+    *unsubscribe: Callable[[], None],
+) -> Result:
+    sending = asyncio.create_task(submit)
+    try:
+        try:
+            async with asyncio.timeout(timeout):
+                await asyncio.wait((sending, finished), return_when=asyncio.FIRST_COMPLETED)
+                if finished.done():
+                    return result(finished.result())
+                failure = sending.result()
+                return result(failure or await finished)
+        except TimeoutError:
+            return result("timed_out")
+        finally:
+            for stop in unsubscribe:
+                stop()
+            sending.cancel()
+            await asyncio.gather(sending, return_exceptions=True)
+    except asyncio.CancelledError as error:
+        error.placement_progress = result("cancelled")
+        raise
 
 
 async def observe_placement(
@@ -158,10 +208,7 @@ async def observe_placement(
                 return
             last_slot_descriptor = descriptor
             after = inventory._observed_stack(slot)
-            if after is None or after.count != inventory_baseline.count - 1:
-                return
-            if (after.item_id == 0 if inventory_baseline.count == 1
-                else _item_identity(after) == _item_identity(inventory_baseline)):
+            if _one_item_decrease(inventory_baseline, after):
                 inventory_change = PlacementInventoryChange(inventory_baseline, after)
                 if world_change is not None:
                     finish("observations_complete")
@@ -207,23 +254,150 @@ async def observe_placement(
     unsubscribe_block = blocks.subscribe_block_changes(on_block, dimension_id=dimension, position=target, layer=0)
     unsubscribe_packet = packets.subscribe_raw(on_packet)
     unsubscribe_end = packets.subscribe_reader_end(lambda _cause: finish("disconnected"))
-    sending = asyncio.create_task(submit())
-    try:
+    return await _wait_for_placement(
+        submit(), finished, timeout, result, unsubscribe_block, unsubscribe_packet, unsubscribe_end,
+    )
+
+
+async def observe_boat_placement(
+    containers: Containers,
+    blocks: Blocks,
+    creative: CreativeInventory,
+    entities: Entities,
+    get_item_registry: Callable[[], ItemRegistrySnapshot | None],
+    position: tuple[int, int, int],
+    *,
+    timeout: float = 15,
+) -> BoatPlacementResult:
+    """Submit one click on observed source water and wait for boat and inventory evidence."""
+    if not isfinite(timeout) or timeout < 0:
+        raise ValueError("placement timeout must be a finite nonnegative number")
+
+    inventory, movement, packets = containers.inventory, containers.movement, containers.packets
+    binding = packets.protocol.binding
+    x, y, z = position
+    position = (x, y, z)
+    dimension = blocks.dimension_id
+    held = inventory.held_item
+    slot, before = held.slot, held.observed_item
+    selection_revision = inventory.selection_revision
+    submitted = False
+    spawn = None
+    inventory_change = None
+    inventory_baseline = None
+
+    def result(reason: _PlacementReason) -> BoatPlacementResult:
+        return BoatPlacementResult(dimension, position, slot, submitted, reason, spawn, inventory_change)
+
+    def is_oak_boat(item_id: int) -> bool:
+        registry = get_item_registry()
+        return registry is not None and registry.name_for_id(item_id) == "minecraft:oak_boat"
+
+    if blocks._closed or packets._reader_end_result()[0]:
+        return result("disconnected")
+    if movement._changing_dimension:
+        return result("dimension_changed")
+    if (creative.game_mode != binding.GameType.SURVIVAL
+        or before is None or before.item_id == 0 or before.count <= 0 or held.predicted_count is not None
+        or not is_oak_boat(before.item_id)):
+        return result("precondition_failed")
+
+    water = blocks.observed_block_state(position)
+    if water is None or water.name != "minecraft:water":
+        return result("precondition_failed")
+    depth = water.properties.get("liquid_depth")
+    if type(depth) is not int or depth != 0:
+        return result("precondition_failed")
+    if timeout == 0:
+        return result("timed_out")
+
+    click_pos = (0.5, 0.875, 0.5)
+    # AddActor carries native float32 coordinates, including when a half block rounds away.
+    wire_click = binding.Vec3(x=x + click_pos[0], y=y + click_pos[1], z=z + click_pos[2])
+    world_click = (wire_click.x, wire_click.y, wire_click.z)
+    seen_ids = {actor.entity_id for actor in entities.snapshot()}
+    finished = asyncio.get_running_loop().create_future()
+
+    def finish(reason: _PlacementReason) -> None:
+        if not finished.done():
+            finished.set_result(reason)
+
+    def on_inventory(change: InventorySlotChange) -> None:
+        nonlocal inventory_change
+        if (submitted is not True or finished.done() or inventory_change is not None
+            or inventory_baseline is None or change.before is None):
+            return
+        if (change.before.count == inventory_baseline.count
+            and _item_identity(change.before) == _item_identity(inventory_baseline)
+            and _one_item_decrease(change.before, change.after)):
+            inventory_change = PlacementInventoryChange(change.before, change.after)
+            if spawn is not None:
+                finish("observations_complete")
+
+    def on_packet(raw: RawPacket) -> None:
+        nonlocal spawn
+        if raw.packet_id == binding.ChangeDimensionPacket.ID:
+            finish("dimension_changed")
+        elif raw.packet_id == binding.DisconnectPacket.ID:
+            finish("disconnected")
+        elif raw.packet_id == binding.AddActorPacket.ID and not finished.done() and spawn is None:
+            actor = packets.protocol.decode(raw)
+            entity_id = int(actor.entity_id)
+            if entity_id in seen_ids:
+                return
+            # A retransmission of an earlier actor cannot establish a new spawn after send.
+            seen_ids.add(entity_id)
+            if submitted is True and actor.actor_type == "minecraft:boat":
+                location = (float(actor.pos.x), float(actor.pos.y), float(actor.pos.z))
+                if location == world_click:
+                    spawn = EntitySpawn(entity_id, int(actor.runtime_id), actor.actor_type, location)
+                    if inventory_change is not None:
+                        finish("observations_complete")
+
+    def before_send() -> None:
+        nonlocal submitted
+        if movement._changing_dimension or blocks.dimension_id != dimension:
+            finish("dimension_changed")
+        if blocks._closed:
+            finish("disconnected")
+        current = inventory.held_item
+        if (finished.done() or creative.game_mode != binding.GameType.SURVIVAL
+            or inventory.selection_revision != selection_revision
+            or current.slot != slot or current.observed_item != before or current.predicted_count is not None
+            or not is_oak_boat(before.item_id) or blocks.observed_block_state(position) != water):
+            raise _PreconditionChanged
+        submitted = None
+
+    async def submit() -> _PlacementReason | None:
+        nonlocal submitted, inventory_baseline
         try:
-            async with asyncio.timeout(timeout):
-                await asyncio.wait((sending, finished), return_when=asyncio.FIRST_COMPLETED)
-                if finished.done():
-                    return result(finished.result())
-                failure = sending.result()
-                return result(failure or await finished)
-        except TimeoutError:
-            return result("timed_out")
-        finally:
-            unsubscribe_block()
-            unsubscribe_packet()
-            unsubscribe_end()
-            sending.cancel()
-            await asyncio.gather(sending, return_exceptions=True)
-    except asyncio.CancelledError as error:
-        error.placement_progress = result("cancelled")
-        raise
+            await movement.wait_for_position_sync(timeout=None)
+        except ConnectionError:
+            return "disconnected"
+        if movement.input_position is None:
+            return "precondition_failed"
+        try:
+            await containers.click_block(position, blocks, face=1, click_pos=click_pos, _before_send=before_send)
+        except _PreconditionChanged:
+            return "precondition_failed"
+        except Exception:
+            if submitted is not False:
+                return "send_failed"
+            if packets._reader_end_result()[0]:
+                return "disconnected"
+            raise
+        observed = inventory._observed_stack(slot)
+        if observed is not None and observed.count > 0 and _item_identity(observed) == _item_identity(before):
+            inventory_baseline = observed
+        submitted = True
+        return None
+
+    try:
+        unsubscribe_inventory = inventory.subscribe_inventory_changes(on_inventory, slot=slot)
+    except ConnectionError:
+        return result("disconnected")
+    unsubscribe_packet = packets.subscribe_raw(on_packet)
+    unsubscribe_end = packets.subscribe_reader_end(lambda _cause: finish("disconnected"))
+    return await _wait_for_placement(
+        submit(), finished, timeout, result, unsubscribe_inventory, unsubscribe_packet, unsubscribe_end,
+    )

@@ -4,11 +4,13 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock
 
-from endpilot import Bot, PlacementInventoryChange, PlacementResult
+from endpilot import BoatPlacementResult, Bot, ItemRegistrySnapshot, PlacementInventoryChange, PlacementResult
 from endpilot.blocks import Blocks, HASHED_AIR_RUNTIME_ID
 from endpilot.compression import PacketConnection
 from endpilot.containers import Containers
+from endpilot.entities import Entities, EntitySpawn
 from endpilot.inventory import Inventory
+from endpilot.login import JoinSession
 from endpilot.protocol import write_batch
 from test_scheduled_input import Wire
 
@@ -19,7 +21,7 @@ FURNACE_ITEM_STATE, FURNACE_PLACED_STATE = 3463497305, 4038254352
 STONE, SHORT_GRASS = 2150698529, 2827903781
 
 
-class PlacementTests(unittest.IsolatedAsyncioTestCase):
+class _PlacementHarness(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.bot = Bot("Placement", protocol=2225)
         protocol = self.bot.protocol
@@ -64,16 +66,10 @@ class PlacementTests(unittest.IsolatedAsyncioTestCase):
         self.wire.incoming.put_nowait(write_batch(self.bot.protocol.encode(packet) for packet in (*packets, marker)))
         await read
 
-    async def place(self, timeout=0.6, **expected):
-        return await self.bot.place_block(
-            SUPPORT, face=1, click_pos=(0.25, 1, 0.75), timeout=timeout,
-            **(expected or {"expected_runtime_id": PLACED_ID}),
-        )
-
-    async def arm(self, timeout=0.6, **expected):
+    async def arm_click(self, action):
         sent = asyncio.Event()
         stop = self.packets.subscribe_sent(lambda packet_id: sent.set() if packet_id == self.b.InventoryTransactionPacket.ID else None)
-        pending = asyncio.create_task(self.place(timeout, **expected))
+        pending = asyncio.create_task(action)
         self.addAsyncCleanup(self.stop_task, pending)
         try:
             await asyncio.wait_for(sent.wait(), 0.5)
@@ -85,6 +81,17 @@ class PlacementTests(unittest.IsolatedAsyncioTestCase):
     async def stop_task(task):
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+class PlacementTests(_PlacementHarness):
+    async def place(self, timeout=0.6, **expected):
+        return await self.bot.place_block(
+            SUPPORT, face=1, click_pos=(0.25, 1, 0.75), timeout=timeout,
+            **(expected or {"expected_runtime_id": PLACED_ID}),
+        )
+
+    async def arm(self, timeout=0.6, **expected):
+        return await self.arm_click(self.place(timeout, **expected))
 
     async def test_one_click_and_separate_observations_in_either_order(self):
         for world_first in (True, False):
@@ -400,3 +407,265 @@ class PlacementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((result.submitted, result.reason), (True, "disconnected"))
         self.assertEqual(result.world_change.after.runtime_id, PLACED_ID)
         self.assertIsNone(result.inventory_change)
+
+
+WATER, FLOWING_WATER = 0x483B8B2A, 1334811448
+BOAT_ITEM, BOAT_SLOT = 496, 8
+BOAT_POSITION = (4.5, 90.875, 7.5)
+
+
+class BoatPlacementTests(_PlacementHarness):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.bot._entities = Entities(self.packets)
+        self.bot._entities.start()
+        self.addCleanup(self.bot._entities.close)
+        session = self.bot._session = JoinSession(self.packets, None, "placement fixture")
+        session._item_registry_subscriptions = (
+            self.packets.subscribe_raw(session._on_item_registry),
+            self.packets.subscribe_reader_end(session._clear_item_registry),
+        )
+        self.addCleanup(session._clear_item_registry)
+        await self.deliver(self.registry_packet("minecraft:oak_boat"),
+                           self.block(SUPPORT, WATER), self.boat_slot(2), self.select(BOAT_SLOT))
+        self.registry = self.bot.item_registry
+        self.subscribers = tuple(map(tuple, (
+            self.inventory._slot_observers, self.packets._subscribers, self.packets._reader_end_subscribers,
+        )))
+
+    def boat_slot(self, count, *, slot=BOAT_SLOT, item_id=BOAT_ITEM, net_id=21):
+        return self.slot(count, slot=slot, item_id=item_id, net_id=net_id, block_runtime_id=0)
+
+    def registry_packet(self, name):
+        return self.b.ItemRegistryPacket(items=[
+            self.b.ItemData(id=BOAT_ITEM, name=name),
+            self.b.ItemData(id=378, name="minecraft:birch_boat"),
+        ])
+
+    def select(self, slot):
+        return self.b.PlayerHotbarPacket(
+            selected_slot=slot, container_id=self.b.ContainerID.INVENTORY, should_select_slot=True,
+        )
+
+    def spawn(self, entity_id, *, position=BOAT_POSITION, actor_type="minecraft:boat"):
+        x, y, z = position
+        return self.b.AddActorPacket(
+            entity_id=entity_id, runtime_id=-entity_id, actor_type=actor_type, pos=self.b.Vec3(x=x, y=y, z=z),
+        )
+
+    def place_boat(self, timeout=0.6):
+        return self.bot.place_oak_boat(SUPPORT, timeout=timeout)
+
+    def assert_observers_restored(self):
+        self.assertEqual(tuple(map(tuple, (
+            self.inventory._slot_observers, self.packets._subscribers, self.packets._reader_end_subscribers,
+        ))), self.subscribers)
+
+    async def test_exact_click_and_two_independent_observations(self):
+        for spawn_first, count, entity_id in ((True, 2, -40), (False, 1, -41)):
+            with self.subTest(spawn_first=spawn_first):
+                await self.deliver(self.boat_slot(count))
+                self.wire.sent.clear()
+                self.movement.wait_for_position_sync.reset_mock()
+                pending = await self.arm_click(self.place_boat())
+                self.movement.wait_for_position_sync.assert_awaited_once_with(timeout=None)
+                sent, = self.wire.sent
+                self.assertIsInstance(sent, self.b.InventoryTransactionPacket)
+                tx = sent.variant_transaction
+                self.assertEqual(sent.legacy_request_id.raw_id, 0)
+                self.assertEqual(tx.transaction.actions, [])
+                self.assertEqual(tx.action_type, self.b.ItemUseInventoryTransaction.ActionType.PLACE)
+                self.assertEqual((tx.pos.x, tx.pos.y, tx.pos.z), SUPPORT)
+                self.assertEqual((tx.click_pos.x, tx.click_pos.y, tx.click_pos.z), (0.5, 0.875, 0.5))
+                self.assertEqual((tx.face, tx.slot, tx.target_block_id), (1, BOAT_SLOT, WATER))
+                self.assertEqual((tx.item.id, tx.item.stack_size, tx.item.net_id_variant), (BOAT_ITEM, count, 21))
+
+                actor, inventory = self.spawn(entity_id), self.boat_slot(count - 1, net_id=22)
+                first, second = (actor, inventory) if spawn_first else (inventory, actor)
+                await self.deliver(first)
+                self.assertFalse(pending.done())
+                await self.deliver(second)
+                result = await pending
+                self.assertIsInstance(result, BoatPlacementResult)
+                self.assertEqual((result.dimension_id, result.position, result.slot), (0, SUPPORT, BOAT_SLOT))
+                self.assertEqual((result.submitted, result.reason), (True, "observations_complete"))
+                self.assertEqual(result.spawn, EntitySpawn(entity_id, -entity_id, "minecraft:boat", BOAT_POSITION))
+                self.assertIsInstance(result.inventory_change, PlacementInventoryChange)
+                before, after = result.inventory_change.before, result.inventory_change.after
+                self.assertEqual((before.item_id, before.count, after.item_id, after.count, after.net_id),
+                                 (BOAT_ITEM, count, BOAT_ITEM if count == 2 else 0, count - 1, 22 if count == 2 else None))
+                with self.assertRaises(FrozenInstanceError):
+                    result.position = TARGET
+                self.assertEqual(len(self.wire.sent), 1)
+                self.assert_observers_restored()
+
+    async def test_rejects_non_source_or_untrusted_water(self):
+        unknown = (7, 90, 7)
+        rejected = await self.bot.place_oak_boat(unknown)
+        self.assertEqual((rejected.submitted, rejected.reason), (False, "precondition_failed"))
+        for runtime_id in (FLOWING_WATER, STONE):
+            with self.subTest(runtime_id=runtime_id):
+                await self.deliver(self.block(SUPPORT, runtime_id), self.block(SUPPORT, WATER, layer=1))
+                result = await self.place_boat()
+                self.assertEqual((result.submitted, result.reason), (False, "precondition_failed"))
+        await self.deliver(self.block(SUPPORT, WATER))
+        self.blocks._protocol = 2193
+        result = await self.place_boat()
+        self.assertEqual((result.submitted, result.reason), (False, "precondition_failed"))
+        self.assertEqual(self.wire.sent, [])
+
+    async def test_requires_survival_catalog_and_an_observed_nonpredicted_selected_stack(self):
+        for registry in (None, ItemRegistrySnapshot({}), ItemRegistrySnapshot({BOAT_ITEM: "minecraft:birch_boat"})):
+            with self.subTest(registry=registry):
+                self.bot._session.item_registry = registry
+                result = await self.place_boat()
+                self.assertEqual((result.submitted, result.reason), (False, "precondition_failed"))
+
+        self.bot._session.item_registry = self.registry
+        self.bot._creative.game_mode = self.b.GameType.CREATIVE
+        result = await self.place_boat()
+        self.assertEqual((result.submitted, result.reason), (False, "precondition_failed"))
+        self.bot._creative.game_mode = self.b.GameType.SURVIVAL
+        self.inventory._drop_key_counts[BOAT_SLOT] = 1
+        result = await self.place_boat()
+        self.assertEqual((result.submitted, result.reason), (False, "precondition_failed"))
+
+        for correction in ((self.boat_slot(0),), (self.boat_slot(1, item_id=378),), (self.select(7),)):
+            with self.subTest(correction=correction):
+                await self.deliver(*correction)
+                result = await self.place_boat()
+                self.assertEqual((result.submitted, result.reason), (False, "precondition_failed"))
+        self.assertEqual(self.wire.sent, [])
+
+    async def test_rechecks_selection_stack_water_and_registry_after_position_sync(self):
+        corrections = (
+            (self.select(2), self.select(BOAT_SLOT)), (self.boat_slot(1),),
+            (self.block(SUPPORT, STONE),), (self.registry_packet("minecraft:spruce_boat"),),
+        )
+        for correction in corrections:
+            with self.subTest(correction=correction):
+                await self.deliver(self.boat_slot(2), self.block(SUPPORT, WATER))
+                entering, ready = asyncio.Event(), asyncio.Event()
+
+                async def sync(*, timeout):
+                    entering.set()
+                    await ready.wait()
+
+                self.movement.wait_for_position_sync.side_effect = sync
+                pending = asyncio.create_task(self.place_boat())
+                self.addAsyncCleanup(self.stop_task, pending)
+                await asyncio.wait_for(entering.wait(), 0.5)
+                await self.deliver(*correction)
+                ready.set()
+                result = await pending
+                self.assertEqual((result.submitted, result.reason), (False, "precondition_failed"))
+                self.assert_observers_restored()
+        self.assertEqual(self.wire.sent, [])
+
+    async def test_spawn_matches_exact_world_click_at_wire_precision(self):
+        position = (8388608, 90, -8388609)
+        encoded_click = (8388608.0, 90.875, -8388608.0)
+        await self.deliver(self.block(position, WATER))
+        pending = await self.arm_click(self.bot.place_oak_boat(position, timeout=0.6))
+        await self.deliver(self.boat_slot(1), self.spawn(-41, position=(8388609.0, 90.875, -8388608.0)))
+        self.assertFalse(pending.done())
+        await self.deliver(self.spawn(-42, position=(8388608.5, 90.875, -8388608.5)))
+        result = await pending
+        self.assertEqual((result.reason, result.position), ("observations_complete", position))
+        self.assertEqual(result.spawn, EntitySpawn(-42, 42, "minecraft:boat", encoded_click))
+
+    async def test_ignores_stale_and_unrelated_spawn_and_inventory_updates(self):
+        await self.deliver(self.spawn(-40), self.boat_slot(4))
+
+        async def in_flight():
+            await self.deliver(self.spawn(-41), self.b.RemoveActorPacket(entity_id=-41), self.boat_slot(3))
+
+        self.wire.before_send = in_flight
+        pending = await self.arm_click(self.place_boat())
+        await self.deliver(
+            self.b.RemoveActorPacket(entity_id=-40), self.spawn(-40), self.spawn(-41),
+            self.spawn(-42, actor_type="minecraft:chicken"), self.spawn(-43, position=(4.5, 90.875, 7.5625)),
+            self.spawn(-43), self.boat_slot(2, slot=7), self.boat_slot(3), self.boat_slot(1), self.boat_slot(2),
+        )
+        self.assertFalse(pending.done())
+        await self.deliver(self.spawn(-44))
+        self.assertFalse(pending.done())
+        await self.deliver(self.boat_slot(3), self.boat_slot(2, net_id=22))
+        result = await pending
+        self.assertEqual((result.submitted, result.reason, result.spawn.entity_id), (True, "observations_complete", -44))
+        self.assertEqual((result.inventory_change.before.count, result.inventory_change.after.count), (3, 2))
+        self.assert_observers_restored()
+
+    async def test_timeout_preserves_the_boat_observation_and_cleans_up(self):
+        pending = await self.arm_click(self.place_boat(timeout=0.2))
+        await self.deliver(self.spawn(-42), self.boat_slot(1, item_id=378))
+        result = await pending
+        self.assertEqual((result.submitted, result.reason, result.spawn.entity_id), (True, "timed_out", -42))
+        self.assertIsNone(result.inventory_change)
+        self.assert_observers_restored()
+
+    async def test_timeout_covers_position_sync_and_transport_send(self):
+        never = asyncio.Event()
+
+        async def sync(*, timeout):
+            await never.wait()
+
+        self.movement.wait_for_position_sync.side_effect = sync
+        for timeout in (0, 0.05):
+            result = await self.place_boat(timeout=timeout)
+            self.assertEqual((result.submitted, result.reason), (False, "timed_out"))
+            self.assert_observers_restored()
+
+        self.movement.wait_for_position_sync.side_effect = None
+        self.wire.before_send = never.wait
+        result = await self.place_boat(timeout=0.05)
+        self.assertEqual((result.submitted, result.reason), (None, "timed_out"))
+        self.assertEqual(self.wire.sent, [])
+        self.assert_observers_restored()
+
+    async def test_send_failure_cannot_claim_early_observations(self):
+        async def fail():
+            await self.deliver(self.spawn(-42), self.boat_slot(1))
+            raise OSError("transport failed while writing")
+
+        self.wire.before_send = fail
+        result = await self.place_boat()
+        self.assertEqual((result.submitted, result.reason), (None, "send_failed"))
+        self.assertIsNone(result.spawn)
+        self.assertIsNone(result.inventory_change)
+        self.assert_observers_restored()
+
+    async def test_cancellation_preserves_the_original_error_and_partial_evidence(self):
+        pending = await self.arm_click(self.place_boat())
+        await self.deliver(self.boat_slot(1))
+        pending.cancel("stop waiting")
+        with self.assertRaisesRegex(asyncio.CancelledError, "stop waiting") as caught:
+            await pending
+        result = caught.exception.placement_progress
+        self.assertTrue(pending.cancelled())
+        self.assertEqual((result.submitted, result.reason), (True, "cancelled"))
+        self.assertEqual(result.inventory_change.after.count, 1)
+        self.assertIsNone(result.spawn)
+        self.assert_observers_restored()
+
+    async def test_dimension_change_keeps_partial_evidence_and_excludes_later_spawns(self):
+        pending = await self.arm_click(self.place_boat())
+        await self.deliver(self.boat_slot(1), self.b.ChangeDimensionPacket(dimension_id=1), self.spawn(-42))
+        result = await pending
+        self.assertEqual((result.dimension_id, result.submitted, result.reason), (0, True, "dimension_changed"))
+        self.assertEqual(result.inventory_change.after.count, 1)
+        self.assertIsNone(result.spawn)
+        self.assert_observers_restored()
+
+    async def test_reader_end_keeps_partial_evidence(self):
+        pending = await self.arm_click(self.place_boat())
+        await self.deliver(self.spawn(-42))
+        reader = self.packets.start_receiving()
+        reader.cancel()
+        result = await pending
+        self.assertEqual((result.submitted, result.reason, result.spawn.entity_id), (True, "disconnected", -42))
+        self.assertIsNone(result.inventory_change)
+        self.assertTrue(reader.cancelled())
+        self.assertFalse(self.inventory._slot_observers)
+        self.assertTrue(set(self.packets._subscribers).issubset(self.subscribers[1]))
+        self.assertFalse(self.packets._reader_end_subscribers)

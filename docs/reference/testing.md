@@ -89,6 +89,31 @@ support, then `read_block` to record that update. Call `place_against` with
 the support coordinates. The returned tick confirms input submission. Check
 the target block or server state to verify placement.
 
+## Place an oak boat
+
+In Survival, select a hotbar slot with a server-observed oak boat stack and
+move within reach of a known source water block. Pass the water block's
+coordinates to `await bot.place_oak_boat(position, timeout=15)`. The call
+checks the held item against the current session's item registry and requires
+protocol 2225's vanilla `minecraft:water` with `liquid_depth=0` in the main
+layer. It synchronizes the player's position and submits one top-face click
+at the block-local point `(0.5, 0.875, 0.5)`.
+
+`BoatPlacementResult` records the original dimension, water block, selected
+slot, and local submission state. `submitted` is `False` before the write,
+`None` if the write began without local confirmation, and `True` after the
+transport confirms the send. `observations_complete` means the SDK received
+both an `AddActorPacket` for a new `minecraft:boat` at the exact click
+position and a one-item decrease in the selected slot after the send. These
+are independent server observations with no request ID linking them to the
+click.
+
+The timeout covers position synchronization, submission, and observations.
+The result preserves either observation on timeout, dimension change, or
+disconnect. If the caller cancels after the action starts, the original
+`CancelledError` carries the partial result in `placement_progress`.
+[Placement tests](../../tests/test_placement.py)
+
 ## Observe and answer forms
 
 Use a server that sends the player a form through a plugin. Wait for
