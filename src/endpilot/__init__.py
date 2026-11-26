@@ -6,8 +6,8 @@ from .beds import BedObservation, PlayerRespawnPoint, SleepRejected
 from .biome_data import VanillaBiome, vanilla_biomes
 from .block_raycast import BlockRaycastResult, MiningFaceResult
 from .blocks import (
-    BlockChange, BlockMatch, BlockObservation, BlockSearchResult, ColumnCoverage, ColumnCoverageEvent,
-    ColumnCoverageInvalidated, DimensionBounds, MiningFaceUnavailable, MiningTarget,
+    BlockChange, BlockMatch, BlockObservation, BlockSearchResult, BlockStateObservation, ColumnCoverage,
+    ColumnCoverageEvent, ColumnCoverageInvalidated, DimensionBounds, MiningFaceUnavailable, MiningTarget,
 )
 from .books import BookSnapshot
 from .boss_bars import BossBar, BossBarEvent, BossBarEventKind
@@ -71,6 +71,7 @@ __all__ = [
     "BlockObservation",
     "BlockRaycastResult",
     "BlockSearchResult",
+    "BlockStateObservation",
     "BookSnapshot",
     "BossBar",
     "BossBarEvent",

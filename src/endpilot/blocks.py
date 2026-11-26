@@ -2,15 +2,16 @@
 
 import asyncio
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from heapq import nsmallest
 from math import atan2, degrees, dist, floor, hypot, isfinite, isqrt, prod
+from types import MappingProxyType
 from typing import Literal
 
 from bedrock_protocol import nbt
 
-from .block_data import VanillaBlockState, _catalog, _state_lookup, vanilla_block_state
+from .block_data import VanillaBlockState, _catalog, _vanilla_state_properties, vanilla_block_state
 from .block_raycast import (
     BlockRaycastResult, MiningFaceResult, OutlineObservation, trace_blocks, trace_blocks_towards, trace_mining_face,
 )
@@ -62,6 +63,21 @@ class BlockObservation:
     runtime_id: int | None
     layer: int
     is_air: bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class BlockStateObservation:
+    """An independent snapshot of an observed vanilla block state."""
+
+    position: tuple[int, int, int]
+    runtime_id: int | None
+    layer: int
+    name: str
+    properties: Mapping[str, int | str]
+
+    def __post_init__(self):
+        object.__setattr__(self, "position", tuple(self.position))
+        object.__setattr__(self, "properties", MappingProxyType(dict(self.properties)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -693,6 +709,25 @@ class Blocks:
             is_air = None if state is None else state.is_air
         return BlockObservation(position, runtime_id, layer, is_air)
 
+    def observed_block_state(
+        self, position: tuple[int, int, int], *, layer: int = 0,
+    ) -> BlockStateObservation | None:
+        if self._protocol != 2225:
+            return None
+        observation = self.observed_block(position, layer=layer)
+        if observation is None:
+            return None
+        position, runtime_id, layer = observation.position, observation.runtime_id, observation.layer
+        if observation.is_air is True:
+            return BlockStateObservation(position, runtime_id, layer, "minecraft:air", {})
+        if runtime_id is None:
+            return None
+        state = self._vanilla_state(runtime_id)
+        if state is None:
+            return None
+        properties = _vanilla_state_properties(state.name, runtime_id, hashed=self.hashed_runtime_ids)
+        return BlockStateObservation(position, runtime_id, layer, state.name, properties)
+
     def observed_biome(self, position: tuple[int, int, int]) -> int | None:
         """Return the current column's observed biome ID at an integer block position."""
         x, y, z = position
@@ -1085,15 +1120,7 @@ class Blocks:
         if not (name == "minecraft:pitcher_crop" or name.endswith(("_fence", "fence_gate"))):
             return None
 
-        # Recover shape properties through the same protocol 2225 palette as block-state lookup.
-        _, by_name, _ = _state_lookup()
-        first, layout = by_name[name]
-        index = _catalog()[1][runtime_id] if self.hashed_runtime_ids else runtime_id
-        offset = index - first
-        properties = {}
-        for key, _, values in reversed(layout):
-            offset, ordinal = divmod(offset, len(values))
-            properties[key] = values[ordinal]
+        properties = _vanilla_state_properties(name, runtime_id, hashed=self.hashed_runtime_ids)
 
         if name == "minecraft:pitcher_crop":
             if properties["upper_block_bit"]:

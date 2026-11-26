@@ -7,6 +7,17 @@ integer block coordinates. `None` means the position is unknown. A returned
 snapshot includes the runtime ID when known, and `is_air` is `True` for
 confirmed air. This query sends no packets.
 
+`bot.observed_block_state((x, y, z), layer=0)` resolves a cached layer against
+the protocol 2225 vanilla palette. The immutable `BlockStateObservation`
+holds `position`, `runtime_id`, `layer`, `name` and a read-only `properties`
+mapping. Byte and Int properties are Python integers. String properties are
+Python strings. Later world updates leave the snapshot unchanged.
+
+Known air has the name `minecraft:air` and an empty property mapping. The
+`runtime_id` can be `None` for a server-confirmed empty layer. The query
+returns `None` for missing observations, unresolved IDs, unverified sequential
+IDs and unsupported protocol versions. It sends no packets.
+
 ## Estimate a source-free script explosion
 
 On vanilla Bedrock 2225, use this synchronous query before a single

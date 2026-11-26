@@ -114,6 +114,19 @@ def _state_lookup():
     return lookup["version"], by_name, tuple(hash_id for hash_id, _ in data["palette"])
 
 
+def _vanilla_state_properties(name: str, runtime_id: int, *, hashed: bool) -> dict[str, int | str]:
+    """Decode the property values of an already resolved vanilla state."""
+    _, by_name, _ = _state_lookup()
+    first, layout = by_name[name]
+    index = _catalog()[1][runtime_id] if hashed else runtime_id
+    offset = index - first
+    properties = {}
+    for key, _, values in reversed(layout):
+        offset, ordinal = divmod(offset, len(values))
+        properties[key] = values[ordinal]
+    return properties
+
+
 def lookup_vanilla_block_state(state: nbt.CompoundTag) -> tuple[int, int] | None:
     """Resolve an exact 2225 block-state tag to (palette index, network hash)."""
     if type(state) is not nbt.CompoundTag or set(state.keys()) != {"name", "states", "version"}:

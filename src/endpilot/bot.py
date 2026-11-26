@@ -17,8 +17,8 @@ from .authentication import (
 from .beds import BedObservation, Beds, PlayerRespawnPoint
 from .block_raycast import BlockRaycastResult, MiningFaceResult
 from .blocks import (
-    Blocks, BlockChange, BlockMatch, BlockObservation, BlockSearchResult, BlockUpdate, ColumnCoverage, ColumnCoverageEvent,
-    DimensionBounds, MiningTarget,
+    Blocks, BlockChange, BlockMatch, BlockObservation, BlockSearchResult, BlockStateObservation, BlockUpdate,
+    ColumnCoverage, ColumnCoverageEvent, DimensionBounds, MiningTarget,
 )
 from .books import BookEdit, BookSnapshot, Books
 from .boss_bars import BossBar, BossBarEvent, BossBarEventKind, BossBars
@@ -1123,6 +1123,14 @@ class Bot:
         if self._blocks is None:
             raise RuntimeError("player has not joined")
         return self._blocks.observed_block(position, layer=layer)
+
+    def observed_block_state(
+        self, position: tuple[int, int, int], *, layer: int = 0,
+    ) -> BlockStateObservation | None:
+        """Return the cached vanilla state snapshot, or None if it cannot be resolved."""
+        if self._blocks is None:
+            raise RuntimeError("player has not joined")
+        return self._blocks.observed_block_state(position, layer=layer)
 
     def observed_block_entity(self, position: tuple[int, int, int]) -> nbt.CompoundTag | None:
         """Return an independent copy of the latest observed block entity NBT.

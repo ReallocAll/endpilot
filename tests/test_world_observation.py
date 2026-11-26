@@ -9,7 +9,7 @@ import zlib
 
 from bedrock_protocol import nbt
 
-from endpilot import BlockObservation, Bot, ColumnCoverageInvalidated, DimensionBounds
+from endpilot import BlockObservation, BlockStateObservation, Bot, ColumnCoverageInvalidated, DimensionBounds
 from endpilot.compression import PacketConnection
 from endpilot.login import JoinSession
 from endpilot.protocol import RawPacket, read_batch, write_batch
@@ -34,8 +34,8 @@ class Transport:
 
 
 class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
-    async def connect(self, *, auto=False, hashed_runtime_ids=False):
-        self.bot = Bot("Coverage", protocol=2225)
+    async def connect(self, *, auto=False, hashed_runtime_ids=False, protocol=2225):
+        self.bot = Bot("Coverage", protocol=protocol)
         self.addAsyncCleanup(self.bot.close)
         self.b = self.bot.protocol.binding
         self.transport = Transport()
@@ -128,6 +128,103 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
             b.SubChunkPacket.SubChunkPacketData(result=b.SubChunkPacket.SubChunkRequestResult.SUCCESS,
                                                serialized_sub_chunk=data),
         ])
+
+    async def test_observed_block_state_decodes_each_layer_and_retains_its_properties(self):
+        position = (3, 64, 7)
+        properties = {"minecraft:corner": "outer_left", "upside_down_bit": 1, "weirdo_direction": 2}
+        for hashed, stairs_id, replacement_id, water_id in (
+            (True, 3671572261, 3688141530, 1334811448),
+            (False, 1888, 1870, 14124),
+        ):
+            with self.subTest(hashed=hashed):
+                await self.connect(hashed_runtime_ids=hashed)
+                b = self.b
+                pos = b.BlockPos(x=3, y=64, z=7)
+                await self.deliver(b.UpdateBlockPacket(pos=pos, runtime_id=stairs_id),
+                                   b.UpdateBlockPacket(pos=pos, runtime_id=water_id, layer=1))
+
+                snapshot = self.bot.observed_block_state(position)
+                self.assertEqual(snapshot, BlockStateObservation(
+                    position, stairs_id, 0, "minecraft:oak_stairs", properties,
+                ))
+                for key, value in properties.items():
+                    self.assertIs(type(snapshot.properties[key]), type(value))
+                self.assertEqual(self.bot.observed_block_state(position, layer=1),
+                                 BlockStateObservation(position, water_id, 1, "minecraft:water", {"liquid_depth": 2}))
+                with self.assertRaises(TypeError):
+                    snapshot.properties["weirdo_direction"] = 0
+                with self.assertRaises(FrozenInstanceError):
+                    snapshot.name = "minecraft:air"
+
+                await self.deliver(b.UpdateBlockPacket(pos=pos, runtime_id=replacement_id))
+                current = self.bot.observed_block_state(position)
+                self.assertEqual(current, BlockStateObservation(position, replacement_id, 0, "minecraft:oak_stairs", {
+                    "minecraft:corner": "inner_left", "upside_down_bit": 1, "weirdo_direction": 0,
+                }))
+                self.assertEqual(snapshot.properties, properties)
+                self.assertEqual(self.transport.sent, [])
+                await self.bot.close()
+
+    def test_block_state_observation_copies_input_properties(self):
+        properties = {"facing_direction": 2}
+        snapshot = BlockStateObservation((3, 64, 7), 1838280610, 0, "minecraft:piston", properties)
+        properties["facing_direction"] = 4
+        self.assertEqual(snapshot.properties, {"facing_direction": 2})
+
+    async def test_observed_block_state_distinguishes_known_air_from_unknown_cells_and_ids(self):
+        position = (3, 64, 7)
+        for hashed, air_id, unknown_id in ((True, 0xDBF44120, 0xFFFFFFFE), (False, 18894, 11244)):
+            with self.subTest(hashed=hashed):
+                await self.connect(hashed_runtime_ids=hashed)
+                self.assertIsNone(self.bot.observed_block_state(position))
+                self.assertIsNone(self.bot.observed_block_state(position, layer=1))
+                await self.deliver(self.air(4))
+                self.assertEqual(self.bot.observed_block_state(position), BlockStateObservation(
+                    position, air_id if hashed else None, 0, "minecraft:air", {},
+                ))
+                self.assertEqual(self.bot.observed_block_state(position, layer=1),
+                                 BlockStateObservation(position, None, 1, "minecraft:air", {}))
+
+                b = self.b
+                pos = b.BlockPos(x=3, y=64, z=7)
+                await self.deliver(b.UpdateBlockPacket(pos=pos, runtime_id=air_id))
+                self.assertEqual(self.bot.observed_block_state(position),
+                                 BlockStateObservation(position, air_id, 0, "minecraft:air", {}))
+                for runtime_id in (unknown_id, 0xFFFFFFFF):
+                    await self.deliver(b.UpdateBlockPacket(pos=pos, runtime_id=runtime_id))
+                    self.assertEqual(self.bot.observed_block(position).runtime_id, runtime_id)
+                    self.assertIsNone(self.bot.observed_block_state(position))
+                self.assertEqual(self.transport.sent, [])
+                await self.bot.close()
+
+    async def test_observed_block_state_rejects_unverified_sequential_ids(self):
+        self.bot = Bot("Coverage")
+        self.addAsyncCleanup(self.bot.close)
+        b = self.b = self.bot.protocol.binding
+        await self.join_dimension_session(0)
+        sent_at_join = len(self.transport.sent)
+        position = (3, 64, 7)
+        pos = b.BlockPos(x=3, y=64, z=7)
+        incoming = self.air(4), b.UpdateBlockPacket(pos=pos, runtime_id=1888)
+        self.transport.incoming.put_nowait(write_batch(map(self.bot.protocol.encode, incoming)))
+        await asyncio.sleep(0)
+        self.assertEqual(self.bot.observed_block(position), BlockObservation(position, 1888, 0, None))
+        self.assertIsNone(self.bot.observed_block_state(position))
+        self.assertEqual(self.bot.observed_block_state(position, layer=1),
+                         BlockStateObservation(position, None, 1, "minecraft:air", {}))
+        self.assertEqual(len(self.transport.sent), sent_at_join)
+
+    async def test_observed_block_state_requires_protocol_2225_even_for_known_air(self):
+        await self.connect(hashed_runtime_ids=True, protocol=2193)
+        b = self.b
+        position = (3, 64, 7)
+        pos = b.BlockPos(x=3, y=64, z=7)
+        await self.deliver(self.air(4), b.UpdateBlockPacket(pos=pos, runtime_id=3671572261))
+        self.assertEqual(self.bot.observed_block(position).runtime_id, 3671572261)
+        self.assertTrue(self.bot.observed_block(position, layer=1).is_air)
+        self.assertIsNone(self.bot.observed_block_state(position))
+        self.assertIsNone(self.bot.observed_block_state(position, layer=1))
+        self.assertEqual(self.transport.sent, [])
 
     async def test_block_entity_query_distinguishes_empty_and_unknown_and_copies_native_values(self):
         await self.connect()
