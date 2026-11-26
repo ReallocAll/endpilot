@@ -145,6 +145,75 @@ class XboxCacheStorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((saved.home_account_id, saved.xuid, saved.gamertag), (_ACCOUNT, _XUID, "Verified"))
             self.assertEqual(other_after, saved_other)
 
+    async def test_skin_binding_requires_both_verified_identity_fields_and_is_removed_with_account(self):
+        skin = _cache.SkinBinding(str(self.root / "first.png"), "slim")
+        other_skin = _cache.SkinBinding(str(self.root / "other.png"), "wide")
+        async with _cache.locked_cache(self.path):
+            self.assertFalse(_cache.set_account_skin(self.path, _ACCOUNT, _XUID, skin))
+            self.assertFalse(self.path.exists())
+
+            _cache.save_cache(self.path, _ACCOUNT, _SERIALIZED)
+            original = self.path.read_bytes()
+            self.assertFalse(_cache.set_account_skin(self.path, _ACCOUNT, _XUID, skin))
+            self.assertEqual(self.path.read_bytes(), original)
+
+            first = _cache.AccountRecord(_ACCOUNT, json.dumps(_msal_state(_ACCOUNT)), _XUID, "First")
+            other = _cache.AccountRecord(_OTHER_ACCOUNT, json.dumps(_msal_state(_OTHER_ACCOUNT)), _OTHER_XUID, "Other")
+            _cache.upsert_account(self.path, other)
+            self.assertFalse(_cache.set_account_skin(self.path, _ACCOUNT, _XUID, skin))
+            _cache.upsert_account(self.path, first)
+            original = self.path.read_bytes()
+            self.assertNotIn("skin", json.loads(original)["accounts"][0])
+            self.assertTrue(all(account.skin is None for account in _cache.load_accounts(self.path)))
+
+            self.assertFalse(_cache.set_account_skin(self.path, _ACCOUNT, _OTHER_XUID, skin))
+            self.assertFalse(_cache.set_account_skin(self.path, _OTHER_ACCOUNT, _XUID, skin))
+            self.assertFalse(_cache.set_account_skin(self.path, "missing", _XUID, skin))
+            self.assertEqual(self.path.read_bytes(), original)
+
+            self.assertTrue(_cache.set_account_skin(self.path, _ACCOUNT, _XUID, skin))
+            first_saved, other_saved = _cache.load_accounts(self.path)
+            self.assertEqual(first_saved.skin, skin)
+            self.assertIsNone(other_saved.skin)
+            first_entry, other_entry = json.loads(self.path.read_bytes())["accounts"]
+            self.assertEqual(first_entry["skin"], {"path": skin.path, "model": "slim"})
+            self.assertNotIn("skin", other_entry)
+
+            self.assertTrue(_cache.set_account_skin(self.path, _OTHER_ACCOUNT, _OTHER_XUID, other_skin))
+            self.assertTrue(_cache.set_account_skin(self.path, _ACCOUNT, _XUID, None))
+            self.assertTrue(_cache.set_account_skin(self.path, _ACCOUNT, _XUID, None))
+            first_saved, other_saved = _cache.load_accounts(self.path)
+            self.assertIsNone(first_saved.skin)
+            self.assertEqual(other_saved.skin, other_skin)
+            self.assertNotIn("skin", json.loads(self.path.read_bytes())["accounts"][0])
+
+            self.assertTrue(_cache.set_account_skin(self.path, _ACCOUNT, _XUID, skin))
+            self.assertTrue(_cache.delete_account(self.path, _ACCOUNT))
+            self.assertEqual(_cache.load_accounts(self.path), (other_saved,))
+            _cache.upsert_account(self.path, first)
+            self.assertIsNone(_cache.load_accounts(self.path)[1].skin)
+
+    async def test_failed_skin_replacement_keeps_the_previous_binding(self):
+        account = _cache.AccountRecord(_ACCOUNT, json.dumps(_msal_state(_ACCOUNT)), _XUID, "First")
+        previous = _cache.SkinBinding(str(self.root / "first.png"), "slim")
+        replacement = _cache.SkinBinding(str(self.root / "replacement.png"), "wide")
+        async with _cache.locked_cache(self.path):
+            _cache.upsert_account(self.path, account)
+            self.assertTrue(_cache.set_account_skin(self.path, _ACCOUNT, _XUID, previous))
+            original = self.path.read_bytes()
+
+            with (
+                patch.object(os, "replace", side_effect=OSError("replacement interrupted")),
+                self.assertRaisesRegex(OSError, "replacement interrupted"),
+            ):
+                _cache.set_account_skin(self.path, _ACCOUNT, _XUID, replacement)
+
+            self.assertEqual(self.path.read_bytes(), original)
+            self.assertEqual(_cache.load_accounts(self.path)[0].skin, previous)
+            self.assertEqual(list(self.path.parent.glob(f".{self.path.name}.*.tmp")), [])
+            self.assertTrue(_cache.set_account_skin(self.path, _ACCOUNT, _XUID, replacement))
+            self.assertEqual(_cache.load_accounts(self.path)[0].skin, replacement)
+
     async def test_upsert_filters_msal_state_and_rejects_identity_conflicts(self):
         own = _msal_state(_ACCOUNT)
         foreign = _msal_state(_OTHER_ACCOUNT, refresh_token="synthetic-other-secret")
@@ -156,11 +225,15 @@ class XboxCacheStorageTests(unittest.IsolatedAsyncioTestCase):
         async with _cache.locked_cache(self.path):
             _cache.upsert_account(self.path, _cache.AccountRecord(_ACCOUNT, json.dumps(mixed), _XUID, "First"))
             _cache.upsert_account(self.path, unrelated)
+            skin = _cache.SkinBinding(str(self.root / "first.png"), "slim")
+            self.assertTrue(_cache.set_account_skin(self.path, _ACCOUNT, _XUID, skin))
             _cache.upsert_account(self.path, _cache.AccountRecord(_ACCOUNT, json.dumps(mixed), _XUID, "New Name"))
 
             saved, saved_other = _cache.load_accounts(self.path)
             self.assertEqual((saved.xuid, saved.gamertag), (_XUID, "New Name"))
+            self.assertEqual(saved.skin, skin)
             self.assertEqual(saved_other.home_account_id, _OTHER_ACCOUNT)
+            self.assertIsNone(saved_other.skin)
             state = json.loads(saved.serialized_cache)
             self.assertEqual(set(state), {"Account", "RefreshToken"})
             self.assertEqual(set(state["Account"]), {_ACCOUNT})
@@ -261,10 +334,13 @@ class XboxCacheStorageTests(unittest.IsolatedAsyncioTestCase):
             state = json.dumps(_msal_state(_ACCOUNT))
             _cache.upsert_account(self.path, _cache.AccountRecord(_ACCOUNT, state, _XUID, "Verified"))
             self.assertEqual(_cache.load_cache(self.path)[0], _ACCOUNT)
+            skin = _cache.SkinBinding(str(self.root / "renewed.png"), "wide")
+            self.assertTrue(_cache.set_account_skin(self.path, _ACCOUNT, _XUID, skin))
             renewed = json.dumps(_msal_state(_ACCOUNT, refresh_token="synthetic-rotated"))
             _cache.save_cache(self.path, _ACCOUNT, renewed)
             record, = _cache.load_accounts(self.path)
             self.assertEqual((record.xuid, record.gamertag), (_XUID, "Verified"))
+            self.assertEqual(record.skin, skin)
             self.assertEqual(json.loads(record.serialized_cache)["RefreshToken"], json.loads(renewed)["RefreshToken"])
 
             original = self.path.read_bytes()
@@ -275,7 +351,9 @@ class XboxCacheStorageTests(unittest.IsolatedAsyncioTestCase):
             _cache.upsert_account(self.path, other)
             saved_other = _cache.load_accounts(self.path)[1]
             _cache.save_cache(self.path, _ACCOUNT, state)
-            self.assertEqual(_cache.load_accounts(self.path)[1], saved_other)
+            saved, other_after = _cache.load_accounts(self.path)
+            self.assertEqual(saved.skin, skin)
+            self.assertEqual(other_after, saved_other)
             with self.assertRaisesRegex(ValueError, "multiple accounts"):
                 _cache.load_cache(self.path)
             self.assertTrue(_cache.delete_cache(self.path))
@@ -286,11 +364,22 @@ class XboxCacheStorageTests(unittest.IsolatedAsyncioTestCase):
             state = json.dumps(_msal_state(_ACCOUNT))
             _cache.upsert_account(self.path, _cache.AccountRecord(_ACCOUNT, state, _XUID, "Verified"))
             entry, = json.loads(self.path.read_bytes())["accounts"]
+            skin = {"path": str(self.root / "first.png"), "model": "wide"}
             for accounts in (
                 [dict(entry, xuid=int(_XUID))],
                 [dict(entry, gamertag=None)],
                 [entry, dict(entry, xuid=_OTHER_XUID)],
                 [entry, dict(entry, home_account_id=_OTHER_ACCOUNT)],
+                [dict(entry, skin=None)],
+                [dict(entry, skin=[])],
+                [dict(entry, skin={"path": skin["path"]})],
+                [dict(entry, skin=dict(skin, extra=True))],
+                [dict(entry, skin=dict(skin, path=100))],
+                [dict(entry, skin=dict(skin, path="relative.png"))],
+                [dict(entry, skin=dict(skin, path=skin["path"] + "\0"))],
+                [dict(entry, skin=dict(skin, model="invalid"))],
+                [dict(entry, skin=dict(skin, model=None))],
+                [dict(entry, xuid=None, gamertag=None, skin=skin)],
             ):
                 raw = json.dumps({"version": 2, "accounts": accounts})
                 self.path.write_text(raw, encoding="utf-8")

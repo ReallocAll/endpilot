@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import chdir, redirect_stderr, redirect_stdout
 from importlib.util import find_spec
 from io import StringIO
 import json
@@ -11,7 +11,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import ANY, AsyncMock, patch
 
-from endpilot import BedrockCredentials, LoginRefused, ResourcePackDecision, _cli_terminal
+from endpilot import BedrockCredentials, LoginRefused, ResourcePackDecision, Skin, _cli_terminal
 from endpilot import __main__ as cli
 from endpilot.__main__ import main
 from endpilot.authentication import OfflineIdentity
@@ -19,6 +19,7 @@ from endpilot.compression import PacketConnection
 from endpilot.login import JoinSession, request_network_settings
 from endpilot.protocol import Protocol, write_batch
 from test_join import FakeTransport
+from test_skin import _png
 from test_xbox_cache_storage import _msal_state
 from test_xbox_device_flow import CODE, URI, public_key
 
@@ -27,6 +28,7 @@ class _CliTestCase(unittest.TestCase):
     def setUp(self):
         self.bot_factory = self.enterContext(patch("endpilot.Bot"))
         self.bot = self.bot_factory.return_value
+        self.bot._skin = None
         self.bot.join_address = AsyncMock()
         self.bot.close = AsyncMock()
         self.stdout = self.enterContext(redirect_stdout(StringIO()))
@@ -128,11 +130,48 @@ class GeneralCliTests(_CliTestCase):
                 self.assertEqual(output.getvalue(), expected + "\n")
 
     def test_invalid_join_options_fail_before_creating_a_bot(self):
-        for options in (["--xuid", "123"], ["--hold", "nan"], ["--hold", "-1"],
+        for options in (["--xuid", "123"], ["--name", "First Player"],
+                        ["--xbox", "--xuid", "123", "--name", "First Player"],
+                        ["--skin-model", "slim"], ["--skin", "skin.png", "--skin-model", "other"],
+                        ["--hold", "nan"], ["--hold", "-1"],
                         ["--server-key-sha256", "not-a-digest"]):
             with self.subTest(options=options), self.assertRaises(SystemExit) as exited:
                 main(["join", "play.example:19132", *options])
             self.assertEqual(exited.exception.code, 2)
+        self.bot_factory.assert_not_called()
+
+    def test_account_skin_selectors_are_mutually_exclusive(self):
+        for command in (["set", "skin.png"], ["clear"]):
+            with self.subTest(command=command), self.assertRaises(SystemExit) as exited:
+                main(["account", "skin", *command, "--xuid", "123", "--name", "First Player"])
+            self.assertEqual(exited.exception.code, 2)
+        self.bot_factory.assert_not_called()
+
+    @unittest.skipUnless(find_spec("PIL"), "requires the skin extra")
+    def test_offline_join_passes_the_decoded_explicit_skin_to_both_transports(self):
+        png = Path(self.enterContext(TemporaryDirectory())) / "skin.png"
+        row = bytes(range(256))
+        png.write_bytes(_png(64, 32, [row] * 32))
+        for address, options, model in (
+            ("raknet://play.example:19132", [], "wide"),
+            ("http://play.example:19132", ["--skin-model", "slim"], "slim"),
+        ):
+            with self.subTest(address=address):
+                self.bot_factory.reset_mock()
+                self.assertEqual(main(["join", address, "--hold", "0", "--skin", str(png), *options]), 0)
+                self.bot_factory.assert_called_once_with("EndPilot", skin=Skin(row * 32, model=model, height=32))
+
+    def test_skin_decode_failures_have_fixed_messages_and_do_not_create_a_bot(self):
+        for failure, message in (
+            (ImportError("private module detail"), "PNG skins require Pillow. Install endpilot[skin]."),
+            (OSError("private path"), "Could not load the skin PNG."),
+            (ValueError("private parser detail"), "Could not load the skin PNG."),
+        ):
+            with (self.subTest(failure=type(failure)), redirect_stderr(StringIO()) as output,
+                  patch.object(Skin, "from_png", side_effect=failure)):
+                self.assertEqual(main(["join", "play.example:19132", "--skin", "private.png"]), 1)
+                self.assertIn(message, output.getvalue())
+                self.assertNotIn("private", output.getvalue())
         self.bot_factory.assert_not_called()
 
     def test_raknet_pin_is_rejected_before_creating_a_bot(self):
@@ -206,14 +245,15 @@ class XboxCliTests(_CliTestCase):
 
         self.bot.join_address.side_effect = join
 
-    def save(self, xuid, gamertag):
+    def save(self, xuid, gamertag, *, skin=None):
         account = f"test-{xuid}"
         state = _msal_state(account, client_id=self.xbox.DEFAULT_CLIENT_ID)
 
         async def write():
             async with self.cache.locked_cache(self.path):
-                self.cache.upsert_account(self.path, self.cache.AccountRecord(account, json.dumps(state), xuid,
-                                                                            gamertag))
+                self.cache.upsert_account(self.path, self.cache.AccountRecord(
+                    account, json.dumps(state), xuid, gamertag, skin=skin,
+                ))
 
         asyncio.run(write())
 
@@ -291,7 +331,107 @@ class XboxCliTests(_CliTestCase):
         with patch.object(sys, "stdin", StringIO("1\n")), patch.object(cli, "_can_read_terminal", return_value=True):
             self.assertEqual(main(join), 0)
         self.auth.assert_awaited_once_with(ANY, self.key, xuid="9007199254740993", add=False)
-        self.assertIn("Second Player", self.terminal.return_value.getvalue())
+        self.assertIn("2. Second Player (9007199254740995)", self.terminal.return_value.getvalue())
+
+    def test_name_selection_matches_the_whole_verified_gamertag_and_detects_ambiguity(self):
+        self.save("9007199254740993", "Straße Player")
+        self.save("9007199254740995", "Second Player")
+        join = ["join", "play.example:19132", "--xbox", "--hold", "0", "--name"]
+        self.assertEqual(main([*join, "STRASSE PLAYER"]), 0)
+        self.auth.assert_awaited_once_with(ANY, self.key, xuid="9007199254740993", add=False)
+        self.auth.reset_mock()
+        self.bot_factory.reset_mock()
+
+        self.assertEqual(main([*join, "STRASSE"]), 1)
+        self.assertIn("No remembered Xbox account matches --name.", self.stderr.getvalue())
+        self.save("9007199254740997", "Strasse Player")
+        self.assertEqual(main([*join, "STRASSE PLAYER"]), 1)
+        self.assertIn("Multiple remembered Xbox accounts match --name. Select one with --xuid.", self.stderr.getvalue())
+        self.auth.assert_not_awaited()
+        self.bot_factory.assert_not_called()
+
+    @unittest.skipUnless(find_spec("PIL"), "requires the skin extra")
+    def test_skin_set_validates_and_resolves_a_local_png_and_clear_removes_only_the_binding(self):
+        self.save("9007199254740993", "First Player")
+        self.save("9007199254740995", "Second Player")
+        png = self.path.parent / "custom.png"
+        original = self.cache.load_accounts(self.path)
+        set_skin = ["account", "skin", "set", png.name, "--name", "second player", "--model", "slim"]
+        with chdir(png.parent):
+            png.write_bytes(b"invalid PNG")
+            self.assertEqual(main(set_skin), 1)
+            self.assertEqual(self.cache.load_accounts(self.path), original)
+            png.write_bytes(_png(64, 32, [bytes(range(256))] * 32))
+            self.assertEqual(main(set_skin), 0)
+        first, second = self.cache.load_accounts(self.path)
+        self.assertEqual(first, original[0])
+        self.assertEqual(second.skin, self.cache.SkinBinding(str(png.resolve()), "slim"))
+        self.assertEqual(main(["account", "skin", "clear", "--xuid", second.xuid]), 0)
+        self.assertEqual(self.cache.load_accounts(self.path), original)
+        self.assertTrue(png.is_file())
+        self.auth.assert_not_awaited()
+        self.bot_factory.assert_not_called()
+
+    def test_skin_commands_require_a_verified_saved_account_without_authorizing(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy), redirect_stderr(StringIO()) as output:
+                if legacy:
+                    self.save_legacy()
+                self.assertEqual(main(["account", "skin", "set", "missing.png", "--name", "Player"]), 1)
+                self.assertEqual(main(["account", "skin", "clear"]), 1)
+                self.assertIn("No verified Xbox accounts are remembered. Run python -m endpilot account add.",
+                              output.getvalue())
+                self.assertEqual(self.path.exists(), legacy)
+        self.auth.assert_not_awaited()
+        self.bot_factory.assert_not_called()
+
+    def test_sole_account_uses_its_saved_skin_after_the_profile_is_verified(self):
+        png = self.path.parent / "remembered.png"
+        row = bytes(range(256))
+        skin = Skin(row * 32, height=32)
+        with patch.object(Skin, "from_png", return_value=skin) as load:
+            self.save("9007199254740993", "First Player")
+            self.assertEqual(main(["account", "skin", "set", str(png)]), 0)
+            record, = self.cache.load_accounts(self.path)
+            self.assertEqual(record.skin, self.cache.SkinBinding(str(png.resolve()), "wide"))
+            load.reset_mock()
+
+            async def authorize(_provider, key, *, xuid, add):
+                self.assertEqual((key, xuid, add), (self.key, None, False))
+                load.assert_not_called()
+                self.assertIsNone(self.bot._skin)
+                return self.auth.return_value
+
+            self.auth.side_effect = authorize
+            self.assertEqual(main(["join", "play.example:19132", "--xbox", "--hold", "0"]), 0)
+            load.assert_called_once_with(str(png.resolve()), model="wide")
+        self.bot_factory.assert_called_once_with("EndPilot")
+        self.assertIs(self.bot._skin, skin)
+
+    @unittest.skipUnless(find_spec("PIL"), "requires the skin extra")
+    def test_unusable_binding_is_only_loaded_for_the_matching_profile_without_an_override(self):
+        path = self.path.parent / "missing.png"
+        self.save("9007199254740993", "First Player", skin=self.cache.SkinBinding(str(path), "slim"))
+        join = ["join", "play.example:19132", "--xbox", "--hold", "0"]
+        self.auth.return_value = self.credentials, ("9007199254740995", "Different Player"), False
+        self.assertEqual(main(join), 0)
+        self.assertIsNone(self.bot._skin)
+
+        self.auth.return_value = self.credentials, ("9007199254740993", "First Player"), False
+        for contents in (None, b"invalid PNG"):
+            with self.subTest(contents=contents), redirect_stderr(StringIO()) as output:
+                if contents is not None:
+                    path.write_bytes(contents)
+                self.assertEqual(main(join), 1)
+                self.assertIn("Could not load the saved Xbox skin. Use join --skin to override it,", output.getvalue())
+                self.assertNotIn(str(path), output.getvalue())
+
+        png = self.path.parent / "override.png"
+        row = bytes(range(256))
+        png.write_bytes(_png(64, 32, [row] * 32))
+        self.bot_factory.reset_mock()
+        self.assertEqual(main([*join, "--skin", str(png), "--skin-model", "wide"]), 0)
+        self.bot_factory.assert_called_once_with("EndPilot", skin=Skin(row * 32, height=32))
 
     def test_no_terminal_or_choice_cancellation_stops_before_join_or_forget(self):
         self.save_legacy()
@@ -299,7 +439,7 @@ class XboxCliTests(_CliTestCase):
         original = self.path.read_bytes()
         join = ["join", "play.example:19132", "--xbox", "--hold", "0"]
         self.assertEqual(main(join), 1)
-        self.assertIn("--xuid", self.stderr.getvalue())
+        self.assertIn("--name or --xuid", self.stderr.getvalue())
         self.terminal.return_value = StringIO()
         with patch.object(sys, "stdin", StringIO("\n")), patch.object(cli, "_can_read_terminal", return_value=True):
             self.assertEqual(main(join), 130)

@@ -48,7 +48,8 @@ python -m endpilot join raknet://127.0.0.1:19132 --hold 10
 
 After spawning, the CLI prints `Joined.` and then `Disconnected.` after the
 hold time. The default hold is two seconds. Press Ctrl+C to cancel.
-Run `python -m endpilot join --help` for all join options.
+Run `python -m endpilot join --help` for all join options. To join with a PNG
+skin, see [Load a skin at login](skins.md#load-a-skin-at-login).
 
 To join as `Knight` from Python, save this as `offline_join.py` and run
 `python offline_join.py`. Omitting the credential provider selects offline login.
@@ -113,28 +114,34 @@ and newly issued Bedrock credentials.
 ```sh
 python -m endpilot account add
 python -m endpilot account list
+python -m endpilot join raknet://bedrock.example:19132 --xbox --name Knight
 python -m endpilot join raknet://bedrock.example:19132 --xbox --xuid 2533274790000000
 python -m endpilot account forget --xuid 2533274790000000
 ```
 
 Run `account add` in an interactive terminal to authorize and save an account
 without joining a server. `account list` shows the XUID and gamertag of each
-verified account. Replace the sample XUID with one from that list. Run
-`python -m endpilot account --help` for the available account commands.
+verified account. For `join --xbox`, use either `--name` or `--xuid` with a
+value from that list. `--name` matches the full saved gamertag without regard
+to case. If several accounts share that gamertag, use `--xuid` to select one.
+Run `python -m endpilot account --help` for the available account commands.
 
 - With an empty cache, `join --xbox` starts device authorization.
 - With one account, the join tries it silently and prompts for device
   authorization if required and a terminal is available.
-- With multiple accounts, choose one by number in an interactive terminal or
-  pass `--xuid` for a verified account. Press Enter at the chooser to cancel.
+- With multiple accounts, choose by number from the list of names in an
+  interactive terminal. Press Enter at the chooser to cancel. In a
+  non-interactive session, pass `--name` or `--xuid` to choose the account.
   The CLI tries only the selected account. Selecting a verified account uses
-  silent sign-in, including in a non-interactive session when using `--xuid`.
-  If it needs fresh authorization, use `account add` for that account and
-  retry the join.
+  silent sign-in. If it needs fresh authorization, use `account add` for that
+  account and retry the join.
 
 A legacy record with no verified XUID can be selected from the interactive
 menu. The CLI can ask you to authorize the same account to verify its identity.
 If the upgrade succeeds, the next account list shows its XUID and gamertag.
+
+To use a PNG skin whenever you join with a verified account, see
+[Save a skin for an Xbox account](skins.md#save-a-skin-for-an-xbox-account).
 
 The cache stores renewable credentials in plaintext. Anyone who can read the
 file may reuse the authorization. The CLI shows the actual path before

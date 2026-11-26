@@ -9,11 +9,12 @@ from pathlib import Path
 import re
 import sys
 
-from . import LoginRefused
+from . import LoginRefused, Skin
 from ._cli_terminal import (
     _can_read_terminal, _device_terminal, _print_remember_notice, _print_status, _show_device_code, _write_notice,
 )
 from ._join_address import _parse_join_address
+from .skin import _SkinModel
 
 
 class _Arguments(argparse.ArgumentParser):
@@ -71,24 +72,26 @@ def _nethernet_failure_message(error: BaseException) -> str | None:
     return None
 
 
-def _choose_account(labels: list[str], owned: ExitStack) -> int:
+def _choose_account(labels: list[str], owned: ExitStack, *, allow_name: bool) -> int:
+    selector = "--name or --xuid" if allow_name else "--xuid"
     if not _can_read_terminal(sys.stdin):
-        raise _CommandError("Multiple Xbox accounts are remembered. Select one with --xuid.")
+        raise _CommandError(f"Multiple Xbox accounts are remembered. Select one with {selector}.")
     terminal = _device_terminal(owned)
     rows = [f"  {index}. {label}" for index, label in enumerate(labels, 1)]
     prompt = "\n".join(["Choose an Xbox account", *rows, "Enter a number, or press Enter to cancel."])
     if not _write_notice(prompt, terminal):
-        raise _CommandError("Could not display the Xbox account chooser. Select an account with --xuid.")
+        raise _CommandError(f"Could not display the Xbox account chooser. Select an account with {selector}.")
     try:
         answer = sys.stdin.readline().strip()
     except (OSError, ValueError):
-        raise _CommandError("Could not read the Xbox account choice. Select an account with --xuid.") from None
+        raise _CommandError(f"Could not read the Xbox account choice. Select an account with {selector}.") from None
     if not answer:
         raise asyncio.CancelledError
     for index in range(len(labels)):
         if answer == str(index + 1):
             return index
-    raise _CommandError("Invalid Xbox account choice. Run account list to find the XUID for --xuid.")
+    guidance = f"select an account with {selector}" if allow_name else "find the XUID for --xuid"
+    raise _CommandError(f"Invalid Xbox account choice. Run account list to {guidance}.")
 
 
 def _account_label(account) -> str:
@@ -97,16 +100,32 @@ def _account_label(account) -> str:
     return f"{account.gamertag} ({account.xuid})"
 
 
-def _select_account(accounts, xuid: str | None):
+def _select_account(accounts, xuid: str | None, *, name: str | None = None, allow_name: bool = True):
     if xuid is not None:
         for account in accounts:
             if account.xuid == xuid:
                 return account
         raise _CommandError("No remembered Xbox account matches --xuid. Run account list to see saved accounts.")
+    if name is not None:
+        name = name.casefold()
+        matches = [account for account in accounts if account.xuid is not None and account.gamertag.casefold() == name]
+        if not matches:
+            raise _CommandError("No remembered Xbox account matches --name. Run account list to see saved accounts.")
+        if len(matches) > 1:
+            raise _CommandError("Multiple remembered Xbox accounts match --name. Select one with --xuid.")
+        return matches[0]
     if len(accounts) < 2:
         return accounts[0] if accounts else None
     with ExitStack() as owned:
-        return accounts[_choose_account([_account_label(account) for account in accounts], owned)]
+        index = _choose_account([_account_label(account) for account in accounts], owned, allow_name=allow_name)
+    return accounts[index]
+
+
+def _add_account_selector(parser: argparse.ArgumentParser, *, requires_xbox: bool = False) -> None:
+    selector = parser.add_mutually_exclusive_group()
+    suffix = " (requires --xbox)" if requires_xbox else ""
+    selector.add_argument("--xuid", metavar="XUID", help=f"select a remembered Xbox account by XUID{suffix}")
+    selector.add_argument("--name", metavar="NAME", help=f"select a remembered Xbox account by gamertag{suffix}")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -116,7 +135,9 @@ def _parser() -> argparse.ArgumentParser:
     join.add_argument("address", metavar="ADDRESS",
                       help="host:port or a raknet://, https:// or http:// server URL")
     join.add_argument("--xbox", action="store_true", help="sign in with an Xbox account")
-    join.add_argument("--xuid", metavar="XUID", help="select a remembered Xbox account (requires --xbox)")
+    _add_account_selector(join, requires_xbox=True)
+    join.add_argument("--skin", type=Path, metavar="PNG", help="use a custom skin PNG for this join")
+    join.add_argument("--skin-model", choices=("wide", "slim"), help="arm model for --skin (default: wide)")
     join.add_argument("--server-key-sha256", metavar="HEX", help="trusted NetherNet server key digest")
     join.add_argument("--hold", type=float, default=2, metavar="SECONDS",
                       help="time to stay connected after spawning (default: 2)")
@@ -128,14 +149,52 @@ def _parser() -> argparse.ArgumentParser:
     accounts.add_parser("list", help="list remembered Xbox accounts")
     forget = accounts.add_parser("forget", help="remove a remembered Xbox account")
     forget.add_argument("--xuid", metavar="XUID", help="select a remembered Xbox account")
+    skin = accounts.add_parser("skin", help="manage a remembered Xbox account's skin")
+    skin_commands = skin.add_subparsers(dest="skin_command", required=True)
+    set_skin = skin_commands.add_parser("set", help="bind a skin PNG to a remembered Xbox account")
+    set_skin.add_argument("skin", type=Path, metavar="PNG", help="path to a custom skin PNG")
+    set_skin.add_argument("--model", choices=("wide", "slim"), default="wide", help="arm model (default: wide)")
+    clear_skin = skin_commands.add_parser("clear", help="clear a remembered Xbox account's skin")
+    _add_account_selector(set_skin)
+    _add_account_selector(clear_skin)
     return parser
 
 
-async def _join(args, credential_provider=None) -> None:
+def _load_skin(path: str | Path, model: _SkinModel, *, saved: bool = False) -> Skin:
+    try:
+        return Skin.from_png(path, model=model)
+    except ImportError:
+        raise _CommandError("PNG skins require Pillow. Install endpilot[skin].") from None
+    except (OSError, ValueError):
+        if saved:
+            raise _CommandError("Could not load the saved Xbox skin. Use join --skin to override it, "
+                                "or run account skin set or account skin clear.") from None
+        raise _CommandError("Could not load the skin PNG. Use a readable 64x32, 64x64, or 128x128 static PNG.") from None
+
+
+async def _join(args, authorize_account=None, *, selected_account=None) -> None:
     from . import Bot, ResourcePackDecision
 
-    bot = Bot("EndPilot")
+    if args.skin is None:
+        bot = Bot("EndPilot")
+    else:
+        bot = Bot("EndPilot", skin=_load_skin(args.skin, args.skin_model or "wide"))
+
     try:
+        credential_provider = None
+        if authorize_account is not None:
+            binding = selected_account.skin if args.skin is None and selected_account is not None else None
+
+            async def credentials(public_key: str):
+                authorized, (xuid, _), remember_skipped = await authorize_account(public_key)
+                if remember_skipped:
+                    _write_notice("Xbox account was not remembered. Continuing with this sign-in only.", sys.stderr)
+                if binding is not None and xuid == selected_account.xuid:
+                    # The fresh CLI bot reads _skin after acquiring identity and before opening the connection.
+                    bot._skin = _load_skin(binding.path, binding.model, saved=True)
+                return authorized
+
+            credential_provider = credentials
         on_resource_packs = None
         if args.accept_resource_packs:
             on_resource_packs = lambda _offer: ResourcePackDecision.ACCEPT
@@ -207,26 +266,46 @@ async def _run_xbox(args) -> None:
             return
 
         if args.command == "join":
+            selected = _select_account(accounts, args.xuid, name=args.name)
             xuid = None
             legacy_account_id = None
-            if args.xuid is not None or len(accounts) > 1:
-                selected = _select_account(accounts, args.xuid)
+            if args.xuid is not None or args.name is not None or len(accounts) > 1:
                 xuid = selected.xuid
                 if xuid is None:
                     legacy_account_id = selected.home_account_id
 
-            async def credentials(public_key: str):
-                authorized, _, remember_skipped = await _authorize_account(
+            async def authorize(public_key: str):
+                return await _authorize_account(
                     public_key, path, xuid=xuid, legacy_account_id=legacy_account_id,
                 )
-                if remember_skipped:
-                    _write_notice("Xbox account was not remembered. Continuing with this sign-in only.", sys.stderr)
-                return authorized
 
-            await _join(args, credentials)
+            await _join(args, authorize, selected_account=selected)
             return
 
-        selected = _select_account(accounts, args.xuid)
+        if args.account_command == "skin":
+            verified = tuple(account for account in accounts if account.xuid is not None)
+            if not verified:
+                raise _CommandError("No verified Xbox accounts are remembered. Run python -m endpilot account add.")
+            selected = _select_account(verified, args.xuid, name=args.name)
+            binding = None
+            if args.skin_command == "set":
+                try:
+                    skin_path = args.skin.resolve()
+                except (OSError, ValueError, RuntimeError):
+                    raise _CommandError("Could not resolve the skin PNG path. Check the path and try again.") from None
+                _load_skin(skin_path, args.model)
+                binding = _cache.SkinBinding(str(skin_path), args.model)
+            async with xbox._locked_cache(path):
+                updated = xbox._cache_operation(
+                    _cache.set_account_skin, path, selected.home_account_id, selected.xuid, binding,
+                )
+            if not updated:
+                raise _CommandError("The selected Xbox account is no longer remembered. Run account list and try again.")
+            action = "Set" if binding is not None else "Cleared"
+            _print_status(f"{action} the skin for {_account_label(selected)}.", flush=True)
+            return
+
+        selected = _select_account(accounts, args.xuid, allow_name=False)
         if selected is None:
             _print_status("No remembered Xbox accounts.", flush=True)
             return
@@ -256,8 +335,13 @@ def main(argv: list[str] | None = None) -> int:
             address = _parse_join_address(args.address)
         except ValueError:
             parser.exit(2, "Invalid server address. See join --help.\n")
-        if args.xuid is not None and not args.xbox:
-            parser.exit(2, "--xuid requires --xbox for a join.\n")
+        if not args.xbox:
+            if args.xuid is not None:
+                parser.exit(2, "--xuid requires --xbox for a join.\n")
+            if args.name is not None:
+                parser.exit(2, "--name requires --xbox for a join.\n")
+        if args.skin_model is not None and args.skin is None:
+            parser.exit(2, "--skin-model requires --skin.\n")
         if not isfinite(args.hold) or args.hold < 0:
             parser.exit(2, "--hold requires a finite, nonnegative duration.\n")
         if args.server_key_sha256 is not None:

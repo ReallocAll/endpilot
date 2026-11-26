@@ -149,6 +149,20 @@ def _validate_profile(xuid: object, gamertag: object) -> None:
 
 
 @dataclass(frozen=True, slots=True)
+class SkinBinding:
+    """The absolute local PNG path and classic skin model saved for an account."""
+
+    path: str
+    model: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, str) or "\0" in self.path or not Path(self.path).is_absolute():
+            raise ValueError("Xbox account skin requires an absolute path")
+        if not isinstance(self.model, str) or self.model not in ("wide", "slim"):
+            raise ValueError("Xbox account skin model must be 'wide' or 'slim'")
+
+
+@dataclass(frozen=True, slots=True)
 class AccountRecord:
     """One Microsoft account and its last verified Xbox profile, if available."""
 
@@ -156,11 +170,14 @@ class AccountRecord:
     serialized_cache: str = field(repr=False)
     xuid: str | None = None
     gamertag: str | None = None
+    skin: SkinBinding | None = None
 
     def __post_init__(self):
         if (not isinstance(self.home_account_id, str) or not self.home_account_id
                 or not isinstance(self.serialized_cache, str) or not self.serialized_cache):
             raise ValueError("Xbox cache requires an account ID and serialized cache")
+        if self.skin is not None and (self.xuid is None or not isinstance(self.skin, SkinBinding)):
+            raise ValueError("Xbox account skin requires a verified account and skin binding")
         if self.xuid is None and self.gamertag is None:
             return
         _validate_profile(self.xuid, self.gamertag)
@@ -186,8 +203,14 @@ def _read_cache(path: Path) -> tuple[int | None, dict[str, AccountRecord]]:
         for entry in data["accounts"]:
             if not isinstance(entry, dict):
                 raise ValueError
+            skin = None
+            if "skin" in entry:
+                binding = entry["skin"]
+                if not isinstance(binding, dict) or binding.keys() != {"path", "model"}:
+                    raise ValueError
+                skin = SkinBinding(binding["path"], binding["model"])
             account = AccountRecord(entry["home_account_id"], entry["serialized_cache"],
-                                    entry["xuid"], entry["gamertag"])
+                                    entry["xuid"], entry["gamertag"], skin)
             if account.home_account_id in accounts or account.xuid in xuids:
                 raise ValueError
             accounts[account.home_account_id] = account
@@ -237,13 +260,27 @@ def upsert_account(path: Path, account: AccountRecord) -> None:
         raise ValueError("Xbox cache requires a verified Xbox profile")
     _, accounts = _read_cache(path)
     previous = accounts.get(account.home_account_id)
-    if previous is not None and previous.xuid is not None and previous.xuid != account.xuid:
-        raise ValueError("Xbox cache account already has a different XUID")
+    if previous is not None and previous.xuid is not None:
+        if previous.xuid != account.xuid:
+            raise ValueError("Xbox cache account already has a different XUID")
+        account = replace(account, skin=previous.skin)
     if any(saved.xuid == account.xuid and saved.home_account_id != account.home_account_id
            for saved in accounts.values()):
         raise ValueError("Xbox cache XUID already belongs to a different account")
     accounts[account.home_account_id] = _verified_cache(path, account)
     _write_accounts(path, accounts.values())
+
+
+def set_account_skin(path: Path, home_account_id: str, xuid: str, skin: SkinBinding | None) -> bool:
+    """Set or clear a skin under the caller's lock. Return whether both IDs matched."""
+    _, accounts = _read_cache(path)
+    account = accounts.get(home_account_id)
+    if account is None or account.xuid is None or account.xuid != xuid:
+        return False
+    if account.skin != skin:
+        accounts[home_account_id] = replace(account, skin=skin)
+        _write_accounts(path, accounts.values())
+    return True
 
 
 def save_cache(path: Path, home_account_id: str, serialized_cache: str) -> None:
@@ -264,7 +301,13 @@ def save_cache(path: Path, home_account_id: str, serialized_cache: str) -> None:
 
 
 def _write_accounts(path: Path, accounts: Iterable[AccountRecord]) -> None:
-    _write_cache(path, {"version": 2, "accounts": [asdict(account) for account in accounts]})
+    entries = []
+    for account in accounts:
+        entry = asdict(account)
+        if account.skin is None:
+            del entry["skin"]
+        entries.append(entry)
+    _write_cache(path, {"version": 2, "accounts": entries})
 
 
 def _write_cache(path: Path, data: dict) -> None:
