@@ -183,3 +183,42 @@ player or an unobserved entity raises `LookupError`, as does a pending wait
 whose instance leaves view or is replaced. A dimension change ends pending
 waits with `RuntimeError`. A deadline raises `TimeoutError`, and connection
 end raises `ConnectionError` in pending waits and ends all subscriptions.
+
+## Observe native entity actor events
+
+`bot.subscribe_entity_actor_events(callback, runtime_id=..., event_id=...)`
+calls a synchronous callback with one `EntityActorEvent` for each matching
+packet, including repeats, and returns an idempotent unsubscribe function.
+Use
+`await bot.wait_for_entity_actor_event(runtime_id=..., event_id=..., timeout=15)`
+for the next matching packet, or set `timeout=None` to wait without a deadline.
+Both methods send no packets.
+
+Omit `runtime_id` to observe any currently tracked remote entity. Omit
+`event_id` to receive events without filtering by ID, or pass a native
+`ActorEvent` member or an integer from 0 through 255. An invalid filter
+value raises `ValueError`.
+Each immutable `EntityActorEvent` contains the packet's numeric `event_id`,
+opaque integer `data`, and `fire_at_position` as an `(x, y, z)` tuple or
+`None`. Its `entity` is the immutable `EntityState` tracked under the
+packet's runtime ID at packet time. The snapshot includes the unique
+`entity_id` when known. For a player awaiting a roster entry, it is `0`.
+
+```python
+ActorEvent = bot.protocol.binding.ActorEvent
+event = await bot.wait_for_entity_actor_event(event_id=ActorEvent.EAT_GRASS)
+print(event.entity.runtime_id, event.event_id)
+```
+
+`EAT_GRASS` is the server's grazing notification. Observe the block
+separately to confirm a terrain change.
+[Read an observed block](world.md#read-an-observed-block)
+
+A runtime filter binds to the current entity instance. If the entity leaves
+view or its runtime ID is reused, a filtered subscription ends and a pending
+filtered wait raises `LookupError`. A runtime filter for the local player
+or an unobserved entity also raises `LookupError`. Dimension changes end
+filtered subscriptions and raise `RuntimeError` in pending waits.
+Subscriptions without a runtime filter continue across dimension changes.
+A deadline raises `TimeoutError`. Disconnection removes all subscriptions
+and raises `ConnectionError` in pending waits.

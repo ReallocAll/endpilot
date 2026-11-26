@@ -1,11 +1,11 @@
-"""Exercise remote actor health observations through a joined Bot."""
+"""Exercise remote actor observations through a joined Bot."""
 
 import asyncio
 from dataclasses import FrozenInstanceError
 import unittest
 from unittest.mock import patch
 
-from endpilot import Bot, EntityHealthEvent
+from endpilot import Bot, EntityActorEvent, EntityHealthEvent
 from endpilot.protocol import write_batch
 from test_scheduled_input import ManualClock, Wire
 
@@ -38,11 +38,15 @@ class EntityHealthEventTests(unittest.IsolatedAsyncioTestCase):
         return b.AddActorPacket(runtime_id=runtime_id, entity_id=entity_id, actor_type="minecraft:zombie",
                                 pos=b.Vec3(x=1.5, y=100, z=1.5))
 
-    def actor_event(self, event="HURT", runtime_id=8, data=0):
-        return self.b.ActorEventPacket(runtime_id=runtime_id, event_id=self.b.ActorEvent[event], data=data)
+    def actor_event(self, event="HURT", runtime_id=8, data=0, fire_at_position=None):
+        if isinstance(event, str):
+            event = self.b.ActorEvent[event]
+        return self.b.ActorEventPacket(runtime_id=runtime_id, event_id=event, data=data,
+                                       fire_at_position=fire_at_position)
 
-    async def arm(self, **filters):
-        wait = asyncio.create_task(self.bot.wait_for_entity_health_event(timeout=1, **filters))
+    async def arm(self, wait_for_event=None, **filters):
+        wait_for_event = wait_for_event or self.bot.wait_for_entity_health_event
+        wait = asyncio.create_task(wait_for_event(timeout=1, **filters))
         self.addAsyncCleanup(self.cancel, wait)
         await asyncio.sleep(0)
         return wait
@@ -51,6 +55,87 @@ class EntityHealthEventTests(unittest.IsolatedAsyncioTestCase):
     async def cancel(wait):
         wait.cancel()
         await asyncio.gather(wait, return_exceptions=True)
+
+    async def test_actor_events_preserve_codec_fields_order_and_packet_time_state(self):
+        b = self.b
+        eat_grass = b.ActorEvent.EAT_GRASS
+        await self.deliver(self.spawn(), self.spawn(9, 109))
+        actors = {actor.runtime_id: actor for actor in self.bot.observed_entities}
+        original, other = actors[8], actors[9]
+        beginning = len(self.wire.sent)
+        seen, eating, unknown, health = [], [], [], []
+        self.bot.subscribe_entity_actor_events(seen.append)
+        self.bot.subscribe_entity_actor_events(eating.append, runtime_id=8, event_id=eat_grass)
+        self.bot.subscribe_entity_actor_events(unknown.append, event_id=255)
+        self.bot.subscribe_entity_health_events(health.append)
+        wait_for_actor_event = self.bot.wait_for_entity_actor_event
+        first_eat = await self.arm(wait_for_actor_event, runtime_id=8, event_id=eat_grass)
+        first_unknown = await self.arm(wait_for_actor_event, event_id=255)
+
+        await self.deliver(self.actor_event(255, runtime_id=99), self.actor_event(255, runtime_id=7),
+                           self.actor_event(eat_grass, runtime_id=9, data=10), self.actor_event(data=12))
+        self.assertFalse(first_eat.done())
+        self.assertFalse(first_unknown.done())
+        self.assertEqual(eating, [])
+        self.assertEqual(unknown, [])
+
+        position = (2.25, -4.5, 12.75)
+        first = self.actor_event(eat_grass, data=-13, fire_at_position=b.Vec3(x=2.25, y=-4.5, z=12.75))
+        move = b.MoveActorAbsolutePacket(move_data=b.MoveActorAbsoluteData(
+            runtime_id=8, pos=b.Vec3(x=3.5, y=100, z=1.5),
+        ))
+        await self.deliver(first, first, move, self.actor_event(eat_grass), self.actor_event(255, data=-128))
+        current = next(actor for actor in self.bot.observed_entities if actor.runtime_id == 8)
+        self.assertEqual(current.position, (3.5, 100.0, 1.5))
+        first_event = EntityActorEvent(original, eat_grass, -13, position)
+        later_event = EntityActorEvent(current, eat_grass, 0, None)
+        unknown_event = EntityActorEvent(current, 255, -128, None)
+        self.assertEqual(seen, [EntityActorEvent(other, eat_grass, 10, None),
+                                EntityActorEvent(original, b.ActorEvent.HURT, 12, None),
+                                first_event, first_event, later_event, unknown_event])
+        self.assertEqual(eating, [first_event, first_event, later_event])
+        self.assertEqual(unknown, [unknown_event])
+        self.assertEqual(await first_eat, first_event)
+        self.assertEqual(await first_unknown, unknown_event)
+        self.assertEqual(health, [EntityHealthEvent("hurt", original)])
+        self.assertEqual(seen[2].entity.position, (1.5, 100.0, 1.5))
+        with self.assertRaises(FrozenInstanceError):
+            seen[2].fire_at_position = None
+        self.assertEqual(len(self.wire.sent), beginning)
+
+    async def test_actor_event_filters_end_when_the_tracked_instance_ends(self):
+        eat_grass = self.b.ActorEvent.EAT_GRASS
+        await self.deliver(self.spawn())
+        old, seen = [], []
+        subscribe = self.bot.subscribe_entity_actor_events
+        wait_for_actor_event = self.bot.wait_for_entity_actor_event
+        subscribe(old.append, runtime_id=8, event_id=eat_grass)
+        subscribe(seen.append, event_id=eat_grass)
+        waiting = await self.arm(wait_for_actor_event, runtime_id=8, event_id=eat_grass)
+        await self.deliver(self.b.RemoveActorPacket(entity_id=108), self.actor_event(eat_grass))
+        self.assertTrue(waiting.done())
+        with self.assertRaisesRegex(LookupError, "no longer observed"):
+            await waiting
+        self.assertEqual(seen, [])
+
+        await self.deliver(self.spawn(entity_id=109), self.actor_event(eat_grass))
+        displaced, replacement = [], []
+        subscribe(displaced.append, runtime_id=8)
+        waiting = await self.arm(wait_for_actor_event, runtime_id=8)
+        global_wait = await self.arm(wait_for_actor_event, event_id=eat_grass)
+        await self.deliver(self.spawn(entity_id=110), self.actor_event(eat_grass))
+        self.assertTrue(waiting.done())
+        with self.assertRaisesRegex(LookupError, "no longer observed"):
+            await waiting
+        self.assertEqual(old, [])
+        self.assertEqual(displaced, [])
+        self.assertEqual([event.entity.entity_id for event in seen], [109, 110])
+        self.assertEqual(await global_wait, seen[-1])
+
+        subscribe(replacement.append, runtime_id=8)
+        await self.deliver(self.actor_event(eat_grass))
+        self.assertEqual(replacement, [seen[-1]])
+        self.assertEqual(seen[-1].entity.entity_id, 110)
 
     async def test_supported_remote_events_filter_and_keep_packet_time_state(self):
         b = self.b
@@ -155,15 +240,19 @@ class EntityHealthEventTests(unittest.IsolatedAsyncioTestCase):
                 await self.deliver(self.spawn(), b.SetActorLinkPacket(
                     link=b.ActorLink(a=108, b=17, type=b.ActorLinkType.RIDING),
                 ))
-                seen, waits = [], []
+                health, actor_events, waits = [], [], []
 
                 def register(change):
                     if change.reason == "unobserved":
-                        self.bot.subscribe_entity_health_events(seen.append, runtime_id=8)
-                        waiting = asyncio.eager_task_factory(asyncio.get_running_loop(),
-                            self.bot.wait_for_entity_health_event(runtime_id=8, timeout=1))
-                        self.addAsyncCleanup(self.cancel, waiting)
-                        waits.append(waiting)
+                        loop = asyncio.get_running_loop()
+                        for subscribe, wait_for_event, seen in (
+                            (self.bot.subscribe_entity_health_events, self.bot.wait_for_entity_health_event, health),
+                            (self.bot.subscribe_entity_actor_events, self.bot.wait_for_entity_actor_event, actor_events),
+                        ):
+                            subscribe(seen.append, runtime_id=8)
+                            waiting = asyncio.eager_task_factory(loop, wait_for_event(runtime_id=8, timeout=1))
+                            self.addAsyncCleanup(self.cancel, waiting)
+                            waits.append(waiting)
 
                 stop_links = self.bot.subscribe_vehicle_links(register)
                 try:
@@ -172,10 +261,13 @@ class EntityHealthEventTests(unittest.IsolatedAsyncioTestCase):
                     await self.deliver(self.spawn(entity_id=109), self.actor_event())
                 finally:
                     stop_links()
-                waiting, = waits
-                with self.assertRaises(RuntimeError if dimension_change else LookupError):
-                    await waiting
-                self.assertEqual(seen, [])
+                self.assertEqual(len(waits), 2)
+                for waiting in waits:
+                    self.assertTrue(waiting.done())
+                    with self.assertRaises(RuntimeError if dimension_change else LookupError):
+                        await waiting
+                self.assertEqual(health, [])
+                self.assertEqual(actor_events, [])
 
     async def test_callback_failure_timeout_cancellation_and_unsubscribe_leave_stream_running(self):
         await self.deliver(self.spawn())
@@ -220,11 +312,12 @@ class EntityHealthEventTests(unittest.IsolatedAsyncioTestCase):
         unsubscribe()
 
     async def test_reader_failure_ends_wait_and_preserves_cause(self):
-        waiting = await self.arm()
+        waits = (await self.arm(), await self.arm(self.bot.wait_for_entity_actor_event))
         cause = OSError("synthetic receive failure")
         self.wire.incoming.put_nowait(cause)
-        with self.assertRaises(ConnectionError) as caught:
-            await waiting
-        self.assertIs(caught.exception.__cause__, cause)
+        for waiting in waits:
+            with self.assertRaises(ConnectionError) as caught:
+                await waiting
+            self.assertIs(caught.exception.__cause__, cause)
         with self.assertRaises(OSError):
             await self.bot.close()
