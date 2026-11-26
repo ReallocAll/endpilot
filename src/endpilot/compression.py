@@ -114,7 +114,7 @@ class PacketConnection:
         for callback in tuple(subscribers):
             try:
                 callback(value)
-            except Exception as error:
+            except (Exception, asyncio.CancelledError) as error:
                 asyncio.get_running_loop().call_exception_handler({
                     "message": "packet observer failed",
                     "exception": error,
@@ -139,7 +139,7 @@ class PacketConnection:
             try:
                 if match is None or match(raw):
                     received.set_result(raw)
-            except Exception as error:
+            except (Exception, asyncio.CancelledError) as error:
                 received.set_exception(error)
 
         unsubscribe = self.subscribe_raw(observe)
@@ -192,12 +192,19 @@ class PacketConnection:
                     "callback": callback,
                 })
 
+    def _fail_raw_reads(self, error):
+        while self._waiters:
+            waiter = self._waiters.popleft()
+            if not waiter.done():
+                waiter.set_exception(error)
+
     def _notify_reader_end(self, reader):
         cause = None if reader.cancelled() else reader.exception()
         # Dispatch reports receive errors inline. This callback still covers cancellation,
         # including cancellation before the coroutine starts.
         if not isinstance(cause, Exception):
             self._publish_reader_end(cause)
+            self._fail_raw_reads(ConnectionError("connection closed"))
 
     async def _dispatch(self, before_dispatch):
         try:
@@ -219,26 +226,30 @@ class PacketConnection:
         except Exception as error:
             # Invalidate observations before releasing readers or completing the reader task.
             self._publish_reader_end(error)
-            for waiter in self._waiters:
-                if not waiter.done():
-                    waiter.set_exception(error)
-            self._waiters.clear()
+            self._fail_raw_reads(error)
             raise
 
     async def recv_raw(self) -> RawPacket:
-        if self._reader_task is None:
+        reader = self._reader_task
+        if reader is None:
             return await self._read_wire()
-        if self._reader_task.done():
-            await self._reader_task
+        if reader.done():
+            if reader.cancelled():
+                raise ConnectionError("connection closed")
+            reader.result()
+            raise ConnectionError("packet reader stopped")
         # Once dispatch runs, a direct read waits for the *next* live packet.
         # Subscribe before receiving to observe every packet of a particular type.
         waiter = asyncio.get_running_loop().create_future()
         self._waiters.append(waiter)
         try:
             return await waiter
-        finally:
-            if not waiter.done():
-                waiter.cancel()
+        except asyncio.CancelledError:
+            try:
+                self._waiters.remove(waiter)
+            except ValueError:
+                pass  # Dispatch or close already removed it.
+            raise
 
     async def recv(self):
         return self.protocol.decode(await self.recv_raw())
@@ -252,8 +263,5 @@ class PacketConnection:
                 except asyncio.CancelledError:
                     pass
         finally:
-            for waiter in self._waiters:
-                if not waiter.done():
-                    waiter.set_exception(ConnectionError("connection closed"))
-            self._waiters.clear()
+            self._fail_raw_reads(ConnectionError("connection closed"))
             await self.transport.close()

@@ -776,7 +776,15 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
         sent = []
         unsubscribe = stream.subscribe_sent(sent.append)
         packet = b.RequestChunkRadiusPacket(chunk_radius=16, max_chunk_radius=16)
-        await stream.send(packet)
+
+        def cancelled(_packet_id):
+            raise asyncio.CancelledError("sent observer failed")
+
+        stop = stream.subscribe_sent(cancelled)
+        with patch.object(asyncio.get_running_loop(), "call_exception_handler") as report:
+            await stream.send(packet)
+        self.assertIsInstance(report.call_args.args[0]["exception"], asyncio.CancelledError)
+        stop()
         with patch.object(fake, "send", side_effect=ConnectionError("transport refused")):
             with self.assertRaisesRegex(ConnectionError, "transport refused"):
                 await stream.send(packet)
@@ -794,7 +802,9 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
         stream = PacketConnection(fake, protocol, settings)
         observed = []
 
-        def broken(_raw):
+        def broken(raw):
+            if raw.body == b"second":
+                raise asyncio.CancelledError("extension callback cancelled")
             raise ValueError("extension callback failed")
 
         stream.subscribe_raw(broken)
@@ -808,10 +818,53 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await asyncio.wait_for(receiving, 1), raw)
 
             self.assertEqual([packet.body for packet in observed], [b"first", b"second"])
-            self.assertEqual(report.call_count, 2)
+            self.assertEqual([type(call.args[0]["exception"]) for call in report.call_args_list],
+                             [ValueError, asyncio.CancelledError])
 
         await stream.close()
         self.assertTrue(fake.closed)
+
+    async def test_cancelled_match_ends_only_its_own_packet_wait(self):
+        fake = FakeTransport()
+        stream = PacketConnection(fake, None, SimpleNamespace(compression_algorithm=65535, compression_threshold=0))
+        self.addAsyncCleanup(stream.close)
+        stream.start_receiving()
+
+        def cancelled(raw):
+            raise asyncio.CancelledError("predicate cancelled")
+
+        raw = RawPacket(4, b"marker")
+        matching = asyncio.create_task(stream.wait_for_packet(raw.packet_id, match=cancelled, timeout=1))
+        await asyncio.sleep(0)
+        fake.received.put_nowait(write_batch([raw]))
+        with self.assertRaisesRegex(asyncio.CancelledError, "predicate cancelled"):
+            await matching
+        fake.received.put_nowait(write_batch([raw]))
+        async with asyncio.timeout(1):
+            self.assertEqual(await stream.recv_raw(), raw)
+
+    async def test_caller_and_reader_cancellations_settle_only_their_raw_reads(self):
+        fake = FakeTransport()
+        stream = PacketConnection(fake, None, SimpleNamespace(compression_algorithm=65535, compression_threshold=0))
+        self.addAsyncCleanup(stream.close)
+        reader = stream.start_receiving()
+        first, abandoned, last = (asyncio.create_task(stream.recv_raw()) for _ in range(3))
+        await asyncio.sleep(0)
+        abandoned.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await abandoned
+        retained = len(stream._waiters)  # No incoming traffic to release abandoned readers.
+        raw = RawPacket(4, b"first")
+        fake.received.put_nowait(write_batch([raw]))
+        self.assertEqual(await asyncio.wait_for(first, 1), raw)
+        reader.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await reader
+        with self.assertRaises(ConnectionError):
+            await asyncio.wait_for(last, 1)
+        with self.assertRaises(ConnectionError):
+            await stream.recv_raw()
+        self.assertEqual(retained, 2)
 
     async def test_reader_end_callback_cancellation_keeps_eof_and_notifies_each_subscriber_once(self):
         source = EOFError("transport EOF")
