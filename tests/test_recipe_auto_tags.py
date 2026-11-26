@@ -18,7 +18,7 @@ class RecipeAutoTagTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.enterContext(ManualClock().patch_scheduler())
 
-    async def join(self, *, stack_toggles=(), game_toggles=()):
+    async def join(self, *, stack_toggles=(), game_toggles=(), item_names=(OAK, BIRCH, TABLE)):
         self.bot = Bot("RecipeAuto", protocol=2225)
         self.addAsyncCleanup(self.bot.close)
         self.b = b = self.bot.protocol.binding
@@ -37,7 +37,7 @@ class RecipeAutoTagTests(unittest.IsolatedAsyncioTestCase):
                 game_rules=b.GameRulesChangedPacketData(rules=[b.GameRule(name="doLimitedCrafting", value=False)]),
                 experiments=experiments(game_toggles),
             )),
-            b.ItemRegistryPacket(items=[b.ItemData(id=index, name=name) for index, name in enumerate((OAK, BIRCH, TABLE), 1)]),
+            b.ItemRegistryPacket(items=[b.ItemData(id=index, name=name) for index, name in enumerate(item_names, 1)]),
             b.PlayStatusPacket(status=b.PlayStatus.PLAYER_SPAWN),
         ):
             self.wire.push(packet)
@@ -51,13 +51,13 @@ class RecipeAutoTagTests(unittest.IsolatedAsyncioTestCase):
             user_data_buffer=data, block_runtime_id=runtime_id,
         )
 
-    def recipe(self, *descriptors):
+    def recipe(self, *descriptors, result_id=3, result_aux=0):
         b = self.b
         ingredients = [b.SerializedRecipeIngredient(descriptor=descriptor, stack_size=1, aux_value=aux)
                        for descriptor, aux in descriptors]
         return b.CraftingDataPacket(shapeless_recipes=[b.ShapelessRecipePayload(
             recipe_id="test:auto", net_id=40, tag="crafting_table", ingredients=ingredients,
-            results=[b.SerializedNetworkItemInstanceDescriptor(id=3, stack_size=1)],
+            results=[b.SerializedNetworkItemInstanceDescriptor(id=result_id, stack_size=1, aux_value=result_aux)],
         )])
 
     async def deliver(self, *packets):
@@ -142,6 +142,38 @@ class RecipeAutoTagTests(unittest.IsolatedAsyncioTestCase):
                         await self.bot.craft_recipe_auto(40, 1)
                     self.assertEqual(self.wire.sent, outgoing)
             await self.bot.close()
+
+    async def test_bed_dye_selects_the_advertised_color_and_leaves_another_bed_alone(self):
+        bed, dye = "minecraft:bed", "minecraft:gray_dye"
+        await self.join(item_names=(bed, dye))
+        # Vanilla bed_dye_8_9 on BDS 1.26.66.1 advertises a pink bed as bed:6.
+        recipe = self.recipe(({"name": bed + ":6"}, 6), ({"name": dye}, 32767), result_id=1, result_aux=7)
+        wrong, pink, gray = self.item(1, 1, 3, 51), self.item(1, 1, 6, 52), self.item(2, 1, 0, 53)
+        await self.arrange(wrong, self.item(), gray, recipe=recipe)
+        self.assertEqual(self.bot.get_recipe(40).ingredients[0].name, bed + ":6")
+        self.assertEqual(self.bot.recipes_for(bed, 7), ())
+        outgoing = list(self.wire.sent)
+        with self.assertRaisesRegex(ValueError, "not enough"):
+            await self.bot.craft_recipe_auto(40, 8)
+        self.assertEqual(self.wire.sent, outgoing)
+
+        await self.arrange(wrong, pink, gray, recipe=recipe)
+        self.assertEqual([r.net_id for r in self.bot.recipes_for(bed, 7)], [40])
+        _, request = await self.submit(8)
+        inputs, sources = self.actions(request)[2:4]
+        self.assertEqual(inputs, [(bed, 6, 1), (dye, 32767, 1)])
+        self.assertEqual(sources, [(1, 52, 1), (2, 53, 1)])
+
+    async def test_named_wildcard_leaves_the_only_exact_variant_for_a_later_position(self):
+        await self.join()
+        recipe = self.recipe(({"name": OAK}, 32767), ({"name": OAK}, 3))
+        await self.arrange(self.item(1, 2, 3, 51), self.item(1, 1, 7, 52), self.item(1, 1, 8, 53),
+                           recipe=recipe)
+        self.assertEqual([r.net_id for r in self.bot.recipes_for(TABLE, min_result_count=2)], [40])
+        _, request = await self.submit(8, times=2)
+        inputs, sources = self.actions(request)[2:4]
+        self.assertEqual(inputs, [(OAK, 32767, 1), (OAK, 3, 1)])
+        self.assertEqual(sources, [(1, 52, 1), (2, 53, 1), (0, 51, 2)])
 
     async def test_tag_assignment_reserves_the_fixed_ingredient_and_applies_only_the_matching_verdict(self):
         await self.join()

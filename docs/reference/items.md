@@ -31,6 +31,10 @@ for a recipe that fits that screen. The destination is a main inventory
 slot with room for the output. The call returns the server's item-stack
 verdict. Check the verdict and the observed destination stack.
 
+When several recipes produce the same item, use `bot.recipes_for` to find
+ones that match your inventory. For example, `bot.recipes_for("bed", 7)`
+finds recipes for a gray bed using the input colors you actually carry.
+
 For supported vanilla protocol 2225 recipe tags, automatic crafting
 can assign different matching materials to the same tag. For example,
 planks of multiple wood types can contribute to a crafting table.

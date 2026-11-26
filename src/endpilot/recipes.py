@@ -32,6 +32,14 @@ class RecipeIngredient:
     count: int
     aux_value: int | None = None
 
+    @property
+    def _item_name(self) -> str | None:
+        # Keep the catalog spelling, e.g. minecraft:bed:6. Inventory and
+        # stack requests carry the item name and its aux value separately.
+        if self.name and self.aux_value not in (None, _ANY_AUX_VALUE) and self.name.count(":") == 2:
+            return self.name.removesuffix(f":{self.aux_value}")
+        return self.name
+
 
 @dataclass(frozen=True, slots=True)
 class RecipeResult:
@@ -282,7 +290,7 @@ class Recipes:
         needed = 0
         for slot, ingredient in enumerate(recipe.ingredients):
             names = (self._tag_members.get(ingredient.tag, ()) if ingredient.tag is not None
-                     else (ingredient.name,))
+                     else (ingredient._item_name,))
             variants = [
                 item for item, amount in materials.items()
                 if amount >= ingredient.count and item[0] in names
@@ -386,8 +394,8 @@ class Recipes:
         inventory = self.inventory
         items = inventory.slots
         remaining = {slot: int(item.stack_size) for slot, item in items.items()}
-        consumes = []
-        ingredients = []
+        consumes_by_ingredient = [[] for _ in recipe.ingredients]
+        ingredients = [None] * len(recipe.ingredients)
 
         def slot_info(name, slot, net_id):
             return cereal.SlotInfoData(
@@ -402,25 +410,31 @@ class Recipes:
         if tagged:
             materials = self._tagged_auto_materials(recipe, items, times)
         else:
-            materials = (((ingredient.name, _ANY_AUX_VALUE), items) for ingredient in recipe.ingredients)
+            materials = tuple(((i._item_name, _ANY_AUX_VALUE if i.aux_value is None else i.aux_value), items)
+                              for i in recipe.ingredients)
 
-        for ingredient, ((name, aux), slots) in zip(recipe.ingredients, materials, strict=True):
+        # Reserve exact variants before a wildcard can take them. The packet
+        # still describes and consumes ingredients in the advertised order.
+        for pos in sorted(range(len(materials)), key=lambda i: materials[i][0][1] == _ANY_AUX_VALUE):
+            ingredient = recipe.ingredients[pos]
+            (name, aux), slots = materials[pos]
             if name is None:
                 raise ValueError("automatic crafting requires a known ingredient descriptor")
-            ingredients.append(cereal.RecipeIngredientData(
+            ingredients[pos] = cereal.RecipeIngredientData(
                 item_descriptor=cereal.ItemNameDescriptorData(full_name=name, aux_value=aux),
                 stack_size=ingredient.count,
-            ))
+            )
             needed = ingredient.count * times
             for slot in slots:
                 if needed <= 0:
                     break
                 item = items[slot]
                 if (not 0 <= slot <= 255 or remaining[slot] <= 0
-                        or self.item_names.get(int(item.id)) != name):
+                        or self.item_names.get(int(item.id)) != name
+                        or aux not in (_ANY_AUX_VALUE, int(item.aux_value))):
                     continue
                 used = min(needed, remaining[slot])
-                consumes.append(cereal.ConsumeActionData(
+                consumes_by_ingredient[pos].append(cereal.ConsumeActionData(
                     amount=used,
                     source=slot_info(
                         "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER",
@@ -432,6 +446,7 @@ class Recipes:
             if needed:
                 raise ValueError(f"not enough {name} to craft {recipe.recipe_id}")
 
+        consumes = [action for group in consumes_by_ingredient for action in group]
         request_id = inventory._allocate_request_id()
         # Recipe data can expose this unsigned runtime ID as a signed int32.
         output_descriptor = b.SerializedNetworkItemStackDescriptor(
