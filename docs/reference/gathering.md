@@ -97,6 +97,16 @@ yields an empty result with `search_complete=True`. An interrupted call
 includes the initial search completeness in `collection_progress` if the
 search finished. `collect_by_count` leaves `search_complete` as `None`.
 
+Either counted method accepts `tool_chest=HarvestToolChest(chest_position,
+chest_slots=range(4, 7), inventory_slots=range(14, 16))`. Import
+`HarvestToolChest` from `endpilot.harvest`. If the bot confirms it lacks a
+required tool, it can visit that chest once for the target and take a suitable
+tool from the authorized slots. It waits for the chest to close before
+returning to the target. Read the attempt's `tool_acquisition` for the refill
+outcome.
+The candidate snapshot and the count of confirmed block pickups still govern
+which targets the bot attempts.
+
 ## Collect blocks and existing drops together
 
 Pass block coordinates and current item snapshots from `bot.observed_drops`

@@ -937,6 +937,44 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             search_radius=search_radius, timeout=timeout,
         ))
 
+    async def test_counted_collection_refills_and_stops_at_the_requested_inventory_gain(self):
+        bot = await self.refill_bot()
+        await self.emit(self.block(ORE), self.slot(2, DIRT, 4, net_id=15))
+        chest = HarvestToolChest(REFILL_CHEST, range(4, 5), range(3, 4))
+        task = asyncio.create_task(bot.collect_by_count(
+            ORE, item_id=DIRT, count=1, radius=3, ticks=0, search_radius=0, timeout=1, tool_chest=chest,
+        ))
+
+        late = (-2, 100, 4)
+        await self.emit(await self.refill_request(), self.block(ORE, position=late))
+        equipped = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+        self.assertIsInstance(equipped, self.b.MobEquipmentPacket)
+        self.assertEqual((equipped.item.id, equipped.item.net_id_variant), (445, 20))
+        close = await self.refill_close(confirm=False)
+        self.assertTrue(self.wire.outgoing.empty())
+        await self.emit(close)
+        await self.expect_batch_start(SECOND_TARGET)
+        await self.finish_batch_break(SECOND_TARGET, runtime_id=101, total=5, net_id=15)
+
+        result = await asyncio.wait_for(task, 1)
+        self.assertEqual((result.positions, result.collected_count, result.search_complete, result.active),
+                         ((SECOND_TARGET, TARGET), 1, None, None))
+        attempt, = result.results
+        self.assertEqual((attempt.position, attempt.status, attempt.inventory_delta), (SECOND_TARGET, "collected", 1))
+        self.assertEqual(attempt.tool, attempt.tool_acquisition.tool)
+        self.assertEqual(attempt.tool_acquisition.transfer.confirmed_count, 1)
+        self.assertEqual(bot.inventory_count(DIRT), 5)
+        self.assertEqual(bot.observed_block(TARGET).runtime_id, ORE)
+        self.assertIsNone(bot.open_window)
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_counted_collection_validates_the_optional_chest_before_sending(self):
+        bot = await self.log_bot(TARGET)
+        for collect, target in ((bot.collect_by_count, "oak_log"), (bot.collect_vein_by_count, TARGET)):
+            with self.subTest(collect=collect.__name__), self.assertRaisesRegex(TypeError, "tool_chest"):
+                await collect(target, item_id=OAK_LOG_ITEM, count=1, tool_chest=REFILL_CHEST)
+        self.assertTrue(self.wire.outgoing.empty())
+
     async def test_counted_collection_reselects_log_removed_during_approach_and_counts_the_actual_gain(self):
         first, second, third = (-1, 100, 3), (0, 100, 3), (1, 100, 3)
         outside = (2, 100, 6)
@@ -1159,9 +1197,10 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_counted_vein_distinguishes_unknown_seeds_from_air_without_sending(self):
         bot = await self.log_bot(TARGET)
+        chest = HarvestToolChest(REFILL_CHEST, range(4, 5))
         for seed, complete in (((5, 100, 3), False), ((-2, 100, 4), True)):
             with self.subTest(seed=seed):
-                result = await bot.collect_vein_by_count(seed, item_id=OAK_LOG_ITEM, count=1)
+                result = await bot.collect_vein_by_count(seed, item_id=OAK_LOG_ITEM, count=1, tool_chest=chest)
                 self.assertEqual(result, CountedBlockCollection(
                     0, (), (), item_id=OAK_LOG_ITEM, requested_count=1, collected_count=0, search_complete=complete,
                 ))
@@ -1202,6 +1241,55 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
                          (THIRD_TARGET, "inventory_unconfirmed", PLAYER, 0))
         self.assertFalse(bot._block_collector._lock.locked())
         self.assert_no_more_collection_inputs()
+
+    async def start_counted_vein_refill(self, chest_slots):
+        bot = await self.refill_bot()
+        await self.emit(self.block(ORE), self.block(ORE, position=(-4, 100, 4)), self.slot(3, 445, 1, net_id=14))
+        chest = HarvestToolChest(REFILL_CHEST, chest_slots, range(3, 4))
+        task = asyncio.create_task(bot.collect_vein_by_count(
+            TARGET, item_id=DIRT, count=2, max_blocks=2, ticks=0, search_radius=0, timeout=1, tool_chest=chest,
+        ))
+        await self.expect_batch_start(TARGET)
+        self.wire.emit(self.slot(3))
+        await self.finish_batch_break(TARGET, runtime_id=101, total=1, net_id=15)
+        return bot, task
+
+    async def test_counted_vein_refill_ignores_unauthorized_tool_and_keeps_partial_gain(self):
+        bot, task = await self.start_counted_vein_refill(range(5, 6))
+        await self.refill_click()
+        await self.emit(*self.refill_window())
+        await self.refill_close()
+
+        result = await asyncio.wait_for(task, 1)
+        self.assertEqual((result.positions, result.collected_count, result.search_complete, result.active),
+                         ((TARGET, SECOND_TARGET), 1, False, None))
+        first, second = result.results
+        self.assertEqual((first.status, first.tool_acquisition, second.status), ("collected", None, "tool_unavailable"))
+        self.assertEqual(second.tool_acquisition.status, "tool_unavailable")
+        self.assertIsNone(second.tool_acquisition.transfer)
+        self.assertIsNone(bot.open_window)
+        self.assertEqual(bot.observed_block(SECOND_TARGET).runtime_id, ORE)
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_counted_vein_cancellation_during_refill_keeps_transfer_and_partial_gain(self):
+        bot, task = await self.start_counted_vein_refill(range(4, 5))
+        await self.emit(await self.refill_request())
+        equipped = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+        self.assertIsInstance(equipped, self.b.MobEquipmentPacket)
+        await self.refill_close(confirm=False)
+
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError) as interrupted:
+            await asyncio.wait_for(task, 1)
+        progress = interrupted.exception.collection_progress
+        self.assertEqual((progress.positions, progress.collected_count, progress.search_complete),
+                         ((TARGET, SECOND_TARGET), 1, False))
+        first, = progress.results
+        self.assertEqual((first.position, first.status, first.tool_acquisition), (TARGET, "collected", None))
+        self.assertEqual(progress.active.position, SECOND_TARGET)
+        self.assertEqual(progress.active.tool_acquisition.transfer.confirmed_count, 1)
+        self.assertEqual(bot.observed_block(SECOND_TARGET).runtime_id, ORE)
+        self.assertTrue(self.wire.outgoing.empty())
 
     async def mixed_drop(self, bot):
         await self.emit(self.drop(191, entity_id=5191, position=(1.5, 100.125, 3.5), item_id=77))

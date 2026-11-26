@@ -2049,6 +2049,7 @@ class Bot:
     async def collect_by_count(
         self, names: str | int | Iterable[str] | Iterable[int], *, item_id: int, count: int,
         radius: int = 16, ticks: int = 160, search_radius: int = 8, timeout: float = 15,
+        tool_chest: HarvestToolChest | None = None,
     ) -> CountedBlockCollection:
         """Collect a positive count of one item from nearby observed matching blocks.
 
@@ -2056,18 +2057,21 @@ class Bot:
         before START in the same world generation. Stop on other failures.
         The result counts confirmed main-inventory gains for item_id and can
         exceed count. Exceptions carry known collection_progress.
+
+        Pass tool_chest to allow a refill from the specified chest when a
+        target requires a tool the bot lacks. See each result's tool_acquisition.
         """
         if self._block_collector is None:
             raise RuntimeError("player has not joined")
         return await self._block_collector.collect_by_count(
-            names, item_id=item_id, count=count, radius=radius, ticks=ticks,
-            search_radius=search_radius, timeout=timeout,
+            self, names, item_id=item_id, count=count, radius=radius, ticks=ticks,
+            search_radius=search_radius, timeout=timeout, tool_chest=tool_chest,
         )
 
     async def collect_vein_by_count(
         self, seed: tuple[int, int, int], *, item_id: int, count: int, max_blocks: int = 100,
         max_distance: int = 16, flood_radius: int = 1, ticks: int = 160,
-        search_radius: int = 8, timeout: float = 15,
+        search_radius: int = 8, timeout: float = 15, tool_chest: HarvestToolChest | None = None,
     ) -> CountedBlockCollection:
         """Collect a positive count of one item from an observed block vein.
 
@@ -2076,14 +2080,17 @@ class Bot:
         main-inventory gains for item_id, including a pickup that exceeds
         count. Each attempt requires a finite positive timeout. Exceptions
         carry known collection_progress.
+
+        Pass tool_chest to allow the same shortage refill as collect_by_count.
         """
         if self._block_collector is None:
             raise RuntimeError("player has not joined")
         if timeout is None or not 0 < timeout < inf:
             raise ValueError("collection timeout must be finite and positive")
         return await self._block_collector.collect_vein_by_count(
-            seed, item_id=item_id, count=count, max_blocks=max_blocks, max_distance=max_distance,
+            self, seed, item_id=item_id, count=count, max_blocks=max_blocks, max_distance=max_distance,
             flood_radius=flood_radius, ticks=ticks, search_radius=search_radius, timeout=timeout,
+            tool_chest=tool_chest,
         )
 
     async def collect_mixed_targets(

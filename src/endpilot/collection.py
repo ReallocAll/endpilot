@@ -195,12 +195,9 @@ class _BlockCollector:
                 return progress.snapshot()
             epoch = self.blocks._mining_epoch
             before = tuple(self.blocks.observed_block(position) for position in positions)
-            refill = None if tool_chest is None else partial(
-                self._refill_tool, bot, tool_chest, dimension=progress.dimension_id, epoch=epoch,
-                ticks=ticks, search_radius=search_radius, timeout=timeout,
-            )
             await self._run(self._collect_batch(
-                progress, before, epoch, ticks=ticks, search_radius=search_radius, timeout=timeout, refill=refill,
+                bot, progress, before, epoch, ticks=ticks, search_radius=search_radius, timeout=timeout,
+                tool_chest=tool_chest,
             ))
         except (Exception, asyncio.CancelledError) as error:
             error.collection_progress = progress.snapshot()
@@ -208,33 +205,39 @@ class _BlockCollector:
         return progress.snapshot()
 
     async def collect_by_count(
-        self, names: str | int | Iterable[str] | Iterable[int], *, item_id: int, count: int,
+        self, bot: "Bot", names: str | int | Iterable[str] | Iterable[int], *, item_id: int, count: int,
         radius: int = 16, ticks: int = 160, search_radius: int = 8, timeout: float = 15,
+        tool_chest: HarvestToolChest | None = None,
     ) -> CountedBlockCollection:
         return await self._collect_counted(
-            partial(self.blocks.find_blocks, names, radius=radius, limit=None),
+            bot, partial(self.blocks.find_blocks, names, radius=radius, limit=None),
             item_id=item_id, count=count, ticks=ticks, search_radius=search_radius, timeout=timeout,
+            tool_chest=tool_chest,
         )
 
     async def collect_vein_by_count(
-        self, seed: tuple[int, int, int], *, item_id: int, count: int,
+        self, bot: "Bot", seed: tuple[int, int, int], *, item_id: int, count: int,
         max_blocks: int, max_distance: int, flood_radius: int, ticks: int, search_radius: int, timeout: float,
+        tool_chest: HarvestToolChest | None = None,
     ) -> CountedBlockCollection:
         return await self._collect_counted(
-            partial(self.blocks.find_block_vein, seed, max_blocks=max_blocks, max_distance=max_distance,
-                    flood_radius=flood_radius),
+            bot, partial(self.blocks.find_block_vein, seed, max_blocks=max_blocks, max_distance=max_distance,
+                         flood_radius=flood_radius),
             item_id=item_id, count=count, ticks=ticks, search_radius=search_radius, timeout=timeout,
-            report_completeness=True,
+            tool_chest=tool_chest, report_completeness=True,
         )
 
     async def _collect_counted(
-        self, find_candidates: Callable[[], BlockSearchResult], *, item_id: int, count: int,
-        ticks: int, search_radius: int, timeout: float, report_completeness: bool = False,
+        self, bot: "Bot", find_candidates: Callable[[], BlockSearchResult], *, item_id: int, count: int,
+        ticks: int, search_radius: int, timeout: float, tool_chest: HarvestToolChest | None,
+        report_completeness: bool = False,
     ) -> CountedBlockCollection:
         if not isinstance(item_id, int) or isinstance(item_id, bool) or item_id == 0:
             raise ValueError("collection item ID must be a nonzero integer")
         if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
             raise ValueError("collection count must be a positive integer")
+        if tool_chest is not None and not isinstance(tool_chest, HarvestToolChest):
+            raise TypeError("tool_chest must be a HarvestToolChest")
         progress = _CountedProgress(self.blocks.dimension_id, item_id, count)
         try:
             self._check_connection()
@@ -249,8 +252,8 @@ class _BlockCollector:
             progress.positions = tuple(before.position for before in observations)
             if observations:
                 await self._run(self._collect_batch(
-                    progress, observations, epoch, ticks=ticks, search_radius=search_radius,
-                    timeout=timeout,
+                    bot, progress, observations, epoch, ticks=ticks, search_radius=search_radius,
+                    timeout=timeout, tool_chest=tool_chest,
                 ))
         except (Exception, asyncio.CancelledError) as error:
             error.collection_progress = progress.snapshot()
@@ -327,10 +330,14 @@ class _BlockCollector:
             )
 
     async def _collect_batch(
-        self, progress: _BatchProgress, observations: tuple[BlockObservation | None, ...], epoch: int, *,
-        ticks: int, search_radius: int, timeout: float, refill: _ToolRefill | None = None,
+        self, bot: "Bot", progress: _BatchProgress, observations: tuple[BlockObservation | None, ...], epoch: int, *,
+        ticks: int, search_radius: int, timeout: float, tool_chest: HarvestToolChest | None,
     ) -> None:
         counted = progress if isinstance(progress, _CountedProgress) else None
+        refill = None if tool_chest is None else partial(
+            self._refill_tool, bot, tool_chest, dimension=progress.dimension_id, epoch=epoch,
+            ticks=ticks, search_radius=search_radius, timeout=timeout,
+        )
         async with self._lock:
             for position, before in zip(progress.positions, observations, strict=True):
                 self._check_connection()
