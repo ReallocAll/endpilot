@@ -128,7 +128,10 @@ class MiningFaceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((action.pos.x, action.pos.y, action.pos.z), TARGET)
                 self.assertEqual((start.pos.x, start.pos.y, start.pos.z), (4.5, 100.5, 8.5))
                 self.assertEqual((start.move.x, start.move.y, start.rot.y), (0, 0, -90))
-                self.assertEqual([a.player_action_type.name for a in stop.player_block_actions], ["STOP_DESTROY_BLOCK"])
+                abort, release = stop.player_block_actions
+                self.assertEqual((abort.player_action_type.name, release.player_action_type.name),
+                                 ("ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"))
+                self.assertEqual((abort.pos.x, abort.pos.y, abort.pos.z), TARGET)
 
     async def test_half_slab_covers_five_samples_but_leaves_an_unsampled_gap(self):
         self.scene(y=100.15)

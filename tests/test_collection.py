@@ -195,7 +195,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             self.take(),
         )
         result = await task
-        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.assertEqual(result.status, "collected")
         self.assertEqual(result.block_before.runtime_id, 900)
         self.assertTrue(result.block_after.is_air)
@@ -209,7 +209,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         await self.emit(self.slot(0))
         task = await self.start(timeout=3)
         self.wire.emit(self.block(HASHED_AIR_RUNTIME_ID), self.drop(), self.take())
-        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.assertFalse(task.done())
         self.wire.emit(self.slot(0, DIRT, 1))
         result = await task
@@ -225,7 +225,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             self.slot(0, DIRT, 1), self.drop(102, item_id=DIRT + 1),
         )
         result = await task
-        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.assertEqual(result.status, "ambiguous_drop")
         self.assertEqual([drop.runtime_id for drop in result.drops], [101, 102])
         self.assert_released()
@@ -239,7 +239,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             self.block(HASHED_AIR_RUNTIME_ID),
         )
         result = await task
-        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.assertEqual(result.status, "drop_unobserved")
         self.assertTrue(result.timed_out)
         self.assertEqual(result.drops, ())
@@ -253,7 +253,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             self.take(102), self.slot(0, DIRT, 1),
         )
         result = await task
-        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.assertEqual(result.status, "drop_unobserved")
         self.assertEqual(result.drops, ())
         self.assert_released()
@@ -267,7 +267,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             self.take(102), self.slot(0, DIRT, 1),
         )
         result = await task
-        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.assertEqual(result.status, "collected")
         self.assertEqual([(drop.entity_id, drop.runtime_id) for drop in result.drops], [(2001, 101)])
         self.assert_released()
@@ -277,7 +277,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         task = self.collect(timeout=1, follow_ticks=12)
         self.assertEqual(await self.next_actions(), ["START_DESTROY_BLOCK"])
         self.wire.emit(self.block(HASHED_AIR_RUNTIME_ID), self.drop(entity_id=2001))
-        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         first_frame = await asyncio.wait_for(self.wire.outgoing.get(), 1)
         forward = self.b.PlayerAuthInputPacket.InputData.UP
         self.assertIn(forward, first_frame.input_data)
@@ -360,7 +360,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await holder).runtime_id, HASHED_AIR_RUNTIME_ID)
         release = self.wire.outgoing.get_nowait()
         self.assertEqual([action.player_action_type.name for action in release.player_block_actions],
-                         ["STOP_DESTROY_BLOCK"])
+                         ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.assertFalse(limit.expired())
         self.assertIsNotNone(target)
         self.assertIs(held_after_queue, target)
@@ -463,7 +463,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         await expect_input(abort, stop, start)
         await self.emit(ready(PLAYER + 1), self.block(HASHED_AIR_RUNTIME_ID))
         self.assertEqual((await whole).runtime_id, HASHED_AIR_RUNTIME_ID)
-        await expect_input(stop)
+        await expect_input(abort, stop)
 
         for runtime_id, tick_ms in ((0, 50), (PLAYER, 100)):
             with self.subTest(runtime_id=runtime_id):
@@ -490,7 +490,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.wire.emit(self.block(HASHED_AIR_RUNTIME_ID), self.drop(), self.take(),
                        self.slot(2, DIRT, 1))
         first_result, second_result = await asyncio.gather(first, second)
-        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.assertEqual(first_result.status, "collected")
         self.assertEqual(first_result.tool.item_name, "minecraft:iron_pickaxe")
         self.assertEqual(first_result.approach.face, 4)
@@ -720,7 +720,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         if total is not None:
             packets.extend((self.take(runtime_id, player=player), self.slot(2, item_id, total, net_id=net_id)))
         self.wire.emit(*packets)
-        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
 
     async def test_batch_counts_distinct_positions_in_input_order(self):
         bot = await self.batch_bot()
@@ -1349,7 +1349,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             self.block(HASHED_AIR_RUNTIME_ID, position=THIRD_TARGET),
             self.drop(102, position=(-2.5, 100.5, 2.5), item_id=OAK_LOG_ITEM), self.take(102),
         )
-        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
 
         task.cancel()
         with self.assertRaises(asyncio.CancelledError) as interrupted:
@@ -1989,7 +1989,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             self.slot(0, DIRT, 1),
         )
         result = await task
-        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.assertEqual((result.status, result.collector_id), ("taken_by_other", 12))
         self.assert_released()
 
@@ -2001,7 +2001,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             self.slot(0, DIRT, 1),
         )
         result = await task
-        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.assertEqual(result.status, "ambiguous_drop")
         self.assertEqual((result.collector_id, result.inventory_delta), (PLAYER, 1))
         self.assert_released()
@@ -2014,7 +2014,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             self.slot(1, DIRT, 1),
         )
         result = await task
-        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.assertEqual(result.status, "inventory_unconfirmed")
         self.assertEqual(result.collector_id, PLAYER)
         self.assertIsNone(result.inventory_delta)
@@ -2029,7 +2029,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             self.slot(1), self.content(self.item(DIRT, 1)),
         )
         result = await task
-        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.assertEqual(result.status, "inventory_unconfirmed")
         self.assertIsNone(result.inventory_delta)
         self.assert_released()
@@ -2044,7 +2044,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             self.slot(36, DIRT, 1),
         )
         result = await task
-        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.assertEqual((result.status, result.inventory_delta), ("inventory_unconfirmed", 0))
         self.assert_released()
 
@@ -2056,7 +2056,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             self.inventory_transaction((0, 5, 6)),
         )
         result = await task
-        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.assertEqual((result.status, result.collector_id), ("inventory_unconfirmed", PLAYER))
         self.assertIsNone(result.inventory_delta)
         self.assert_released()
@@ -2069,7 +2069,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             self.inventory_transaction((0, 5, 6), (1, 0, 0)),
         )
         result = await task
-        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.assertEqual((result.status, result.inventory_delta), ("collected", 1))
         self.assert_released()
 
@@ -2121,7 +2121,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             self.block(HASHED_AIR_RUNTIME_ID), self.drop(), self.take(), self.slot(0, DIRT, 2),
         )
         result = await task
-        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.assertEqual((result.status, result.inventory_delta), ("collected", 1))
         self.assertEqual([drop.runtime_id for drop in result.drops], [101])
         self.assert_released()
@@ -2161,7 +2161,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_dimension_change_preserves_only_evidence_from_the_original_dimension(self):
         task = await self.start(timeout=3)
         self.wire.emit(self.block(HASHED_AIR_RUNTIME_ID), self.drop())
-        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.wire.emit(self.b.ChangeDimensionPacket(dimension_id=1), self.take())
         result = await task
         self.assertEqual(result.status, "dimension_changed")
@@ -2174,7 +2174,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_transport_loss_after_break_does_not_become_a_partial_timeout(self):
         task = await self.start()
         self.wire.emit(self.block(HASHED_AIR_RUNTIME_ID))
-        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.wire.incoming.put_nowait(OSError("lost wire"))
         with self.assertRaisesRegex(ConnectionError, "packet stream lost") as failure:
             await task

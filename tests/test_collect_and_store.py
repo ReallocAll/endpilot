@@ -126,8 +126,8 @@ class CollectAndStoreTests(unittest.IsolatedAsyncioTestCase):
     async def finish_target(self, position, actor_id, *, item_id=DIAMOND, total=None):
         await self.emit(*self.target_packets(position, actor_id, item_id=item_id, total=total))
         frame = await self.outgoing(self.b.PlayerAuthInputPacket)
-        action, = frame.player_block_actions
-        self.assertEqual(action.player_action_type.name, "STOP_DESTROY_BLOCK")
+        self.assertEqual([action.player_action_type.name for action in frame.player_block_actions],
+                         ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
 
     async def change_dimension_after_pickup(self, position, actor_id, *, total, ambiguous=False):
         b = self.b

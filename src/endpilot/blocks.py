@@ -1618,12 +1618,13 @@ class Blocks:
             raise MiningFaceUnavailable("unknown" if status == "unknown" else "no_sample")
         self.movement.set_rotation(*rotation)
 
-    def _release_mining_actions(self, *, abort: bool) -> list:
-        target = self._mining_target
-        if target is None:
+    def _release_mining_actions(self, target: MiningTarget | None = None) -> list:
+        if self._mining_target is None:
             return []
         actions = []
-        if abort and self.mining_target is not None:
+        if target is None:
+            target = self.mining_target
+        if target is not None:
             actions.append(("ABORT_DESTROY_BLOCK", target.position, 0))
         actions.append(("STOP_DESTROY_BLOCK", (0, 0, 0), 0))
         return actions
@@ -1666,7 +1667,7 @@ class Blocks:
             if generation is not None:
                 actions = [("CONTINUE_DESTROY_BLOCK", target.position, target.face)]
             else:
-                actions = self._release_mining_actions(abort=True)
+                actions = self._release_mining_actions()
                 actions.append(("START_DESTROY_BLOCK", target.position, target.face))
             return await self._submit_mining(
                 actions, target, epoch, validate=lambda: self._observed_mining_input(target, allow_edge_hit=True),
@@ -1677,7 +1678,7 @@ class Blocks:
         epoch = self._mining_epoch
         async with self._mining_lock:
             self._check_mining_epoch(epoch)
-            actions = self._release_mining_actions(abort=True)
+            actions = self._release_mining_actions()
             if not actions:
                 return None
             return await self._submit_mining(actions, None, epoch)
@@ -1716,7 +1717,7 @@ class Blocks:
             previous = self.mining_target
             actions = []
             if previous is None or previous.position != position:
-                actions = self._release_mining_actions(abort=True)
+                actions = self._release_mining_actions()
                 actions.append(("START_DESTROY_BLOCK", position, face))
             actions.extend((("CONTINUE_DESTROY_BLOCK", position, face),
                             ("PREDICT_DESTROY_BLOCK", position, face)))
@@ -1806,7 +1807,7 @@ class Blocks:
             async with asyncio.timeout_at(deadline):
                 # The observer must be active before START enters the wire.
                 await asyncio.sleep(0)
-                actions = self._release_mining_actions(abort=True)
+                actions = self._release_mining_actions()
                 actions.append(("START_DESTROY_BLOCK", position, face))
                 await self._submit_mining(actions, target, epoch, validate=start, build_item_use=prepare_start)
                 raw = await waiter
@@ -1819,12 +1820,13 @@ class Blocks:
             waiter.cancel()
             if started and self._mining_target is target:
                 try:
-                    await self._submit_mining(self._release_mining_actions(abort=True), None, epoch)
+                    await self._submit_mining(self._release_mining_actions(), None, epoch)
                 except Exception as cleanup_error:
                     # A lost transport may also reject ABORT. Keep the cause.
                     error.add_note(f"mining abort failed: {cleanup_error!r}")
             await asyncio.gather(waiter, return_exceptions=True)
             raise
-        await self._submit_mining(self._release_mining_actions(abort=False), None, epoch)
+        # Seeing air ends the observation, not the server's held break input.
+        await self._submit_mining(self._release_mining_actions(target), None, epoch)
         packet = self.packets.protocol.decode(raw)
         return BlockUpdate(position, int(packet.runtime_id), int(packet.layer))

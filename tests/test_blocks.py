@@ -312,7 +312,10 @@ class BlocksTests(unittest.IsolatedAsyncioTestCase):
                                 start.player_block_actions[0].pos.y,
                                 start.player_block_actions[0].pos.z)), (1, 100, 0))
         self.assertEqual(start.player_block_actions[0].facing, 4)
-        self.assertEqual(stop.player_block_actions[0].player_action_type, b.PlayerActionType.STOP_DESTROY_BLOCK)
+        abort, release = stop.player_block_actions
+        self.assertEqual(abort.player_action_type, b.PlayerActionType.ABORT_DESTROY_BLOCK)
+        self.assertEqual((abort.pos.x, abort.pos.y, abort.pos.z), (1, 100, 0))
+        self.assertEqual(release.player_action_type, b.PlayerActionType.STOP_DESTROY_BLOCK)
         self.assertEqual(stream.observers, [])
 
     async def test_mining_timeout_aborts_the_target(self):
