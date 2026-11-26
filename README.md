@@ -10,6 +10,9 @@ protocol 2225 (Minecraft Bedrock 1.26.6x).
 ### Install
 
 From the SDK checkout, create a virtual environment with standard CPython 3.12 or later.
+For the NetherNet quick start on Windows, we recommend standard CPython 3.15.2.
+CPython 3.12.13 can hang when closing the UDP connection
+([CPython #156920](https://github.com/python/cpython/issues/156920)).
 Run `python -m venv .venv`, then activate it with `source .venv/bin/activate`
 on Linux or `.\.venv\Scripts\Activate.ps1` in PowerShell.
 
