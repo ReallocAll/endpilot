@@ -314,10 +314,9 @@ class PlayerState:
     async def wait_for_health_update(self, timeout: float = 15) -> float:
         """Return the next server health update, not a locally predicted value."""
         b = self.packets.protocol.binding
-        raw = await self.packets.wait_for_packet(
-            (b.UpdateAttributesPacket.ID, b.SetHealthPacket.ID),
-            timeout=timeout,
-            match=lambda packet: self._read_health(packet) is not None,
+        raw = await self._wait(
+            (b.UpdateAttributesPacket.ID, b.SetHealthPacket.ID), timeout,
+            lambda packet: self._read_health(packet) is not None, require_live_after_match=False,
         )
         return self._read_health(raw)
 
@@ -326,10 +325,9 @@ class PlayerState:
         def hunger(packet):
             return self._read_attribute(packet, "minecraft:player.hunger")
 
-        raw = await self.packets.wait_for_packet(
-            self.packets.protocol.binding.UpdateAttributesPacket.ID,
-            timeout=timeout,
-            match=lambda packet: hunger(packet) is not None,
+        raw = await self._wait(
+            self.packets.protocol.binding.UpdateAttributesPacket.ID, timeout,
+            lambda packet: hunger(packet) is not None, require_live_after_match=False,
         )
         return hunger(raw)
 

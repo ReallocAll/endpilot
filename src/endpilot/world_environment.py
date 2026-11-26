@@ -99,7 +99,7 @@ class WorldEnvironment:
         self._weather_ids = (binding.StartGamePacket.ID, binding.LevelEventPacket.ID)
         self._packet_ids = world_environment_packet_ids(binding)
         self._disconnect_id = binding.DisconnectPacket.ID
-        self._rule_ids = (binding.StartGamePacket.ID, binding.GameRulesChangedPacket.ID, self._disconnect_id)
+        self._rule_ids = (binding.StartGamePacket.ID, binding.GameRulesChangedPacket.ID)
         self._disconnected = False
         self._daylight_ticks = None
         self._game_ticks_at_join = None
@@ -217,7 +217,11 @@ class WorldEnvironment:
             if self.weather.thundering != thundering:
                 self.weather = replace(self.weather, thundering=thundering, lightning_level=None)
 
-    async def _wait_for_change(self, packet_ids, snapshot, timeout):
+    async def _wait_for_change(self, packet_ids, snapshot, timeout, observation):
+        # Let a stopped reader report its transport failure. A DisconnectPacket can arrive
+        # while the reader is still open.
+        if self._disconnected and not self.packets._reader_end_result()[0]:
+            raise ConnectionError("server already disconnected")
         before = snapshot()
         update = before
 
@@ -229,18 +233,18 @@ class WorldEnvironment:
             update = snapshot()
             return update != before
 
-        raw = await self.packets.wait_for_packet(packet_ids, timeout=timeout, match=changed)
+        raw = await self.packets.wait_for_packet((*packet_ids, self._disconnect_id), timeout=timeout, match=changed)
         if raw.packet_id == self._disconnect_id:
-            raise ConnectionError("server disconnected while waiting for world rules")
+            raise ConnectionError(f"server disconnected while waiting for {observation}")
         return update
 
     async def wait_for_time_update(self, timeout: float) -> WorldTime:
-        return await self._wait_for_change(self._time_ids, self.time, timeout)
+        return await self._wait_for_change(self._time_ids, self.time, timeout, "world time")
 
     async def wait_for_weather_update(self, timeout: float) -> Weather:
-        return await self._wait_for_change(self._weather_ids, lambda: self.weather, timeout)
+        return await self._wait_for_change(self._weather_ids, lambda: self.weather, timeout, "weather")
 
     async def wait_for_rules_update(self, timeout: float) -> tuple[WorldRule, ...]:
         if self._disconnected:
             raise ConnectionError("server already disconnected")
-        return await self._wait_for_change(self._rule_ids, self.rules, timeout)
+        return await self._wait_for_change(self._rule_ids, self.rules, timeout, "world rules")

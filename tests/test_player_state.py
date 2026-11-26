@@ -3,7 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from endpilot import Bot, DeathEvent, PlayerEffect, PlayerVitals, WorldRule
+from endpilot import Bot, DeathEvent, PlayerEffect, PlayerVitals, Weather, WorldRule
 from endpilot.compression import PacketConnection
 from endpilot.login import JoinSession
 from endpilot.player_state import PlayerState
@@ -45,7 +45,7 @@ class PlayerStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.health, 12.0)
 
         async def wait(ids, *, timeout, match):
-            self.assertEqual(set(ids), {b.SetHealthPacket.ID, b.UpdateAttributesPacket.ID})
+            self.assertEqual(set(ids), {b.SetHealthPacket.ID, b.UpdateAttributesPacket.ID, b.DisconnectPacket.ID})
             self.assertEqual(timeout, 3)
             self.assertFalse(match(RawPacket(b.UpdateAttributesPacket.ID, b"other")))
             self.assertFalse(match(RawPacket(b.UpdateAttributesPacket.ID, b"speed")))
@@ -86,8 +86,8 @@ class PlayerStateTests(unittest.IsolatedAsyncioTestCase):
         observers[0](RawPacket(b.UpdateAttributesPacket.ID, b"hunger"))
         self.assertEqual(state.hunger, 17.0)
 
-        async def wait(packet_id, *, timeout, match):
-            self.assertEqual(packet_id, b.UpdateAttributesPacket.ID)
+        async def wait(ids, *, timeout, match):
+            self.assertEqual(set(ids), {b.UpdateAttributesPacket.ID, b.DisconnectPacket.ID})
             self.assertEqual(timeout, 3)
             self.assertFalse(match(RawPacket(b.UpdateAttributesPacket.ID, b"other")))
             self.assertFalse(match(RawPacket(b.UpdateAttributesPacket.ID, b"health")))
@@ -614,15 +614,21 @@ class VitalSnapshotTests(unittest.IsolatedAsyncioTestCase):
                                                      air_supply_max=300, experience_level=0,
                                                      experience_progress=0))
 
+    def scalar_waits(self):
+        return (self.bot.wait_for_health_update, self.bot.wait_for_hunger_update,
+                self.bot.wait_for_world_time_update, self.bot.wait_for_weather_update)
+
     async def test_snapshot_updates_before_same_batch_disconnect_are_delivered(self):
         b = self.b
         await self.join(rules=self.rules(randomTickSpeed=3))
         vitals = asyncio.create_task(self.bot.wait_for_vitals_update(timeout=1))
         effects = asyncio.create_task(self.bot.wait_for_status_effects_update(timeout=1))
         rules = asyncio.create_task(self.bot.wait_for_world_rules_update(timeout=1))
+        scalar_updates = [asyncio.create_task(wait(timeout=1)) for wait in self.scalar_waits()]
         await self.processed(
-            b.SetHealthPacket(health=16), self.effect(),
+            b.SetHealthPacket(health=16), self.attributes(health=15, hunger=12), self.effect(),
             b.GameRulesChangedPacket(rule_data=self.rules(randomTickSpeed=4)),
+            b.SetTimePacket(time=25), b.SetTimePacket(time=30), b.LevelEventPacket(event_id=3001),
             b.DisconnectPacket(),
         )
         updates = await asyncio.gather(vitals, effects, rules, return_exceptions=True)
@@ -630,21 +636,25 @@ class VitalSnapshotTests(unittest.IsolatedAsyncioTestCase):
             PlayerVitals(health=16), (PlayerEffect(1, 0, 50, True, False),),
             (WorldRule("randomTickSpeed", 4, True),),
         ])
+        health, hunger, world_time, weather = await asyncio.gather(*scalar_updates)
+        self.assertEqual((health, hunger, world_time.daylight_ticks, weather.raining), (16, 12, 25, True))
 
     async def test_disconnect_rejects_unmatched_and_new_snapshot_waiters(self):
         b = self.b
         await self.join(rules=self.rules(randomTickSpeed=3))
         waits = (self.bot.wait_for_vitals_update, self.bot.wait_for_status_effects_update,
-                 self.bot.wait_for_world_rules_update)
+                 self.bot.wait_for_world_rules_update, *self.scalar_waits())
         pending = [asyncio.create_task(wait(timeout=0.1)) for wait in waits]
         await self.processed(
             self.attributes(43, saturation=4), self.effect(runtime_id=43),
             b.GameRulesChangedPacket(rule_data=self.rules(randomTickSpeed=3)),
-            b.DisconnectPacket(),
+            b.DisconnectPacket(), self.attributes(health=14, hunger=12), b.SetTimePacket(time=500),
+            b.LevelEventPacket(event_id=3001),
         )
         pending_errors = await asyncio.gather(*pending, return_exceptions=True)
-        await self.processed(b.SetTimePacket(time=500))
         self.assertEqual(self.bot.world_time.daylight_ticks, 500)
+        self.assertEqual(self.bot.weather, Weather(True, False, None, 0.0))
+        self.assertFalse(self.bot.packets.start_receiving().done())
         new_errors = await asyncio.gather(*(wait(timeout=0.1) for wait in waits), return_exceptions=True)
         for error in (*pending_errors, *new_errors):
             self.assertIsInstance(error, ConnectionError)
@@ -653,7 +663,7 @@ class VitalSnapshotTests(unittest.IsolatedAsyncioTestCase):
         await self.join()
         pending = [asyncio.create_task(wait(timeout=1)) for wait in (
             self.bot.wait_for_vitals_update, self.bot.wait_for_status_effects_update,
-            self.bot.wait_for_world_rules_update,
+            self.bot.wait_for_world_rules_update, *self.scalar_waits(),
         )]
         await asyncio.sleep(0)
         failure = ConnectionError("test transport lost")
@@ -661,5 +671,25 @@ class VitalSnapshotTests(unittest.IsolatedAsyncioTestCase):
         for error in await asyncio.gather(*pending, return_exceptions=True):
             self.assertIsInstance(error, ConnectionError)
             self.assertIs(error.__cause__, failure)
+        for wait in self.scalar_waits():
+            with self.assertRaises(ConnectionError) as raised:
+                await wait(timeout=1)
+            self.assertIs(raised.exception.__cause__, failure)
         with self.assertRaisesRegex(ConnectionError, "test transport lost"):
             await self.bot.close()
+
+    async def test_scalar_waits_timeout_or_cancel_independently_on_live_connection(self):
+        await self.join()
+        packets = self.bot.packets
+        observers = len(packets._subscribers)
+        waits = self.scalar_waits()
+        done = await asyncio.gather(*(wait(timeout=0) for wait in waits), return_exceptions=True)
+        self.assertTrue(all(isinstance(error, TimeoutError) for error in done))
+        pending = [asyncio.create_task(wait(timeout=1)) for wait in waits]
+        await asyncio.sleep(0)
+        for task in pending:
+            task.cancel()
+        self.assertTrue(all(isinstance(error, asyncio.CancelledError)
+                            for error in await asyncio.gather(*pending, return_exceptions=True)))
+        self.assertEqual(len(packets._subscribers), observers)
+        self.assertIsNone(self.bot.session_end)
