@@ -2395,6 +2395,21 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._commands.execute(command, timeout=timeout)
 
+    async def set_command_block(self, position: tuple[int, int, int], command: str, *,
+                                timeout: float = 15) -> BlockEntityUpdate:
+        """Set the exact command text of an observed impulse command block on protocol 2225.
+
+        Send one edit with the observed settings and return the next matching direct
+        block entity update within the deadline. The server decides whether to accept
+        the edit. The update reports observed text, without proving command execution.
+        """
+        if self.protocol.number != 2225:
+            raise NotImplementedError("command block editing is supported on protocol 2225")
+        commands, blocks = self._commands, self._blocks
+        if commands is None or blocks is None:
+            raise ConnectionError("player is not connected")
+        return await commands.set_command_block(blocks, position, command, timeout=timeout)
+
     @property
     def health(self) -> float | None:
         """Latest server-reported health; None until a health packet arrives."""

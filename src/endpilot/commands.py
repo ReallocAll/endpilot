@@ -1,15 +1,20 @@
-"""Published command names, player-initiated commands and BDS text feedback."""
+"""Published commands, player command feedback and command block edits."""
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from math import isfinite
 import uuid
 
-from bedrock_protocol import TextPacketType
+from bedrock_protocol import TextPacketType, nbt
 
+from .blocks import Blocks, BlockEntityUpdate, BlockStateObservation
 from .protocol import RawPacket
 
 
 _DISCONNECT_ERROR = "server disconnected while waiting for command feedback"
+_EDIT_DISCONNECT_ERROR = "connection ended during command block edit"
+_EDIT_DIMENSION_ERROR = "dimension changed during command block edit"
+_IMPULSE_COMMAND_BLOCK = "minecraft:command_block"
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +32,51 @@ class CommandCatalog:
     commands: tuple[CommandCatalogEntry, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _CommandBlockOptions:
+    requires_redstone: bool
+    conditional: bool
+    name: str
+    filtered_name: str
+    # Output can change while the edit waits without changing its settings.
+    last_output: str = field(compare=False)
+    track_output: bool
+    tick_delay: int
+    execute_on_first_tick: bool
+
+
+def _command_block_snapshot(
+    blocks: Blocks, position: tuple[int, int, int],
+) -> tuple[BlockStateObservation, _CommandBlockOptions]:
+    block = blocks.observed_block_state(position)
+    if block is None or block.name != _IMPULSE_COMMAND_BLOCK:
+        raise RuntimeError("a normal impulse command block must be observed at the target position")
+    root = blocks.observed_block_entity(position)
+    actor_id = root["id"] if root is not None and "id" in root else None
+    if not isinstance(actor_id, nbt.StringTag) or actor_id.value != "CommandBlock":
+        raise RuntimeError("CommandBlock NBT must be observed at the target position")
+    try:
+        auto, conditional, track_output, first_tick = (
+            root[key] for key in ("auto", "conditionalMode", "TrackOutput", "ExecuteOnFirstTick")
+        )
+        name, last_output, delay = root["CustomName"], root["LastOutput"], root["TickDelay"]
+    except KeyError:
+        raise RuntimeError("command block configuration is missing or invalid") from None
+    filtered_name = root["FilteredCustomName"] if "FilteredCustomName" in root else None
+    if (any(not isinstance(tag, nbt.ByteTag) or tag.value not in (0, 1)
+            for tag in (auto, conditional, track_output, first_tick))
+            or not isinstance(name, nbt.StringTag)
+            or (filtered_name is not None and not isinstance(filtered_name, nbt.StringTag))
+            or not isinstance(last_output, nbt.StringTag)
+            or not isinstance(delay, nbt.IntTag) or delay.value < 0):
+        raise RuntimeError("command block configuration is missing or invalid")
+    return block, _CommandBlockOptions(
+        not auto.value, bool(conditional.value), name.value,
+        "" if filtered_name is None else filtered_name.value, last_output.value,
+        bool(track_output.value), delay.value, bool(first_tick.value),
+    )
+
+
 class Commands:
     def __init__(
         self, packets, player_uuid: uuid.UUID, player_unique_id: int, *,
@@ -36,7 +86,10 @@ class Commands:
         self.player_uuid = player_uuid
         self.player_unique_id = player_unique_id
         self._lock = asyncio.Lock()
+        self._command_block_lock = asyncio.Lock()
         self._server_disconnected = False
+        self._closed = False
+        self._command_block_edits: set[asyncio.Future[Exception]] = set()
         self._catalog: CommandCatalog | None = None
         self._commands_enabled = initial_commands_enabled
         self._subscriptions = ()
@@ -51,6 +104,8 @@ class Commands:
             )
 
     def close(self) -> None:
+        self._closed = True
+        self._end_command_block_edits(ConnectionError, _EDIT_DISCONNECT_ERROR)
         for unsubscribe in self._subscriptions:
             unsubscribe()
         self._subscriptions = ()
@@ -59,6 +114,11 @@ class Commands:
 
     def _on_reader_end(self, _cause) -> None:
         self.close()
+
+    def _end_command_block_edits(self, error_type: type[Exception], message: str) -> None:
+        for failure in self._command_block_edits:
+            if not failure.done():
+                failure.set_result(error_type(message))
 
     @property
     def command_catalog(self) -> CommandCatalog | None:
@@ -102,6 +162,8 @@ class Commands:
         elif raw.packet_id == binding.DisconnectPacket.ID:
             self._server_disconnected = True
             self.close()
+        elif raw.packet_id == binding.ChangeDimensionPacket.ID:
+            self._end_command_block_edits(RuntimeError, _EDIT_DIMENSION_ERROR)
 
     def _request(self, command: str):
         b = self.packets.protocol.binding
@@ -159,3 +221,119 @@ class Commands:
             finally:
                 waiting.cancel()
                 await asyncio.gather(waiting, return_exceptions=True)
+
+    async def set_command_block(self, blocks: Blocks, position: tuple[int, int, int], command: str,
+                                *, timeout: float) -> BlockEntityUpdate:
+        if (not isinstance(position, (tuple, list)) or len(position) != 3
+                or any(type(axis) is not int or not -(1 << 31) <= axis < (1 << 31) for axis in position)):
+            raise ValueError("command block position must contain three signed 32-bit integers")
+        position = tuple(position)
+        if not isinstance(command, str):
+            raise ValueError("command block command must be a string")
+        if not isfinite(timeout):
+            raise ValueError("command block edit timeout must be finite")
+        if timeout <= 0:
+            raise TimeoutError("command block edit timed out")
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        movement = blocks.movement
+        dimension, epoch = blocks.dimension_id, movement._dimension_epoch
+        failure: asyncio.Future[Exception] = loop.create_future()
+        received: asyncio.Future[BlockEntityUpdate] = loop.create_future()
+        send_started = False
+
+        def require_context():
+            if failure.done():
+                raise failure.result()
+            if self._closed or self.packets._reader_end_result()[0]:
+                raise ConnectionError(_EDIT_DISCONNECT_ERROR)
+            if movement._changing_dimension or movement._dimension_epoch != epoch or blocks.dimension_id != dimension:
+                raise RuntimeError(_EDIT_DIMENSION_ERROR)
+            if loop.time() >= deadline:
+                raise TimeoutError("command block edit timed out")
+
+        require_context()
+        command.encode("utf-8")
+        snapshot = _command_block_snapshot(blocks, position)
+        initial_block, options = snapshot
+        b = self.packets.protocol.binding
+        update_type = b.CommandBlockUpdatePacket
+        x, y, z = position
+        target = update_type.BlockCommandData(
+            block_pos=b.BlockPos(x=x, y=y, z=z), mode=b.CommandBlockMode.NORMAL,
+            redstone_mode=options.requires_redstone, is_conditional=options.conditional,
+        )
+        packet = update_type(
+            target=target, command=command, last_output=options.last_output,
+            name=options.name, filtered_name=options.filtered_name, track_output=options.track_output,
+            tick_delay=options.tick_delay, execute_on_first_tick=options.execute_on_first_tick,
+        )
+
+        def observe(update: BlockEntityUpdate):
+            if (not send_started or received.done() or failure.done() or movement._changing_dimension
+                    or movement._dimension_epoch != epoch):
+                return
+            root = update.data
+            if "id" not in root or "Command" not in root:
+                return
+            actor_id, text = root["id"], root["Command"]
+            if (isinstance(actor_id, nbt.StringTag) and actor_id.value == "CommandBlock"
+                    and isinstance(text, nbt.StringTag) and text.value == command):
+                block = blocks.observed_block_state(position)
+                if block is not None and block.name == _IMPULSE_COMMAND_BLOCK:
+                    received.set_result(update)
+
+        terrain_packets = (
+            b.UpdateBlockPacket.ID, b.UpdateSubChunkBlocksPacket.ID, b.SubChunkPacket.ID,
+            b.LevelChunkPacket.ID, b.NetworkChunkPublisherUpdatePacket.ID,
+        )
+
+        def observe_terrain(raw: RawPacket):
+            if failure.done() or raw.packet_id not in terrain_packets:
+                return
+            if send_started:
+                block = blocks.observed_block_state(position)
+                if block is not None and block.name != _IMPULSE_COMMAND_BLOCK:
+                    failure.set_result(RuntimeError("command block target changed while waiting for its update"))
+                return
+            # A replacement can clear the actor before a later packet describes a new one.
+            current = blocks.observed_block(position)
+            if (current is None or current.runtime_id != initial_block.runtime_id
+                    or blocks._block_entity(position) is None):
+                failure.set_result(RuntimeError("command block observation was invalidated before sending"))
+
+        def before_send():
+            nonlocal send_started
+            require_context()
+            if _command_block_snapshot(blocks, position) != snapshot:
+                raise RuntimeError("command block or its configuration changed before sending")
+            require_context()
+            send_started = True
+
+        async def edit():
+            async with self._command_block_lock:
+                require_context()
+                await self.packets.send(packet, _before_send=before_send)
+                return await received
+
+        stop_updates = blocks.subscribe_block_entity_updates(observe, position=position, dimension_id=dimension)
+        stop_terrain = self.packets.subscribe_raw(observe_terrain)
+        self._command_block_edits.add(failure)
+        editing = asyncio.create_task(edit())
+        try:
+            async with asyncio.timeout_at(deadline):
+                await asyncio.wait((editing, failure), return_when=asyncio.FIRST_COMPLETED)
+                require_context()
+                return editing.result()
+        finally:
+            stop_updates()
+            stop_terrain()
+            self._command_block_edits.discard(failure)
+            failure.cancel()
+            received.cancel()
+            if not editing.done():
+                editing.cancel()
+                await asyncio.gather(editing, return_exceptions=True)
+            elif not editing.cancelled():
+                editing.exception()
