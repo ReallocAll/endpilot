@@ -1,12 +1,17 @@
 """Passive observations of sound, particles and block feedback."""
 
+import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from bedrock_protocol import nbt
 
 from .blocks import Blocks
 from .compression import PacketConnection
+
+if TYPE_CHECKING:
+    from .login import _SessionEndState
 
 
 SoundKind = Literal["play", "stop", "level", "update"]
@@ -97,7 +102,7 @@ class BlockEvent:
 
 
 class WorldFeedback:
-    def __init__(self, packets: PacketConnection, blocks: Blocks):
+    def __init__(self, packets: PacketConnection, blocks: Blocks, end_state: "_SessionEndState"):
         self.packets = packets
         self.blocks = blocks
         self.binding = packets.protocol.binding
@@ -107,24 +112,77 @@ class WorldFeedback:
         update = getattr(b, "ClientboundUpdateSoundDataPacket", None)
         if update is not None:
             self._sound_ids += (update.ID,)
+        self._particle_ids = (b.SpawnParticleEffectPacket.ID,)
         self._block_ids = (b.BlockEventPacket.ID,)
         if self._is_2225:
             self._block_ids += (b.BlockActorDataPacket.ID, b.LevelEventPacket.ID, b.LevelSoundEventPacket.ID)
+        self._end_state = end_state
+        self._closed = False
+        self._subscriptions: dict[object, Callable[[], None]] = {}
+        self._unsubscribe_reader_end: Callable[[], None] | None = None
 
-    async def _wait(self, packet_ids, project, matches, timeout):
+    def close(self, _cause: BaseException | None = None) -> None:
+        self._closed = True
+        if self._unsubscribe_reader_end is not None:
+            self._unsubscribe_reader_end()
+            self._unsubscribe_reader_end = None
+        for unsubscribe in self._subscriptions.values():
+            unsubscribe()
+        self._subscriptions.clear()
+
+    def _event(self, raw, project, filters):
+        # Capture the dimension during this dispatch, before the next packet can change it.
+        event = project(self.packets.protocol.decode(raw), self.blocks.dimension_id)
+        if event is not None and all(value is None or getattr(event, field) == value for field, value in filters.items()):
+            return event
+        return None
+
+    async def _wait(self, packet_ids, project, timeout, **filters):
         observed = None
 
         def observe(raw):
             nonlocal observed
-            # Capture the dimension during this dispatch, before the next packet can change it.
-            event = project(self.packets.protocol.decode(raw), self.blocks.dimension_id)
-            if event is None or not matches(event):
-                return False
-            observed = event
-            return True
+            observed = self._event(raw, project, filters)
+            return observed is not None
 
         await self.packets.wait_for_packet(packet_ids, match=observe, timeout=timeout)
         return observed
+
+    def _subscribe(self, packet_ids, project, callback, **filters) -> Callable[[], None]:
+        if self._closed or self._end_state.result is not None or self.packets._reader_end_result()[0]:
+            raise ConnectionError("world feedback subscription stream is closed")
+        registrations = self._subscriptions
+        key = object()
+
+        def observe(raw):
+            # A previous observer can unsubscribe this one during the current dispatch.
+            if key not in registrations:
+                return
+            if raw.packet_id == self.binding.DisconnectPacket.ID:
+                self.close()
+                return
+            if raw.packet_id not in packet_ids:
+                return
+            event = self._event(raw, project, filters)
+            if event is None:
+                return
+            try:
+                callback(event)
+            except asyncio.CancelledError as error:
+                # A callback can raise cancellation without the shared reader being cancelled.
+                asyncio.get_running_loop().call_exception_handler({
+                    "message": "packet observer failed", "exception": error, "callback": callback,
+                })
+
+        def unsubscribe():
+            remove_observer = registrations.pop(key, None)
+            if remove_observer is not None:
+                remove_observer()
+
+        registrations[key] = self.packets.subscribe_raw(observe)
+        if self._unsubscribe_reader_end is None:
+            self._unsubscribe_reader_end = self.packets.subscribe_reader_end(self.close)
+        return unsubscribe
 
     def _sound(self, packet, dimension: int) -> SoundEvent:
         b = self.binding
@@ -140,19 +198,24 @@ class WorldFeedback:
         return SoundEvent("update", dimension, packet)
 
     async def wait_for_sound(self, name: str | None, kind: SoundKind | None, timeout: float) -> SoundEvent:
-        return await self._wait(
-            self._sound_ids, self._sound,
-            lambda event: (name is None or event.name == name) and (kind is None or event.kind == kind), timeout,
-        )
+        return await self._wait(self._sound_ids, self._sound, timeout, name=name, kind=kind)
+
+    def subscribe_sound(
+        self, callback: Callable[[SoundEvent], None], *, name: str | None = None, kind: SoundKind | None = None,
+    ) -> Callable[[], None]:
+        return self._subscribe(self._sound_ids, self._sound, callback, name=name, kind=kind)
+
+    @staticmethod
+    def _particle(packet, dimension: int) -> ParticleEvent:
+        return ParticleEvent(dimension, packet.effect_name, _xyz(packet.pos), packet)
 
     async def wait_for_particle(self, name: str | None, timeout: float) -> ParticleEvent:
-        def particle(packet, dimension):
-            return ParticleEvent(dimension, packet.effect_name, _xyz(packet.pos), packet)
+        return await self._wait(self._particle_ids, self._particle, timeout, name=name)
 
-        return await self._wait(
-            self.binding.SpawnParticleEffectPacket.ID, particle,
-            lambda event: name is None or event.name == name, timeout,
-        )
+    def subscribe_particle(
+        self, callback: Callable[[ParticleEvent], None], *, name: str | None = None,
+    ) -> Callable[[], None]:
+        return self._subscribe(self._particle_ids, self._particle, callback, name=name)
 
     def _block_state(self, position: _Cell):
         block = self.blocks.observed_block(position)
@@ -209,8 +272,9 @@ class WorldFeedback:
         return BlockEvent(kind, dimension, position, packet, chest_partner, piston_face, piston_attached_blocks)
 
     async def wait_for_block_event(self, position: _Position | None, kind: str | None, timeout: float) -> BlockEvent:
-        return await self._wait(
-            self._block_ids, self._block,
-            lambda event: (position is None or event.position == position) and (kind is None or event.kind == kind),
-            timeout,
-        )
+        return await self._wait(self._block_ids, self._block, timeout, position=position, kind=kind)
+
+    def subscribe_block_events(
+        self, callback: Callable[[BlockEvent], None], *, position: _Position | None = None, kind: str | None = None,
+    ) -> Callable[[], None]:
+        return self._subscribe(self._block_ids, self._block, callback, position=position, kind=kind)

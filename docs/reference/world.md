@@ -199,6 +199,16 @@ Note events expose `note_pitch` and `instrument_id`. A crack-end packet with
 an all-zero position has `event.position` set to `None`. Its native
 `packet.pos` remains available.
 
+Use `bot.subscribe_sound(callback, name=..., kind=...)`,
+`bot.subscribe_particle(callback, name=...)`, or
+`bot.subscribe_block_events(callback, position=..., kind=...)` to receive
+every future matching event in packet order. All filters are optional and
+use the same matching rules and typed events as the corresponding waits.
+Each callback runs synchronously during packet dispatch. Subscriptions start
+after registration and end when the bot closes, receives a server disconnect,
+or its packet reader ends. The returned function stops delivery immediately
+and can be called more than once.
+
 In protocol 2225, `chest_open` and `chest_close` apply when the observed main
 layer at the packet's position is `minecraft:chest` or
 `minecraft:trapped_chest` and the packet reports a lid change. When the block

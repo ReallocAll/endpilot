@@ -390,7 +390,7 @@ class Bot:
         session.player_state_packets.clear()
         self._environment = WorldEnvironment(session.packets, session.environment_packets)
         session.environment_packets.clear()
-        self._feedback = WorldFeedback(session.packets, self._blocks)
+        self._feedback = WorldFeedback(session.packets, self._blocks, session._end_state)
         self._recipes = Recipes(
             session.packets, session.item_names, session.crafting_data_packets,
             inventory=self._inventory, containers=self._containers, environment=self._environment,
@@ -577,11 +577,27 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._feedback.wait_for_sound(name, kind, timeout)
 
+    def subscribe_sound(
+        self, callback: Callable[[SoundEvent], None], *, name: str | None = None, kind: SoundKind | None = None,
+    ) -> Callable[[], None]:
+        """Call a synchronous observer for each future matching sound and return an unsubscribe function."""
+        if self._feedback is None:
+            raise RuntimeError("player has not joined")
+        return self._feedback.subscribe_sound(callback, name=name, kind=kind)
+
     async def wait_for_particle(self, name: str | None = None, *, timeout: float = 15) -> ParticleEvent:
         """Wait for the next matching named particle packet."""
         if self._feedback is None:
             raise RuntimeError("player has not joined")
         return await self._feedback.wait_for_particle(name, timeout)
+
+    def subscribe_particle(
+        self, callback: Callable[[ParticleEvent], None], *, name: str | None = None,
+    ) -> Callable[[], None]:
+        """Call a synchronous observer for each future matching particle and return an unsubscribe function."""
+        if self._feedback is None:
+            raise RuntimeError("player has not joined")
+        return self._feedback.subscribe_particle(callback, name=name)
 
     async def wait_for_block_event(
         self, position: tuple[float, float, float] | None = None, *, kind: str | None = None, timeout: float = 15,
@@ -590,6 +606,15 @@ class Bot:
         if self._feedback is None:
             raise RuntimeError("player has not joined")
         return await self._feedback.wait_for_block_event(position, kind, timeout)
+
+    def subscribe_block_events(
+        self, callback: Callable[[BlockEvent], None], *,
+        position: tuple[float, float, float] | None = None, kind: str | None = None,
+    ) -> Callable[[], None]:
+        """Call a synchronous observer for each future matching block event and return an unsubscribe function."""
+        if self._feedback is None:
+            raise RuntimeError("player has not joined")
+        return self._feedback.subscribe_block_events(callback, position=position, kind=kind)
 
     @property
     def recipes(self) -> tuple[Recipe, ...]:
@@ -2955,8 +2980,8 @@ class Bot:
         scoreboard, self._scoreboard = self._scoreboard, None
         close_component(scoreboard)
         environment, self._environment = self._environment, None
-        self._feedback = None
-        for component in (environment, recipes, player_state, entities, item_use):
+        feedback, self._feedback = self._feedback, None
+        for component in (feedback, environment, recipes, player_state, entities, item_use):
             close_component(component)
         # Cancel the input ticker before draining another component can yield to it.
         movement_errors: list[BaseException] = []

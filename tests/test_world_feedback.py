@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -75,6 +76,153 @@ class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((event.dimension_id, event.position), (1, (-1.375, 221.25, 3.75)))
         self.assertEqual(event.packet, particle)
 
+    async def test_subscriptions_deliver_every_matching_packet_in_dispatch_order(self):
+        b = self.b
+        cell = (3, 220, 7)
+        pos = b.Vec3(x=3, y=220, z=7)
+        history = b.StopSoundPacket(name="history")
+        first_sound = b.PlaySoundPacket(name="random.pop", pos=b.BlockPos(x=24, y=1760, z=56))
+        other_sound = b.PlaySoundPacket(name="random.orb")
+        stop = b.StopSoundPacket(name="random.pop")
+        note = b.LevelSoundEventPacket(pos=pos, sound_event="note", data=257)
+        particle = b.SpawnParticleEffectPacket(
+            vanilla_dimension_id=2, actor_id=91, pos=pos, effect_name="minecraft:basic_flame_particle",
+            molang_variables='{"variable.a":1.5}',
+        )
+        other_particle = b.SpawnParticleEffectPacket(effect_name="minecraft:basic_smoke_particle")
+        lid = b.BlockEventPacket(pos=self.pos(cell), b0=1, b1=1)
+        other_lid = b.BlockEventPacket(pos=self.pos((4, 220, 7)), b0=1, b1=1)
+        self.push(history)
+        self.assertEqual((await self.bot.wait_for_sound(timeout=1)).packet, history)
+
+        seen, sounds, particles, blocks = [], [], [], []
+        self.bot.subscribe_sound(lambda event: seen.append(("sound", event)))
+        self.bot.subscribe_particle(lambda event: seen.append(("particle", event)))
+        self.bot.subscribe_block_events(lambda event: seen.append(("block", event)))
+        self.bot.subscribe_sound(sounds.append, name="random.pop", kind="play")
+        self.bot.subscribe_particle(particles.append, name=particle.effect_name)
+        self.bot.subscribe_block_events(blocks.append, position=cell, kind="chest_open")
+        async with asyncio.TaskGroup() as group:
+            sound_wait = group.create_task(self.bot.wait_for_sound("random.pop", kind="play", timeout=1))
+            particle_wait = group.create_task(self.bot.wait_for_particle(particle.effect_name, timeout=1))
+            block_wait = group.create_task(self.bot.wait_for_block_event(cell, kind="chest_open", timeout=1))
+            cancelled = group.create_task(self.bot.wait_for_sound("random.pop", kind="play"))
+            await asyncio.sleep(0)
+            cancelled.cancel()
+            self.push(first_sound, other_sound, stop, particle, other_particle,
+                      b.ChangeDimensionPacket(dimension_id=1, pos=pos),
+                      b.UpdateBlockPacket(pos=lid.pos, runtime_id=0x2C383C60),
+                      b.UpdateBlockPacket(pos=other_lid.pos, runtime_id=0x2C383C60),
+                      note, other_lid, lid, particle, first_sound,
+                      b.ChangeDimensionPacket(dimension_id=2, pos=pos))
+
+        self.assertTrue(cancelled.cancelled())
+        self.assertEqual([(source, event.dimension_id, event.packet) for source, event in seen], [
+            ("sound", 0, first_sound), ("sound", 0, other_sound), ("sound", 0, stop),
+            ("particle", 0, particle), ("particle", 0, other_particle),
+            ("sound", 1, note), ("block", 1, note), ("block", 1, other_lid), ("block", 1, lid),
+            ("particle", 1, particle), ("sound", 1, first_sound),
+        ])
+        self.assertEqual([(event.dimension_id, event.position) for event in sounds], [(0, cell), (1, cell)])
+        self.assertEqual([(event.dimension_id, event.position) for event in particles], [(0, cell), (1, cell)])
+        self.assertEqual([(event.kind, event.position) for event in blocks], [("chest_open", cell)])
+        self.assertEqual((sound_wait.result(), particle_wait.result(), block_wait.result()),
+                         (sounds[0], particles[0], blocks[0]))
+
+    async def test_unsubscribe_is_immediate_and_callback_error_is_isolated(self):
+        first = self.b.StopSoundPacket(name="first")
+        second = self.b.StopSoundPacket(name="second")
+        removed, kept = [], []
+        failure = ValueError("sound observer failed")
+        cancellation = asyncio.CancelledError("observer cancelled itself")
+
+        def remove_and_fail(_event):
+            unsubscribe()
+            unsubscribe()
+            raise failure
+
+        def fail_with_cancellation(_event):
+            raise cancellation
+
+        stop_failure = self.bot.subscribe_sound(remove_and_fail, name="first")
+        unsubscribe = self.bot.subscribe_sound(removed.append)
+        self.bot.subscribe_sound(fail_with_cancellation, name="first")
+        self.bot.subscribe_sound(kept.append)
+        waiting = asyncio.create_task(self.bot.wait_for_sound("second", timeout=1))
+        await asyncio.sleep(0)
+        with patch.object(asyncio.get_running_loop(), "call_exception_handler") as report:
+            self.push(first, second)
+            self.assertEqual((await waiting).packet, second)
+
+        stop_failure()
+        self.assertEqual(removed, [])
+        self.assertEqual([event.packet for event in kept], [first, second])
+        self.assertEqual([(call.args[0]["message"], call.args[0]["exception"]) for call in report.call_args_list],
+                         [("packet observer failed", failure), ("packet observer failed", cancellation)])
+
+    async def test_first_subscription_rejects_after_game_disconnect(self):
+        waiting = asyncio.create_task(self.bot.wait_for_server_disconnect(timeout=1))
+        await asyncio.sleep(0)
+        self.push(self.b.DisconnectPacket())
+        await waiting
+        self.assertFalse(self.bot.packets._reader_end_result()[0])
+        with self.assertRaises(ConnectionError):
+            self.bot.subscribe_particle(lambda _: None)
+
+    async def test_disconnect_stops_delivery_before_trailing_packets_and_rejoin(self):
+        b = self.b
+        old_feedback = self.bot._feedback
+        seen, errors = [], []
+        unsubscribe = self.bot.subscribe_sound(seen.append)
+        self.bot.subscribe_particle(seen.append)
+        self.bot.subscribe_block_events(seen.append)
+
+        def inspect(raw):
+            if raw.packet_id == b.DisconnectPacket.ID:
+                try:
+                    self.bot.subscribe_sound(seen.append)
+                except ConnectionError as error:
+                    errors.append(error)
+
+        self.addCleanup(self.bot.packets.subscribe_raw(inspect))
+        last = b.StopSoundPacket(name="late")
+        waiting = asyncio.create_task(self.bot.wait_for_sound("late", timeout=1))
+        await asyncio.sleep(0)
+        self.push(b.DisconnectPacket(), b.SpawnParticleEffectPacket(effect_name="late"), b.BlockEventPacket(), last)
+        self.assertEqual((await waiting).packet, last)
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(seen, [])
+        with self.assertRaises(ConnectionError):
+            old_feedback.subscribe_block_events(seen.append)
+        await self.bot.close()
+
+        await self.join()
+        new = []
+        self.bot.subscribe_sound(new.append)
+        unsubscribe()
+        self.push(last)
+        self.assertEqual((await self.bot.wait_for_sound(timeout=1)).packet, last)
+        self.assertEqual([event.packet for event in new], [last])
+        self.assertEqual(seen, [])
+
+    async def test_reader_failure_releases_callbacks_and_rejects_new_subscriptions(self):
+        def listener(_event):
+            self.fail("unexpected particle callback")
+
+        callback = weakref.ref(listener)
+        unsubscribe = self.bot.subscribe_particle(listener)
+        del listener
+        ended = asyncio.Event()
+        self.bot.packets.subscribe_reader_end(lambda _cause: ended.set())
+        self.incoming.put_nowait(b"\x02\x00")
+        await asyncio.wait_for(ended.wait(), timeout=1)
+        self.assertIsNone(callback())
+        unsubscribe()
+        with self.assertRaises(ConnectionError):
+            self.bot.subscribe_particle(lambda _: None)
+        with self.assertRaisesRegex(ValueError, "truncated packet in batch"):
+            await self.bot.close()
+
     async def test_sound_after_spawn_uses_the_dimension_changed_during_login(self):
         b = self.b
         stopped = b.StopSoundPacket(name="random.pop")
@@ -127,11 +275,31 @@ class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(event.result().piston_attached_blocks)
 
     async def test_pending_observation_ends_on_close(self):
-        waiting = asyncio.create_task(self.bot.wait_for_sound())
+        feedback = self.bot._feedback
+        packets = self.bot.packets
+        player_state = self.bot._player_state
+        drain_player_state = player_state.aclose
+        sounds = []
+        self.bot.subscribe_sound(sounds.append)
+        late = self.b.StopSoundPacket(name="late")
+
+        async def drain_with_packet():
+            self.push(late)
+            raw = await packets.wait_for_packet(late.ID, timeout=1)
+            self.assertEqual(self.bot.protocol.decode(raw), late)
+            await drain_player_state()
+
+        waiting = asyncio.create_task(self.bot.wait_for_sound("pending"))
         await asyncio.sleep(0)
-        await self.bot.close()
+        with patch.object(player_state, "aclose", side_effect=drain_with_packet):
+            await self.bot.close()
+        self.assertEqual(sounds, [])
         with self.assertRaises(ConnectionError):
             await asyncio.wait_for(waiting, 1)
+        with self.assertRaises(ConnectionError):
+            feedback.subscribe_sound(lambda _: None)
+        with self.assertRaises(RuntimeError):
+            self.bot.subscribe_sound(lambda _: None)
 
     def pos(self, cell):
         return self.b.BlockPos(x=cell[0], y=cell[1], z=cell[2])
