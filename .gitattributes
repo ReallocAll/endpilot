@@ -1,0 +1,4 @@
+scripts/mining-observations-2225.json text eol=lf
+src/endpilot/data/biomes-2225.json text eol=lf
+src/endpilot/data/harvest-2225.json text eol=lf
+src/endpilot/data/outline-2225.json text eol=lf

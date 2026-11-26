@@ -1,0 +1,571 @@
+{
+  "source": "https://www.minecraft.net/bedrockdedicatedserver/bin-win/bedrock-server-1.26.66.1.zip",
+  "bds": "1.26.66.1",
+  "build_id": 53696234,
+  "exe_sha256": "3ced9e27c540849661fd7d56f4169a493e91a01096fb5b1e3cb9bb7da2277c16",
+  "register_file_offset": "0x2b5be60",
+  "direct_register_calls": 51,
+  "motifs": {
+    "Kebab": {
+      "pixels": [
+        16,
+        16
+      ],
+      "blocks": [
+        1,
+        1
+      ],
+      "register_arguments_file_offset": "0x2b85d1d"
+    },
+    "Aztec": {
+      "pixels": [
+        16,
+        16
+      ],
+      "blocks": [
+        1,
+        1
+      ],
+      "register_arguments_file_offset": "0x2b85d91"
+    },
+    "Alban": {
+      "pixels": [
+        16,
+        16
+      ],
+      "blocks": [
+        1,
+        1
+      ],
+      "register_arguments_file_offset": "0x2b85e05"
+    },
+    "Aztec2": {
+      "pixels": [
+        16,
+        16
+      ],
+      "blocks": [
+        1,
+        1
+      ],
+      "register_arguments_file_offset": "0x2b85e7a"
+    },
+    "Bomb": {
+      "pixels": [
+        16,
+        16
+      ],
+      "blocks": [
+        1,
+        1
+      ],
+      "register_arguments_file_offset": "0x2b85edd"
+    },
+    "Plant": {
+      "pixels": [
+        16,
+        16
+      ],
+      "blocks": [
+        1,
+        1
+      ],
+      "register_arguments_file_offset": "0x2b85f51"
+    },
+    "Wasteland": {
+      "pixels": [
+        16,
+        16
+      ],
+      "blocks": [
+        1,
+        1
+      ],
+      "register_arguments_file_offset": "0x2b85fc4"
+    },
+    "Pool": {
+      "pixels": [
+        32,
+        16
+      ],
+      "blocks": [
+        2,
+        1
+      ],
+      "register_arguments_file_offset": "0x2b86027"
+    },
+    "Courbet": {
+      "pixels": [
+        32,
+        16
+      ],
+      "blocks": [
+        2,
+        1
+      ],
+      "register_arguments_file_offset": "0x2b8609b"
+    },
+    "Sea": {
+      "pixels": [
+        32,
+        16
+      ],
+      "blocks": [
+        2,
+        1
+      ],
+      "register_arguments_file_offset": "0x2b8610f"
+    },
+    "Sunset": {
+      "pixels": [
+        32,
+        16
+      ],
+      "blocks": [
+        2,
+        1
+      ],
+      "register_arguments_file_offset": "0x2b86184"
+    },
+    "Creebet": {
+      "pixels": [
+        32,
+        16
+      ],
+      "blocks": [
+        2,
+        1
+      ],
+      "register_arguments_file_offset": "0x2b861f8"
+    },
+    "Wanderer": {
+      "pixels": [
+        16,
+        32
+      ],
+      "blocks": [
+        1,
+        2
+      ],
+      "register_arguments_file_offset": "0x2b86266"
+    },
+    "Graham": {
+      "pixels": [
+        16,
+        32
+      ],
+      "blocks": [
+        1,
+        2
+      ],
+      "register_arguments_file_offset": "0x2b862db"
+    },
+    "Match": {
+      "pixels": [
+        32,
+        32
+      ],
+      "blocks": [
+        2,
+        2
+      ],
+      "register_arguments_file_offset": "0x2b8634f"
+    },
+    "Bust": {
+      "pixels": [
+        32,
+        32
+      ],
+      "blocks": [
+        2,
+        2
+      ],
+      "register_arguments_file_offset": "0x2b863b2"
+    },
+    "Stage": {
+      "pixels": [
+        32,
+        32
+      ],
+      "blocks": [
+        2,
+        2
+      ],
+      "register_arguments_file_offset": "0x2b8642e"
+    },
+    "Void": {
+      "pixels": [
+        32,
+        32
+      ],
+      "blocks": [
+        2,
+        2
+      ],
+      "register_arguments_file_offset": "0x2b86491"
+    },
+    "SkullAndRoses": {
+      "pixels": [
+        32,
+        32
+      ],
+      "blocks": [
+        2,
+        2
+      ],
+      "register_arguments_file_offset": "0x2b8650e"
+    },
+    "Wither": {
+      "pixels": [
+        32,
+        32
+      ],
+      "blocks": [
+        2,
+        2
+      ],
+      "register_arguments_file_offset": "0x2b8658a"
+    },
+    "Fighters": {
+      "pixels": [
+        64,
+        32
+      ],
+      "blocks": [
+        4,
+        2
+      ],
+      "register_arguments_file_offset": "0x2b865f8"
+    },
+    "Pointer": {
+      "pixels": [
+        64,
+        64
+      ],
+      "blocks": [
+        4,
+        4
+      ],
+      "register_arguments_file_offset": "0x2b86670"
+    },
+    "Pigscene": {
+      "pixels": [
+        64,
+        64
+      ],
+      "blocks": [
+        4,
+        4
+      ],
+      "register_arguments_file_offset": "0x2b866de"
+    },
+    "BurningSkull": {
+      "pixels": [
+        64,
+        64
+      ],
+      "blocks": [
+        4,
+        4
+      ],
+      "register_arguments_file_offset": "0x2b86754"
+    },
+    "Skeleton": {
+      "pixels": [
+        64,
+        48
+      ],
+      "blocks": [
+        4,
+        3
+      ],
+      "register_arguments_file_offset": "0x2b867c2"
+    },
+    "DonkeyKong": {
+      "pixels": [
+        64,
+        48
+      ],
+      "blocks": [
+        4,
+        3
+      ],
+      "register_arguments_file_offset": "0x2b86837"
+    },
+    "Earth": {
+      "pixels": [
+        32,
+        32
+      ],
+      "blocks": [
+        2,
+        2
+      ],
+      "register_arguments_file_offset": "0x2b868ab"
+    },
+    "Wind": {
+      "pixels": [
+        32,
+        32
+      ],
+      "blocks": [
+        2,
+        2
+      ],
+      "register_arguments_file_offset": "0x2b8690e"
+    },
+    "Fire": {
+      "pixels": [
+        32,
+        32
+      ],
+      "blocks": [
+        2,
+        2
+      ],
+      "register_arguments_file_offset": "0x2b86971"
+    },
+    "Water": {
+      "pixels": [
+        32,
+        32
+      ],
+      "blocks": [
+        2,
+        2
+      ],
+      "register_arguments_file_offset": "0x2b869ed"
+    },
+    "baroque": {
+      "pixels": [
+        32,
+        32
+      ],
+      "blocks": [
+        2,
+        2
+      ],
+      "register_arguments_file_offset": "0x2b86a5a"
+    },
+    "humble": {
+      "pixels": [
+        32,
+        32
+      ],
+      "blocks": [
+        2,
+        2
+      ],
+      "register_arguments_file_offset": "0x2b86ac8"
+    },
+    "meditative": {
+      "pixels": [
+        16,
+        16
+      ],
+      "blocks": [
+        1,
+        1
+      ],
+      "register_arguments_file_offset": "0x2b86b36"
+    },
+    "prairie_ride": {
+      "pixels": [
+        16,
+        32
+      ],
+      "blocks": [
+        1,
+        2
+      ],
+      "register_arguments_file_offset": "0x2b86ba5"
+    },
+    "unpacked": {
+      "pixels": [
+        64,
+        64
+      ],
+      "blocks": [
+        4,
+        4
+      ],
+      "register_arguments_file_offset": "0x2b86c0c"
+    },
+    "backyard": {
+      "pixels": [
+        48,
+        64
+      ],
+      "blocks": [
+        3,
+        4
+      ],
+      "register_arguments_file_offset": "0x2b86c73"
+    },
+    "bouquet": {
+      "pixels": [
+        48,
+        48
+      ],
+      "blocks": [
+        3,
+        3
+      ],
+      "register_arguments_file_offset": "0x2b86ce0"
+    },
+    "cavebird": {
+      "pixels": [
+        48,
+        48
+      ],
+      "blocks": [
+        3,
+        3
+      ],
+      "register_arguments_file_offset": "0x2b86d47"
+    },
+    "changing": {
+      "pixels": [
+        64,
+        32
+      ],
+      "blocks": [
+        4,
+        2
+      ],
+      "register_arguments_file_offset": "0x2b86dae"
+    },
+    "cotan": {
+      "pixels": [
+        48,
+        48
+      ],
+      "blocks": [
+        3,
+        3
+      ],
+      "register_arguments_file_offset": "0x2b86e1b"
+    },
+    "endboss": {
+      "pixels": [
+        48,
+        48
+      ],
+      "blocks": [
+        3,
+        3
+      ],
+      "register_arguments_file_offset": "0x2b86e88"
+    },
+    "fern": {
+      "pixels": [
+        48,
+        48
+      ],
+      "blocks": [
+        3,
+        3
+      ],
+      "register_arguments_file_offset": "0x2b86ee4"
+    },
+    "finding": {
+      "pixels": [
+        64,
+        32
+      ],
+      "blocks": [
+        4,
+        2
+      ],
+      "register_arguments_file_offset": "0x2b86f51"
+    },
+    "lowmist": {
+      "pixels": [
+        64,
+        32
+      ],
+      "blocks": [
+        4,
+        2
+      ],
+      "register_arguments_file_offset": "0x2b86fbe"
+    },
+    "orb": {
+      "pixels": [
+        64,
+        64
+      ],
+      "blocks": [
+        4,
+        4
+      ],
+      "register_arguments_file_offset": "0x2b8702b"
+    },
+    "owlemons": {
+      "pixels": [
+        48,
+        48
+      ],
+      "blocks": [
+        3,
+        3
+      ],
+      "register_arguments_file_offset": "0x2b87092"
+    },
+    "passage": {
+      "pixels": [
+        64,
+        32
+      ],
+      "blocks": [
+        4,
+        2
+      ],
+      "register_arguments_file_offset": "0x2b870ff"
+    },
+    "pond": {
+      "pixels": [
+        48,
+        64
+      ],
+      "blocks": [
+        3,
+        4
+      ],
+      "register_arguments_file_offset": "0x2b8715b"
+    },
+    "sunflowers": {
+      "pixels": [
+        48,
+        48
+      ],
+      "blocks": [
+        3,
+        3
+      ],
+      "register_arguments_file_offset": "0x2b871c9"
+    },
+    "tides": {
+      "pixels": [
+        48,
+        48
+      ],
+      "blocks": [
+        3,
+        3
+      ],
+      "register_arguments_file_offset": "0x2b87236"
+    },
+    "dennis": {
+      "pixels": [
+        48,
+        48
+      ],
+      "blocks": [
+        3,
+        3
+      ],
+      "register_arguments_file_offset": "0x2b872a4"
+    }
+  }
+}

@@ -1,0 +1,317 @@
+import asyncio
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
+from ipaddress import IPv4Address
+from pathlib import Path
+import ssl
+import sys
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+import unittest
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
+
+from aiohttp import ClientConnectorCertificateError, ClientResponseError, web
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from nethernet import ConnectionFailed, InvalidIdentity, SessionError
+
+from endpilot import Bot
+from endpilot._join_address import _parse_join_address
+from endpilot.transport._nethernet_http import _NetherNetUnavailable, _request, connect_http
+from endpilot.transport.nethernet import _check_signaling_endpoint
+from test_join import _spawn_transport
+
+
+@asynccontextmanager
+async def _listen(routes, *, ssl_context=None):
+    app = web.Application()
+    app.add_routes(routes)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    try:
+        await web.TCPSite(runner, "127.0.0.1", 0, ssl_context=ssl_context).start()
+        yield f"127.0.0.1:{runner.addresses[0][1]}"
+    finally:
+        await runner.cleanup()
+
+
+def _untrusted_tls(directory: Path) -> ssl.SSLContext:
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, "untrusted join fixture")])
+    now = datetime.now(UTC)
+    certificate = (
+        x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+        .serial_number(x509.random_serial_number()).not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(minutes=1))
+        .add_extension(x509.SubjectAlternativeName([x509.IPAddress(IPv4Address("127.0.0.1"))]), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    cert_path, key_path = directory / "certificate.pem", directory / "key.pem"
+    cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption(),
+    ))
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_path, key_path)
+    return context
+
+
+class JoinAddressTests(unittest.IsolatedAsyncioTestCase):
+    def test_offline_default_and_explicit_player_names(self):
+        self.assertEqual(Bot().identity.name, "EndPilot")
+        self.assertEqual(Bot("Knight").identity.name, "Knight")
+
+    def test_bare_ipv6_and_full_signaling_path(self):
+        target = _parse_join_address("[2001:0DB8::1]:19132")
+        self.assertIsNone(target.scheme)
+        self.assertEqual((target.host, target.port, target.authority), ("2001:db8::1", 19132, "[2001:db8::1]:19132"))
+        url = "https://[::1]:443/path/%2flobby"
+        self.assertEqual(_parse_join_address(url).value, url)
+        self.assertEqual(_parse_join_address("raknet://[::1]").port, 19132)
+
+    async def test_invalid_address_or_pin_is_rejected_before_authorization(self):
+        provider = AsyncMock()
+        for address, pin in (
+            ("localhost", None), ("localhost:0", None), ("localhost:65536", None), ("::1:19132", None),
+            ("[::1]bad:19132", None), ("localhost:19132/path", None), ("https://user@localhost:19132", None),
+            ("http://localhost:19132/path?", None), ("http://localhost:19132/path#fragment", None),
+            ("ftp://localhost:19132", None), ("localhost:19132", "bad"), ("raknet://localhost", "a" * 64),
+        ):
+            with self.subTest(address=address, pin=pin), self.assertRaises(ValueError):
+                await Bot("Knight").join_address(address, server_key_sha256=pin, credential_provider=provider)
+        provider.assert_not_awaited()
+
+    async def test_probe_preserves_terminal_status_and_accepts_a_2xx_without_a_protocol(self):
+        async def capability(request):
+            return web.Response(status=int(request.match_info["status"]))
+
+        async with _listen([web.get("/{status}/v1/join", capability)]) as authority:
+            for status in (401, 403, 503, 307):
+                with self.subTest(status=status), self.assertRaises(ClientResponseError) as caught:
+                    await _check_signaling_endpoint(f"http://{authority}/{status}")
+                self.assertEqual(caught.exception.status, status)
+            await _check_signaling_endpoint(f"http://{authority}/204")
+            with self.assertRaises(_NetherNetUnavailable) as caught:
+                await _check_signaling_endpoint(f"http://{authority}/404")
+            self.assertEqual(caught.exception.error.status, 404)
+
+    async def test_signaling_requests_disable_redirects(self):
+        url = "http://127.0.0.1:19132/v1/join"
+        for method, options in (("GET", {}), ("POST", {"data": b"v=0", "headers": {"Content-Type": "application/sdp"}})):
+            with self.subTest(method=method):
+                client = MagicMock()
+                client.request.return_value.__aenter__.return_value = SimpleNamespace(
+                    status=200, text=AsyncMock(return_value="v=0"),
+                )
+                await _request(client, method, url, **options)
+                client.request.assert_called_once_with(method, url, allow_redirects=False, **options)
+
+    async def test_peer_reported_timeout_and_http_denials_stop_before_accepting_an_answer(self):
+        async def capability(_request):
+            return web.Response()
+
+        async def signal(request):
+            status = int(request.match_info["status"])
+            return web.Response(status=status, text=str(int(SessionError.NEGOTIATION_TIMEOUT_WAITING_FOR_ACCEPT)))
+
+        async with _listen([web.get("/{status}/v1/join", capability),
+                            web.post("/{status}/v1/join/{id}", signal)]) as authority:
+            for status in (200, 307, 401, 403, 404):
+                for explicit in (False, True):
+                    with self.subTest(status=status, explicit=explicit):
+                        connection = self._mock_connection()
+                        with (
+                            patch("endpilot.transport._nethernet_http._make_http_session", return_value=connection),
+                            self.assertRaises(ConnectionFailed) as caught,
+                        ):
+                            await connect_http(
+                                f"http://{authority}/{status}", identity_signer=Mock(sign=str),
+                                on_server_identity=None, capability_check=explicit,
+                            )
+                        if status == 200:
+                            self.assertIs(caught.exception.error, SessionError.NEGOTIATION_TIMEOUT_WAITING_FOR_ACCEPT)
+                        else:
+                            self.assertIs(caught.exception.error, SessionError.SIGNALING_FAILED_TO_SEND)
+                            self.assertEqual(caught.exception.__cause__.status, status)
+                        connection._session.accept_answer.assert_not_awaited()
+                        connection._session.aclose.assert_awaited_once_with(SessionError.GENERIC_FAILURE)
+
+    async def test_only_automatic_join_can_continue_after_a_local_post_answer_timeout(self):
+        async def capability(_request):
+            return web.Response()
+
+        async def answer(_request):
+            return web.Response(text="v=0")
+
+        async with _listen([web.get("/v1/join", capability), web.post("/v1/join/{id}", answer)]) as authority:
+            for explicit in (False, True):
+                with self.subTest(explicit=explicit):
+                    connection = self._mock_connection()
+                    timeout = ConnectionFailed(SessionError.NEGOTIATION_TIMEOUT_WAITING_FOR_ACCEPT)
+                    connection._await_connected.side_effect = timeout
+                    with (
+                        patch("endpilot.transport._nethernet_http._make_http_session", return_value=connection),
+                        self.assertRaises(ConnectionFailed if explicit else _NetherNetUnavailable) as caught,
+                    ):
+                        await connect_http(
+                            f"http://{authority}", identity_signer=Mock(sign=str),
+                            on_server_identity=None, capability_check=explicit,
+                        )
+                    error = caught.exception if explicit else caught.exception.error
+                    self.assertIs(error, timeout)
+                    connection._session.accept_answer.assert_awaited_once_with("v=0")
+                    connection._session.aclose.assert_awaited_once_with(SessionError.GENERIC_FAILURE)
+
+    @staticmethod
+    def _mock_connection():
+        session = SimpleNamespace(offer=AsyncMock(return_value="v=0"), accept_answer=AsyncMock(), aclose=AsyncMock())
+        return SimpleNamespace(_session=session, _await_connected=AsyncMock())
+
+    async def test_untrusted_certificate_stops_before_offer_or_other_transport(self):
+        bot = Bot("Knight")
+        with TemporaryDirectory() as directory:
+            context = _untrusted_tls(Path(directory))
+            async with _listen([], ssl_context=context) as authority:
+                with (
+                    patch("endpilot.transport.nethernet._check_signaling_endpoint", wraps=_check_signaling_endpoint) as probe,
+                    patch("endpilot.transport.nethernet.connect_http") as offer,
+                    patch("endpilot.transport.raknet.connect") as raknet,
+                ):
+                    with self.assertRaises(ClientConnectorCertificateError):
+                        await bot.join_address(authority, timeout=2)
+                    probe.assert_awaited_once_with(f"https://{authority}")
+                    offer.assert_not_awaited()
+                    raknet.assert_not_awaited()
+        await bot.close()
+
+    async def test_pin_mismatch_stops_selection(self):
+        async def wrong_pin(_url, *, on_server_identity, **_kwargs):
+            on_server_identity(SimpleNamespace(key_digest="0" * 64))
+
+        with (
+            patch("endpilot.transport.nethernet._check_signaling_endpoint") as probe,
+            patch("endpilot.transport.nethernet.connect_http", side_effect=wrong_pin) as offer,
+            patch("endpilot.transport.raknet.connect") as raknet,
+        ):
+            with self.assertRaisesRegex(InvalidIdentity, "does not match server_key_sha256"):
+                await Bot("Knight").join_address("localhost:19132", server_key_sha256="1" * 64)
+            probe.assert_awaited_once_with("https://localhost:19132")
+            self.assertFalse(offer.await_args.kwargs["capability_check"])
+            raknet.assert_not_awaited()
+
+    async def test_pin_stops_before_raknet_if_neither_nethernet_endpoint_exists(self):
+        last_error = ConnectionRefusedError("HTTP refused")
+        with (
+            patch("endpilot.transport.nethernet._check_signaling_endpoint", side_effect=[
+                _NetherNetUnavailable(ConnectionRefusedError("HTTPS refused")), _NetherNetUnavailable(last_error),
+            ]) as probe,
+            patch("endpilot.transport.raknet.connect") as raknet,
+        ):
+            with self.assertRaises(ConnectionRefusedError) as caught:
+                await Bot("Knight").join_address("localhost:19132", server_key_sha256="1" * 64)
+            self.assertIs(caught.exception, last_error)
+            self.assertEqual([call.args for call in probe.await_args_list], [
+                ("https://localhost:19132",), ("http://localhost:19132",),
+            ])
+            raknet.assert_not_awaited()
+
+    async def test_bare_address_uses_raknet_when_either_nethernet_http_dependency_is_absent(self):
+        for missing in ("nethernet", "aiohttp"):
+            with self.subTest(missing=missing):
+                bot = Bot()
+                wire = _spawn_transport(bot.protocol, 42)
+                with (
+                    patch.dict(sys.modules, {missing: None}),
+                    patch("endpilot.login.JoinSession.connect_nethernet") as nethernet,
+                    patch("endpilot.transport.raknet.connect", return_value=wire) as raknet,
+                ):
+                    try:
+                        await bot.join_address("127.0.0.1:19132")
+                        self.assertEqual(bot.player_id, 42)
+                        nethernet.assert_not_awaited()
+                        raknet.assert_awaited_once_with("127.0.0.1", 19132)
+                    finally:
+                        await bot.close()
+
+    async def test_missing_optional_dependency_does_not_change_a_required_nethernet_route(self):
+        for address, options in (
+            ("127.0.0.1:19132", {"server_key_sha256": "a" * 64}),
+            ("https://127.0.0.1:19132/lobby", {}),
+        ):
+            with self.subTest(address=address):
+                with (
+                    patch.dict(sys.modules, {"nethernet": None}),
+                    patch("endpilot.transport.raknet.connect") as raknet,
+                    self.assertRaises(ModuleNotFoundError) as caught,
+                ):
+                    await Bot().join_address(address, **options)
+                self.assertEqual(caught.exception.name, "nethernet")
+                raknet.assert_not_awaited()
+
+    async def test_internal_import_failure_is_preserved_when_nethernet_http_is_present(self):
+        error = ModuleNotFoundError("No module named 'aiortc'", name="aiortc")
+        with (
+            patch("endpilot.transport.nethernet._check_signaling_endpoint", side_effect=error),
+            patch("endpilot.transport.raknet.connect") as raknet,
+            self.assertRaises(ModuleNotFoundError) as caught,
+        ):
+            await Bot().join_address("127.0.0.1:19132")
+        self.assertIs(caught.exception, error)
+        raknet.assert_not_awaited()
+
+    async def test_ambiguous_post_error_is_preserved_without_fallback(self):
+        error = ConnectionFailed(SessionError.SIGNALING_FAILED_TO_SEND)
+        with (
+            patch("endpilot.transport.nethernet._check_signaling_endpoint") as probe,
+            patch("endpilot.transport.nethernet.connect_http", side_effect=error) as offer,
+            patch("endpilot.transport.raknet.connect") as raknet,
+        ):
+            with self.assertRaises(ConnectionFailed) as caught:
+                await Bot("Knight").join_address("localhost:19132")
+            self.assertIs(caught.exception, error)
+            self.assertEqual(error.__notes__, ["NetherNet HTTP offer exchange failed before the transport opened"])
+            probe.assert_awaited_once_with("https://localhost:19132")
+            self.assertFalse(offer.await_args.kwargs["capability_check"])
+            raknet.assert_not_awaited()
+
+    async def test_timeout_while_unwinding_an_identity_rejection_does_not_fall_back(self):
+        rejection = InvalidIdentity("test identity rejection")
+
+        async def reject_and_clean_up(*_args, **_kwargs):
+            try:
+                raise rejection
+            except InvalidIdentity:
+                await asyncio.Future()
+
+        with (
+            patch("endpilot.transport.nethernet._check_signaling_endpoint") as probe,
+            patch("endpilot.transport.nethernet.connect_http", side_effect=reject_and_clean_up),
+            patch("endpilot.transport.raknet.connect") as raknet,
+        ):
+            with self.assertRaises(TimeoutError) as caught:
+                await Bot("Knight").join_address("localhost:19132", timeout=0.05)
+            self.assertIs(caught.exception.__cause__.__context__, rejection)
+            probe.assert_awaited_once_with("https://localhost:19132")
+            raknet.assert_not_awaited()
+
+    async def test_close_during_offline_selection_drains_the_probe(self):
+        entered, exited = asyncio.Event(), asyncio.Event()
+
+        async def blocked(_url):
+            try:
+                entered.set()
+                await asyncio.Future()
+            finally:
+                exited.set()
+
+        bot = Bot("Knight")
+        with patch("endpilot.transport.nethernet._check_signaling_endpoint", side_effect=blocked) as probe:
+            async with asyncio.timeout(2):
+                joining = asyncio.create_task(bot.join_address("localhost:19132"))
+                await entered.wait()
+                await bot.close()
+                self.assertTrue(exited.is_set())
+                with self.assertRaises(asyncio.CancelledError):
+                    await joining
+            probe.assert_awaited_once_with("https://localhost:19132")

@@ -1,0 +1,16 @@
+include CONTRIBUTING.md
+recursive-include docs *.md
+include examples/*.py
+include examples/form_extension/README.md examples/form_extension/pyproject.toml
+recursive-include examples/form_extension/src *.py
+include examples/form_extension/tests/*.py
+include scripts/bedrock_source.py
+include scripts/bedrock_mining.py
+include scripts/mining-observations-2225.json
+include scripts/generate_armor_data.py
+include scripts/generate_biome_data.py
+include scripts/generate_harvest_data.py
+include scripts/generate_outline_data.py
+include scripts/generate_painting_motifs.py
+include scripts/painting-motifs-2225.json
+include tests/*.py tests/fixtures/*.py tests/fixtures/*.hex

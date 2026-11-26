@@ -1,0 +1,1598 @@
+"""Observe server actors, dropped items and player-list changes."""
+
+import asyncio
+import math
+from collections import deque
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from typing import Literal
+from uuid import UUID
+
+from bedrock_protocol import ActorSwingSource, DecodeError, HandSlot, PlayerListPacketType
+
+from .entity_cursor import Box, expanded_box, trace_entities
+from .expression import animation
+from .inventory import HeldItemStack
+from .protocol import RawPacket, _read_uint
+
+
+@dataclass(frozen=True, slots=True)
+class EntitySpawn:
+    entity_id: int
+    runtime_id: int
+    actor_type: str
+    position: tuple[float, float, float]
+
+
+@dataclass(frozen=True, slots=True)
+class EntityMovement:
+    """Coordinates sent in one server movement packet; None means axis omitted."""
+
+    runtime_id: int
+    x: float | None
+    y: float | None
+    z: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class PaintingSnapshot:
+    """Fields from an AddPainting packet, including its original position and direction."""
+
+    entity_id: int
+    runtime_id: int
+    position: tuple[float, float, float]
+    dir: int
+    motif: str
+
+
+@dataclass(frozen=True, slots=True)
+class EntityState:
+    """Immutable actor state, with details from item and painting packets.
+
+    ``last_observed_offhand`` records the last offhand stack received for this
+    visible remote player instance. It is ``None`` until an offhand packet
+    arrives. A stack with item ID and count zero represents an observed empty hand.
+    The server can omit updates, so the observed stack can be stale.
+
+    ``gliding`` is the latest server-reported glide flag for this visible remote
+    player instance. ``None`` means the flag is unknown or does not apply.
+    """
+
+    entity_id: int
+    runtime_id: int
+    actor_type: str
+    position: tuple[float, float, float]
+    item_id: str | None = None
+    item_count: int | None = None
+    item_network_id: int | None = None
+    name: str | None = None
+    owner_entity_id: int | None = None
+    is_from_fishing: bool = False
+    boat_rotation: tuple[float, float] | None = None
+    boat_velocity: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    painting: PaintingSnapshot | None = None
+    last_observed_offhand: HeldItemStack | None = None
+    gliding: bool | None = None
+
+
+_MovementWaiters = dict[asyncio.Future[EntityState | BaseException], Callable[[EntityState], bool]]
+
+
+@dataclass(frozen=True, slots=True)
+class EntitySwing:
+    """One received swing, with the entity and protocol fields observed at that packet."""
+
+    runtime_id: int
+    entity_id: int | None
+    entity: EntityState | None
+    source: ActorSwingSource | str | None
+    hand: HandSlot | int | None
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _SwingObserver:
+    runtime_id: int | None
+    callback: Callable[[EntitySwing], None]
+    waiter: asyncio.Future[EntitySwing] | None = None
+
+
+def _decode_unknown_swing_source(protocol, raw: RawPacket):
+    """Read the unknown textual source rejected by the native enum decoder."""
+    body = raw.body
+    if getattr(protocol, "number", 0) < 898 or not body or body[0] != int(protocol.binding.AnimatePacket.Action.SWING):
+        return None
+    for offset in range(1, min(len(body), 11)):
+        if body[offset] < 128:
+            break
+    else:
+        return None
+    # The runtime varint is followed by a float and a source flag. Any nonzero byte means present.
+    presence = offset + 5
+    if presence >= len(body) or body[presence] == 0:
+        return None
+    try:
+        size, start = _read_uint(memoryview(body), presence + 1)
+        end = start + size
+        if end + hasattr(protocol.binding.AnimatePacket, "hand_slot") != len(body):
+            return None
+        source = body[start:end].decode("utf-8")
+        if not source:
+            return None
+        packet = protocol.decode(RawPacket(raw.header, body[:presence] + b"\x00" + body[end:]))
+    except (DecodeError, ValueError):
+        return None
+    return packet, source
+
+
+@dataclass(frozen=True, slots=True)
+class EntityCursorResult:
+    """Closest observed target, absence of a candidate, or insufficient observations."""
+
+    status: Literal["hit", "miss", "unknown"]
+    dimension_id: int
+    entity: EntityState | None = None
+    distance: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PlayerEquipmentSnapshot:
+    """Visible equipment sent for one remote player; None denotes an unobserved field."""
+
+    runtime_id: int
+    entity_id: int | None
+    name: str
+    selected_slot: int | None = None
+    main_hand: HeldItemStack | None = None
+    head: HeldItemStack | None = None
+    chest: HeldItemStack | None = None
+    legs: HeldItemStack | None = None
+    feet: HeldItemStack | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ItemPickup:
+    """A server-named pickup with identities and a drop snapshot when observed."""
+
+    item_runtime_id: int
+    collector_runtime_id: int
+    item_entity_id: int | None
+    collector_entity_id: int | None
+    item: EntityState | None
+
+
+@dataclass(frozen=True, slots=True)
+class PlayerListEntry:
+    """Player identity and metadata as reported in a server player-list add."""
+
+    uuid: UUID
+    name: str
+    entity_id: int
+    xuid: str | None
+    play_fab_id: str | None
+    platform_online_id: str | None
+    build_platform: int
+    is_teacher: bool
+    is_host: bool
+    is_sub_client: bool
+    color: int
+
+
+@dataclass(frozen=True, slots=True)
+class PlayerListChange:
+    """A player-list entry sent by the server. Removes carry only the UUID."""
+
+    action: Literal["add", "remove"]
+    uuid: UUID
+    player: PlayerListEntry | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class VehicleLink:
+    """A server-observed ride. Runtime IDs are absent until the actors are known."""
+
+    vehicle_entity_id: int
+    rider_entity_id: int
+    role: Literal["RIDING", "PASSENGER"]
+    vehicle_runtime_id: int | None
+    rider_runtime_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class VehicleLinkChange:
+    """A link transition or loss of observation, in wire order."""
+
+    rider_entity_id: int
+    before: VehicleLink | None
+    after: VehicleLink | None
+    reason: Literal["link", "unobserved"]
+
+
+_Ride = tuple[int, Literal["RIDING", "PASSENGER"]]
+_PlayerFeet = tuple[tuple[float, float, float], int]  # Position and unresolved ride epoch.
+_PlayerFlagWords = tuple[int | None, int | None]
+_PlayerRotation = tuple[float, float]
+_PLAYER = "minecraft:player"
+_COW = "minecraft:cow"
+_SHEEP = "minecraft:sheep"
+_VILLAGER = "minecraft:villager_v2"
+_ACTOR_DELTA_FEET_TYPES = frozenset((_COW, _VILLAGER))
+_ACTOR_SPAWN_FEET_TYPES = _ACTOR_DELTA_FEET_TYPES | {_SHEEP}
+_CURSOR_BODY_TYPES = frozenset((_COW, _SHEEP))
+_UNBOUNDED_BOX: Box = ((-math.inf,) * 3, (math.inf,) * 3)
+
+
+@dataclass(eq=False, slots=True)
+class _ActorInstance:
+    feet_known: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _PlayerView:
+    spawn_entity_id: int | None
+    rotation: _PlayerRotation | None
+    flags: _PlayerFlagWords
+    ordinary_move: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class _CursorBody:
+    size: tuple[float | None, float | None] = (None, None)
+    flags: _PlayerFlagWords = (None, None)
+
+
+def _cursor_body(metadata, binding, previous: _CursorBody = _CursorBody()) -> _CursorBody:
+    # Protocol 2225 metadata 53 and 54 are separate width and height writes.
+    width, height = previous.size
+    for item in metadata:
+        if int(item.id) not in (53, 54):
+            continue
+        value = float(item.payload.value) if isinstance(item.payload, binding.DataItemFloatPayload) else None
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            value = None
+        if int(item.id) == 53:
+            width = value
+        else:
+            height = value
+    return replace(previous, size=(width, height), flags=_player_flag_words(metadata, binding, previous.flags))
+
+
+def _upright_box(feet, width: float | None, height: float | None) -> Box:
+    x, y, z = feet
+    half = math.inf if width is None else width / 2
+    top = math.inf if height is None else y + height
+    return (x - half, y, z - half), (x + half, top, z + half)
+
+
+def _player_flag_words(metadata, binding, previous: _PlayerFlagWords = (None, None)) -> _PlayerFlagWords:
+    low, high = previous
+    for item in metadata:
+        if item.id in (0, 92):
+            value = int(item.payload.value) if isinstance(item.payload, binding.DataItemInt64Payload) else None
+            if item.id == 0:
+                low = value
+            else:
+                high = value
+    return low, high
+
+
+def _player_flag(words: _PlayerFlagWords, flag: int) -> bool:
+    index = int(flag)
+    word = words[index // 64]
+    return word is not None and bool(word & (1 << (index % 64)))
+
+
+def _player_gliding(words: _PlayerFlagWords, binding) -> bool | None:
+    return None if words[0] is None else _player_flag(words, binding.ActorFlags.GLIDING)
+
+
+def _unsupported_view_pose(words: _PlayerFlagWords, binding) -> bool:
+    flags = binding.ActorFlags
+    return any(_player_flag(words, flag)
+               for flag in (flags.RIDING, flags.GLIDING, flags.SWIMMING, flags.SLEEPING, flags.CRAWLING))
+
+
+def _player_rotation(packet) -> _PlayerRotation | None:
+    rotation = getattr(packet, "rot", None)
+    if rotation is None:
+        return None
+    pitch, yaw, head_yaw = float(rotation.x), float(rotation.y), float(packet.y_head_rot)
+    # A turn can relay the new head heading with the previous pitch and yaw.
+    if not all(map(math.isfinite, (pitch, yaw, head_yaw))) or math.remainder(yaw - head_yaw, 360):
+        return None
+    return pitch, yaw
+_PAINTING = "minecraft:painting"
+
+
+def _painting_snapshot(packet) -> PaintingSnapshot:
+    return PaintingSnapshot(
+        int(packet.entity_id), int(packet.runtime_id),
+        (float(packet.pos.x), float(packet.pos.y), float(packet.pos.z)),
+        int(packet.dir), str(packet.motif),
+    )
+
+
+def _equipment_stack(item) -> HeldItemStack | None:
+    if item is None:
+        return None
+    net_id = item.net_id_variant
+    return HeldItemStack(int(item.id), int(item.stack_size), int(item.aux_value),
+                         None if net_id is None else int(net_id), int(item.block_runtime_id),
+                         bytes(item.user_data_buffer))
+
+
+def _player_list_change(entry) -> PlayerListChange:
+    if entry.action == PlayerListPacketType.REMOVE:
+        return PlayerListChange("remove", entry.uuid)
+    return PlayerListChange("add", entry.uuid, PlayerListEntry(
+        uuid=entry.uuid,
+        name=entry.name,
+        entity_id=int(entry.id),
+        xuid=entry.xuid or None,
+        play_fab_id=getattr(entry, "play_fab_id", None) or None,
+        platform_online_id=entry.platform_online_id or None,
+        build_platform=int(entry.build_platform),
+        is_teacher=entry.is_teacher,
+        is_host=entry.is_host,
+        is_sub_client=entry.is_sub_client,
+        color=int(entry.color),
+    ))
+
+
+class Entities:
+    def __init__(self, packets, *, item_names: dict[int, str] | None = None,
+                 own_runtime_id: int | None = None, own_entity_id: int | None = None):
+        self.packets = packets
+        self._own_runtime_id = own_runtime_id
+        self._own_entity_id = own_entity_id
+        self._players_by_uuid: dict[UUID, PlayerListEntry] = {}
+        self._player_runtime_by_uuid: dict[UUID, int] = {}
+        self._player_uuid_by_runtime: dict[int, UUID] = {}
+        self._player_feet_by_runtime: dict[int, _PlayerFeet] = {}
+        self._player_views: dict[int, _PlayerView] = {}
+        self._item_names = dict(item_names or {})
+        self._by_runtime: dict[int, EntityState] = {}
+        self._actor_instances: dict[int, _ActorInstance] = {}
+        self._movement_waiters: dict[int, _MovementWaiters] = {}
+        self._cursor_bodies: dict[int, _CursorBody] = {}
+        self._player_equipment: dict[int, PlayerEquipmentSnapshot] = {}
+        self._equipment_waiters: dict[int, set[asyncio.Future[PlayerEquipmentSnapshot]]] = {}
+        self._swing_observers: list[_SwingObserver] = []
+        self._glide_observers: list[Callable[[EntityState], None]] = []
+        self._unidentified_equipment_since: dict[int, int] = {}
+        # AddPlayer can identify an instance before its unique ID appears in EntityState.
+        self._unlisted_player_runtime_by_id: dict[int, int] = {}
+        self._equipment_removals: deque[tuple[int, int]] = deque(maxlen=128)
+        self._runtime_by_id: dict[int, int] = {}
+        self._last_pickup: tuple[RawPacket, ItemPickup, _ActorInstance | None] | None = None
+        self._rides: dict[int, _Ride] = {}
+        self._own_ride_epoch = 0
+        self._unresolved_ride_epoch = 0
+        self._unresolved_ride_changes: deque[tuple[int, int]] = deque(maxlen=128)
+        self._ride_observers: list[Callable[[VehicleLinkChange], None]] = []
+        self._dimension_epoch = 0
+        self._closed = False
+        self._unsubscribe = None
+        self._unsubscribe_reader_end = None
+
+    def start(self) -> None:
+        self._unsubscribe = self.packets.subscribe_raw(self._on_packet)
+        subscribe_reader_end = getattr(self.packets, "subscribe_reader_end", None)
+        if subscribe_reader_end is not None:
+            self._unsubscribe_reader_end = subscribe_reader_end(self._end_session)
+
+    def close(self) -> None:
+        if self._unsubscribe is not None:
+            self._unsubscribe()
+            self._unsubscribe = None
+        self._end_session()
+        self._players_by_uuid.clear()
+
+    def _end_session(self, _cause: Exception | None = None) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._last_pickup = None
+        self._end_movement_waiters(ConnectionError, "entity session is closed", _cause)
+        self._clear_player_equipment(ConnectionError, "entity session is closed", _cause)
+        self._end_swing_observers(lambda _: True, ConnectionError, "entity session is closed", _cause)
+        self._glide_observers.clear()
+        self._actor_instances.clear()
+        self._cursor_bodies.clear()
+        if self._unsubscribe_reader_end is not None:
+            self._unsubscribe_reader_end()
+            self._unsubscribe_reader_end = None
+        self._player_feet_by_runtime.clear()
+        self._player_views.clear()
+        self._unresolved_ride_changes.clear()
+        try:
+            self._clear_links()
+        finally:
+            self._ride_observers.clear()
+
+    def player_list(self) -> tuple[PlayerListEntry, ...]:
+        return tuple(self._players_by_uuid.values())
+
+    async def wait_for_player_list_update(
+        self, *, action: Literal["add", "remove"] | None, player_uuid: UUID | None, timeout: float,
+    ) -> tuple[PlayerListChange, ...]:
+        binding = self.packets.protocol.binding
+        changes = ()
+
+        def matches(raw):
+            nonlocal changes
+            packet = self.packets.protocol.decode(raw)
+            changes = tuple(
+                _player_list_change(entry) for entry in packet.entries
+                if (player_uuid is None or entry.uuid == player_uuid)
+                and (action is None or entry.action.name.lower() == action)
+            )
+            return bool(changes)
+
+        await self.packets.wait_for_packet(binding.PlayerListPacket.ID, match=matches, timeout=timeout)
+        return changes
+
+    def snapshot(self) -> tuple[EntityState, ...]:
+        """Snapshot actors observed since subscription; not a world entity scan."""
+        return tuple(self._by_runtime.values())
+
+    def get(self, runtime_id: int) -> EntityState | None:
+        return self._by_runtime.get(runtime_id)
+
+    def subscribe_entity_glides(self, callback: Callable[[EntityState], None]) -> Callable[[], None]:
+        self._require_live()
+
+        def observe(entity: EntityState) -> None:
+            try:
+                callback(entity)
+            except asyncio.CancelledError as error:
+                asyncio.get_running_loop().call_exception_handler({
+                    "message": "entity glide observer failed", "exception": error, "callback": callback,
+                })
+
+        return self.packets._subscribe(self._glide_observers, observe)
+
+    def _require_swing_target(self, runtime_id: int | None) -> None:
+        self._require_live()
+        if runtime_id is not None and runtime_id != self._own_runtime_id and runtime_id not in self._actor_instances:
+            raise LookupError("entity is not currently observed")
+
+    def subscribe_entity_swings(
+        self, callback: Callable[[EntitySwing], None], *, runtime_id: int | None = None,
+    ) -> Callable[[], None]:
+        self._require_swing_target(runtime_id)
+        observer = _SwingObserver(runtime_id, callback)
+        return self.packets._subscribe(self._swing_observers, observer)
+
+    async def wait_for_entity_swing(
+        self, *, runtime_id: int | None = None, timeout: float | None = 15,
+    ) -> EntitySwing:
+        self._require_swing_target(runtime_id)
+        future = asyncio.get_running_loop().create_future()
+
+        def observe(event):
+            if not future.done():
+                future.set_result(event)
+
+        unsubscribe = self.packets._subscribe(self._swing_observers, _SwingObserver(runtime_id, observe, future))
+        try:
+            async with asyncio.timeout(timeout):
+                return await future
+        finally:
+            unsubscribe()
+
+    def _end_swing_observers(self, matches, error_type, message, cause=None):
+        for observer in tuple(self._swing_observers):
+            if not matches(observer):
+                continue
+            self._swing_observers.remove(observer)
+            waiter = observer.waiter
+            if waiter is not None and not waiter.done():
+                error = error_type(message)
+                error.__cause__ = cause
+                waiter.set_exception(error)
+                waiter.exception()
+
+    def _forget_entity_swings(self, runtime_id):
+        self._end_swing_observers(lambda observer: observer.runtime_id == runtime_id,
+                                  LookupError, "entity is no longer observed")
+
+    def _observe_swing(self, raw: RawPacket) -> None:
+        if not self._swing_observers:
+            return
+        protocol = self.packets.protocol
+        try:
+            packet = protocol.decode(raw)
+            source = getattr(packet, "swing_source", None)
+        except DecodeError as error:
+            if error.path != ("swing_source",) or error.reason != "unknown value":
+                return
+            decoded = _decode_unknown_swing_source(protocol, raw)
+            if decoded is None:
+                return
+            packet, source = decoded
+        if packet.action != protocol.binding.AnimatePacket.Action.SWING:
+            return
+        runtime_id = int(packet.runtime_id)
+        event = EntitySwing(runtime_id, self._swing_entity_id(runtime_id), self._by_runtime.get(runtime_id), source,
+                            getattr(packet, "hand_slot", None))
+        for observer in tuple(self._swing_observers):
+            if observer.runtime_id is not None and observer.runtime_id != runtime_id:
+                continue
+            try:
+                observer.callback(event)
+            except (Exception, asyncio.CancelledError) as error:
+                asyncio.get_running_loop().call_exception_handler({
+                    "message": "entity swing observer failed", "exception": error, "callback": observer.callback,
+                })
+
+    def player_equipment(self, runtime_id: int) -> PlayerEquipmentSnapshot | None:
+        """Return the equipment observed for the currently visible remote player."""
+        self._sync_reader_end()
+        return self._player_equipment.get(runtime_id)
+
+    async def wait_for_player_equipment_change(
+        self, runtime_id: int, *, timeout: float | None = 15,
+    ) -> PlayerEquipmentSnapshot:
+        """Wait for the next equipment change on this visible player instance."""
+        self._require_live()
+        if runtime_id not in self._player_equipment:
+            raise LookupError("remote player is not currently observed")
+        future = asyncio.get_running_loop().create_future()
+        waiters = self._equipment_waiters.setdefault(runtime_id, set())
+        waiters.add(future)
+        try:
+            async with asyncio.timeout(timeout):
+                return await future
+        finally:
+            waiters.discard(future)
+            if not waiters and self._equipment_waiters.get(runtime_id) is waiters:
+                self._equipment_waiters.pop(runtime_id)
+
+    def _publish_player_equipment(self, previous, current):
+        if current != previous:
+            self._player_equipment[current.runtime_id] = current
+            for waiter in self._equipment_waiters.pop(current.runtime_id, ()):
+                if not waiter.done():
+                    waiter.set_result(current)
+
+    def _fail_equipment_waiters(self, runtime_id, error_type, message, cause=None):
+        for waiter in self._equipment_waiters.pop(runtime_id, ()):
+            if not waiter.done():
+                error = error_type(message)
+                error.__cause__ = cause
+                waiter.set_exception(error)
+                waiter.exception()
+
+    def _forget_player_equipment(self, runtime_id):
+        equipment = self._player_equipment.pop(runtime_id, None)
+        if equipment is not None and self._unlisted_player_runtime_by_id.get(equipment.entity_id) == runtime_id:
+            self._unlisted_player_runtime_by_id.pop(equipment.entity_id)
+        self._unidentified_equipment_since.pop(runtime_id, None)
+        self._fail_equipment_waiters(runtime_id, LookupError, "remote player is no longer observed")
+
+    def _clear_player_equipment(self, error_type, message, cause=None):
+        self._player_equipment.clear()
+        self._unidentified_equipment_since.clear()
+        self._unlisted_player_runtime_by_id.clear()
+        self._equipment_removals.clear()
+        for runtime_id in tuple(self._equipment_waiters):
+            self._fail_equipment_waiters(runtime_id, error_type, message, cause)
+
+    def _equipment_removal_cursor(self):
+        return self._equipment_removals[-1][0] if self._equipment_removals else 0
+
+    def _equipment_removal_may_match(self, since, entity_id):
+        removals = self._equipment_removals
+        # A gap means this appearance may already have been removed before its identity was known.
+        return bool(removals) and (since + 1 < removals[0][0] or any(
+            cursor > since and removed == entity_id for cursor, removed in removals
+        ))
+
+    def _actor_instance(self, runtime_id: int) -> object | None:
+        """Identify the observed actor instance across ordinary state updates."""
+        self._sync_reader_end()
+        return self._actor_instances.get(runtime_id)
+
+    def _bound_item(self, target: EntityState, instance: object) -> EntityState | None:
+        current = self.get(target.runtime_id)
+        if (current is not None and current.actor_type == "minecraft:item"
+                and current.entity_id == target.entity_id and self._actor_instance(target.runtime_id) is instance):
+            return current
+        return None
+
+    def _observed_pickup(self, raw: RawPacket) -> tuple[ItemPickup, object | None] | None:
+        observed = self._last_pickup
+        return observed[1:] if observed is not None and observed[0] is raw else None
+
+    def _apply_boat_correction(self, state: EntityState, packet) -> None:
+        self._by_runtime[state.runtime_id] = replace(
+            state,
+            position=(float(packet.pos.x), float(packet.pos.y), float(packet.pos.z)),
+            boat_rotation=(float(packet.vehicle_rotation.x), float(packet.vehicle_rotation.y)),
+            boat_velocity=(float(packet.pos_delta.x), float(packet.pos_delta.y), float(packet.pos_delta.z)),
+        )
+
+    def _get_by_unique_id(self, entity_id: int) -> EntityState | None:
+        return self._by_runtime.get(self._runtime_by_id.get(entity_id))
+
+    def _non_player_feet(self, state: EntityState) -> tuple[float, float, float] | None:
+        instance = self._actor_instances.get(state.runtime_id)
+        if instance is not None and instance.feet_known and all(map(math.isfinite, state.position)):
+            return state.position
+        return None
+
+    def _navigation_target(self, entity_id: int) -> tuple[object, tuple[float, float, float] | None] | None:
+        """Resolve a visible instance and its feet when the position reference is known."""
+        self._sync_reader_end()
+        state = self._get_by_unique_id(entity_id)
+        if state is None:
+            return None
+        instance = self._actor_instances.get(state.runtime_id)
+        if instance is None:
+            return None
+        feet = self._player_feet_by_runtime.get(state.runtime_id)
+        if feet is not None:
+            return instance, feet[0]
+        if state.actor_type == _VILLAGER:
+            return instance, self._non_player_feet(state)
+        return instance, None
+
+    def entity_at_cursor(self, pose, blocks, max_distance: float) -> EntityCursorResult:
+        self._sync_reader_end()
+        if self._closed or getattr(self.packets.protocol, "number", None) != 2225:
+            pose = None
+        candidates, unresolved = [], []
+        if pose is not None:
+            binding = self.packets.protocol.binding
+            for state in self._by_runtime.values():
+                if state.runtime_id == self._own_runtime_id or state.entity_id == self._own_entity_id:
+                    continue
+                feet, supported = self._cursor_feet(state, binding)
+                body = self._cursor_bodies.get(state.runtime_id)
+                width, height = (None, None) if body is None else body.size
+                if feet is None or not all(map(math.isfinite, feet)):
+                    unresolved.append(_UNBOUNDED_BOX)
+                    continue
+                box = _upright_box(feet, width, height)
+                if supported and width is not None and height is not None:
+                    candidates.append((state, box))
+                else:
+                    # Keep independently observed planes. Unobserved planes
+                    # stay open, since an anchor is not a surface bound.
+                    unresolved.append(expanded_box(box))
+        status, entity, distance = trace_entities(
+            pose, candidates, unresolved, max_distance=max_distance,
+            trace_blocks=lambda reach: blocks._raycast_view(pose, reach),
+        )
+        return EntityCursorResult(status, blocks.dimension_id, entity, distance)
+
+    def _cursor_feet(self, state: EntityState, binding):
+        runtime_id, entity_id = state.runtime_id, state.entity_id
+        if entity_id in self._rides:
+            return None, False
+        stable_identity = entity_id and self._runtime_by_id.get(entity_id) == runtime_id
+        if state.actor_type == _PLAYER:
+            observed = self._player_feet_by_runtime.get(runtime_id)
+            if observed is None:
+                return None, False
+            view = self._player_views.get(runtime_id)
+            upright = (view is not None and view.ordinary_move and None not in view.flags
+                       and not _unsupported_view_pose(view.flags, binding))
+            return (observed[0], bool(stable_identity)) if upright else (None, False)
+        if state.actor_type in _CURSOR_BODY_TYPES:
+            body = self._cursor_bodies.get(runtime_id)
+            feet = self._non_player_feet(state)
+            if body is not None and feet is not None:
+                adult = (None not in body.flags and not _player_flag(body.flags, binding.ActorFlags.BABY)
+                         and not _unsupported_view_pose(body.flags, binding))
+                if adult:
+                    # Vanilla sheep spawn geometry establishes an envelope.
+                    # Selecting sheep and interpreting their movement need separate evidence.
+                    return feet, state.actor_type == _COW and bool(stable_identity)
+        return None, False
+
+    def player_view_pose(self, runtime_id: int) -> tuple[tuple[float, float, float], _PlayerRotation] | None:
+        """Return a visible remote player's observed eye position and (pitch, yaw)."""
+        self._sync_reader_end()
+        view = self._player_views.get(runtime_id)
+        observed = self._player_feet_by_runtime.get(runtime_id)
+        if view is None or view.rotation is None or observed is None or runtime_id in self._unidentified_equipment_since:
+            return None
+        feet, _ = observed
+        low, high = view.flags
+        if low is None or high is None or not all(map(math.isfinite, feet)):
+            return None
+        sneaking = self.packets.protocol.binding.ActorFlags.SNEAKING
+        height = 1.17 if _player_flag(view.flags, sneaking) else 1.52
+        return (feet[0], feet[1] + height, feet[2]), view.rotation
+
+    def nearest_player(
+        self, origin: tuple[float, float, float] | None, match: Callable[[EntityState], bool] | None = None,
+    ) -> EntityState | None:
+        """Find the nearest observed remote player with a known identity and feet position."""
+        return self._nearest_entity(origin, match, players_only=True)
+
+    def nearest_entity(
+        self, origin: tuple[float, float, float] | None, match: Callable[[EntityState], bool] | None = None,
+    ) -> EntityState | None:
+        """Find the nearest observed remote actor with a known identity and position."""
+        return self._nearest_entity(origin, match, players_only=False)
+
+    def _nearest_entity(self, origin, match, *, players_only: bool) -> EntityState | None:
+        self._sync_reader_end()
+        if self._closed or origin is None or not all(map(math.isfinite, origin)):
+            return None
+        nearest = None
+        nearest_key = None
+        runtime_ids = self._player_feet_by_runtime if players_only else self._by_runtime
+        matches = [] if match is not None else None
+        epoch = self._dimension_epoch
+        for runtime_id in tuple(runtime_ids) if match is not None else runtime_ids:
+            state = self._by_runtime.get(runtime_id)
+            if (state is None or runtime_id == self._own_runtime_id or state.entity_id == self._own_entity_id
+                    or not state.entity_id or self._runtime_by_id.get(state.entity_id) != runtime_id):
+                continue
+            feet = None
+            if state.actor_type == _PLAYER:
+                feet = self._player_feet_by_runtime.get(runtime_id)
+                if feet is None:
+                    continue
+                position, _ = feet
+            elif players_only:
+                continue
+            else:
+                position = state.position
+            if not all(map(math.isfinite, position)):
+                continue
+            if match is not None:
+                accepted = bool(match(state))
+                self._sync_reader_end()
+                if self._closed or self._dimension_epoch != epoch:
+                    return None
+                if not accepted or not self._nearest_candidate_current(state, feet):
+                    continue
+            dx, dy, dz = (coordinate - base for coordinate, base in zip(position, origin))
+            key = (dx * dx + dy * dy + dz * dz, state.entity_id)
+            if matches is not None:
+                matches.append((key, state, feet))
+            elif nearest_key is None or key < nearest_key:
+                nearest, nearest_key = state, key
+
+        # A later predicate can invalidate an earlier match. Retain alternatives
+        # during callback scans so the nearest surviving match still wins.
+        if matches is not None:
+            for key, state, feet in matches:
+                if (nearest_key is None or key < nearest_key) and self._nearest_candidate_current(state, feet):
+                    nearest, nearest_key = state, key
+        return nearest
+
+    def _nearest_candidate_current(self, state: EntityState, feet: _PlayerFeet | None) -> bool:
+        runtime_id = state.runtime_id
+        return (self._by_runtime.get(runtime_id) is state
+                and self._runtime_by_id.get(state.entity_id) == runtime_id
+                and (feet is None or self._player_feet_by_runtime.get(runtime_id) is feet))
+
+    def _actor_runtime_id(self, entity_id: int) -> int | None:
+        if entity_id == self._own_entity_id:
+            return self._own_runtime_id
+        return self._runtime_by_id.get(entity_id)
+
+    def _actor_entity_id(self, runtime_id: int | None) -> int | None:
+        if runtime_id is not None and runtime_id == self._own_runtime_id:
+            return self._own_entity_id or None
+        state = self._by_runtime.get(runtime_id)
+        return (state.entity_id or None) if state is not None else None
+
+    def _swing_entity_id(self, runtime_id: int) -> int | None:
+        entity_id = self._actor_entity_id(runtime_id)
+        if entity_id is not None:
+            return entity_id
+        equipment = self._player_equipment.get(runtime_id)
+        return equipment.entity_id if equipment is not None else None
+
+    def _vehicle_link(self, rider: int, vehicle: int, role: Literal["RIDING", "PASSENGER"]) -> VehicleLink:
+        return VehicleLink(vehicle, rider, role, self._actor_runtime_id(vehicle), self._actor_runtime_id(rider))
+
+    def vehicle_links(self) -> tuple[VehicleLink, ...]:
+        self._sync_reader_end()
+        return tuple(self._vehicle_link(rider, vehicle, role) for rider, (vehicle, role) in self._rides.items())
+
+    def vehicle(self) -> VehicleLink | None:
+        self._sync_reader_end()
+        rider = self._own_entity_id
+        if rider is None or rider not in self._rides:
+            return None
+        return self._vehicle_link(rider, *self._rides[rider])
+
+    @property
+    def _own_unmounted_epoch(self) -> int | None:
+        """Identify the current interval in which the local actor has no observed ride."""
+        self._sync_reader_end()
+        if self._closed or self._own_entity_id in self._rides:
+            return None
+        return self._own_ride_epoch
+
+    def subscribe_vehicle_links(
+        self, callback: Callable[[VehicleLinkChange], None], *,
+        rider_entity_id: int | None, vehicle_entity_id: int | None,
+    ) -> Callable[[], None]:
+        self._require_live()
+
+        def observe(change: VehicleLinkChange) -> None:
+            if rider_entity_id is not None and change.rider_entity_id != rider_entity_id:
+                return
+            if vehicle_entity_id is not None and all(
+                link is None or link.vehicle_entity_id != vehicle_entity_id for link in (change.before, change.after)
+            ):
+                return
+            try:
+                callback(change)
+            except asyncio.CancelledError as error:
+                asyncio.get_running_loop().call_exception_handler({
+                    "message": "vehicle link observer failed", "exception": error, "callback": callback,
+                })
+
+        return self.packets._subscribe(self._ride_observers, observe)
+
+    def _set_ride(self, rider: int, ride: _Ride | None, reason: Literal["link", "unobserved"]) -> None:
+        previous = self._rides.get(rider)
+        if previous == ride:
+            return
+        if ride is None:
+            del self._rides[rider]
+        else:
+            self._rides[rider] = ride
+        if rider == self._own_entity_id:
+            self._own_ride_epoch += 1
+        else:
+            runtime_id = self._runtime_by_id.get(rider)
+            if runtime_id is not None:
+                self._player_feet_by_runtime.pop(runtime_id, None)
+                instance = self._actor_instances.get(runtime_id)
+                if instance is not None:
+                    instance.feet_known = False
+            else:
+                self._unresolved_ride_epoch += 1
+                self._unresolved_ride_changes.append((self._unresolved_ride_epoch, rider))
+                # The spawn can identify this view before the roster binds its entity ID.
+                for runtime, view in self._player_views.items():
+                    if view.spawn_entity_id == rider:
+                        self._player_views[runtime] = replace(view, rotation=None)
+        if self._ride_observers:
+            before = None if previous is None else self._vehicle_link(rider, *previous)
+            after = None if ride is None else self._vehicle_link(rider, *ride)
+            self.packets._notify(self._ride_observers, VehicleLinkChange(rider, before, after, reason))
+
+    def _observe_link(self, link) -> None:
+        if self._closed:
+            return
+        types = self.packets.protocol.binding.ActorLinkType
+        vehicle, rider = int(link.a), int(link.b)
+        if link.type == types.RIDING:
+            self._set_ride(rider, (vehicle, "RIDING"), "link")
+        elif link.type == types.PASSENGER:
+            self._set_ride(rider, (vehicle, "PASSENGER"), "link")
+        elif link.type == types.NONE:
+            current = self._rides.get(rider)
+            if current is not None and current[0] == vehicle:
+                self._set_ride(rider, None, "link")
+
+    def _forget_links(self, entity_id: int) -> None:
+        for rider, (vehicle, _) in tuple(self._rides.items()):
+            if rider == entity_id or vehicle == entity_id:
+                self._set_ride(rider, None, "unobserved")
+
+    def _clear_links(self) -> None:
+        rides, self._rides = self._rides, {}
+        if self._own_entity_id in rides:
+            self._own_ride_epoch += 1
+        if self._ride_observers:
+            for rider, ride in rides.items():
+                before = self._vehicle_link(rider, *ride)
+                self.packets._notify(self._ride_observers, VehicleLinkChange(rider, before, None, "unobserved"))
+
+    def _sync_reader_end(self) -> None:
+        # Raw read waiters can resume before the reader's done callback runs.
+        if self._unsubscribe_reader_end is not None:
+            reader = self.packets._reader_task
+            if reader is not None and reader.done():
+                self._end_session()
+
+    def _require_live(self) -> None:
+        self._sync_reader_end()
+        if self._closed:
+            raise ConnectionError("entity session is closed")
+
+    async def dismount(self) -> None:
+        self._require_live()
+        link = self.vehicle()
+        if link is None or link.vehicle_runtime_id is None:
+            raise RuntimeError("the player is not riding a vehicle the client knows")
+        packet = self.packets.protocol.binding.InteractPacket
+        await self.packets.send(packet(action=packet.Action.STOP_RIDING, target_id=link.vehicle_runtime_id, pos=None))
+
+    def drops(self) -> tuple[EntityState, ...]:
+        return tuple(state for state in self._by_runtime.values()
+                     if state.actor_type == "minecraft:item")
+
+    def _record(self, state: EntityState, *, player_uuid: UUID | None = None,
+                player_feet: _PlayerFeet | None = None, new_instance: bool = True,
+                unlisted_entity_id: int | None = None, identity_matches: bool = True) -> None:
+        runtime_id = state.runtime_id
+        previous = self._by_runtime.get(runtime_id)
+        known_id = self._swing_entity_id(runtime_id)
+        # A conflicting roster ID can appear in the snapshot without claiming that identity.
+        entity_id = (state.entity_id or unlisted_entity_id) if identity_matches else None
+        if new_instance or (known_id is not None and state.entity_id and known_id != state.entity_id):
+            self._end_movement_waiters(LookupError, "entity is no longer observed", runtime_id=runtime_id)
+            self._forget_entity_swings(runtime_id)
+        if previous is not None and self._runtime_by_id.get(previous.entity_id) == runtime_id:
+            if previous.entity_id != entity_id:
+                self._forget_links(previous.entity_id)
+            self._runtime_by_id.pop(previous.entity_id, None)
+        old_uuid = self._player_uuid_by_runtime.get(runtime_id)
+        if old_uuid is not None and old_uuid != player_uuid:
+            self._forget_runtime(runtime_id)
+        if player_uuid is not None:
+            old_runtime = self._player_runtime_by_uuid.get(player_uuid)
+            if old_runtime is not None and old_runtime != runtime_id:
+                self._forget_runtime(old_runtime)
+        if entity_id is not None:
+            previous_runtime = self._runtime_by_id.get(entity_id)
+            if previous_runtime is not None and previous_runtime != runtime_id:
+                self._forget_runtime(previous_runtime)
+            previous_unlisted = self._unlisted_player_runtime_by_id.pop(entity_id, None)
+            if previous_unlisted is not None and previous_unlisted != runtime_id:
+                self._forget_runtime(previous_unlisted)
+            if state.entity_id:
+                self._runtime_by_id[entity_id] = runtime_id
+        self._by_runtime[runtime_id] = state
+        if new_instance:
+            self._forget_player_equipment(runtime_id)
+            self._player_views.pop(runtime_id, None)
+            self._cursor_bodies.pop(runtime_id, None)
+            self._actor_instances[runtime_id] = _ActorInstance(
+                state.actor_type in _ACTOR_SPAWN_FEET_TYPES and state.entity_id not in self._rides,
+            )
+        if unlisted_entity_id is not None:
+            self._unlisted_player_runtime_by_id[unlisted_entity_id] = runtime_id
+        if player_uuid is not None:
+            self._player_runtime_by_uuid[player_uuid] = runtime_id
+            self._player_uuid_by_runtime[runtime_id] = player_uuid
+        if player_feet is None or state.entity_id in self._rides:
+            self._player_feet_by_runtime.pop(runtime_id, None)
+        else:
+            self._player_feet_by_runtime[runtime_id] = player_feet
+
+    def _forget_runtime(self, runtime_id: int) -> None:
+        self._end_movement_waiters(LookupError, "entity is no longer observed", runtime_id=runtime_id)
+        self._forget_entity_swings(runtime_id)
+        self._forget_player_equipment(runtime_id)
+        state = self._by_runtime.pop(runtime_id, None)
+        self._actor_instances.pop(runtime_id, None)
+        self._cursor_bodies.pop(runtime_id, None)
+        self._player_feet_by_runtime.pop(runtime_id, None)
+        self._player_views.pop(runtime_id, None)
+        if state is not None and self._runtime_by_id.get(state.entity_id) == runtime_id:
+            self._runtime_by_id.pop(state.entity_id, None)
+        player_uuid = self._player_uuid_by_runtime.pop(runtime_id, None)
+        if player_uuid is not None:
+            self._player_runtime_by_uuid.pop(player_uuid, None)
+
+    def _item_state(self, packet) -> EntityState:
+        item = packet.item
+        network_id = int(item.id)
+        return EntityState(
+            int(packet.id), int(packet.runtime_id), "minecraft:item",
+            (float(packet.pos.x), float(packet.pos.y), float(packet.pos.z)),
+            self._item_names.get(network_id, f"#{network_id}"),
+            int(item.stack_size), network_id,
+            is_from_fishing=bool(getattr(packet, "is_from_fishing", False)),
+        )
+
+    def _on_packet(self, raw) -> None:
+        if self._closed:
+            return
+        b = self.packets.protocol.binding
+        if raw.packet_id == b.DisconnectPacket.ID:
+            self._end_session()
+        elif raw.packet_id == b.AnimatePacket.ID:
+            self._observe_swing(raw)
+        elif raw.packet_id == b.ItemRegistryPacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            self._item_names = {int(item.id): str(item.name) for item in packet.items}
+        elif raw.packet_id == b.PlayerListPacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            for entry in packet.entries:
+                change = _player_list_change(entry)
+                runtime_id = self._player_runtime_by_uuid.get(change.uuid)
+                if change.player is not None:
+                    self._players_by_uuid[change.uuid] = change.player
+                    state = self._by_runtime.get(runtime_id)
+                    if state is not None:
+                        entity_id = change.player.entity_id
+                        if not entity_id:
+                            # A roster entry without a unique ID supplies no new entity identity.
+                            continue
+                        since = self._unidentified_equipment_since.pop(runtime_id, None)
+                        if since is not None and self._equipment_removal_may_match(since, entity_id):
+                            self._forget_runtime(runtime_id)
+                            continue
+                        feet = self._player_feet_by_runtime.get(runtime_id)
+                        changes = self._unresolved_ride_changes
+                        if feet is not None and not state.entity_id and changes:
+                            _, observed_epoch = feet
+                            # A late identity can expose a ride after the foot observation.
+                            # If older changes have expired, that interval is unverified.
+                            if (observed_epoch + 1 < changes[0][0] or any(
+                                epoch > observed_epoch and rider == entity_id for epoch, rider in changes
+                            )):
+                                feet = None
+                        identity_matches = (runtime_id in self._player_views
+                                            and self._swing_entity_id(runtime_id) in (None, entity_id))
+                        state = replace(state, entity_id=entity_id)
+                        self._record(state, player_uuid=change.uuid, player_feet=feet, new_instance=False,
+                                     identity_matches=identity_matches)
+                        equipment = self._player_equipment.get(runtime_id)
+                        if equipment is not None:
+                            if equipment.entity_id is None:
+                                self._player_equipment[runtime_id] = replace(equipment, entity_id=entity_id)
+                            elif equipment.entity_id != entity_id:
+                                self._forget_player_equipment(runtime_id)
+                                self._player_views.pop(runtime_id, None)
+                                if state.last_observed_offhand is not None or state.gliding is not None:
+                                    self._by_runtime[runtime_id] = replace(state, last_observed_offhand=None, gliding=None)
+                else:
+                    removed = self._players_by_uuid.pop(change.uuid, None)
+                    if removed is not None and (runtime_id is None
+                                                or self._runtime_by_id.get(removed.entity_id) == runtime_id):
+                        self._forget_links(removed.entity_id)
+                    if runtime_id is not None:
+                        self._forget_runtime(runtime_id)
+        elif raw.packet_id == b.AddPlayerPacket.ID:
+            player = self.packets.protocol.decode(raw)
+            for link in player.links:
+                self._observe_link(link)
+            runtime_id = int(player.runtime_id)
+            if runtime_id == self._own_runtime_id:
+                return
+            player_uuid = player.uuid
+            listed = self._players_by_uuid.get(player_uuid)
+            position = (float(player.pos.x), float(player.pos.y), float(player.pos.z))
+            metadata = getattr(getattr(player, "unpack", None), "data", ())
+            entity_id = int(getattr(getattr(player, "abilities_data", None), "target_player", 0) or 0)
+            listed_id = listed.entity_id if listed is not None else 0
+            identity_matches = not entity_id or not listed_id or entity_id == listed_id
+            words = _player_flag_words(metadata, b) if identity_matches else (None, None)
+            self._record(EntityState(
+                listed_id, runtime_id, _PLAYER, position, name=str(player.name), gliding=_player_gliding(words, b),
+            ), player_uuid=player_uuid, player_feet=(position, self._unresolved_ride_epoch),
+                unlisted_entity_id=entity_id if entity_id and not listed_id else None,
+                identity_matches=identity_matches)
+            if getattr(self.packets.protocol, "number", None) == 2225:
+                self._cursor_bodies[runtime_id] = _cursor_body(metadata, b)
+            if identity_matches:
+                spawn_entity_id = entity_id or listed_id or None
+                if spawn_entity_id is None:
+                    self._unidentified_equipment_since[runtime_id] = self._equipment_removal_cursor()
+                self._player_equipment[runtime_id] = PlayerEquipmentSnapshot(
+                    runtime_id, spawn_entity_id, str(player.name),
+                    main_hand=_equipment_stack(getattr(player, "carried_item", None)),
+                )
+                rotation = None
+                if (spawn_entity_id not in self._rides and getattr(player, "passenger_of_block_data", None) is None
+                        and not _unsupported_view_pose(words, b)):
+                    rotation = _player_rotation(player)
+                self._player_views[runtime_id] = _PlayerView(
+                    spawn_entity_id, rotation, words,
+                    ordinary_move=(getattr(player, "passenger_of_block_data", None) is None
+                                   and getattr(player, "player_game_type", None) != b.GameType.SPECTATOR
+                                   and not _unsupported_view_pose(words, b)),
+                )
+        elif raw.packet_id == b.SetActorDataPacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            runtime_id = int(packet.id)
+            body = self._cursor_bodies.get(runtime_id)
+            if body is not None:
+                self._cursor_bodies[runtime_id] = _cursor_body(packet.packed_items.data, b, body)
+            view = self._player_views.get(runtime_id)
+            if view is not None:
+                words = _player_flag_words(packet.packed_items.data, b, view.flags)
+                # Once out of the measured poses, require a fresh ground sample.
+                unsupported = _unsupported_view_pose(words, b)
+                self._player_views[runtime_id] = replace(
+                    view, rotation=None if unsupported else view.rotation, flags=words,
+                    ordinary_move=view.ordinary_move and not unsupported,
+                )
+                gliding = _player_gliding(words, b)
+                previous = self._by_runtime[runtime_id]
+                if gliding is not None and gliding != previous.gliding:
+                    state = replace(previous, gliding=gliding)
+                    self._by_runtime[runtime_id] = state
+                    if previous.gliding is False and gliding:
+                        self.packets._notify(self._glide_observers, state)
+        elif raw.packet_id == b.MobEquipmentPacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            runtime_id = int(packet.runtime_id)
+            current = self._player_equipment.get(runtime_id)
+            if current is None:
+                return
+            if packet.container_id == b.ContainerID.INVENTORY:
+                self._publish_player_equipment(current, replace(
+                    current, selected_slot=int(packet.selected_slot), main_hand=_equipment_stack(packet.item),
+                ))
+            elif packet.container_id == b.ContainerID.OFFHAND:
+                state = self._by_runtime[runtime_id]
+                offhand = _equipment_stack(packet.item)
+                if offhand != state.last_observed_offhand:
+                    self._by_runtime[runtime_id] = replace(state, last_observed_offhand=offhand)
+        elif raw.packet_id == b.MobArmorEquipmentPacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            current = self._player_equipment.get(int(packet.runtime_id))
+            if current is not None:
+                self._publish_player_equipment(current, replace(
+                    current, head=_equipment_stack(packet.head), chest=_equipment_stack(packet.torso),
+                    legs=_equipment_stack(packet.legs), feet=_equipment_stack(packet.feet),
+                ))
+        elif raw.packet_id == b.AddActorPacket.ID:
+            actor = self.packets.protocol.decode(raw)
+            owner = None
+            if actor.actor_type == "minecraft:fishing_hook":
+                owner = next((int(entry.payload.value) for entry in actor.data.data
+                              if int(entry.id) == int(b.ActorDataIDs.OWNER)
+                              and isinstance(entry.payload, b.DataItemInt64Payload)), None)
+            is_boat = actor.actor_type == "minecraft:boat"
+            self._record(EntityState(
+                int(actor.entity_id), int(actor.runtime_id), actor.actor_type,
+                (float(actor.pos.x), float(actor.pos.y), float(actor.pos.z)),
+                owner_entity_id=None if owner == -1 else owner,
+                boat_rotation=(float(actor.rot.x), float(actor.rot.y)) if is_boat else None,
+                boat_velocity=(float(actor.velocity.x), float(actor.velocity.y), float(actor.velocity.z))
+                if is_boat else (0.0, 0.0, 0.0),
+            ))
+            if (actor.actor_type in _ACTOR_SPAWN_FEET_TYPES
+                    and getattr(actor, "passenger_of_block_data", None) is not None):
+                self._actor_instances[int(actor.runtime_id)].feet_known = False
+            if actor.actor_type in _CURSOR_BODY_TYPES and getattr(self.packets.protocol, "number", None) == 2225:
+                self._cursor_bodies[int(actor.runtime_id)] = _cursor_body(actor.data.data, b)
+            for link in actor.links:
+                self._observe_link(link)
+        elif raw.packet_id == b.SetActorLinkPacket.ID:
+            self._observe_link(self.packets.protocol.decode(raw).link)
+        elif raw.packet_id == b.AddItemActorPacket.ID:
+            self._record(self._item_state(self.packets.protocol.decode(raw)))
+        elif raw.packet_id == b.AddPaintingPacket.ID:
+            painting = _painting_snapshot(self.packets.protocol.decode(raw))
+            self._record(EntityState(
+                painting.entity_id, painting.runtime_id, _PAINTING, painting.position, painting=painting,
+            ))
+        elif raw.packet_id == b.ChangeDimensionPacket.ID:
+            # Actors from the previous dimension are no longer observable.
+            self._dimension_epoch += 1
+            self._last_pickup = None
+            self._end_movement_waiters(RuntimeError, "dimension changed while waiting for entity movement")
+            self._end_swing_observers(lambda observer: observer.runtime_id is not None or observer.waiter is not None,
+                                      RuntimeError, "dimension changed while waiting for an entity swing")
+            self._clear_player_equipment(LookupError, "remote player is no longer observed")
+            self._clear_links()
+            self._by_runtime.clear()
+            self._actor_instances.clear()
+            self._cursor_bodies.clear()
+            self._runtime_by_id.clear()
+            # PlayerList membership survives a dimension switch.
+            self._player_runtime_by_uuid.clear()
+            self._player_uuid_by_runtime.clear()
+            self._player_feet_by_runtime.clear()
+            self._player_views.clear()
+            self._unresolved_ride_changes.clear()
+        elif raw.packet_id == b.RemoveActorPacket.ID:
+            entity_id = int(self.packets.protocol.decode(raw).entity_id)
+            self._forget_links(entity_id)
+            runtime_id = self._runtime_by_id.get(entity_id)
+            if runtime_id is None:
+                runtime_id = self._unlisted_player_runtime_by_id.get(entity_id)
+            if runtime_id is not None:
+                self._forget_runtime(runtime_id)
+            elif entity_id and self._unidentified_equipment_since:
+                self._equipment_removals.append((self._equipment_removal_cursor() + 1, entity_id))
+        elif raw.packet_id == b.MovePlayerPacket.ID:
+            move = self.packets.protocol.decode(raw)
+            runtime_id = int(move.player_id)
+            state = self._by_runtime.get(runtime_id)
+            if state is not None and state.actor_type == "minecraft:player":
+                x, y, z = position = (float(move.pos.x), float(move.pos.y), float(move.pos.z))
+                state = replace(state, position=position)
+                self._by_runtime[runtime_id] = state
+                if move.riding_id or int(move.reset_position) == 3 or state.entity_id in self._rides:
+                    self._player_feet_by_runtime.pop(runtime_id, None)
+                else:
+                    # Ordinary MovePlayer retains its standing-height reference while sneaking.
+                    self._player_feet_by_runtime[runtime_id] = ((x, y - 1.62, z), self._unresolved_ride_epoch)
+                view = self._player_views.get(runtime_id)
+                if view is not None:
+                    rotation = None
+                    ordinary_move = (move.on_ground and int(move.reset_position) == 0 and not move.riding_id
+                                     and view.spawn_entity_id not in self._rides
+                                     and not _unsupported_view_pose(view.flags, b))
+                    if ordinary_move:
+                        rotation = _player_rotation(move)
+                    self._player_views[runtime_id] = replace(
+                        view, rotation=rotation, ordinary_move=ordinary_move,
+                    )
+                self._match_movement_waiters(state)
+        elif raw.packet_id == b.TakeItemActorPacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            runtime_id, collector = int(packet.item_id), int(packet.actor_id)
+            state = self._by_runtime.get(runtime_id)
+            # The packet waiters run after the entity observer removes the item.
+            self._last_pickup = (raw, ItemPickup(
+                runtime_id, collector, self._actor_entity_id(runtime_id), self._actor_entity_id(collector),
+                state if state is not None and state.actor_type == "minecraft:item" else None,
+            ), self._actor_instances.get(runtime_id))
+            self._forget_runtime(runtime_id)
+        elif raw.packet_id == b.SetActorMotionPacket.ID:
+            motion = self.packets.protocol.decode(raw)
+            runtime_id = int(motion.runtime_id)
+            state = self._by_runtime.get(runtime_id)
+            if state is not None and state.boat_rotation is not None:
+                self._by_runtime[runtime_id] = replace(
+                    state, boat_velocity=(float(motion.motion.x), float(motion.motion.y), float(motion.motion.z)),
+                )
+        elif raw.packet_id in (b.MoveActorAbsolutePacket.ID, b.MoveActorDeltaPacket.ID):
+            move = self.packets.protocol.decode(raw).move_data
+            runtime_id = int(move.runtime_id)
+            state = self._by_runtime.get(runtime_id)
+            if state is None:
+                return
+            instance = self._actor_instances.get(runtime_id) if state.actor_type in _ACTOR_SPAWN_FEET_TYPES else None
+            if raw.packet_id == b.MoveActorAbsolutePacket.ID:
+                position = (float(move.pos.x), float(move.pos.y), float(move.pos.z))
+                if instance is not None:
+                    instance.feet_known = False
+            else:
+                axes = move.new_position_x, move.new_position_y, move.new_position_z
+                position = tuple(
+                    float(value) if value is not None else old
+                    for value, old in zip(axes, state.position)
+                )
+                # A delta with omitted axes can only keep a previously verified feet position.
+                if instance is not None:
+                    if state.actor_type in _ACTOR_DELTA_FEET_TYPES and all(value is not None for value in axes):
+                        instance.feet_known = state.entity_id not in self._rides
+                    elif state.actor_type == _SHEEP and any(value is not None for value in axes):
+                        instance.feet_known = False
+            rotation = state.boat_rotation
+            if rotation is not None:
+                # Packed actor angles are unsigned fractions of a turn.
+                rotation = tuple(
+                    old if value is None else (int(value) & 255) * 360 / 256
+                    for old, value in zip(rotation, (move.rot_x, move.rot_y))
+                )
+            state = replace(state, position=position, boat_rotation=rotation)
+            self._by_runtime[runtime_id] = state
+            self._player_feet_by_runtime.pop(runtime_id, None)
+            self._match_movement_waiters(state)
+
+    async def attack(self, movement, inventory, runtime_id: int, *,
+                     hit_height: float = 0.5) -> None:
+        """Submit an attack transaction; server damage is observed separately."""
+        await self._use_actor(movement, inventory, runtime_id,
+                              hit_height=hit_height, interact=False)
+
+    async def interact(self, movement, inventory, runtime_id: int, *,
+                       hit_height: float = 0.5, _before_send: Callable[[], None] | None = None) -> None:
+        """Submit a right-click actor transaction; no server effect is implied."""
+        await self._use_actor(movement, inventory, runtime_id,
+                              hit_height=hit_height, interact=True, _before_send=_before_send)
+
+    async def mount(self, movement, inventory, runtime_id: int) -> None:
+        await self._use_actor(movement, inventory, runtime_id, hit_height=0.5, interact=True, mounting=True)
+
+    async def swing(self, player_id: int, source: str = "NONE") -> None:
+        """Submit an arm-swing animation; packet submission is not server receipt."""
+        await self.animate(player_id, "SWING", source=source)
+
+    async def animate(self, player_id: int, action_name: str, data: float = 0.0, *, source: str | None = None) -> None:
+        self._require_live()
+        b = self.packets.protocol.binding
+        await self.packets.send(animation(b, player_id, action_name, data, source=source))
+
+    async def _use_actor(self, movement, inventory, runtime_id: int, *,
+                         hit_height: float, interact: bool, mounting: bool = False,
+                         _before_send: Callable[[], None] | None = None) -> None:
+        """Use an ItemUseOnActor transaction with the selected item and position."""
+        self._require_live()
+        actor = self.get(runtime_id)
+        unsubscribe = None
+        if mounting:
+            if actor is None or not actor.entity_id:
+                raise ValueError("vehicle actor is not currently observed")
+            entity_id, epoch = actor.entity_id, self._dimension_epoch
+            invalidated = False
+
+            def check_target(_raw=None):
+                nonlocal invalidated
+                current = self.get(runtime_id)
+                if self._dimension_epoch != epoch or current is None or current.entity_id != entity_id:
+                    invalidated = True
+                return current
+
+            unsubscribe = self.packets.subscribe_raw(check_target)
+        try:
+            slot = inventory.selected_slot
+            item = inventory.item_or_empty(slot)
+            await movement.wait_for_position_sync()
+        finally:
+            if unsubscribe is not None:
+                unsubscribe()
+        self._require_live()
+        if mounting:
+            actor = check_target()
+            if invalidated:
+                raise RuntimeError("vehicle target changed while waiting to mount")
+        elif _before_send is not None:
+            actor = self.get(runtime_id)
+        # Position sync waits for a server pose. Flat walking can then advance the
+        # input origin through committed frames before the server sends another pose.
+        x, y, z = movement._actor_interaction_origin()
+        # Use the player's position when the target actor is outside the tracking cache.
+        target = actor.position if actor is not None else (x, y, z)
+        b = self.packets.protocol.binding
+        action = b.ItemUseOnActorInventoryTransaction(
+            transaction=b.InventoryTransaction(actions=[]),
+            runtime_id=runtime_id,
+            action_type=(b.ItemUseOnActorInventoryTransaction.ActionType.INTERACT
+                         if interact else b.ItemUseOnActorInventoryTransaction.ActionType.ATTACK),
+            slot=slot,
+            item=item,
+            from_pos=b.Vec3(x=x, y=y, z=z),
+            hit_pos=b.Vec3(
+                x=target[0],
+                y=target[1] + hit_height,
+                z=target[2],
+            ),
+        )
+        packet = b.InventoryTransactionPacket(
+            legacy_request_id=b.ItemStackLegacyRequestId(raw_id=0),
+            legacy_set_item_slots=None,
+            variant_transaction=action,
+        )
+        if _before_send is None:
+            await self.packets.send(packet)
+        else:
+            await self.packets.send(packet, _before_send=_before_send)
+
+    async def wait_for_spawn(self, *, actor_type: str | None = None, timeout: float = 15) -> EntitySpawn:
+        """Wait for AddActor, also accepting AddPainting for a painting filter."""
+        b = self.packets.protocol.binding
+        packet_ids = (b.AddActorPacket.ID, b.AddPaintingPacket.ID) if actor_type == _PAINTING else b.AddActorPacket.ID
+
+        def matches(raw):
+            return (raw.packet_id == b.AddPaintingPacket.ID or actor_type is None
+                    or self.packets.protocol.decode(raw).actor_type == actor_type)
+
+        raw = await self.packets.wait_for_packet(
+            packet_ids, match=matches, timeout=timeout
+        )
+        packet = self.packets.protocol.decode(raw)
+        if raw.packet_id == b.AddPaintingPacket.ID:
+            painting = _painting_snapshot(packet)
+            return EntitySpawn(painting.entity_id, painting.runtime_id, _PAINTING, painting.position)
+        return EntitySpawn(
+            int(packet.entity_id),
+            int(packet.runtime_id),
+            packet.actor_type,
+            (float(packet.pos.x), float(packet.pos.y), float(packet.pos.z)),
+        )
+
+    async def wait_for_item_pickup(
+        self, *, item_runtime_id: int | None = None, collector_runtime_id: int | None = None,
+        item_entity_id: int | None = None, collector_entity_id: int | None = None, timeout: float = 15,
+        _item_instance: object | None = None,
+    ) -> ItemPickup:
+        """Observe the next matching server pickup in the current dimension."""
+        self._require_live()
+        b = self.packets.protocol.binding
+        known_item_id = self._actor_entity_id(item_runtime_id)
+        known_collector_id = self._actor_entity_id(collector_runtime_id)
+        result = None
+
+        def matches(raw):
+            nonlocal result
+            self._require_live()
+            if raw.packet_id == b.ChangeDimensionPacket.ID:
+                raise RuntimeError("dimension changed while waiting for a pickup")
+            observed = self._observed_pickup(raw)
+            if observed is None:
+                return False
+            pickup, instance = observed
+            if _item_instance is not None and instance is not _item_instance:
+                return False
+            identities = (
+                (item_runtime_id, pickup.item_runtime_id),
+                (collector_runtime_id, pickup.collector_runtime_id),
+                (item_entity_id, pickup.item_entity_id),
+                (collector_entity_id, pickup.collector_entity_id),
+                (known_item_id, pickup.item_entity_id),
+                (known_collector_id, pickup.collector_entity_id),
+            )
+            if any(expected is not None and expected != actual for expected, actual in identities):
+                return False
+            result = pickup
+            return True
+
+        await self.packets.wait_for_packet(
+            (b.TakeItemActorPacket.ID, b.ChangeDimensionPacket.ID, b.DisconnectPacket.ID),
+            match=matches, timeout=timeout,
+        )
+        assert result is not None
+        return result
+
+    async def collect_drop(
+        self, movement, runtime_id: int, player_id: int, *,
+        ticks: int = 120, timeout: float = 15
+    ) -> EntityState:
+        """Approach an observed drop; return only after BDS confirms our pickup.
+
+        Movement uses a straight path on level terrain; the item may be taken by
+        another actor, despawn, or remain unreachable. Those do not imply success.
+        """
+        drop = self.get(runtime_id)
+        instance = self._actor_instance(runtime_id)
+        if drop is None or drop.actor_type != "minecraft:item" or instance is None:
+            raise ValueError("item actor is not currently observed")
+        pickup = asyncio.create_task(self.wait_for_item_pickup(
+            item_runtime_id=runtime_id, collector_runtime_id=player_id,
+            item_entity_id=drop.entity_id or None, timeout=timeout,
+            _item_instance=instance,
+        ))
+        follow = None
+        try:
+            # Register the packet waiter before sending any movement input.
+            await asyncio.sleep(0)
+            follow = asyncio.create_task(movement.follow_entity(
+                self, runtime_id, ticks=ticks, stop_distance=0.0,
+                _resolve=lambda selected: self._bound_item(drop, instance) if selected == runtime_id else None,
+            ))
+            done, _ = await asyncio.wait(
+                (pickup, follow), return_when=asyncio.FIRST_COMPLETED
+            )
+            if follow in done:
+                await follow
+            await pickup
+            return drop
+        finally:
+            tasks = (pickup, follow) if follow is not None else (pickup,)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def wait_for_item_drop(self, timeout: float = 15) -> EntityState:
+        """Observe the next server-sent item spawn, not an inventory transfer."""
+        self._require_live()
+        b = self.packets.protocol.binding
+        drop = None
+
+        def capture(raw):
+            nonlocal drop
+            if self._closed or raw.packet_id == b.DisconnectPacket.ID:
+                raise ConnectionError("entity session is closed")
+            drop = self._item_state(self.packets.protocol.decode(raw))
+            return True
+
+        await self.packets.wait_for_packet(
+            (b.AddItemActorPacket.ID, b.DisconnectPacket.ID), match=capture, timeout=timeout,
+        )
+        assert drop is not None
+        return drop
+
+    async def wait_for_removal(self, entity_id: int, *, timeout: float = 15) -> None:
+        """Wait for a new RemoveActor referencing the server's unique actor ID."""
+        b = self.packets.protocol.binding
+
+        def matches(raw):
+            return int(self.packets.protocol.decode(raw).entity_id) == entity_id
+
+        await self.packets.wait_for_packet(
+            b.RemoveActorPacket.ID, match=matches, timeout=timeout
+        )
+
+    async def wait_for_movement(self, runtime_id: int, *, timeout: float = 15) -> EntityMovement:
+        """Observe the next movement packet for a specific actor runtime ID.
+
+        Delta packets omit unchanged axes; this is not a full position snapshot.
+        """
+        b = self.packets.protocol.binding
+
+        def matches(raw):
+            packet = self.packets.protocol.decode(raw)
+            actor_id = (packet.player_id if raw.packet_id == b.MovePlayerPacket.ID
+                        else packet.move_data.runtime_id)
+            return int(actor_id) == runtime_id
+
+        raw = await self.packets.wait_for_packet(
+            (b.MoveActorAbsolutePacket.ID, b.MoveActorDeltaPacket.ID,
+             b.MovePlayerPacket.ID),
+            match=matches, timeout=timeout,
+        )
+        packet = self.packets.protocol.decode(raw)
+        if raw.packet_id == b.MovePlayerPacket.ID:
+            return EntityMovement(
+                runtime_id, float(packet.pos.x), float(packet.pos.y), float(packet.pos.z),
+            )
+        move = packet.move_data
+        if raw.packet_id == b.MoveActorAbsolutePacket.ID:
+            return EntityMovement(
+                runtime_id, float(move.pos.x), float(move.pos.y), float(move.pos.z)
+            )
+        return EntityMovement(
+            runtime_id,
+            float(move.new_position_x) if move.new_position_x is not None else None,
+            float(move.new_position_y) if move.new_position_y is not None else None,
+            float(move.new_position_z) if move.new_position_z is not None else None,
+        )
+
+    async def wait_for_movement_matching(
+        self, runtime_id: int, predicate: Callable[[EntityState], bool], *,
+        entity_id: int | None = None, timeout: float | None = 15,
+    ) -> EntityState:
+        """Match this visible actor's current snapshot, then snapshots after movement packets.
+
+        Pass its unique ID to check the initial runtime ID binding. The wait ends
+        if the actor leaves view or is replaced, the dimension changes, or the
+        entity session closes. The synchronous predicate runs in packet order.
+        """
+        self._require_live()
+        state = self.get(runtime_id)
+        # A player with contradictory AddPlayer and roster identities has no view.
+        if (state is None or runtime_id not in self._actor_instances
+                or (state.entity_id and self._get_by_unique_id(state.entity_id) is not state)
+                or (runtime_id in self._player_uuid_by_runtime and runtime_id not in self._player_views)
+                or (entity_id is not None and entity_id != (state.entity_id or None))):
+            raise LookupError("entity is not currently observed")
+
+        future = asyncio.get_running_loop().create_future()
+        waiters = self._movement_waiters.setdefault(runtime_id, {})
+        waiters[future] = predicate
+        try:
+            # An eager task started by the predicate can close the session inline.
+            if predicate(state) and not future.done():
+                return state
+            async with asyncio.timeout(timeout):
+                result = await future
+            if isinstance(result, BaseException):
+                raise result
+            return result
+        finally:
+            waiters.pop(future)
+            if not waiters and self._movement_waiters.get(runtime_id) is waiters:
+                del self._movement_waiters[runtime_id]
+
+    def _match_movement_waiters(self, state: EntityState) -> None:
+        waiters = self._movement_waiters.get(state.runtime_id)
+        if not waiters:
+            return
+        for future, predicate in tuple(waiters.items()):
+            if future.done():
+                continue
+            result: EntityState | BaseException
+            try:
+                if not predicate(state):
+                    continue
+            except (Exception, asyncio.CancelledError) as error:
+                result = error
+            else:
+                result = state
+            # Raise predicate errors in the awaiting coroutine, including StopIteration.
+            if not future.done():
+                future.set_result(result)
+
+    def _end_movement_waiters(self, error_type, message, cause=None, *, runtime_id=None):
+        targets = tuple(self._movement_waiters) if runtime_id is None else (runtime_id,)
+        for target in targets:
+            for future in self._movement_waiters.pop(target, ()):
+                if not future.done():
+                    error = error_type(message)
+                    error.__cause__ = cause
+                    future.set_result(error)

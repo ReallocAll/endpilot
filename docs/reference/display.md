@@ -1,0 +1,161 @@
+# Chat, display, and forms
+
+## Match player chat
+
+On a connected bot, register a regex or an ordered sequence of regexes and await
+its next completion. Each regex searches the text of a server-relayed player
+message. Unrelated messages can arrive between steps.
+
+```python
+pattern_id = bot.add_chat_pattern(
+    "quest", (r"^Quest (?P<name>.+) started$", r"^Reward: (\d+) coins$"),
+    repeat=False,
+)
+result = await bot.wait_for_chat_match(pattern_id, timeout=30)
+print(result.matches[0].group("name"), result.matches[1].group(1))
+```
+
+`result.messages` contains the corresponding player messages in order. Start the
+wait before the final message arrives. Registrations repeat by default. Use
+`remove_chat_pattern(pattern_id)` to remove one registration or pass its name to
+remove all registrations with that name. For chat observations by author, use
+`wait_for_chat(author=...)` as in the [two-player example](../../examples/chat.py).
+
+## Match literal display text
+
+Use `add_display_pattern()` to match incoming player chat formatted as
+`<author> message`, literal raw text, system messages, tips, and supported
+text objects made entirely of literal text. It skips localized text and
+text objects containing dynamic values such as selectors or translations.
+Start the wait before the message arrives. Its `events` are the original
+`TextEvent` values, and `matches` contains the regex captures.
+
+```python
+pattern_id = bot.add_display_pattern("checkpoint", r"^Checkpoint (\d+) saved$", repeat=False)
+result = await bot.wait_for_display_match(pattern_id, timeout=30)
+print(result.matches[0].group(1))
+```
+
+On a test server, trigger the match by sending this from the server console
+while the bot named `Knight` is waiting.
+
+```text
+tellraw Knight {"rawtext":[{"text":"Checkpoint 3 saved"}]}
+```
+
+## Observe server text and send private chat
+
+`await bot.wait_for_text(kind=TextPacketType.WHISPER, author="Player One")`
+waits for the next matching `TextPacket` dispatched after the wait starts.
+Both filters are optional. Import `TextPacketType` from `endpilot` and use
+the packet kind to select player chat, whispers, announcements, system text,
+translations, tips, or text-object variants. `wait_for_chat()` and chat
+patterns continue to match player chat. A wait raises `TimeoutError` at its
+deadline or `ConnectionError` when the packet stream ends first.
+
+A `TextEvent` contains the original `message`, the wire `kind` and `localize`
+flag, and any `author`, `params`, and `filtered_message` fields. It also carries
+the packet's `xuid` and `platform_id`. The `author` filter accepts names without
+the trailing Bedrock formatting reset and preserves the raw source in the
+returned event. Text-object variants expose decoded JSON through `text_object`.
+Accessing it can raise `json.JSONDecodeError` for a malformed text object.
+Translation keys and arguments are preserved for the client's locale. Command
+feedback can arrive as a text object whose source field is absent.
+
+`await bot.send_whisper("Player One", "See you soon")` submits a `/tell` command
+to a single quoted player name, including names with spaces or punctuation.
+The message body is submitted verbatim. Emails such as `user@example.com`,
+literal `@`, Unicode, and existing quotes and backslashes are supported. Empty
+inputs, CR, LF, NUL, selector recipients, and active selectors in the body raise
+`ValueError` before submission. BDS can interpret a selector inside other
+text, as with `operator@a.io`, and can normalize message spacing.
+The receiver's `WHISPER` confirms delivery on that connection. The sender can
+observe the server's text-object echo separately.
+
+## Observe titles and action bar text
+
+`await bot.wait_for_title(timeout=15)` returns the first title event dispatched
+after the wait begins. Pass `kind="title"`, `"subtitle"`, `"actionbar"`,
+`"times"`, `"clear"`, or `"reset"` to select an event. Start the wait before
+triggering the server action. The event records receipt of a packet by the bot.
+A deadline raises `TimeoutError` and a stream that ends first raises `ConnectionError`.
+
+Text events carry `text` and an optional server-supplied `filtered_text`.
+`text_object=True` marks a Bedrock text-object string, preserved as supplied by
+the server. The `kind` filter matches both plain text and text objects for the
+selected title kind. `times` events carry `fade_in_ticks`, `stay_ticks`, and
+`fade_out_ticks`. Text and timing fields that do not apply are `None`.
+
+Run `python examples/observe_title.py URL --protocol 2225 --kind subtitle`
+against a compatible offline server, then send `title Knight subtitle Example`
+from the server console after the example prints `title_watcher_ready`.
+[Title example](../../examples/observe_title.py)
+
+Use `bot.wait_for_title(kind="actionbar")` for the native title actionbar packet.
+Text packets of kind `TIP` are available through `bot.wait_for_text()`.
+
+## Observe boss bars
+
+`bot.boss_bars` returns immutable snapshots of the bars visible to that bot,
+including bars sent during join. Each `BossBar` has a Bedrock actor unique ID
+(`boss_id`), `title`, optional `filtered_title`, `progress`, `color`, and `style`.
+Progress is the server's fraction, and `color` and `style` are the numeric Bedrock
+`BossBarColor` and `BossBarOverlay` values. Bedrock protocol 2225 omits sky, fog,
+and dragon-bar flag fields.
+
+`await bot.wait_for_boss_bar(kind="created", timeout=15)` returns the next
+matching `BossBarEvent` after the wait starts. Filter by `kind` (also `"updated"`
+or `"removed"`) and optionally `boss_id`. A removal includes the bar's last
+snapshot, and a repeated add for the same visible ID refreshes it as an update.
+Each connection starts with its own bar state. Snapshots previously returned to
+you retain their values across updates, removal, and reconnects.
+
+## Read the scoreboard
+
+`bot.scoreboard` returns a fresh snapshot of the objectives, display slots, scores,
+and player identity mappings received in the current session. Keep a snapshot to
+compare it with a later one. `scores_in_slot()` applies that slot's server-supplied
+sort order.
+
+```python
+board = bot.scoreboard
+for score in board.scores_in_slot("sidebar"):
+    print(score.kind, score.scoreboard_id, score.value)
+```
+
+Score entries carry the player or entity unique ID or the fake player name sent
+with the score. Separate player identity updates are available in
+`board.player_identities`, keyed by scoreboard ID. An objective seen only in score
+packets has `None` for its display name and criteria.
+
+`unsubscribe = bot.subscribe_scoreboard(callback)` receives changes from packets
+dispatched after registration. The synchronous callback receives one immutable
+tuple per packet that changes the scoreboard. Each change contains `before` and
+`after` values and identifies the objective, display slot, score, or identity.
+`None` marks an absent value. Changes follow wire order, so a score updated and
+then removed in the same packet appears twice. Objective removal includes the
+removed objective's scores and any affected display slot changes. A batch goes
+to the observers registered when delivery starts. Subscribing or calling
+`unsubscribe()` during a callback changes delivery starting with the next batch.
+A subscription ends when the bot closes.
+
+## Answer player forms
+
+`bot.get_pending_form()` reads the most recently received pending form. Pass a
+`form_id` to look up a specific request. The result contains `form_id` and an
+independent copy of `form`, the server's JSON. If the request is absent, the
+result is `None`.
+
+Use `await bot.answer_form(response, form_id)` with an action form's zero-based
+button index, a boolean for a confirmation form, or one value per control for a
+custom form. A custom form encodes labels, headers and dividers as `null`.
+`await bot.close_form(form_id=form_id)` sends `USER_CLOSED`. Pass `"USER_BUSY"`
+as `reason` to report a busy player. Both calls default to the most recent
+pending form when the ID is omitted.
+
+Successful calls submit a response to the transport and remove that pending
+request. Use the server's form callback to confirm that it handled the answer.
+A server close-form packet clears all pending forms. Pending forms belong to
+one connection. An extension watching the public packet stream can pass the
+received `RawPacket` to select that exact request even when the server later
+reuses the form ID. [Testing forms](testing.md#observe-and-answer-forms)

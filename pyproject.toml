@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "endpilot"
+version = "0.0.0.dev0"
+description = "Python SDK for headless Minecraft Bedrock clients"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0 AND MIT"
+license-files = ["LICENSE"]
+dependencies = ["bedrock-protocol==0.5.0.dev0", "cryptography>=43"]
+
+[project.optional-dependencies]
+nethernet = ["nethernet[http] @ git+https://github.com/EndstoneMC/nethernet-python.git@b51ab0fc095ae2562bcbb3de911a392b86b2b335"]
+raknet = ["raknet>=0.4.0"]
+mcp = ["mcp>=2,<3"]
+skin = ["Pillow>=12"]
+xbox = ["msal>=1.39,<2", "httpx>=0.28.1,<1", "PyJWT[crypto]>=2.15.1,<3", "pywin32>=312; sys_platform == 'win32'"]
+
+[project.urls]
+Repository = "https://github.com/ReallocAll/endpilot"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+endpilot = ["data/biomes-*.json", "data/harvest-*.json", "data/outline-*.json", "data/recipe-tags-2225.json"]

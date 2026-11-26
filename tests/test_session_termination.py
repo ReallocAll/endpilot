@@ -1,0 +1,512 @@
+import asyncio
+import unittest
+import zlib
+from dataclasses import FrozenInstanceError
+from pathlib import Path
+from unittest.mock import patch
+
+from endpilot import BlockObservation, Bot, LoginRefused, PlacementResult, SessionEnd
+from endpilot.blocks import HASHED_AIR_RUNTIME_ID
+from endpilot.movement import Movement
+from endpilot.protocol import RawPacket, write_batch
+from test_join import _online_identity
+from test_scheduled_input import Wire
+
+
+SUPPORT, TARGET = (4, 90, 7), (4, 91, 7)
+STONE = 0x80310E21
+
+
+class _ZlibWire(Wire):
+    async def send(self, batch):
+        # Only the network settings request precedes compression negotiation.
+        if self.sent:
+            if batch[:1] != b"\xff":
+                raise AssertionError("expected an uncompressed batch after network settings")
+            batch = batch[1:]
+        await super().send(batch)
+
+    def push(self, packet):
+        self.incoming.put_nowait(b"\xff" + write_batch([self.protocol.encode(packet)]))
+
+
+class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.bot = Bot("SessionEndTest", protocol=2225)
+        self.b = self.bot.protocol.binding
+        self.addAsyncCleanup(self.bot.close)
+
+    def wire(self, *after_spawn, player_id=41, negotiate_zlib=False, **start_game_options):
+        b = self.b
+        wire = _ZlibWire(self.bot.protocol) if negotiate_zlib else Wire(self.bot.protocol)
+        algorithm = b.PacketCompressionAlgorithm.ZLIB if negotiate_zlib else b.PacketCompressionAlgorithm.NONE
+        settings = b.NetworkSettingsPacket(compression_algorithm=algorithm, compression_threshold=0)
+        wire.incoming.put_nowait(write_batch([wire.protocol.encode(settings)]))
+        batch = write_batch(wire.protocol.encode(packet) for packet in (
+            b.StartGamePacket(runtime_id=player_id, entity_id=player_id, **start_game_options),
+            b.PlayStatusPacket(status=b.PlayStatus.PLAYER_SPAWN),
+            *after_spawn,
+        ))
+        wire.incoming.put_nowait((b"\xff" if negotiate_zlib else b"") + batch)
+        return wire
+
+    def disconnect(self, message=None, *, filtered=""):
+        b = self.b
+        return b.DisconnectPacket(
+            reason=b.DisconnectFailReason.KICKED,
+            messages=None if message is None else b.DisconnectPacketMessages(message=message, filtered_message=filtered),
+        )
+
+    async def connect(self, wire, **options):
+        with patch("endpilot.transport.nethernet.connect", return_value=wire):
+            await self.bot.join_nethernet("http://127.0.0.1:19132", timeout=1, **options)
+
+    def placement_block(self, pos, runtime_id):
+        b = self.b
+        x, y, z = pos
+        return b.UpdateBlockPacket(pos=b.BlockPos(x=x, y=y, z=z), runtime_id=runtime_id, layer=0)
+
+    def placement_slot(self, count, *, net_id=21):
+        b = self.b
+        return b.InventorySlotPacket(
+            inventory_id=b.ContainerID.INVENTORY, slot=0,
+            item=b.SerializedNetworkItemStackDescriptor(
+                id=1, stack_size=count, net_id_variant=net_id, block_runtime_id=STONE,
+            ),
+        )
+
+    async def join_for_placement(self, *, player_id=41, count=4, negotiate_zlib=False):
+        b = self.b
+        wire = self.wire(
+            self.placement_block((3, 90, 7), STONE),
+            self.placement_block(SUPPORT, STONE),
+            self.placement_block(TARGET, HASHED_AIR_RUNTIME_ID),
+            self.placement_slot(count),
+            b.MovePlayerPacket(player_id=player_id, pos=b.Vec3(x=3.5, y=92.62, z=7.5),
+                               reset_position=2, on_ground=True),
+            player_id=player_id, negotiate_zlib=negotiate_zlib, entity_game_type=b.GameType.SURVIVAL,
+            block_network_ids_are_hashes=True,
+        )
+        await self.connect(wire)
+        await self.bot.wait_for_position_sync(timeout=1)
+        return wire
+
+    def placement_transactions(self, wire):
+        return [
+            packet.variant_transaction for packet in wire.sent
+            if isinstance(packet, self.b.InventoryTransactionPacket)
+        ]
+
+    async def start_placement(self, wire, *, timeout, count=4):
+        sent = asyncio.Event()
+
+        def observe_send(packet_id):
+            if packet_id == self.b.InventoryTransactionPacket.ID:
+                sent.set()
+
+        unsubscribe = self.bot.packets.subscribe_sent(observe_send)
+        placing = asyncio.create_task(self.bot.place_block(SUPPORT, face=1, expected_runtime_id=STONE, timeout=timeout))
+
+        async def drain():
+            placing.cancel()
+            await asyncio.gather(placing, return_exceptions=True)
+
+        self.addAsyncCleanup(drain)
+        try:
+            await asyncio.wait_for(sent.wait(), 1)
+        finally:
+            unsubscribe()
+        transaction, = self.placement_transactions(wire)
+        self.assertEqual(transaction.action_type, self.b.ItemUseInventoryTransaction.ActionType.PLACE)
+        self.assertEqual((transaction.pos.x, transaction.pos.y, transaction.pos.z), SUPPORT)
+        self.assertEqual((transaction.face, transaction.target_block_id, transaction.slot), (1, STONE, 0))
+        self.assertEqual((transaction.item.id, transaction.item.stack_size), (1, count))
+        self.assertFalse(placing.done())
+        return placing
+
+    async def test_placement_ends_on_peer_eof_and_same_bot_can_rejoin_after_close(self):
+        wire = await self.join_for_placement()
+        packets = self.bot.packets
+        reader = packets._reader_task
+        ticker = self.bot._movement._ticker
+        clock = self.bot._clock._task
+        baseline = set(packets._subscribers)
+        placing = await self.start_placement(wire, timeout=10)
+        placement_callbacks = set(packets._subscribers) - baseline
+        self.assertEqual(len(placement_callbacks), 1)
+        self.assertFalse(reader.done())
+        self.assertFalse(ticker.done())
+        self.assertFalse(clock.done())
+
+        eof = EOFError("peer ended the receive stream")
+        wire.incoming.put_nowait(eof)
+        self.assertEqual(await asyncio.wait_for(placing, 2),
+                         PlacementResult(0, TARGET, 0, True, "disconnected", None, None))
+        ended = await self.bot.wait_for_session_end(timeout=1)
+        self.assertEqual(ended, SessionEnd("reader_end", error_type="EOFError"))
+        _, pending = await asyncio.wait((reader, ticker, clock), timeout=1)
+        self.assertFalse(pending)
+        self.assertIs(reader.exception(), eof)
+        self.assertFalse(placement_callbacks.intersection(packets._subscribers))
+        self.assertFalse(wire.closed)
+
+        with self.assertRaises(EOFError) as raised:
+            await self.bot.close()
+        self.assertIs(raised.exception, eof)
+        self.assertTrue(wire.closed)
+        self.assertIs(self.bot.session_end, ended)
+
+        replacement = await self.join_for_placement(player_id=42, count=3)
+        self.assertIsNone(self.bot.session_end)
+        self.assertEqual(self.bot.player_id, 42)
+        self.assertIsNot(self.bot.packets, packets)
+        self.assertIsNot(self.bot.packets._reader_task, reader)
+        self.assertFalse(self.bot.packets._reader_task.done())
+        tick = self.bot.get_tick()
+        self.assertGreater(await asyncio.wait_for(self.bot.wait_ticks(1), 1), tick)
+
+        placing = await self.start_placement(replacement, timeout=2, count=3)
+        replacement.push(self.placement_block(TARGET, STONE))
+        replacement.push(self.placement_slot(2, net_id=22))
+        result = await asyncio.wait_for(placing, 1)
+        self.assertEqual((result.submitted, result.reason, result.target, result.slot),
+                         (True, "observations_complete", TARGET, 0))
+        self.assertTrue(result.world_change.before.is_air)
+        self.assertEqual(result.world_change.after.runtime_id, STONE)
+        self.assertEqual((result.inventory_change.before.count, result.inventory_change.after.count), (3, 2))
+        self.assertEqual(result.inventory_change.after.net_id, 22)
+        self.assertEqual(len(self.placement_transactions(wire)), 1)
+        self.assertEqual(len(self.placement_transactions(replacement)), 1)
+
+    async def test_receive_budget_ends_placement_and_same_bot_can_replay_after_close(self):
+        fixture = Path(__file__).with_name("fixtures") / "stock-subchunk-2225.hex"
+        raw = RawPacket(self.b.SubChunkPacket.ID, bytes.fromhex(fixture.read_text(encoding="ascii")))
+        batch = write_batch([raw])
+        frame = b"\x00" + zlib.compress(batch, wbits=-15)
+        chest = (5, 220, 10)
+
+        wire = await self.join_for_placement(negotiate_zlib=True)
+        packets = self.bot.packets
+        blocks = self.bot._blocks
+        reader, ticker, clock = packets._reader_task, self.bot._movement._ticker, self.bot._clock._task
+        baseline = set(packets._subscribers)
+        placing = await self.start_placement(wire, timeout=10)
+        placement_callbacks = set(packets._subscribers) - baseline
+        self.assertEqual(len(placement_callbacks), 1)
+
+        with patch("endpilot.compression.MAX_DECOMPRESSED_BATCH_SIZE", len(batch) - 1):
+            wire.incoming.put_nowait(frame)
+            ended = await self.bot.wait_for_session_end(timeout=1)
+
+        self.assertEqual(ended, SessionEnd("reader_end", error_type="ValueError"))
+        self.assertEqual(await asyncio.wait_for(placing, 2),
+                         PlacementResult(0, TARGET, 0, True, "disconnected", None, None))
+        _, pending = await asyncio.wait((reader, ticker, clock), timeout=1)
+        self.assertFalse(pending)
+        failure = reader.exception()
+        self.assertIsInstance(failure, ValueError)
+        self.assertEqual(str(failure), "invalid compressed batch")
+        with self.assertRaisesRegex(ConnectionError, "packet stream lost while waiting") as waiting:
+            await self.bot.wait_for_server_disconnect(timeout=1)
+        self.assertIs(waiting.exception.__cause__, failure)
+        self.assertFalse(placement_callbacks.intersection(packets._subscribers))
+        self.assertFalse(packets._reader_end_subscribers)
+        self.assertFalse(blocks._block_observers)
+        self.assertFalse(wire.closed)
+
+        with self.assertRaises(ValueError) as closing:
+            await self.bot.close()
+        self.assertIs(closing.exception, failure)
+        self.assertTrue(wire.closed)
+        self.assertIs(self.bot.session_end, ended)
+
+        replacement = await self.join_for_placement(player_id=42, count=3, negotiate_zlib=True)
+        self.assertIsNone(self.bot.session_end)
+        self.assertEqual(self.bot.player_id, 42)
+        self.assertIsNot(self.bot.packets, packets)
+        self.assertIsNone(self.bot.observed_block(chest))
+        replacement.incoming.put_nowait(frame)
+        self.assertEqual(await self.bot.packets.wait_for_packet(raw.packet_id, timeout=1), raw)
+        self.assertEqual(self.bot.observed_block(chest), BlockObservation(chest, 741882976, 0, False))
+
+        placing = await self.start_placement(replacement, timeout=2, count=3)
+        replacement.push(self.placement_block(TARGET, STONE))
+        replacement.push(self.placement_slot(2, net_id=22))
+        result = await asyncio.wait_for(placing, 1)
+        self.assertEqual((result.submitted, result.reason, result.target, result.slot),
+                         (True, "observations_complete", TARGET, 0))
+        self.assertEqual(result.world_change.after.runtime_id, STONE)
+        self.assertEqual((result.inventory_change.before.count, result.inventory_change.after.count), (3, 2))
+
+    async def test_placement_timeout_releases_its_subscriptions_on_a_live_connection(self):
+        wire = await self.join_for_placement()
+        packets = self.bot.packets
+        blocks = self.bot._blocks
+        marker = self.b.SetTimePacket(time=42)
+        waiting = asyncio.create_task(packets.wait_for_packet(marker.ID, timeout=5))
+        try:
+            await asyncio.sleep(0)
+            raw_subscribers = tuple(packets._subscribers)
+            end_subscribers = tuple(packets._reader_end_subscribers)
+            block_observers = tuple(blocks._block_observers)
+            placing = await self.start_placement(wire, timeout=1)
+            self.assertEqual(await asyncio.wait_for(placing, 2),
+                             PlacementResult(0, TARGET, 0, True, "timed_out", None, None))
+            self.assertEqual(len(self.placement_transactions(wire)), 1)
+            self.assertEqual(tuple(packets._subscribers), raw_subscribers)
+            self.assertEqual(tuple(packets._reader_end_subscribers), end_subscribers)
+            self.assertEqual(tuple(blocks._block_observers), block_observers)
+            self.assertFalse(waiting.done())
+            self.assertFalse(packets._reader_task.done())
+            self.assertFalse(wire.closed)
+            self.assertIsNone(self.bot.session_end)
+
+            wire.push(marker)
+            self.assertEqual(packets.protocol.decode(await asyncio.wait_for(waiting, 1)).time, marker.time)
+            tick = self.bot.get_tick()
+            self.assertGreater(await asyncio.wait_for(self.bot.wait_ticks(1), 1), tick)
+        finally:
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
+
+    async def test_disconnect_after_spawn_in_the_same_batch_survives_later_reader_failure(self):
+        wire = self.wire(self.disconnect("First reason", filtered=""), self.disconnect("Later reason"))
+        await self.connect(wire)
+        result = await self.bot.wait_for_session_end(timeout=1)
+        self.assertEqual(result, SessionEnd("server_disconnect", 55, "KICKED", "First reason", ""))
+        self.assertIs(self.bot.session_end, result)
+        self.assertFalse(wire.closed)
+        with self.assertRaises(FrozenInstanceError):
+            result.message = "Changed"
+
+        # The older API still waits for a new packet even after the snapshot is available.
+        waiting = asyncio.create_task(self.bot.wait_for_server_disconnect(timeout=1))
+        await asyncio.sleep(0)
+        self.assertFalse(waiting.done())
+        wire.push(self.disconnect("Next packet", filtered="Filtered"))
+        packet = await waiting
+        self.assertEqual((packet.messages.message, packet.messages.filtered_message), ("Next packet", "Filtered"))
+
+        reader = self.bot.packets._reader_task
+        failure = OSError("reader closed after the kick")
+        wire.incoming.put_nowait(failure)
+        with self.assertRaises(OSError) as raised:
+            await reader
+        self.assertIs(raised.exception, failure)
+        self.assertIs(self.bot.session_end, result)
+        with self.assertRaises(OSError) as raised:
+            await self.bot.close()
+        self.assertIs(raised.exception, failure)
+        self.assertTrue(wire.closed)
+        self.assertIs(await self.bot.wait_for_session_end(timeout=0), result)
+
+    async def test_independent_waiter_timeout_and_cancellation_keep_another_waiter_live(self):
+        wire = self.wire()
+        await self.connect(wire)
+        remaining = asyncio.create_task(self.bot.wait_for_session_end(timeout=1))
+        cancelled = asyncio.create_task(self.bot.wait_for_session_end())
+        try:
+            with self.assertRaises(TimeoutError):
+                await self.bot.wait_for_session_end(timeout=0)
+            cancelled.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await cancelled
+            self.assertFalse(remaining.done())
+            self.assertIsNone(self.bot.session_end)
+            wire.push(self.disconnect())
+            result = await remaining
+            self.assertEqual(result, SessionEnd("server_disconnect", 55, "KICKED"))
+            self.assertIs(await self.bot.wait_for_session_end(timeout=0), result)
+        finally:
+            for task in (remaining, cancelled):
+                task.cancel()
+            await asyncio.gather(remaining, cancelled, return_exceptions=True)
+
+    async def test_unknown_disconnect_enum_keeps_the_received_number_and_messages(self):
+        b = self.b
+        wire = self.wire(b.DisconnectPacket(
+            reason=999,
+            messages=b.DisconnectPacketMessages(message="Unknown reason", filtered_message="Filtered reason"),
+        ))
+        await self.connect(wire)
+        result = await self.bot.wait_for_session_end(timeout=1)
+        self.assertEqual(result, SessionEnd("server_disconnect", 999, None, "Unknown reason", "Filtered reason"))
+
+    async def test_reader_failure_reports_only_the_error_type_and_preserves_close_error(self):
+        wire = self.wire()
+        await self.connect(wire)
+        failure = EOFError("details from the transport")
+        wire.incoming.put_nowait(failure)
+        result = await self.bot.wait_for_session_end(timeout=1)
+        self.assertEqual(result, SessionEnd("reader_end", error_type="EOFError"))
+        self.assertNotIn(str(failure), repr(result))
+        self.assertFalse(wire.closed)
+        with self.assertRaises(EOFError) as raised:
+            await self.bot.close()
+        self.assertIs(raised.exception, failure)
+        self.assertTrue(wire.closed)
+        self.assertIs(self.bot.session_end, result)
+
+    async def test_zero_timeout_wait_and_close_see_reader_completion_before_its_callback(self):
+        for wait_first in (False, True):
+            with self.subTest(wait_first=wait_first):
+                wire = self.wire()
+                original_recv = wire.recv
+                reader_cancellation = asyncio.CancelledError()
+                notified = []
+                close_started = asyncio.Event()
+                close_task = None
+
+                async def early_close():
+                    self.assertEqual(notified, [])
+                    close_started.set()
+                    if wait_first:
+                        result = await self.bot.wait_for_session_end(timeout=0)
+                        self.assertEqual(result, SessionEnd("reader_end"))
+                    await self.bot.close()
+
+                async def recv():
+                    nonlocal close_task
+                    try:
+                        return await original_recv()
+                    except asyncio.CancelledError as error:
+                        if error is reader_cancellation:
+                            # This task is queued ahead of the reader's done callback.
+                            close_task = asyncio.create_task(early_close())
+                        raise
+
+                with patch.object(wire, "recv", new=recv):
+                    await self.connect(wire)
+                    self.bot.packets.subscribe_reader_end(notified.append)
+                    wire.incoming.put_nowait(reader_cancellation)
+                    await asyncio.wait_for(close_started.wait(), 1)
+                    await close_task
+                self.assertEqual(notified, [None])
+                self.assertTrue(wire.closed)
+                self.assertEqual(self.bot.session_end, SessionEnd("reader_end"))
+
+    async def test_local_close_binds_waiters_and_old_reader_packets_cannot_replace_a_rejoin(self):
+        first = self.wire()
+        await self.connect(first)
+        old_packets = self.bot.packets
+        old_wait = asyncio.create_task(self.bot.wait_for_session_end())
+        late_wire = asyncio.create_task(old_packets.wait_for_packet(self.b.DisconnectPacket.ID, timeout=1))
+        state = self.bot._player_state
+        drain = state.aclose
+        detached, release = asyncio.Event(), asyncio.Event()
+
+        async def drain_old_state():
+            detached.set()
+            await release.wait()
+            await drain()
+
+        with patch.object(state, "aclose", new=drain_old_state):
+            closing = asyncio.create_task(self.bot.close())
+            try:
+                await asyncio.wait_for(detached.wait(), 1)
+                old_result = await old_wait
+                self.assertEqual(old_result, SessionEnd("local_close"))
+                self.assertIs(self.bot.session_end, old_result)
+                self.assertFalse(first.closed)
+
+                replacement = self.wire(player_id=42)
+                await self.connect(replacement)
+                self.assertIsNone(self.bot.session_end)
+                first.push(self.disconnect("Old session ended"))
+                self.assertEqual(old_packets.protocol.decode(await late_wire).messages.message, "Old session ended")
+                self.assertIsNone(self.bot.session_end)
+                replacement.push(self.disconnect("New session ended", filtered="New filtered"))
+                new_result = await self.bot.wait_for_session_end(timeout=1)
+                self.assertEqual(new_result, SessionEnd("server_disconnect", 55, "KICKED",
+                                                        "New session ended", "New filtered"))
+            finally:
+                release.set()
+                await closing
+                for task in (old_wait, late_wire):
+                    task.cancel()
+                await asyncio.gather(old_wait, late_wire, return_exceptions=True)
+        self.assertTrue(first.closed)
+        self.assertFalse(replacement.closed)
+        self.assertIs(self.bot.session_end, new_result)
+        self.assertEqual(old_result, SessionEnd("local_close"))
+
+    async def test_pre_spawn_refusal_does_not_publish_a_result_and_invalid_join_retains_the_last_one(self):
+        self.assertIsNone(self.bot.session_end)
+        with self.assertRaisesRegex(RuntimeError, "player has not joined"):
+            await self.bot.wait_for_session_end(timeout=0)
+        await self.connect(self.wire())
+        await self.bot.close()
+        saved = self.bot.session_end
+        with self.assertRaises(ValueError):
+            await self.connect(self.wire(), chunk_radius=0)
+        self.assertIs(self.bot.session_end, saved)
+
+        refused = Wire(self.bot.protocol)
+        refused.push(self.b.NetworkSettingsPacket(compression_algorithm=self.b.PacketCompressionAlgorithm.NONE))
+        refused.push(self.disconnect("refused before spawn"))
+        with self.assertRaises(LoginRefused):
+            await self.connect(refused)
+        self.assertTrue(refused.closed)
+        self.assertIsNone(self.bot.session_end)
+
+    async def test_cancelled_authorization_and_failed_assembly_never_publish_a_session(self):
+        entered = asyncio.Event()
+
+        async def authorize(_public_key):
+            entered.set()
+            await asyncio.Event().wait()
+
+        with patch("endpilot.transport.nethernet.connect") as connect:
+            joining = asyncio.create_task(self.bot.join_nethernet(
+                "http://127.0.0.1:19132", credential_provider=authorize,
+            ))
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                self.assertIsNone(self.bot.session_end)
+                joining.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await joining
+                connect.assert_not_awaited()
+            finally:
+                if not joining.done():
+                    joining.cancel()
+                    await asyncio.gather(joining, return_exceptions=True)
+        self.assertIsNone(self.bot.session_end)
+
+        wire = self.wire(self.disconnect("queued after spawn"))
+        start = Movement.start
+
+        def fail_after_start(movement, **options):
+            start(movement, **options)
+            raise RuntimeError("assembly failed")
+
+        with patch.object(Movement, "start", new=fail_after_start):
+            with self.assertRaisesRegex(RuntimeError, "assembly failed"):
+                await self.connect(wire)
+        self.assertTrue(wire.closed)
+        self.assertIsNone(self.bot.session_end)
+        with self.assertRaisesRegex(RuntimeError, "player has not joined"):
+            await self.bot.wait_for_session_end(timeout=0)
+
+    async def test_cancelled_online_join_after_assembly_keeps_the_end_private(self):
+        wire = self.wire(self.disconnect("queued just after spawn"))
+        start = self.bot._start_session
+
+        def cancel_after_assembly(session, **options):
+            start(session, **options)
+            joining.cancel()
+
+        with (
+            patch("endpilot.transport.nethernet.connect", return_value=wire),
+            patch("endpilot.bot.acquire_online_identity", return_value=_online_identity()),
+            patch.object(self.bot, "_start_session", new=cancel_after_assembly),
+        ):
+            joining = asyncio.create_task(self.bot.join_nethernet(
+                "http://127.0.0.1:19132", credential_provider=object(),
+            ))
+            with self.assertRaises(asyncio.CancelledError):
+                await joining
+        self.assertTrue(wire.closed)
+        self.assertIsNone(self.bot.session_end)
+        with self.assertRaisesRegex(RuntimeError, "player has not joined"):
+            await self.bot.wait_for_session_end(timeout=0)
