@@ -213,6 +213,9 @@ async def _join(args, authorize_account=None, *, selected_account=None) -> None:
                 message = ("The server disconnected the player before the hold ended."
                            if end.kind == "server_disconnect" else "The connection ended before the hold ended.")
                 hold_failure = _CommandError(message)
+        else:
+            # Let a pending interrupt run before entering cleanup.
+            await asyncio.sleep(0)
     finally:
         try:
             await bot.close()

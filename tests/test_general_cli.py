@@ -5,6 +5,7 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -15,10 +16,11 @@ from endpilot import BedrockCredentials, LoginRefused, ResourcePackDecision, Ses
 from endpilot import __main__ as cli
 from endpilot.__main__ import main
 from endpilot.authentication import OfflineIdentity
+from endpilot.bot import Bot
 from endpilot.compression import PacketConnection
 from endpilot.login import JoinSession, request_network_settings
 from endpilot.protocol import Protocol, write_batch
-from test_join import FakeTransport
+from test_join import FakeTransport, _spawn_transport
 from test_skin import _png
 from test_xbox_cache_storage import _msal_state
 from test_xbox_device_flow import CODE, URI, public_key
@@ -74,6 +76,29 @@ class GeneralCliTests(_CliTestCase):
                 self.bot.close.assert_awaited_once_with()
                 self.assertEqual(stdout.getvalue().splitlines(), ["Joined."] if result else ["Joined.", "Disconnected."])
                 self.assertEqual(stderr.getvalue().splitlines(), [diagnostic] if diagnostic else [])
+
+    def test_zero_hold_handles_ctrl_c_after_join_before_closing(self):
+        bot = Bot("EndPilot")
+        self.bot_factory.return_value = bot
+        transport = _spawn_transport(bot.protocol, 1)
+        print_status = cli._print_status
+
+        async def connect(_host, _port, identity, protocol, _timeout, *, timeline, clock, _address, **options):
+            return await JoinSession._join_connected(transport, identity, _address, protocol, timeline, clock, **options)
+
+        def interrupt_on_join(message, **kwargs):
+            print_status(message, **kwargs)
+            if message == "Joined.":
+                asyncio.get_running_loop().call_soon(signal.raise_signal, signal.SIGINT)
+
+        original = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, original)
+        with (patch.object(JoinSession, "connect_raknet", new=connect),
+              patch.object(cli, "_print_status", side_effect=interrupt_on_join)):
+            self.assertEqual(main(["join", "raknet://127.0.0.1:19132", "--hold", "0"]), 130)
+        self.assertTrue(transport.closed)
+        self.assertEqual(self.stdout.getvalue().splitlines(), ["Joined."])
+        self.assertEqual(self.stderr.getvalue().splitlines(), ["Stopped."])
 
     def test_join_reports_login_refusal_and_closes_without_retrying(self):
         self.bot.join_address.side_effect = LoginRefused(
