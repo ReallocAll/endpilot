@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, TypedDict
 
@@ -97,6 +97,7 @@ class MCPPlayer:
         self._observed: dict[tuple[tuple[int, int, int], int], BlockUpdate] = {}
         self._reading: set[asyncio.Task] = set()
         self._movement: _MovementAction | None = None
+        self._actions: set[asyncio.Future[None]] = set()
         self._lifecycle = asyncio.Lock()
         self._transferring = False
         self._connection_cleanups: list[Callable[[], Awaitable[None]]] = []
@@ -106,6 +107,18 @@ class MCPPlayer:
         if self.bot is None or self._transferring:
             raise RuntimeError("connect a player first")
         return self.bot
+
+    @contextmanager
+    def _connection_action(self):
+        bot = self.connected_bot()
+        pending = self._actions
+        settled = asyncio.get_running_loop().create_future()
+        pending.add(settled)
+        try:
+            yield bot
+        finally:
+            pending.remove(settled)
+            settled.set_result(None)
 
     def add_connection_cleanup(self, cleanup: Callable[[], Awaitable[None]]) -> None:
         """Register cleanup to run before the current Bot is closed or handed off."""
@@ -136,6 +149,7 @@ class MCPPlayer:
                 await bot.close()
                 raise
             self.bot = bot
+            self._actions = set()
             return {"name": name, "player_id": bot.player_id}
 
     async def watch_block(self, x: int, y: int, z: int, layer: int = 0, timeout: float = 15) -> dict:
@@ -172,11 +186,11 @@ class MCPPlayer:
 
     async def place_against(self, x: int, y: int, z: int, face: int = 1, slot: int = 0) -> dict:
         """Submit an item-use frame against a server-observed support; not placement acceptance."""
-        bot = self.connected_bot()
-        against = self._observed.get(((x, y, z), 0))
-        if against is None:
-            raise RuntimeError("read a server update for the support block first")
-        tick = await bot.place_against(against, face=face, slot=slot)
+        with self._connection_action() as bot:
+            against = self._observed.get(((x, y, z), 0))
+            if against is None:
+                raise RuntimeError("read a server update for the support block first")
+            tick = await bot.place_against(against, face=face, slot=slot)
         return {"submitted_tick": tick, "against": list(against.position)}
 
     async def observed_block(self, x: int, y: int, z: int, layer: int = 0) -> _BlockSnapshot:
@@ -192,14 +206,14 @@ class MCPPlayer:
         click_pos: tuple[float, float, float] | None = None, timeout: float = 15,
     ) -> _PlacementReport:
         """Use the selected survival item and report independent world and slot observations."""
-        bot = self.connected_bot()
-        try:
-            result = await bot.place_block((x, y, z), face=face, expected_runtime_id=expected_runtime_id,
-                                           click_pos=click_pos, timeout=timeout)
-        except asyncio.CancelledError as error:
-            result = getattr(error, "placement_progress", None)
-            if result is None:
-                raise
+        with self._connection_action() as bot:
+            try:
+                result = await bot.place_block((x, y, z), face=face, expected_runtime_id=expected_runtime_id,
+                                               click_pos=click_pos, timeout=timeout)
+            except asyncio.CancelledError as error:
+                result = getattr(error, "placement_progress", None)
+                if result is None:
+                    raise
         change = result.inventory_change
         return {"dimension_id": result.dimension_id, "target": result.target, "slot": result.slot,
                 "submitted": result.submitted, "reason": result.reason, "world_change": result.world_change,
@@ -246,7 +260,8 @@ class MCPPlayer:
     async def request_sub_chunk(self, x: int, y: int, z: int) -> _SectionRequest:
         """Request the section containing these world block coordinates."""
         position = (x, y, z)
-        await self.connected_bot().request_sub_chunk(position)
+        with self._connection_action() as bot:
+            await bot.request_sub_chunk(position)
         return {"requested": True, "position": position}
 
     def _check_movement_slot(self) -> None:
@@ -369,7 +384,8 @@ class MCPPlayer:
         """Return the live Bot to Python code in this process, without reconnecting.
 
         This is a Python ownership transfer, not an MCP stdio tool: Bot objects
-        cannot be serialized into a different process.
+        cannot be serialized into a different process. Admitted built-in writes
+        finish before transfer. Cancelling the wait leaves the Bot with MCP.
         """
         bot = self.bot
         if bot is None:
@@ -380,6 +396,8 @@ class MCPPlayer:
             self._transferring = True
             try:
                 await self._drain_connection(bot, disconnect=False)
+                if self._actions:
+                    await asyncio.wait(tuple(self._actions))
                 self.bot = None
                 return bot
             finally:

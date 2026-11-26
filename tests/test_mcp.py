@@ -14,6 +14,7 @@ from endpilot.inventory import HeldItemStack
 from endpilot.mcp_server import MCPPlayer
 from endpilot.navigation import BlockInteractionGoal, BlockInteractionMatch, NavigationPlan, NavigationResult, NavigationRules
 from endpilot.placement import PlacementInventoryChange, PlacementResult
+from test_placement import PLACED_ID, SUPPORT, TARGET, _PlacementHarness
 
 
 class FakeBot:
@@ -245,6 +246,78 @@ class MCPPlayerTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(bot.closed)
             await bot.close()
             self.assertTrue(bot.closed)
+
+    async def test_handoff_drains_legacy_place_and_section_request_without_serializing(self):
+        with patch("endpilot.mcp_server.Bot", FakeBot):
+            player = MCPPlayer()
+            await player.connect("http://localhost:19132")
+            bot = player.connected_bot()
+            self.addAsyncCleanup(bot.close)
+            await player.watch_block(2, 99, 0)
+            bot.updated.set()
+            await player.read_block(2, 99, 0)
+            place_started, section_started = asyncio.Event(), asyncio.Event()
+            place_release, section_release = asyncio.Event(), asyncio.Event()
+
+            async def place(*args, **kwargs):
+                place_started.set()
+                await place_release.wait()
+                return 123
+
+            async def request(position):
+                section_started.set()
+                await section_release.wait()
+
+            bot.place_against, bot.request_sub_chunk = place, request
+            placed = asyncio.create_task(player.place_against(2, 99, 0))
+            requested = asyncio.create_task(player.request_sub_chunk(2, 99, 0))
+            tasks = [placed, requested]
+            try:
+                async with asyncio.timeout(2):
+                    await place_started.wait()
+                    await section_started.wait()
+                    handoff = asyncio.create_task(player.handoff())
+                    tasks.append(handoff)
+                    await asyncio.sleep(0)
+                    self.assertFalse(handoff.done())
+                    place_release.set()
+                    self.assertEqual((await placed)["submitted_tick"], 123)
+                    self.assertFalse(handoff.done())
+                    section_release.set()
+                    self.assertTrue((await requested)["requested"])
+                    self.assertIs(await handoff, bot)
+            finally:
+                place_release.set()
+                section_release.set()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_disconnect_does_not_carry_old_actions_to_the_next_handoff(self):
+        with patch("endpilot.mcp_server.Bot", FakeBot):
+            player = MCPPlayer()
+            await player.connect("http://localhost:19132", "old")
+            old = player.connected_bot()
+            started, release = asyncio.Event(), asyncio.Event()
+
+            async def request(position):
+                started.set()
+                await release.wait()
+
+            old.request_sub_chunk = request
+            pending = asyncio.create_task(player.request_sub_chunk(2, 99, 0))
+            try:
+                async with asyncio.timeout(2):
+                    await started.wait()
+                    self.assertTrue((await player.disconnect())["disconnected"])
+                    self.assertTrue(old.closed)
+                    self.assertFalse(pending.done())
+                    await player.connect("http://localhost:19132", "new")
+                    new = player.connected_bot()
+                    self.addAsyncCleanup(new.close)
+                    self.assertIsNot(new, old)
+                    self.assertIs(await player.handoff(), new)
+            finally:
+                release.set()
+                await asyncio.gather(pending, return_exceptions=True)
 
     async def test_handoff_cancels_in_flight_block_read(self):
         with patch("endpilot.mcp_server.Bot", FakeBot):
@@ -583,6 +656,68 @@ class MCPPlayerTests(unittest.IsolatedAsyncioTestCase):
                         self.assertTrue(bot.closed)
                     self.assertEqual(await player.disconnect(), {"disconnected": False})
                     self.assertEqual(calls.count("first"), 2 if release == "handoff" else 1)
+
+
+class MCPPlacementHandoffTests(_PlacementHarness):
+    async def test_cancelled_handoff_keeps_owner_and_successful_handoff_waits_for_placement(self):
+        controller = MCPPlayer()
+        with patch("endpilot.mcp_server.Bot", return_value=self.bot), patch.object(
+            self.bot, "join_nethernet", new=AsyncMock(),
+        ):
+            self.bot._session = Mock(player_id=17)
+            await controller.connect("http://localhost:19132")
+
+        started, release, sent = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def sync(*, timeout):
+            started.set()
+            await release.wait()
+            return self.movement.input_position
+
+        self.movement.wait_for_position_sync.side_effect = sync
+        stop = self.packets.subscribe_sent(lambda packet_id: sent.set())
+        tasks = [asyncio.create_task(controller.place_block(*SUPPORT, expected_runtime_id=PLACED_ID))]
+        placement = tasks[0]
+        try:
+            async with asyncio.timeout(2):
+                await started.wait()
+                self.assertEqual(self.wire.sent, [])
+                first = asyncio.create_task(controller.handoff())
+                tasks.append(first)
+                await asyncio.sleep(0)
+                self.assertFalse(first.done())
+                with self.assertRaisesRegex(RuntimeError, "connect a player first"):
+                    controller.connected_bot()
+                first.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await first
+                self.assertIs(controller.connected_bot(), self.bot)
+                self.assertFalse(placement.done())
+
+                handoff = asyncio.create_task(controller.handoff())
+                tasks.append(handoff)
+                await asyncio.sleep(0)
+                self.assertFalse(handoff.done())
+                release.set()
+                await sent.wait()
+                click, = self.wire.sent
+                self.assertEqual(click.variant_transaction.action_type,
+                                 self.b.ItemUseInventoryTransaction.ActionType.PLACE)
+                self.assertFalse(handoff.done())  # The click was sent, but its effects are not yet observed.
+                await self.deliver(self.block(TARGET, PLACED_ID), self.slot(3))
+                report = await placement
+                self.assertEqual((report["reason"], report["submitted"]), ("observations_complete", True))
+                self.assertIs(await handoff, self.bot)
+                with self.assertRaisesRegex(RuntimeError, "connect a player first"):
+                    await controller.place_block(*SUPPORT, expected_runtime_id=PLACED_ID)
+                self.assertEqual(self.wire.sent, [click])
+        finally:
+            release.set()
+            stop()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @unittest.skipUnless(find_spec("mcp") is not None, "optional MCP SDK unavailable")
