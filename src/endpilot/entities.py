@@ -1,4 +1,4 @@
-"""Observe server actors, dropped items and player-list changes."""
+"""Observe server actors, dropped items and listed players."""
 
 import asyncio
 import math
@@ -14,6 +14,7 @@ from .entity_cursor import Box, expanded_box, trace_entities
 from .expression import animation
 from .inventory import HeldItemStack
 from .protocol import RawPacket, _read_uint
+from .skin import PlayerSkinSnapshot, _player_skin_snapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,7 +175,7 @@ class ItemPickup:
 
 @dataclass(frozen=True, slots=True)
 class PlayerListEntry:
-    """Player identity and metadata as reported in a server player-list add."""
+    """Player-list identity and metadata with the latest reported skin."""
 
     uuid: UUID
     name: str
@@ -187,6 +188,7 @@ class PlayerListEntry:
     is_host: bool
     is_sub_client: bool
     color: int
+    skin: PlayerSkinSnapshot | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,6 +349,7 @@ def _player_list_change(entry) -> PlayerListChange:
         is_host=entry.is_host,
         is_sub_client=entry.is_sub_client,
         color=int(entry.color),
+        skin=_player_skin_snapshot(getattr(entry, "skin", None)),
     ))
 
 
@@ -357,6 +360,7 @@ class Entities:
         self._own_runtime_id = own_runtime_id
         self._own_entity_id = own_entity_id
         self._players_by_uuid: dict[UUID, PlayerListEntry] = {}
+        self._last_skin_update: tuple[RawPacket, UUID] | None = None
         self._player_runtime_by_uuid: dict[UUID, int] = {}
         self._player_uuid_by_runtime: dict[int, UUID] = {}
         self._player_feet_by_runtime: dict[int, _PlayerFeet] = {}
@@ -405,6 +409,7 @@ class Entities:
             return
         self._closed = True
         self._last_pickup = None
+        self._last_skin_update = None
         self._end_movement_waiters(ConnectionError, "entity session is closed", _cause)
         self._clear_player_equipment(ConnectionError, "entity session is closed", _cause)
         for observers in (self._swing_observers, self._health_observers):
@@ -444,6 +449,28 @@ class Entities:
 
         await self.packets.wait_for_packet(binding.PlayerListPacket.ID, match=matches, timeout=timeout)
         return changes
+
+    async def wait_for_player_skin_update(
+        self, player_uuid: UUID, *, timeout: float | None,
+    ) -> PlayerSkinSnapshot | None:
+        self._require_live()
+        binding = self.packets.protocol.binding
+        skin = None
+
+        def matches(raw):
+            nonlocal skin
+            self._require_live()
+            # The roster observer has applied this packet before the waiter runs.
+            update = self._last_skin_update
+            if update is None or update[0] is not raw or update[1] != player_uuid:
+                return False
+            skin = self._players_by_uuid[player_uuid].skin
+            return True
+
+        await self.packets.wait_for_packet(
+            (binding.PlayerSkinPacket.ID, binding.DisconnectPacket.ID), match=matches, timeout=timeout,
+        )
+        return skin
 
     def snapshot(self) -> tuple[EntityState, ...]:
         """Snapshot actors observed since subscription; not a world entity scan."""
@@ -1126,6 +1153,13 @@ class Entities:
                         self._forget_links(removed.entity_id)
                     if runtime_id is not None:
                         self._forget_runtime(runtime_id)
+        elif raw.packet_id == b.PlayerSkinPacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            listed = self._players_by_uuid.get(packet.uuid)
+            if listed is not None:
+                skin = _player_skin_snapshot(getattr(packet, "skin", None))
+                self._players_by_uuid[packet.uuid] = replace(listed, skin=skin)
+                self._last_skin_update = raw, packet.uuid
         elif raw.packet_id == b.AddPlayerPacket.ID:
             player = self.packets.protocol.decode(raw)
             for link in player.links:

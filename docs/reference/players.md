@@ -89,6 +89,20 @@ across updates. Other fields include the build platform code, packed color and
 player flags. `xuid`, `platform_online_id`, and `play_fab_id` are `None` when
 unavailable.
 
+Each entry's `skin` is an immutable `PlayerSkinSnapshot` with `skin_id`,
+`width`, `height`, `rgba` bytes, `model` (`"wide"`, `"slim"`, or `None`), and
+`resource_patch`. It is `None` when the server reports no skin or sends a
+placeholder with an empty ID, 0×0 dimensions, and no RGBA bytes. The skin
+follows the entry across actor visibility and dimension changes. Removing the
+entry discards its current skin from the roster. Previously returned entries
+keep their skin snapshots.
+
+`await bot.wait_for_player_skin_update(player_uuid, timeout=15)` returns the
+skin from the next live skin packet applied to that UUID while it is listed.
+Repeated reports complete the wait, and an empty report returns `None`.
+Use `timeout=None` to wait without a deadline. The wait sends no packets and
+raises `TimeoutError` at its deadline or `ConnectionError` if the session ends.
+
 `await bot.wait_for_player_list_update(action="add", timeout=15)` returns
 matching entries from the first player-list packet dispatched after the wait
 starts. Use `action="remove"` for removals and `player_uuid` for a particular

@@ -527,7 +527,7 @@ class JoinSession:
                 startup_chunks.append(raw)
             elif raw.packet_id in (
                 binding.AddActorPacket.ID, binding.AddItemActorPacket.ID, binding.AddPaintingPacket.ID,
-                binding.AddPlayerPacket.ID, binding.PlayerListPacket.ID,
+                binding.AddPlayerPacket.ID, binding.PlayerListPacket.ID, binding.PlayerSkinPacket.ID,
                 binding.MovePlayerPacket.ID,
                 binding.MoveActorAbsolutePacket.ID, binding.MoveActorDeltaPacket.ID,
                 binding.RemoveActorPacket.ID, binding.TakeItemActorPacket.ID,

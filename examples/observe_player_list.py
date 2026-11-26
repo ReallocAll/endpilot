@@ -9,6 +9,13 @@ from uuid import UUID
 from endpilot import Bot
 
 
+def _player_list_json(entries):
+    def without_rgba(fields):
+        return {name: value for name, value in fields if name != "rgba"}
+
+    return json.dumps([asdict(entry, dict_factory=without_rgba) for entry in entries], default=str)
+
+
 async def main(url, name, action, player_uuid, timeout):
     bot = Bot(name)
     try:
@@ -24,10 +31,10 @@ async def main(url, name, action, player_uuid, timeout):
             action=action, player_uuid=player_uuid, timeout=timeout,
         ))
         await asyncio.sleep(0)
-        print("player_list=" + json.dumps([asdict(player) for player in bot.observed_players], default=str), flush=True)
+        print("player_list=" + _player_list_json(bot.observed_players), flush=True)
         print("player_list_watcher_ready", flush=True)
         changes = await pending
-        print("player_list_update=" + json.dumps([asdict(change) for change in changes], default=str), flush=True)
+        print("player_list_update=" + _player_list_json(changes), flush=True)
     finally:
         await bot.close()
 

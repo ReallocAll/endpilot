@@ -1,4 +1,4 @@
-"""Classic Bedrock skin textures."""
+"""Bedrock skin snapshots and classic textures for submission."""
 
 import hashlib
 from dataclasses import dataclass, field
@@ -15,6 +15,36 @@ _CLASSIC_PNG_SIZES = ((64, 32), (64, 64), (128, 128))
 _BLACK_RGBA = b"\x00\x00\x00\xff"
 _PNG_IEND_CRC = b"\xaeB`\x82"
 _SkinModel = Literal["wide", "slim"]
+
+
+@dataclass(frozen=True, slots=True)
+class PlayerSkinSnapshot:
+    """The base skin image and metadata reported by the server."""
+
+    skin_id: str
+    width: int
+    height: int
+    rgba: bytes = field(repr=False)
+    model: _SkinModel | None
+    resource_patch: str
+
+
+def _player_skin_snapshot(skin) -> PlayerSkinSnapshot | None:
+    if skin is None:
+        return None
+    image = getattr(skin, "skin_image", None)
+    if image is None:
+        # Older bindings expose the image and model directly on SerializedSkinRef.
+        width, height, rgba = int(skin.image_width), int(skin.image_height), bytes(skin.image_bytes)
+        arm_size = skin.arm_size
+    else:
+        width, height, rgba = int(image.width), int(image.height), bytes(image.image_bytes)
+        arm_size = skin.arm_size_type
+    skin_id = str(skin.id)
+    if not skin_id and width == height == 0 and not rgba:
+        return None
+    model = {"WIDE": "wide", "SLIM": "slim"}.get(getattr(arm_size, "name", None))
+    return PlayerSkinSnapshot(skin_id, width, height, rgba, model, str(skin.resource_patch))
 
 
 def _validate_model(model: _SkinModel) -> None:

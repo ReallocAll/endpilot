@@ -59,7 +59,7 @@ from .recipes import Recipe, Recipes
 from .resource_packs import PackDecisionHandler, ResourcePackIndex
 from .scoreboard import Scoreboard, ScoreboardObserver, ScoreboardSnapshot
 from .signs import SignEditor, SignObservation, SignSide, Signs
-from .skin import Skin
+from .skin import PlayerSkinSnapshot, Skin
 from .titles import TitleEvent, TitleKind, Titles
 from .trading import TradeManyResult, TradeOffers, Trading
 from .protocol import DEFAULT_PROTOCOL, Protocol, RawPacket
@@ -2467,6 +2467,14 @@ class Bot:
         return await self._entities.wait_for_player_list_update(
             action=action, player_uuid=player_uuid, timeout=timeout,
         )
+
+    async def wait_for_player_skin_update(
+        self, player_uuid: UUID, *, timeout: float | None = 15,
+    ) -> PlayerSkinSnapshot | None:
+        """Return the skin from the next live update applied to this listed UUID."""
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return await self._entities.wait_for_player_skin_update(player_uuid, timeout=timeout)
 
     @property
     def observed_entities(self) -> tuple[EntityState, ...]:
