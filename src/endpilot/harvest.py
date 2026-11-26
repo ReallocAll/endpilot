@@ -158,7 +158,8 @@ class HarvestTools:
                 continue
             base_speed = rule.speeds.get(name, 1.0)
             speed = base_speed
-            if base_speed > 1 and name.endswith(("_pickaxe", "_axe", "_shovel", "_hoe")) and item.user_data_buffer:
+            if (base_speed > 1 and (name == "minecraft:shears" or name.endswith(("_pickaxe", "_axe", "_shovel", "_hoe")))
+                    and item.user_data_buffer):
                 speed += _efficiency_bonus(bytes(item.user_data_buffer), efficiency_id)
             if best is None or speed > best_speed:
                 best = HarvestTool(slot, name, base_speed)

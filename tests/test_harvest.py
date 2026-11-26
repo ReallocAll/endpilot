@@ -16,6 +16,8 @@ DIRT = 0x824EEF86
 OAK_LOG = 0xF253CAD8
 NETHER_WART_BLOCK = 0x22A97687
 HAY_BLOCK = 0x5A4A90AB
+WHITE_WOOL = 0x9096F28E
+WEB = 0x38FA6D0A
 
 
 def enchantment_data(binding, level, *, enchantment=None):
@@ -46,6 +48,7 @@ class HarvestTests(unittest.IsolatedAsyncioTestCase):
             1208: "minecraft:diamond_shovel",
             1209: "minecraft:iron_hoe",
             1210: "minecraft:diamond_hoe",
+            1211: "minecraft:iron_sword",
             299: "test:iron_pickaxe",
         }
         self.stream.close = self.close_stream
@@ -183,10 +186,28 @@ class HarvestTests(unittest.IsolatedAsyncioTestCase):
         self.inventory_slot(3, 1208)
         self.assertEqual(bot.best_harvest_tool(POSITION), HarvestTool(1, "minecraft:iron_shovel", 6))
 
-        self.block(0x3EE83EB2)  # Both shears get their existing leaf speed.
+        self.block(0x3EE83EB2)  # Oak leaves.
         self.inventory_slot(0, 1203)
         self.inventory_slot(4, 1203, user_data=enchantment_data(b, 5))
-        self.assertEqual(bot.best_harvest_tool(POSITION), HarvestTool(0, "minecraft:shears", 15))
+        self.assertEqual(bot.best_harvest_tool(POSITION), HarvestTool(4, "minecraft:shears", 15))
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_efficiency_shears_rank_only_where_they_have_a_base_speed_bonus(self):
+        bot = await self.connect()
+        self.inventory_slot(0, 1211)
+        self.inventory_slot(4, 1203)
+        self.inventory_slot(12, 1203)
+        self.block(WHITE_WOOL)
+        self.assertEqual(bot.best_harvest_tool(POSITION), HarvestTool(4, "minecraft:shears", 5))
+        self.block(WEB)
+        self.assertEqual(bot.best_harvest_tool(POSITION), HarvestTool(0, "minecraft:iron_sword", 15))
+
+        self.inventory_slot(12, 1203, user_data=enchantment_data(self.binding, 2))
+        self.assertEqual(bot.best_harvest_tool(POSITION), HarvestTool(12, "minecraft:shears", 15))
+        self.block(WHITE_WOOL)
+        self.assertEqual(bot.best_harvest_tool(POSITION), HarvestTool(12, "minecraft:shears", 5))
+        self.block(OAK_LOG)
+        self.assertEqual(bot.best_harvest_tool(POSITION), HarvestTool(None, None, 1))
         self.assertEqual(self.stream.sent, [])
 
     async def test_efficiency_hoe_ranks_only_for_its_material(self):
@@ -582,7 +603,7 @@ class HarvestTests(unittest.IsolatedAsyncioTestCase):
             (DIRT, HarvestTool(0, "minecraft:golden_shovel", 12)),
             (0x3EE83EB2, HarvestTool(1, "minecraft:shears", 15)),  # Oak leaves with byte states.
             (0xF253CAD8, HarvestTool(2, "minecraft:iron_axe", 6)),  # Oak log with string state.
-            (0x38FA6D0A, HarvestTool(1, "minecraft:shears", 15)),  # Web requires a tool.
+            (WEB, HarvestTool(1, "minecraft:shears", 15)),  # Web requires a tool.
         ):
             self.block(runtime_id)
             self.assertEqual(bot.best_harvest_tool(POSITION), expected)

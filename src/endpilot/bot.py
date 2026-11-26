@@ -2155,8 +2155,8 @@ class Bot:
     def best_harvest_tool(self, position: tuple[int, int, int]) -> HarvestTool | None:
         """Rank eligible vanilla tools by base speed and applicable Efficiency I–V.
 
-        Pickaxes, axes, shovels and hoes receive the bonus where their base
-        speed exceeds bare hands. The returned speed_multiplier is the base speed.
+        Pickaxes, axes, shovels, hoes and shears receive the bonus where their
+        base speed exceeds bare hands. The returned speed_multiplier is the base speed.
         Bare hands have item_name=None. An absent candidate, unknown block or
         protocol other than 2225 returns None.
         """
