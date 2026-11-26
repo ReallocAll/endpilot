@@ -12,8 +12,8 @@ from bedrock_protocol import nbt
 
 from endpilot import (
     AllGoal, AnyGoal, BlockApproach, BlockFaceGoal, BlockFaceMatch, BlockInteractionGoal, BlockInteractionMatch,
-    BlockPlacementGoal, BlockPlacementMatch, Bot, DimensionTransition, EntityNearGoal, FootGoal, NavigationCosts,
-    NavigationResult, NavigationRules, NearGoal, NearXZGoal, XZGoal, YGoal,
+    BlockPlacementGoal, BlockPlacementMatch, Bot, DimensionTransition, EntityNearGoal, EntityVisibilityGoal,
+    FootGoal, NavigationCosts, NavigationResult, NavigationRules, NearGoal, NearXZGoal, XZGoal, YGoal,
 )
 from endpilot.blocks import Blocks
 from endpilot.compression import PacketConnection
@@ -99,6 +99,27 @@ class AxisGoalValidationTests(unittest.TestCase):
             YGoal(100.0)
         with self.assertRaisesRegex(TypeError, "navigation goal"):
             AllGoal((XZGoal((0, 0)), (0, 100, 0)))
+
+
+class EntityVisibilityGoalValidationTests(unittest.TestCase):
+    def test_aim_offset_is_immutable_and_configuration_is_validated(self):
+        offset = [0, 1.5, -0.25]
+        goal = EntityVisibilityGoal(-21, aim_offset=offset, max_distance=0)
+        offset[0] = 1
+        self.assertEqual((goal.entity_id, goal.aim_offset, goal.max_distance), (-21, (0.0, 1.5, -0.25), 0.0))
+        with self.assertRaises(FrozenInstanceError):
+            goal.max_distance = 1
+        with self.assertRaises(TypeError):
+            EntityVisibilityGoal(-21, offset, 2)
+        for entity_id in (0, 2.5):
+            with self.subTest(entity_id=entity_id), self.assertRaisesRegex(ValueError, "actor unique ID"):
+                EntityVisibilityGoal(entity_id, aim_offset=offset, max_distance=2)
+        for invalid in ((1, 2), (1, 2, 3, 4), (0, math.inf, 0), (math.nan, 0, 0)):
+            with self.subTest(offset=invalid), self.assertRaisesRegex(ValueError, "three finite"):
+                EntityVisibilityGoal(-21, aim_offset=invalid, max_distance=2)
+        for distance in (-1, math.inf, math.nan):
+            with self.subTest(distance=distance), self.assertRaisesRegex(ValueError, "finite and nonnegative"):
+                EntityVisibilityGoal(-21, aim_offset=offset, max_distance=distance)
 
 
 class NavigationTests(unittest.IsolatedAsyncioTestCase):
@@ -3218,6 +3239,390 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         self.observe_entity(b.MoveActorDeltaPacket(move_data=b.MoveActorDeltaData(
             runtime_id=runtime_id, new_position_x=x, new_position_y=y, new_position_z=z,
         )))
+
+    def prepare_visibility_terrain(self, *, blocked=(), unknown=()):
+        self.prepare_interaction_terrain((4, 100, 3), blocked=blocked, unknown=unknown)
+        self.set_position(0.5, 0.5, on_ground=True)
+
+    def observe_own_sneaking(self, sneaking):
+        b = self.binding
+        flags = 1 << int(b.ActorFlags.SNEAKING) if sneaking else 0
+        entry = b.DataItemEntry(id=0, payload=b.DataItemInt64Payload(value=flags))
+        packet = b.SetActorDataPacket(id=1, packed_items=b.SynchedActorData.CopyableDataList(data=[entry]))
+        self.movement._on_packet(self.stream.protocol.encode(packet))
+
+    async def test_entity_visibility_crouched_start_is_unknown_and_other_goals_still_match(self):
+        block = (1, 100, 0)
+        self.prepare_interaction_terrain(block)
+        self.set_position(0.5, 0.5, on_ground=True)
+        unique_id, runtime_id = self.spawn_navigation_actor(x=0.5)
+        start = (0, 100, 0)
+        sight = EntityVisibilityGoal(unique_id, aim_offset=(0, 1.52, 0), max_distance=0.05)
+        near = EntityNearGoal(unique_id, 0.05)
+        face = BlockFaceGoal(block)
+        both = AllGoal((near, sight))
+        either = AnyGoal((both, face))
+        rules = NavigationRules(search_radius=0, vertical_radius=0)
+
+        async def check_goal(goal, plan_status, status, matches=()):
+            sent = len(self.stream.sent)
+            plan = self.bot.plan_navigation(goal, rules=rules)
+            result = await self.bot.navigate(goal, rules=rules, ticks=0)
+            self.assertEqual((plan.status, plan.matches), (plan_status, matches))
+            self.assertEqual((result.status, result.frames, result.matches), (status, 0, matches))
+            self.assertEqual(result.stand_position, start if status == "reached" else None)
+            self.assertEqual(len(self.stream.sent), sent)
+
+        await check_goal(sight, "found", "reached")
+        await self.bot.set_sneaking(True)
+        await check_goal(sight, "unknown", "unknown")
+        self.observe_own_sneaking(True)
+        await check_goal(sight, "unknown", "unknown")
+        await check_goal(both, "unknown", "unknown")
+        await check_goal(near, "found", "reached")
+        await check_goal(face, "found", "reached", (BlockFaceMatch(block, 4),))
+        await check_goal(either, "found", "reached", (BlockFaceMatch(block, 4),))
+
+        sent = len(self.stream.sent)
+        self.move_villager(runtime_id, z=1.5)
+        future = self.bot.plan_navigation(sight, rules=NavigationRules(search_radius=1, vertical_radius=0))
+        self.assertEqual((future.status, future.nodes), ("found", (start, (0, 100, 1))))
+        self.assertEqual(len(self.stream.sent), sent)
+        self.move_villager(runtime_id, z=0.5)
+
+        await self.bot.set_sneaking(False)
+        await check_goal(sight, "unknown", "unknown")
+        self.observe_own_sneaking(False)
+        for swimming, crawling in ((True, False), (False, True)):
+            with self.subTest(swimming=swimming, crawling=crawling):
+                self.observe_swimming(0, swimming, crawling=crawling)
+                await check_goal(sight, "unknown", "unknown")
+        self.observe_swimming(0, False, crawling=False)
+        await check_goal(both, "found", "reached")
+
+    async def test_entity_visibility_rechecks_crouch_after_input_release(self):
+        self.prepare_visibility_terrain()
+        unique_id, _ = self.spawn_navigation_actor(x=0.5, z=1.5)
+        sight = EntityVisibilityGoal(unique_id, aim_offset=(0, 1.52, 0), max_distance=0.25)
+        goal = AllGoal((FootGoal((0, 100, 1)), sight))
+        rules = NavigationRules(search_radius=1, vertical_radius=0)
+        crouched = False
+
+        def crouch_on_release():
+            nonlocal crouched
+            frame = self.stream.sent[-1]
+            if not crouched and self.up not in frame.input_data and frame.pos_delta.x == frame.pos_delta.z == 0.0:
+                self.observe_own_sneaking(True)
+                crouched = True
+
+        self.stream.on_send = crouch_on_release
+        result = await self.bot.navigate(goal, rules=rules)
+        self.assertTrue(crouched)
+        self.assertEqual((result.status, result.stand_position), ("unknown", None))
+        self.assertGreater(result.frames, 0)
+        self.assert_released()
+
+    async def test_entity_visibility_airborne_start_is_unknown_inside_the_standing_height_tolerance(self):
+        self.prepare_interaction_terrain((4, 100, 3))
+        unique_id, runtime_id = self.spawn_navigation_actor(x=0.5)
+        start = (0, 100, 0)
+        sight = EntityVisibilityGoal(unique_id, aim_offset=(0, 1.52, 0), max_distance=0.05)
+        near = EntityNearGoal(unique_id, 0.05)
+        both = AllGoal((sight, near))
+        rules = NavigationRules(search_radius=0, vertical_radius=0)
+
+        self.set_position(0.5, 0.5, y=101.655, on_ground=False)
+        for goal, plan_status, status in ((sight, "unknown", "unknown"), (both, "unknown", "unknown"),
+                                           (AnyGoal((both, near)), "found", "reached")):
+            with self.subTest(goal=goal):
+                self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, plan_status)
+                result = await self.bot.navigate(goal, rules=rules, ticks=0)
+                self.assertEqual((result.status, result.frames), (status, 0))
+                self.assertEqual(result.stand_position, start if status == "reached" else None)
+        self.move_villager(runtime_id, z=1.5)
+        plan = self.bot.plan_navigation(sight, rules=NavigationRules(search_radius=1, vertical_radius=0))
+        self.assertEqual((plan.status, plan.nodes), ("found", (start, (0, 100, 1))))
+        self.move_villager(runtime_id, z=0.5)
+
+        self.set_position(0.5, 0.5, y=101.655, on_ground=True)
+        self.assertEqual(self.bot.plan_navigation(sight, rules=rules).status, "found")
+        result = await self.bot.navigate(sight, rules=rules, ticks=0)
+        self.assertEqual((result.status, result.frames, result.stand_position), ("reached", 0, start))
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_entity_visibility_rechecks_airborne_after_input_release(self):
+        self.prepare_interaction_terrain((4, 100, 3))
+        self.set_position(0.5, 0.5, on_ground=False)
+        unique_id, _ = self.spawn_navigation_actor(x=0.5, z=1.5)
+        endpoint = (0, 100, 1)
+        sight = EntityVisibilityGoal(unique_id, aim_offset=(0, 1.52, 0), max_distance=0.25)
+        goal = AllGoal((FootGoal(endpoint), sight))
+        rules = NavigationRules(search_radius=1, vertical_radius=0)
+        airborne = False
+
+        def observe_ground_then_airborne_on_release():
+            nonlocal airborne
+            frame = self.stream.sent[-1]
+            if len(self.stream.sent) == 1:
+                self.assertIn(self.up, frame.input_data)
+                self.set_position(frame.pos.x, frame.pos.z, on_ground=True)
+            elif not airborne and self.up not in frame.input_data:
+                self.set_position(0.5, 1.5, y=101.655, on_ground=False)
+                airborne = True
+
+        self.stream.on_send = observe_ground_then_airborne_on_release
+        result = await self.bot.navigate(goal, rules=rules)
+        self.assertTrue(airborne)
+        self.assertEqual((result.status, result.stand_position), ("unknown", None))
+        self.assertGreater(result.frames, 0)
+        self.assertTrue(all(self.up in packet.input_data for packet in self.stream.sent[:-2]))
+        self.assert_released()
+
+    async def test_entity_visibility_uses_current_trusted_feet_and_unique_id(self):
+        self.prepare_visibility_terrain()
+        rules = NavigationRules(search_radius=0, vertical_radius=0)
+        unique_id, runtime_id = self.spawn_navigation_actor(x=2.5)
+        cow_id, _ = self.spawn_navigation_actor(entity_id=-33, runtime_id=4, actor_type="minecraft:cow", x=2.5)
+        for target_id, expected in ((unique_id, "found"), (runtime_id, "unknown"), (cow_id, "unknown")):
+            goal = EntityVisibilityGoal(target_id, aim_offset=(-1, 1.5, 0.25), max_distance=1.1)
+            self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, expected)
+
+        goal = EntityVisibilityGoal(unique_id, aim_offset=(-1, 1.5, 0.25), max_distance=1.1)
+        self.move_villager(runtime_id, x=3.5)
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unreachable")
+        b = self.binding
+        self.observe_entity(b.MoveActorAbsolutePacket(move_data=b.MoveActorAbsoluteData(
+            runtime_id=runtime_id, pos=b.Vec3(x=2.5, y=100, z=0.5),
+        )))
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unknown")
+        self.move_villager(runtime_id, x=2.5, y=100, z=0.5)
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "found")
+
+        peer_id, peer_runtime, roster = self.prepare_peer(x=0.5)
+        peer_goal = EntityVisibilityGoal(peer_id, aim_offset=(0, 1.52, 0), max_distance=0.05)
+        self.assertEqual(self.bot.plan_navigation(peer_goal, rules=rules).status, "unknown")
+        self.observe_entity(roster)
+        self.move_peer(peer_runtime, x=0.5, z=0.5)
+        self.assertEqual(self.bot.plan_navigation(peer_goal, rules=rules).status, "found")
+        result = await self.bot.navigate(peer_goal, rules=rules, ticks=0)
+        self.assertEqual((result.status, result.stand_position, result.matches), ("reached", (0, 100, 0), ()))
+        input_origin = EntityVisibilityGoal(peer_id, aim_offset=(0, 1.62, 0), max_distance=0.05)
+        self.assertEqual(self.bot.plan_navigation(input_origin, rules=rules).status, "unreachable")
+        self.assertEqual((await self.bot.navigate(input_origin, rules=rules, ticks=0)).status, "unreachable")
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_entity_visibility_proves_blockage_with_an_unresolved_outline_in_either_order(self):
+        first, second = (1, 101, 0), (2, 101, 0)
+        self.prepare_visibility_terrain(unknown=(first, second))
+        unique_id, _ = self.spawn_navigation_actor(x=3.5)
+        goal = EntityVisibilityGoal(unique_id, aim_offset=(0, 1.5, 0), max_distance=3.1)
+        rules = NavigationRules(search_radius=0, vertical_radius=0)
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unknown")
+
+        for stone, unresolved in ((first, second), (second, first)):
+            with self.subTest(stone=stone):
+                self.set_block(stone, self.STONE)
+                self.set_block(unresolved, 0xFFFFFFFE)
+                self.assertEqual(self.bot.raycast_block_towards((3.5, 101.5, 0.5)).status, "unknown")
+                self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unreachable")
+                result = await self.bot.navigate(goal, rules=rules)
+                self.assertEqual((result.status, result.frames), ("unreachable", 0))
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_entity_visibility_ray_stops_at_the_aim_point(self):
+        missing, far = (1, 101, 0), (4, 101, 0)
+        self.prepare_visibility_terrain(unknown=(missing, far))
+        unique_id, _ = self.spawn_navigation_actor(x=2.5)
+        goal = EntityVisibilityGoal(unique_id, aim_offset=(0, 1.5, 0), max_distance=5)
+        rules = NavigationRules(search_radius=0, vertical_radius=0)
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unknown")
+        out_of_range = EntityVisibilityGoal(unique_id, aim_offset=(0, 1.5, 0), max_distance=2)
+        self.assertEqual(self.bot.plan_navigation(out_of_range, rules=rules).status, "unreachable")
+
+        self.set_block(missing, self.STONE)
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unreachable")
+        self.set_block(missing, self.AIR)
+        beyond = (3, 101, 0)
+        for runtime_id in (self.STONE, 1211861802):  # Stone and a confined, unresolved water outline.
+            self.set_block(beyond, runtime_id)
+            plan = self.bot.plan_navigation(goal, rules=rules)
+            self.assertEqual((plan.status, plan.nodes, plan.matches), ("found", ((0, 100, 0),), ()))
+        self.set_block(beyond, self.STONE)
+        self.set_block(far, self.AIR)
+        on_face = EntityVisibilityGoal(unique_id, aim_offset=(0.5, 1.5, 0), max_distance=5)
+        self.assertEqual(self.bot.plan_navigation(on_face, rules=rules).status, "unreachable")
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_entity_visibility_uses_an_inclusive_euclidean_range(self):
+        self.prepare_visibility_terrain()
+        unique_id, runtime_id = self.spawn_navigation_actor(x=3.5)
+        rules = NavigationRules(search_radius=0, vertical_radius=0)
+        for distance, expected in ((5, "found"), (math.nextafter(5, 0), "unreachable")):
+            goal = EntityVisibilityGoal(unique_id, aim_offset=(0, 5.52, 0), max_distance=distance)
+            self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, expected)
+        self.move_villager(runtime_id, x=0.5)
+        coincident = EntityVisibilityGoal(unique_id, aim_offset=(0, 1.52, 0), max_distance=0)
+        self.assertEqual(self.bot.plan_navigation(coincident, rules=rules).status, "found")
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_entity_visibility_caps_ray_work_independently_of_node_expansions(self):
+        self.prepare_visibility_terrain(unknown=((1, 101, 0),))
+        unique_id, _ = self.spawn_navigation_actor()
+        goal = EntityVisibilityGoal(unique_id, aim_offset=(1e100, 1.52, 0), max_distance=1e101)
+        rules = NavigationRules(search_radius=0, vertical_radius=0, max_expansions=3)
+        observe = self.blocks._outline_at
+
+        def guarded_observation(position):
+            self.assertLess(position[0], 5)
+            return observe(position)
+
+        with patch.object(self.blocks, "_outline_at", guarded_observation):
+            plan = self.bot.plan_navigation(goal, rules=rules)
+            result = await self.bot.navigate(goal, rules=rules)
+            foot = self.bot.plan_navigation(FootGoal((0, 100, 0)), rules=rules)
+        self.assertEqual((plan.status, plan.expanded), ("budget", 1))
+        self.assertEqual((result.status, result.expanded, result.frames), ("budget", 1, 0))
+        self.assertEqual((foot.status, foot.expanded), ("found", 1))
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_entity_visibility_checks_the_deadline_during_search_and_arrival_rays(self):
+        self.prepare_visibility_terrain()
+        unique_id, _ = self.spawn_navigation_actor(x=3.5)
+        goal = EntityVisibilityGoal(unique_id, aim_offset=(0, 1.52, 0), max_distance=3.1)
+        rules = NavigationRules(search_radius=0, vertical_radius=0)
+        loop = asyncio.get_running_loop()
+        time = loop.time
+        observe = self.blocks._outline_at
+
+        for phase in ("search", "arrival"):
+            with self.subTest(phase=phase):
+                offset = 0
+                armed = phase == "search"
+                reads = []
+
+                def arm_arrival(_):
+                    nonlocal armed
+                    armed = True
+
+                def advance_time(position):
+                    nonlocal offset
+                    if armed:
+                        offset = 12
+                        reads.append(position)
+                    return observe(position)
+
+                with (patch.object(loop, "time", lambda: time() + offset),
+                      patch.object(loop, "slow_callback_duration", 20),
+                      patch.object(self.blocks, "_outline_at", advance_time)):
+                    result = await self.bot.navigate(goal, rules=rules, on_plan=arm_arrival, timeout=10)
+                self.assertEqual((result.status, result.expanded, result.frames), ("budget", 1, 0))
+                self.assertIn((0, 101, 0), reads)
+                self.assertTrue(all(x <= 1 for x, _, _ in reads))
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_entity_visibility_shares_its_ray_limit_with_route_checks_and_releases_input(self):
+        self.prepare_visibility_terrain()
+        unique_id, _ = self.spawn_navigation_actor(x=0.5, z=1.5)
+        goal = EntityVisibilityGoal(unique_id, aim_offset=(0, 1.52, 0), max_distance=0.25)
+        rules = NavigationRules(search_radius=1, vertical_radius=0, max_expansions=2)
+        plan = self.bot.plan_navigation(goal, rules=rules)
+        self.assertEqual((plan.status, plan.endpoint, plan.expanded), ("found", (0, 100, 1), 2))
+
+        result = await self.bot.navigate(goal, rules=rules)
+        self.assertEqual((result.status, result.expanded, result.frames), ("budget", 2, 2))
+        self.assertEqual(len(self.stream.sent), 4)
+        self.assert_released()
+
+    async def test_entity_visibility_checks_the_shared_ray_limit_at_final_stance(self):
+        self.prepare_visibility_terrain()
+        unique_id, _ = self.spawn_navigation_actor(x=0.5)
+        goal = EntityVisibilityGoal(unique_id, aim_offset=(0, 1.52, 0), max_distance=0.05)
+        for limit, status in ((2, "budget"), (3, "reached")):
+            rules = NavigationRules(search_radius=0, vertical_radius=0, max_expansions=limit)
+            result = await self.bot.navigate(goal, rules=rules, ticks=0)
+            self.assertEqual((result.status, result.expanded, result.frames), (status, 1, 0))
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_entity_visibility_detours_to_a_clear_reachable_stance(self):
+        wall_top = (1, 101, 0)
+        self.prepare_visibility_terrain(blocked=((1, 100, 0), wall_top))
+        unique_id, _ = self.spawn_navigation_actor(x=2.5, z=0.75)
+        goal = EntityVisibilityGoal(unique_id, aim_offset=(0, 1.5, 0), max_distance=2.2)
+        rules = NavigationRules(search_radius=2, vertical_radius=0)
+        start_only = NavigationRules(search_radius=0, vertical_radius=0)
+        start = (0, 100, 0)
+        self.assertEqual(self.bot.plan_navigation(EntityNearGoal(unique_id, 2.2), rules=rules).nodes, (start,))
+        self.assertEqual(self.bot.plan_navigation(goal, rules=start_only).status, "unreachable")
+
+        self.set_block(wall_top, 1211861802)  # Confined, unresolved water outline.
+        self.assertEqual(self.bot.plan_navigation(goal, rules=start_only).status, "unknown")
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "found")
+        self.set_block(wall_top, self.STONE)
+        plan = self.bot.plan_navigation(goal, rules=rules)
+        self.assertEqual((plan.status, plan.nodes), ("found", (start, (0, 100, 1), (1, 100, 1))))
+        self.assertEqual(self.stream.sent, [])
+
+        result = await self.bot.navigate(goal, rules=rules)
+        self.assertEqual((result.status, result.stand_position, result.matches), ("reached", plan.endpoint, ()))
+        self.assertGreater(result.frames, 0)
+        self.assertEqual(self.bot.raycast_block_towards((2.5, 101.5, 0.75), max_distance=2.2).status, "miss")
+        self.assert_released()
+
+    async def test_entity_visibility_rechecks_the_synchronized_eye_after_input_release(self):
+        self.prepare_visibility_terrain()
+        unique_id, _ = self.spawn_navigation_actor(x=0.5, z=2.5)
+        endpoint = (0, 100, 1)
+        sight = EntityVisibilityGoal(unique_id, aim_offset=(0, 1.5, -0.25), max_distance=0.86)
+        goal = AllGoal((FootGoal(endpoint), sight))
+        rules = NavigationRules(search_radius=1, vertical_radius=0)
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).endpoint, endpoint)
+
+        corrected = False
+
+        def correct_on_release():
+            nonlocal corrected
+            frame = self.stream.sent[-1]
+            if not corrected and self.up not in frame.input_data and frame.pos_delta.x == frame.pos_delta.z == 0.0:
+                self.correct_position(0.5, 101.65625, 1.386, on_ground=True, tick=frame.client_tick)
+                corrected = True
+
+        self.stream.on_send = correct_on_release
+        result = await self.bot.navigate(goal, rules=rules)
+        self.assertTrue(corrected)
+        self.assertEqual((result.status, result.stand_position), ("unreachable", None))
+        self.assertGreater(result.frames, 0)
+        self.assert_released()
+
+    async def test_entity_visibility_replans_to_the_same_moving_actor(self):
+        self.prepare_visibility_terrain()
+        unique_id, runtime_id = self.spawn_navigation_actor(x=0.5, z=2.5)
+        goal = EntityVisibilityGoal(unique_id, aim_offset=(0, 1.5, 0), max_distance=0.8)
+        rules = NavigationRules(search_radius=2, vertical_radius=0)
+        plans = []
+
+        def move_after_first_frame():
+            if len(self.stream.sent) == 1:
+                self.move_villager(runtime_id, z=1.5)
+
+        self.stream.on_send = move_after_first_frame
+        result = await self.bot.navigate(goal, rules=rules, on_plan=plans.append)
+        self.assertEqual([plan.endpoint for plan in plans], [(0, 100, 2), (0, 100, 1)])
+        self.assertEqual((result.status, result.stand_position), ("reached", (0, 100, 1)))
+        self.assert_released()
+
+    async def test_queued_entity_visibility_goal_does_not_bind_a_reappearing_target(self):
+        self.prepare_visibility_terrain()
+        unique_id, _ = self.spawn_navigation_actor()
+        sight = EntityVisibilityGoal(unique_id, aim_offset=(0, 1.5, 0), max_distance=2)
+        goal = AllGoal((FootGoal((0, 100, 0)), sight))
+        async with self.movement._action_lock:
+            queued = asyncio.create_task(self.bot.navigate(goal))
+            await asyncio.sleep(0)
+            self.observe_entity(self.binding.RemoveActorPacket(entity_id=unique_id))
+            self.spawn_navigation_actor()
+        result = await queued
+        self.assertEqual((result.status, result.frames, self.stream.sent), ("unknown", 0, []))
+        self.assertEqual(self.bot.plan_navigation(goal).status, "found")
 
     async def test_villager_goal_uses_wire_feet_and_unique_id(self):
         self.prepare_terrain()

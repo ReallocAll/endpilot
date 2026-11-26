@@ -34,8 +34,8 @@ from .login import LoginRefused, SessionEnd
 from .movement import BlockApproach, ForwardInput, MovementState
 from .navigation import (
     AllGoal, AnyGoal, BlockFaceGoal, BlockFaceMatch, BlockInteractionGoal, BlockInteractionMatch,
-    BlockPlacementGoal, BlockPlacementMatch, EntityNearGoal, FootGoal, NavigationCosts, NavigationGoal,
-    NavigationPlan, NavigationResult, NavigationRules, NearGoal, NearXZGoal, XZGoal, YGoal,
+    BlockPlacementGoal, BlockPlacementMatch, EntityNearGoal, EntityVisibilityGoal, FootGoal, NavigationCosts,
+    NavigationGoal, NavigationPlan, NavigationResult, NavigationRules, NearGoal, NearXZGoal, XZGoal, YGoal,
 )
 from .placement import BoatPlacementResult, PlacementInventoryChange, PlacementResult
 from .player_state import DeathEvent, GlideBoostEvent, PlayerAbilities, PlayerEffect, PlayerVitals
@@ -110,6 +110,7 @@ __all__ = [
     "EntityHealthEvent",
     "EntityNearGoal",
     "EntitySwing",
+    "EntityVisibilityGoal",
     "FootGoal",
     "ForwardInput",
     "FurnaceProgress",

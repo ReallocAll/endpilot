@@ -201,7 +201,23 @@ cleanup. Time spent in the callback counts toward `timeout`.
 | `BlockInteractionGoal(position, max_distance=5.0)` | A clear ray to one of the sampled aim points on a supported block outline. The match includes `click_pos` for `use_item_on()`. |
 | `BlockPlacementGoal(destination, max_distance=5.0)` | A clear ray to a supported face adjoining the observed air destination. The match includes `position`, `face`, and `click_pos` for `place_block()`. |
 | `EntityNearGoal(entity.entity_id, radius)` | A stance near an observed remote player or ordinary villager in the current session, identified by its unique ID. A target that leaves view becomes unknown. |
+| `EntityVisibilityGoal(entity.entity_id, aim_offset=(0, 1.4, 0), max_distance=2.2)` | A stance with a clear block ray from the standing eye to a chosen point relative to an observed remote player or ordinary villager. |
 | `AnyGoal((goal_a, goal_b))`, `AllGoal((goal_a, goal_b))` | An endpoint satisfying any or all children. Matching block faces follow the child order. |
+
+`EntityVisibilityGoal` adds the world-axis `(x, y, z)` offset to the target's
+latest verified feet position. The ray starts 1.52 blocks above the standing
+player's feet. The distance to the aim point can equal `max_distance`. A confirmed
+block outline on the segment rules out that stance. An unresolved target position
+or a potentially obstructing outline can make the route `unknown`. Execution
+follows the same observed entity instance and checks the ray from the actual
+standing position at arrival. Held sneak input, an observed crouch, or an
+explicit airborne observation leaves the current stance `unknown` for this goal.
+Planning can still find a future standing position.
+Every plan or execution gets a separate limit of `NavigationRules.max_expansions`
+ray cells, shared by its visibility checks. Exhausting that limit returns
+`budget`. The `expanded` count still reports standing nodes.
+After `reached`, use `look_at()` with the latest aim point if needed and
+observe the server's response to the action you choose.
 
 The [chest approach example](../../examples/approach_chest.py) uses the
 `approach_block()` shortcut and opens the chest from the selected face. For

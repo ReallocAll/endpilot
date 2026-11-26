@@ -12,10 +12,11 @@ from .client_clock import ClientClock, TICK_PERIOD_NS
 from .entities import Entities, EntityState, VehicleLinkChange
 from .expression import animation
 from .navigation import (
-    AllGoal, AnyGoal, BlockFaceGoal, Cell, EntityNearGoal, NavigationGoal, NavigationPlan, NavigationResult,
-    NavigationRules,
-    _LADDER_APPROACH, _LADDER_DECK_LENGTH, _LADDER_STRIDE, _StandingGraph, _aim_point, _block_face_cells,
-    _WATER_DECK_LENGTH, _WATER_STRIDE, _is_gap_jump, _is_ladder_climb, _is_two_block_drop,
+    AllGoal, AnyGoal, BlockFaceGoal, Cell, EntityNearGoal, EntityVisibilityGoal, NavigationGoal, NavigationPlan,
+    NavigationResult, NavigationRules,
+    _LADDER_APPROACH, _LADDER_DECK_LENGTH, _LADDER_STRIDE, _STANDING_HEAD_HEIGHT, _StandingGraph,
+    _VisibilityBudgetExhausted, _VisibilityScanBudget, _WATER_DECK_LENGTH, _WATER_STRIDE, _aim_point,
+    _block_face_cells, _is_gap_jump, _is_ladder_climb, _is_two_block_drop,
     _is_water_crossing, _ladder_descent_geometry, _require_goal, _resolve_goal, _runout,
 )
 from .player_state import PlayerState, movement_speed_attribute, swimming_metadata
@@ -377,6 +378,11 @@ class Movement:
         b = self.packets.protocol.binding
         return any(self._actor_flag(flag) for flag in (b.ActorFlags.RIDING, b.ActorFlags.SWIMMING, b.ActorFlags.SLEEPING))
 
+    def _gliding_or_crawling(self) -> bool:
+        flags = self.packets.protocol.binding.ActorFlags
+        return any(self._actor_flag(flag) or (flag in self._pose_intents and self._pose_intents[flag].enabled)
+                   for flag in (flags.GLIDING, flags.CRAWLING))
+
     def _observe_pose_intent(self, flag: int) -> None:
         value = self._actor_flag(flag)
         intent = self._pose_intents.get(flag)
@@ -712,7 +718,7 @@ class Movement:
         if sneaking != self._sneaking:
             return None
         x, y, z = feet
-        return (x, y + (1.17 if sneaking else 1.52), z), self._rotation
+        return (x, y + (1.17 if sneaking else _STANDING_HEAD_HEIGHT), z), self._rotation
 
     @property
     def rotation(self) -> tuple[float, float]:
@@ -2037,6 +2043,11 @@ class Movement:
         return (ground_tick is not None and ground_tick >= self._pending_landing[0]
                 and self._input_position == self.position and blocks._flat_stance(cell) is True)
 
+    def _navigation_visibility_standing(self) -> bool:
+        flags = self.packets.protocol.binding.ActorFlags
+        return not (self._observed_ground is False or self._sneaking or self._actor_flag(flags.SNEAKING)
+                    or self._swimming or self._incompatible_pose() or self._gliding_or_crawling())
+
     def _navigation_instances(self, *goals: NavigationGoal | None) -> dict[int, object]:
         """Bind visible targets before an action can queue behind other movement."""
         instances: dict[int, object] = {}
@@ -2045,7 +2056,7 @@ class Movement:
             return instances
 
         def bind(goal: NavigationGoal | None) -> None:
-            if isinstance(goal, EntityNearGoal):
+            if isinstance(goal, (EntityNearGoal, EntityVisibilityGoal)):
                 target = entities._navigation_target(goal.entity_id)
                 if target is not None:
                     instances[goal.entity_id] = target[0]
@@ -2057,7 +2068,10 @@ class Movement:
             bind(goal)
         return instances
 
-    def _navigation_goal(self, blocks, goal: NavigationGoal, instances: dict[int, object] | None = None):
+    def _navigation_goal(
+        self, blocks, goal: NavigationGoal, instances: dict[int, object] | None = None, *,
+        visibility_budget: _VisibilityScanBudget | None = None,
+    ):
         def entity_feet(entity_id):
             target = None if self._entities is None else self._entities._navigation_target(entity_id)
             if target is None:
@@ -2067,7 +2081,7 @@ class Movement:
                 return None
             return feet
 
-        return _resolve_goal(goal, blocks, entity_feet)
+        return _resolve_goal(goal, blocks, entity_feet, visibility_budget)
 
     def _standard_motion(self, blocks, *, owns_sprint: bool = False, owns_sneak: bool = False) -> bool:
         # Stock reports a 0.13 movement attribute while this action sprints.
@@ -2076,10 +2090,7 @@ class Movement:
         if (self._gap_jump_allowed is None or blocks._player_game_type != "SURVIVAL"
                 or self._input_source is not None or (self._sneaking and not owns_sneak) or not speed_is_standard):
             return False
-        flags = self.packets.protocol.binding.ActorFlags
-        return (not any(self._actor_flag(flag) or (flag in self._pose_intents and self._pose_intents[flag].enabled)
-                        for flag in (flags.GLIDING, flags.CRAWLING))
-                and self._gap_jump_allowed())
+        return not self._gliding_or_crawling() and self._gap_jump_allowed()
 
     def _standard_ground_motion(self, blocks, *, owns_sneak: bool = False) -> bool:
         return (self._standard_motion(blocks, owns_sneak=owns_sneak)
@@ -2105,7 +2116,9 @@ class Movement:
         graph = _StandingGraph(blocks, start, rules, allow_vertical=not (self._sprint_key or self._sneaking),
                                allow_gap=calibrated, allow_drop_two=calibrated, allow_ladder=calibrated,
                                allow_water=calibrated and rules.allow_swimming and self._water_ready())
-        return graph.plan(start, self._navigation_goal(blocks, goal), limit=rules.max_expansions)
+        current_goal = self._navigation_goal(blocks, goal, visibility_budget=_VisibilityScanBudget(rules.max_expansions))
+        return graph.plan(start, current_goal, limit=rules.max_expansions,
+                          start_visibility_standing=self._navigation_visibility_standing)
 
     async def navigate(self, blocks, goal: NavigationGoal, rules: NavigationRules, *,
                        ticks: int, timeout: float,
@@ -2235,6 +2248,9 @@ class Movement:
 
         def expired():
             return timeout.expired() or (deadline is not None and loop.time() >= deadline)
+
+        visibility_budget = _VisibilityScanBudget(rules.max_expansions, expired)
+        visibility_standing = self._navigation_visibility_standing
 
         def interrupted():
             if self._server_disconnected:
@@ -3201,7 +3217,8 @@ class Movement:
                             return outcome("unreachable")
 
                         requested_goal = goal if preferred_goal is None else preferred_goal
-                        current_goal = self._navigation_goal(blocks, requested_goal, instances)
+                        current_goal = self._navigation_goal(blocks, requested_goal, instances,
+                                                             visibility_budget=visibility_budget)
                         target = current_goal.block_exists if legacy else True
                         status = stance_failure(blocks._flat_stance(current), target)
                         if status is not None:
@@ -3209,7 +3226,8 @@ class Movement:
                                 return outcome(status)
                             route = None
                         elif current == aimed_cell and reached_cell(current, x, z) and self._teleport_pending is None:
-                            matches, faces = current_goal.check(current, eye=(x, y, z))
+                            matches, faces = current_goal.check(current, eye=(x, y, z),
+                                                                visibility_standing=visibility_standing)
                             if matches is True:
                                 point = _aim_point(faces)
                                 if point is not None:
@@ -3230,7 +3248,8 @@ class Movement:
                             limit = None if legacy else rules.max_expansions - expanded
                             start_eye = (x, y, z) if reached_cell(current, x, z) else None
                             plan = graph.plan(current, current_goal, limit=limit, used_ascents=used_ascents,
-                                              expired=None if legacy else expired, start_eye=start_eye)
+                                              expired=None if legacy else expired, start_eye=start_eye,
+                                              start_visibility_standing=visibility_standing)
                             expanded += plan.expanded
                             if expired():
                                 return outcome("budget")
@@ -3270,7 +3289,8 @@ class Movement:
                         if route[0][1] == current_y and (reached_cell(route[0], x, z) or ladder_top):
                             anchor = route.popleft()
                             if not route:
-                                matches, faces = current_goal.check(anchor, eye=(x, y, z))
+                                matches, faces = current_goal.check(anchor, eye=(x, y, z),
+                                                                    visibility_standing=visibility_standing)
                                 if matches is not True:
                                     route = None
                                     continue
@@ -3346,6 +3366,8 @@ class Movement:
                 finally:
                     if release_input and not release_sneak:
                         await release()
+        except _VisibilityBudgetExhausted:
+            return outcome("budget")
         except Exception as error:
             if callback_error is not None:
                 raise callback_error from error

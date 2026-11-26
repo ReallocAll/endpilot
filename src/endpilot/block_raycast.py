@@ -301,7 +301,7 @@ def _reaching_distance(squared: Fraction) -> float:
 def _trace_blocks(
     eye: _Vector, direction: _Vector, dimension_id: int, max_distance: float,
     outline_at: Callable[[Position], OutlineObservation], *, direction_length_squared: Fraction | None = None,
-    stop_at_point: bool = False,
+    stop_at_point: bool = False, any_known_hit: bool = False, visit_cell: Callable[[], None] | None = None,
 ) -> BlockRaycastResult:
     coordinate = float if direction_length_squared is None else Fraction
     # Compare against the exact world range without rounding the direction or plane parameter.
@@ -334,7 +334,10 @@ def _trace_blocks(
 
     observe = cache(outline_at)
     entry = 0.0
+    unresolved = None
     while True:
+        if visit_cell is not None:
+            visit_cell()
         position = (cells[0], cells[1], cells[2])
         crossing = min(crossings)
         crossing_in_range = in_range(crossing)
@@ -344,7 +347,11 @@ def _trace_blocks(
             owner = (cells[0] + dx, cells[1] + dy, cells[2] + dz)
             outline, unresolved_overhang = observe(owner)
             if outline is None and (owner == position or unresolved_overhang):
-                return BlockRaycastResult("unknown", dimension_id, owner)
+                if not any_known_hit:
+                    return BlockRaycastResult("unknown", dimension_id, owner)
+                # A known hit still rules out a clear segment.
+                if unresolved is None:
+                    unresolved = owner
             # A neighboring box matters only if its interior extends into this voxel.
             if not outline or not all(outline[i] + offset[i] < 1 and outline[i + 3] + offset[i] > 0
                                       for i in range(3)):
@@ -364,6 +371,8 @@ def _trace_blocks(
                         else _reaching_distance(parameter * parameter * direction_length_squared))
             return BlockRaycastResult("hit", dimension_id, owner, face, click, distance)
         if not crossing_in_range:
+            if unresolved is not None:
+                return BlockRaycastResult("unknown", dimension_id, unresolved)
             return BlockRaycastResult("miss", dimension_id)
         entry = crossing
         # Move across coincident planes together at a voxel edge or corner.

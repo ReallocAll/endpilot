@@ -1,19 +1,20 @@
 """Immutable goals and bounded planning over observed standing positions."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 from heapq import heappop, heappush
 from itertools import count
 import math
 from typing import Literal
 
-from .block_raycast import BlockRaycastResult, _UNIT_BOX, _block_interaction_probe, _validate_distance
+from .block_raycast import BlockRaycastResult, _UNIT_BOX, _block_interaction_probe, _trace_blocks, _validate_distance
 from .blocks import FACE_OFFSETS
 
 
 Cell = tuple[int, int, int]
 Point = tuple[float, float, float]
+_STANDING_HEAD_HEIGHT = 1.52
 _HORIZONTAL_STEPS = ((0, 1), (1, 0), (0, -1), (-1, 0))
 _HORIZONTAL_FACES = {offset: face for face, offset in FACE_OFFSETS.items() if offset[1] == 0}
 _LADDER_APPROACH = 2
@@ -154,6 +155,26 @@ class EntityNearGoal:
 
 
 @dataclass(frozen=True, slots=True)
+class EntityVisibilityGoal:
+    """Stand within range of a feet-relative aim point with a clear block ray."""
+
+    entity_id: int
+    aim_offset: Point = field(kw_only=True)
+    max_distance: float = field(kw_only=True)
+
+    def __post_init__(self):
+        if not isinstance(self.entity_id, int) or self.entity_id == 0:
+            raise ValueError("expected a nonzero actor unique ID")
+        offset = tuple(map(float, self.aim_offset))
+        if len(offset) != 3 or not all(map(math.isfinite, offset)):
+            raise ValueError("aim_offset must contain three finite world-axis coordinates")
+        distance = float(self.max_distance)
+        _validate_distance(distance)
+        object.__setattr__(self, "aim_offset", offset)
+        object.__setattr__(self, "max_distance", distance)
+
+
+@dataclass(frozen=True, slots=True)
 class AnyGoal:
     """Stand at a position satisfying at least one of the supplied goals."""
 
@@ -175,7 +196,7 @@ class AllGoal:
 
 type NavigationGoal = (
     FootGoal | XZGoal | NearXZGoal | YGoal | NearGoal | BlockFaceGoal | BlockInteractionGoal |
-    BlockPlacementGoal | EntityNearGoal | AnyGoal | AllGoal
+    BlockPlacementGoal | EntityNearGoal | EntityVisibilityGoal | AnyGoal | AllGoal
 )
 
 
@@ -218,6 +239,7 @@ class NavigationCosts:
 class NavigationRules:
     """Search bounds and budgets, with optional verified still-water crossings.
 
+    max_expansions also sets a separate limit on entity visibility ray cells.
     Fully observed dry routes take priority. Swimming currently supports the
     calibrated orthogonal crossing of a four-column, three-block-deep pool.
     """
@@ -300,6 +322,26 @@ class NavigationResult:
     matches: tuple[BlockFaceMatch, ...] = ()
 
 
+class _VisibilityBudgetExhausted(Exception):
+    pass
+
+
+class _VisibilityScanBudget:
+    def __init__(self, limit: int, expired: Callable[[], bool] | None = None):
+        self._remaining = limit
+        self._expired = expired
+
+    def check_deadline(self) -> None:
+        if self._expired is not None and self._expired():
+            raise _VisibilityBudgetExhausted
+
+    def visit_cell(self) -> None:
+        self.check_deadline()
+        if self._remaining <= 0:
+            raise _VisibilityBudgetExhausted
+        self._remaining -= 1
+
+
 @dataclass(frozen=True, slots=True)
 class _GoalState:
     goal: NavigationGoal
@@ -307,8 +349,11 @@ class _GoalState:
     block_exists: bool | None = None
     children: "tuple[_GoalState, ...]" = ()
     interaction_probe: Callable[[Point], BlockRaycastResult] | None = None
+    visibility_probe: Callable[[Point], bool | None] | None = None
 
-    def check(self, cell: Cell, *, eye: Point | None = None) -> tuple[bool | None, tuple[BlockFaceMatch, ...]]:
+    def check(
+        self, cell: Cell, *, eye: Point | None = None, visibility_standing: Callable[[], bool] | None = None,
+    ) -> tuple[bool | None, tuple[BlockFaceMatch, ...]]:
         goal = self.goal
         if isinstance(goal, FootGoal):
             return cell == goal.position, ()
@@ -335,6 +380,17 @@ class _GoalState:
             if self.block_exists is None:
                 return None, ()
             return True, (BlockFaceMatch(goal.position, face),)
+        if isinstance(goal, EntityVisibilityGoal):
+            if self.visibility_probe is None or (visibility_standing is not None and not visibility_standing()):
+                return None, ()
+            if eye is None:
+                x, y, z = cell
+                head = (x + 0.5, y + _STANDING_HEAD_HEIGHT, z + 0.5)
+            else:
+                # The synchronized input origin is 1.62 blocks above the feet.
+                x, y, z = eye
+                head = (x, y - 1.62 + _STANDING_HEAD_HEIGHT, z)
+            return self.visibility_probe(head), ()
         if self.interaction_probe is not None:
             x, y, z = cell
             if isinstance(goal, BlockPlacementGoal) and goal.destination in (cell, (x, y + 1, z)):
@@ -347,7 +403,7 @@ class _GoalState:
                 return True, (BlockInteractionMatch(hit.position, hit.face, hit.click_pos),)
             return (None if hit.status == "unknown" else False), ()
 
-        values = tuple(child.check(cell, eye=eye) for child in self.children)
+        values = tuple(child.check(cell, eye=eye, visibility_standing=visibility_standing) for child in self.children)
         if isinstance(goal, AllGoal):
             if any(value is False for value, _ in values):
                 return False, ()
@@ -401,7 +457,33 @@ def _block_placement_probe(goal: BlockPlacementGoal, blocks) -> Callable[[Point]
     return trace
 
 
-def _resolve_goal(goal: NavigationGoal, blocks, entity_feet: Callable[[int], Point | None]) -> _GoalState:
+def _entity_visibility_probe(
+    goal: EntityVisibilityGoal, point: Point, blocks, budget: _VisibilityScanBudget,
+) -> Callable[[Point], bool | None]:
+    dimension = blocks.dimension_id
+    outline_at = blocks._outline_at
+    target = tuple(map(Fraction, point))
+    range_squared = Fraction(goal.max_distance) ** 2
+
+    def visible(eye: Point) -> bool | None:
+        origin = tuple(map(Fraction, eye))
+        direction = tuple(end - start for end, start in zip(target, origin, strict=True))
+        length_squared = sum(value * value for value in direction)
+        if length_squared > range_squared:
+            return False
+        hit = _trace_blocks(origin, direction, dimension, goal.max_distance, outline_at,
+                            direction_length_squared=length_squared, stop_at_point=True, any_known_hit=True,
+                            visit_cell=budget.visit_cell)
+        budget.check_deadline()
+        return None if hit.status == "unknown" else hit.status == "miss"
+
+    return visible
+
+
+def _resolve_goal(
+    goal: NavigationGoal, blocks, entity_feet: Callable[[int], Point | None],
+    visibility_budget: _VisibilityScanBudget | None,
+) -> _GoalState:
     if isinstance(goal, BlockFaceGoal):
         block = blocks.observed_block(goal.position)
         exists = None if block is None or block.is_air is None else not block.is_air
@@ -416,8 +498,16 @@ def _resolve_goal(goal: NavigationGoal, blocks, entity_feet: Callable[[int], Poi
         return _GoalState(goal, point=goal.position)
     if isinstance(goal, EntityNearGoal):
         return _GoalState(goal, point=entity_feet(goal.entity_id))
+    if isinstance(goal, EntityVisibilityGoal):
+        feet = entity_feet(goal.entity_id)
+        if feet is not None:
+            point = tuple(value + offset for value, offset in zip(feet, goal.aim_offset, strict=True))
+            if all(map(math.isfinite, point)):
+                assert visibility_budget is not None
+                return _GoalState(goal, visibility_probe=_entity_visibility_probe(goal, point, blocks, visibility_budget))
     if isinstance(goal, (AnyGoal, AllGoal)):
-        return _GoalState(goal, children=tuple(_resolve_goal(child, blocks, entity_feet) for child in goal.goals))
+        children = tuple(_resolve_goal(child, blocks, entity_feet, visibility_budget) for child in goal.goals)
+        return _GoalState(goal, children=children)
     return _GoalState(goal)
 
 
@@ -599,6 +689,7 @@ class _StandingGraph:
              used_ascents: set[tuple[Cell, Cell]] | frozenset[tuple[Cell, Cell]] = frozenset(),
              expired: Callable[[], bool] | None = None,
              start_eye: Point | None = None,
+             start_visibility_standing: Callable[[], bool] | None = None,
              ) -> NavigationPlan:
         expanded = 0
         args = goal.goal, self.rules, self.blocks.dimension_id, start
@@ -642,7 +733,12 @@ class _StandingGraph:
                 if (limit is not None and expanded >= limit) or (expired is not None and expired()):
                     return NavigationPlan(*args, "budget", expanded=expanded)
                 expanded += 1
-                matches, faces = goal.check(cell, eye=start_eye if cell == start else None)
+                is_start = cell == start
+                try:
+                    matches, faces = goal.check(cell, eye=start_eye if is_start else None,
+                                                visibility_standing=start_visibility_standing if is_start else None)
+                except _VisibilityBudgetExhausted:
+                    return NavigationPlan(*args, "budget", expanded=expanded)
                 if optimistic and matches is not False:
                     return NavigationPlan(*args, "unknown", expanded=expanded)
                 uncertain |= matches is None
