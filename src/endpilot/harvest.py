@@ -214,6 +214,7 @@ class HarvestTools:
         inventory_slots: range, face: int, timeout: float, expected_target: BlockObservation | None = None,
         expected_chest: BlockObservation | None = None, expected_epoch: int | None = None,
         click_pos: tuple[float, float, float] | None = None,
+        on_owned_window: Callable[[ContainerWindow], None] | None = None,
     ) -> HarvestToolAcquisition:
         blocks, inventory, containers = self._blocks, self._inventory, self._containers
         target = blocks.observed_block(position) if expected_target is None else expected_target
@@ -252,6 +253,8 @@ class HarvestTools:
         def remember_window(current):
             nonlocal owned_window, window
             window = owned_window = current
+            if on_owned_window is not None:
+                on_owned_window(current)
 
         async def equip_inventory(choice, slots, *, confirmed=False):
             nonlocal tool

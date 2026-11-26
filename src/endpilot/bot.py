@@ -2070,6 +2070,7 @@ class Bot:
     async def collect_targets(
         self, positions: Iterable[tuple[int, int, int]], *, count: int | None = None,
         ticks: int = 160, search_radius: int = 8, timeout: float = 15, tool_chest: HarvestToolChest | None = None,
+        tool_chests: Sequence[HarvestToolChest] | None = None,
     ) -> BlockCollectionBatch:
         """Collect unique targets in input order, up to count.
 
@@ -2081,18 +2082,23 @@ class Bot:
         to the specified chest for that target, then a return to the target.
         Each leg gets the same movement budget. See the target result's
         tool_acquisition for the chest and transfer evidence.
+
+        Alternatively, pass tool_chests to try a sequence in order. A
+        confirmed shortage in a closed chest or an unreachable approach
+        before clicking permits the next attempt. Read tool_refill_attempts
+        for the sequence of outcomes on each target.
         """
         if self._block_collector is None:
             raise RuntimeError("player has not joined")
         return await self._block_collector.collect_targets(
             self, positions, count=count, ticks=ticks, search_radius=search_radius, timeout=timeout,
-            tool_chest=tool_chest,
+            tool_chest=tool_chest, tool_chests=tool_chests,
         )
 
     async def collect_by_count(
         self, names: str | int | Iterable[str] | Iterable[int], *, item_id: int, count: int,
         radius: int = 16, ticks: int = 160, search_radius: int = 8, timeout: float = 15,
-        tool_chest: HarvestToolChest | None = None,
+        tool_chest: HarvestToolChest | None = None, tool_chests: Sequence[HarvestToolChest] | None = None,
     ) -> CountedBlockCollection:
         """Collect a positive count of one item from nearby observed matching blocks.
 
@@ -2101,20 +2107,22 @@ class Bot:
         The result counts confirmed main-inventory gains for item_id and can
         exceed count. Exceptions carry known collection_progress.
 
-        Pass tool_chest to allow a refill from the specified chest when a
-        target requires a tool the bot lacks. See each result's tool_acquisition.
+        Pass tool_chest or tool_chests to enable the same shortage refills as
+        collect_targets. A change during an unsettled ordered refill ends
+        the batch.
         """
         if self._block_collector is None:
             raise RuntimeError("player has not joined")
         return await self._block_collector.collect_by_count(
             self, names, item_id=item_id, count=count, radius=radius, ticks=ticks,
-            search_radius=search_radius, timeout=timeout, tool_chest=tool_chest,
+            search_radius=search_radius, timeout=timeout, tool_chest=tool_chest, tool_chests=tool_chests,
         )
 
     async def collect_vein_by_count(
         self, seed: tuple[int, int, int], *, item_id: int, count: int, max_blocks: int = 100,
         max_distance: int = 16, flood_radius: int = 1, ticks: int = 160,
         search_radius: int = 8, timeout: float = 15, tool_chest: HarvestToolChest | None = None,
+        tool_chests: Sequence[HarvestToolChest] | None = None,
     ) -> CountedBlockCollection:
         """Collect a positive count of one item from an observed block vein.
 
@@ -2124,7 +2132,8 @@ class Bot:
         count. Each attempt requires a finite positive timeout. Exceptions
         carry known collection_progress.
 
-        Pass tool_chest to allow the same shortage refill as collect_by_count.
+        Pass tool_chest or tool_chests to enable the same shortage refills as
+        collect_by_count.
         """
         if self._block_collector is None:
             raise RuntimeError("player has not joined")
@@ -2133,7 +2142,7 @@ class Bot:
         return await self._block_collector.collect_vein_by_count(
             self, seed, item_id=item_id, count=count, max_blocks=max_blocks, max_distance=max_distance,
             flood_radius=flood_radius, ticks=ticks, search_radius=search_radius, timeout=timeout,
-            tool_chest=tool_chest,
+            tool_chest=tool_chest, tool_chests=tool_chests,
         )
 
     async def collect_mixed_targets(

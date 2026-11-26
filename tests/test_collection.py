@@ -34,6 +34,7 @@ OAK_LOG_BLOCK = 4065577688
 OAK_LOG_ITEM = 17
 IRON_AXE = 446
 REFILL_CHEST = (-3, 100, 2)
+ALTERNATE_REFILL_CHEST = (-4, 100, 3)
 
 
 class Wire:
@@ -741,7 +742,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.inventory_count(DIRT), 2)
         self.assertTrue(self.wire.outgoing.empty())
 
-    async def refill_bot(self, *, chest=REFILL_CHEST):
+    async def refill_bot(self, *, chest=REFILL_CHEST, additional_chests=()):
         bot = await self.public_bot()
         bot._session.item_registry = ItemRegistrySnapshot(bot._session.item_names)
         palette, hashes = _catalog()
@@ -749,14 +750,14 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
                         if palette[index] is not None and palette[index].name == "minecraft:chest")
         await self.emit(
             self.block(OAK_LOG_BLOCK), self.block(ORE, position=SECOND_TARGET),
-            self.block(chest_id, position=chest),
+            *(self.block(chest_id, position=position) for position in (chest, *additional_chests)),
             self.content(stack_descriptor(self.b, 444, 1, 10), *(self.item() for _ in range(35))),
         )
         return bot
 
-    async def refill_batch(self, bot, *, tool_chest):
+    async def refill_batch(self, bot, **chest_options):
         batch = asyncio.create_task(bot.collect_targets(
-            [TARGET, SECOND_TARGET], ticks=0, search_radius=0, timeout=1, tool_chest=tool_chest,
+            [TARGET, SECOND_TARGET], ticks=0, search_radius=0, timeout=1, **chest_options,
         ))
 
         async def settle_batch():
@@ -768,16 +769,16 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         await self.finish_batch_break(TARGET, runtime_id=101, total=1, item_id=OAK_LOG_ITEM, net_id=15)
         return batch
 
-    def refill_window(self, *, position=REFILL_CHEST, iron_slot=4):
+    def refill_window(self, *, position=REFILL_CHEST, iron_slot=4, item_id=445, container_id=2):
         b = self.b
         x, y, z = position
         open_packet = b.ContainerOpenPacket(
-            container_id=2, type=b.ContainerType.CONTAINER,
+            container_id=container_id, type=b.ContainerType.CONTAINER,
             pos=b.BlockPos(x=x, y=y, z=z), entity_unique_id=-1,
         )
-        stacks = {iron_slot: stack_descriptor(b, 445, 1, 14)}
+        stacks = {iron_slot: stack_descriptor(b, item_id, 1, 14)}
         contents = b.InventoryContentPacket(
-            inventory_id=2, slots=[stacks.get(index, self.item()) for index in range(27)],
+            inventory_id=container_id, slots=[stacks.get(index, self.item()) for index in range(27)],
             full_container_name=b.FullContainerName(name=b.ContainerEnumName.LEVEL_ENTITY_CONTAINER),
             storage_item=self.item(),
         )
@@ -884,6 +885,108 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(bot.open_window)
         self.assertTrue(self.wire.outgoing.empty())
 
+    async def test_ordered_refill_snapshots_chests_and_waits_for_each_matching_close(self):
+        bot = await self.refill_bot(additional_chests=(ALTERNATE_REFILL_CHEST,))
+        first_chest = HarvestToolChest(REFILL_CHEST, range(4, 5))
+        second_chest = HarvestToolChest(ALTERNATE_REFILL_CHEST, range(4, 5), range(3, 4))
+        chests = [first_chest, second_chest]
+        batch = await self.refill_batch(bot, tool_chests=chests)
+        await self.refill_click()
+        chests.clear()
+        await self.emit(*self.refill_window(item_id=444))
+        first_close = await self.refill_close(confirm=False)
+        self.assertEqual(first_close.container_id, 2)
+        b = self.b
+        traffic = []
+
+        def received(raw):
+            if raw.packet_id == b.ContainerClosePacket.ID and self.packets.protocol.decode(raw).container_id == 2:
+                traffic.append("close")
+
+        def sent(packet_id):
+            if packet_id == b.InventoryTransactionPacket.ID:
+                traffic.append("click")
+            elif packet_id == b.ItemStackRequestPacket.ID:
+                traffic.append("take")
+
+        self.addCleanup(self.packets.subscribe_raw(received))
+        self.addCleanup(self.packets.subscribe_sent(sent))
+        unrelated_close = self.b.ContainerClosePacket(
+            container_id=9, container_type=self.b.ContainerType.CONTAINER, server_initiated_close=False,
+        )
+        await self.emit(unrelated_close)
+        self.assertFalse(batch.done())
+        self.assertTrue(self.wire.outgoing.empty())
+        unrelated_open, _ = self.refill_window(position=ALTERNATE_REFILL_CHEST, container_id=9)
+        await self.emit(first_close, unrelated_open, unrelated_close)
+
+        await self.emit(await self.refill_request(position=ALTERNATE_REFILL_CHEST))
+        equipped = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+        self.assertIsInstance(equipped, self.b.MobEquipmentPacket)
+        self.assertEqual((equipped.item.id, equipped.item.net_id_variant), (445, 20))
+        second_close = await self.refill_close(confirm=False)
+        self.assertTrue(self.wire.outgoing.empty())
+        await self.emit(second_close)
+        await self.expect_batch_start(SECOND_TARGET)
+        await self.finish_batch_break(SECOND_TARGET, runtime_id=102, total=1)
+
+        first, second = (await asyncio.wait_for(batch, 1)).results
+        self.assertEqual((first.status, first.tool_refill_attempts, second.status), ("collected", (), "collected"))
+        ((attempt_a, miss), (attempt_b, success)) = second.tool_refill_attempts
+        self.assertEqual((attempt_a, attempt_b), (first_chest, second_chest))
+        self.assertEqual((miss.status, miss.window.position, miss.transfer), ("tool_unavailable", REFILL_CHEST, None))
+        self.assertIs(second.tool_acquisition, success)
+        self.assertEqual((success.status, success.window.position, success.transfer.confirmed_count),
+                         ("equipped", ALTERNATE_REFILL_CHEST, 1))
+        self.assertEqual(traffic, ["close", "click", "take", "close"])
+        self.assertIsNone(bot.open_window)
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_ordered_refill_can_skip_a_confirmed_unreachable_chest_before_clicking(self):
+        far_chest = (-12, 100, 3)
+        bot = await self.refill_bot(additional_chests=(far_chest,))
+        first_chest = HarvestToolChest(far_chest, range(4, 5))
+        second_chest = HarvestToolChest(REFILL_CHEST, range(5, 6))
+        batch = await self.refill_batch(bot, tool_chests=(first_chest, second_chest))
+        await self.refill_click()
+        await self.emit(*self.refill_window())
+        await self.refill_close()
+
+        first, second = (await asyncio.wait_for(batch, 1)).results
+        self.assertEqual((first.status, second.status), ("collected", "tool_unavailable"))
+        self.assertEqual([(chest, outcome.status, outcome.transfer) for chest, outcome in second.tool_refill_attempts],
+                         [(first_chest, "chest_approach_unreachable", None),
+                          (second_chest, "tool_unavailable", None)])
+        self.assertIs(second.tool_acquisition, second.tool_refill_attempts[-1][1])
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_ordered_refill_stops_when_the_first_chest_is_unobserved(self):
+        bot = await self.refill_bot()
+        first_chest = HarvestToolChest((12, 100, 3), range(4, 5))
+        second_chest = HarvestToolChest(REFILL_CHEST, range(4, 5))
+        first, second = (await (await self.refill_batch(bot, tool_chests=(first_chest, second_chest)))).results
+        self.assertEqual((first.status, second.status, second.tool_acquisition), ("collected", "tool_unavailable", None))
+        self.assertEqual(second.tool_refill_attempts, ((first_chest, None),))
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_ordered_refill_stops_when_the_window_is_replaced_with_the_same_id(self):
+        bot = await self.refill_bot(additional_chests=(ALTERNATE_REFILL_CHEST,))
+        first_chest = HarvestToolChest(REFILL_CHEST, range(5, 6))
+        second_chest = HarvestToolChest(ALTERNATE_REFILL_CHEST, range(4, 5))
+        batch = await self.refill_batch(bot, tool_chests=(first_chest, second_chest))
+        await self.refill_click()
+        await self.emit(*self.refill_window())
+        close = await self.refill_close(confirm=False)
+        replacement, _ = self.refill_window(position=ALTERNATE_REFILL_CHEST)
+        await self.emit(replacement, close)
+
+        first, second = (await asyncio.wait_for(batch, 1)).results
+        self.assertEqual((first.status, second.status, second.tool_acquisition.status),
+                         ("collected", "tool_refill_failed", "window_changed"))
+        self.assertEqual(second.tool_refill_attempts, ((first_chest, second.tool_acquisition),))
+        self.assertIsNone(bot.open_window)
+        self.assertTrue(self.wire.outgoing.empty())
+
     async def test_target_change_during_refill_keeps_confirmed_transfer_without_start(self):
         bot = await self.refill_bot()
         batch = await self.refill_batch(bot, tool_chest=HarvestToolChest(REFILL_CHEST, range(4, 5), range(3, 4)))
@@ -974,6 +1077,26 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(collect=collect.__name__), self.assertRaisesRegex(TypeError, "tool_chest"):
                 await collect(target, item_id=OAK_LOG_ITEM, count=1, tool_chest=REFILL_CHEST)
         self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_collection_validates_ordered_chests_and_accepts_an_empty_sequence(self):
+        bot = await self.refill_bot()
+        chest = HarvestToolChest(REFILL_CHEST, range(4, 5))
+        calls = (
+            partial(bot.collect_targets, [SECOND_TARGET], ticks=0, search_radius=0),
+            partial(bot.collect_by_count, ORE, item_id=DIRT, count=1, ticks=0, search_radius=0),
+            partial(bot.collect_vein_by_count, SECOND_TARGET, item_id=DIRT, count=1, ticks=0, search_radius=0),
+        )
+        for collect in calls:
+            with self.subTest(collect=collect.func.__name__):
+                with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                    await collect(tool_chest=chest, tool_chests=[])
+                for invalid in (chest, [chest, REFILL_CHEST], iter([chest]), ""):
+                    with self.assertRaisesRegex(TypeError, "tool_chests"):
+                        await collect(tool_chests=invalid)
+                attempt, = (await collect(tool_chests=[])).results
+                self.assertEqual((attempt.status, attempt.tool_acquisition, attempt.tool_refill_attempts),
+                                 ("tool_unavailable", None, ()))
+                self.assertTrue(self.wire.outgoing.empty())
 
     async def test_counted_collection_reselects_log_removed_during_approach_and_counts_the_actual_gain(self):
         first, second, third = (-1, 100, 3), (0, 100, 3), (1, 100, 3)
@@ -1242,12 +1365,14 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(bot._block_collector._lock.locked())
         self.assert_no_more_collection_inputs()
 
-    async def start_counted_vein_refill(self, chest_slots):
-        bot = await self.refill_bot()
+    async def start_counted_vein_refill(self, chest_slots, *, fallback=None, max_blocks=2, timeout=1):
+        bot = await self.refill_bot(additional_chests=() if fallback is None else (fallback.position,))
         await self.emit(self.block(ORE), self.block(ORE, position=(-4, 100, 4)), self.slot(3, 445, 1, net_id=14))
         chest = HarvestToolChest(REFILL_CHEST, chest_slots, range(3, 4))
+        options = {"tool_chest": chest} if fallback is None else {"tool_chests": (chest, fallback)}
         task = asyncio.create_task(bot.collect_vein_by_count(
-            TARGET, item_id=DIRT, count=2, max_blocks=2, ticks=0, search_radius=0, timeout=1, tool_chest=chest,
+            TARGET, item_id=DIRT, count=2, max_blocks=max_blocks, ticks=0, search_radius=0, timeout=timeout,
+            **options,
         ))
         await self.expect_batch_start(TARGET)
         self.wire.emit(self.slot(3))
@@ -1289,6 +1414,90 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(progress.active.position, SECOND_TARGET)
         self.assertEqual(progress.active.tool_acquisition.transfer.confirmed_count, 1)
         self.assertEqual(bot.observed_block(SECOND_TARGET).runtime_id, ORE)
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_ordered_refill_keeps_the_counted_prefix_when_close_is_unconfirmed(self):
+        fallback = HarvestToolChest(ALTERNATE_REFILL_CHEST, range(4, 5))
+        bot, task = await self.start_counted_vein_refill(range(5, 6), fallback=fallback, timeout=0.25)
+        await self.refill_click()
+        await self.emit(*self.refill_window())
+        await self.refill_close(confirm=False)
+
+        result = await asyncio.wait_for(task, 1)
+        self.assertEqual((result.collected_count, result.active), (1, None))
+        first, second = result.results
+        self.assertEqual((first.status, first.tool_refill_attempts, second.status, second.timed_out),
+                         ("collected", (), "tool_timeout", True))
+        (chest, acquisition), = second.tool_refill_attempts
+        self.assertEqual((chest.position, acquisition.status, acquisition.transfer),
+                         (REFILL_CHEST, "tool_unavailable", None))
+        self.assertIs(second.tool_acquisition, acquisition)
+        self.assertEqual(bot.open_window.position, REFILL_CHEST)
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_counted_ordered_refill_does_not_reselect_after_an_unsettled_transfer(self):
+        fallback = HarvestToolChest(ALTERNATE_REFILL_CHEST, range(4, 5))
+        bot, task = await self.start_counted_vein_refill(range(4, 5), fallback=fallback, max_blocks=3)
+        await self.emit(await self.refill_request(), self.block(OAK_LOG_BLOCK, position=SECOND_TARGET))
+        await self.refill_close()
+
+        result = await asyncio.wait_for(task, 1)
+        self.assertEqual(result.positions, (TARGET, SECOND_TARGET, (-4, 100, 4)))
+        self.assertEqual(result.collected_count, 1)
+        first, second = result.results
+        self.assertEqual((first.status, first.tool_refill_attempts, second.status), ("collected", (), "target_changed"))
+        (chest, acquisition), = second.tool_refill_attempts
+        self.assertEqual((chest.position, acquisition.status, acquisition.transfer.confirmed_count),
+                         (REFILL_CHEST, "unobserved", 1))
+        self.assertIs(second.tool_acquisition, acquisition)
+        self.assertIsNone(bot.open_window)
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_counted_ordered_refill_reselects_a_changed_target_after_a_settled_miss(self):
+        fallback = HarvestToolChest(ALTERNATE_REFILL_CHEST, range(4, 5))
+        _, task = await self.start_counted_vein_refill(range(5, 6), fallback=fallback, max_blocks=3)
+        await self.refill_click()
+        await self.emit(*self.refill_window())
+        close = await self.refill_close(confirm=False)
+        await self.emit(self.block(OAK_LOG_BLOCK, position=SECOND_TARGET), self.slot(3, 445, 1, net_id=14), close)
+        last = (-4, 100, 4)
+        await self.expect_batch_start(last)
+        await self.finish_batch_break(last, runtime_id=102, total=2, net_id=15)
+
+        result = await asyncio.wait_for(task, 1)
+        self.assertEqual(result.collected_count, 2)
+        self.assertEqual([(row.position, row.status) for row in result.results],
+                         [(TARGET, "collected"), (SECOND_TARGET, "target_changed"), (last, "collected")])
+        first, second, third = result.results
+        self.assertEqual((first.tool_refill_attempts, third.tool_refill_attempts), ((), ()))
+        (chest, acquisition), = second.tool_refill_attempts
+        self.assertEqual((chest.position, acquisition.status, acquisition.transfer),
+                         (REFILL_CHEST, "tool_unavailable", None))
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_ordered_refill_cancellation_keeps_counted_prefix_and_both_attempts(self):
+        fallback = HarvestToolChest(ALTERNATE_REFILL_CHEST, range(4, 5), range(3, 4))
+        bot, task = await self.start_counted_vein_refill(range(5, 6), fallback=fallback)
+        await self.refill_click()
+        await self.emit(*self.refill_window())
+        await self.refill_close()
+        await self.emit(await self.refill_request(position=ALTERNATE_REFILL_CHEST))
+        equipped = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+        self.assertIsInstance(equipped, self.b.MobEquipmentPacket)
+        await self.refill_close(confirm=False)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError) as caught:
+            await task
+
+        progress = caught.exception.collection_progress
+        self.assertEqual(progress.collected_count, 1)
+        first, = progress.results
+        self.assertEqual((first.status, first.tool_refill_attempts), ("collected", ()))
+        self.assertEqual(progress.active.position, SECOND_TARGET)
+        ((chest, miss), (last_chest, active)) = progress.active.tool_refill_attempts
+        self.assertEqual((chest.position, miss.status, miss.transfer), (REFILL_CHEST, "tool_unavailable", None))
+        self.assertEqual((last_chest, active.transfer.confirmed_count), (fallback, 1))
+        self.assertIs(progress.active.tool_acquisition, active)
         self.assertTrue(self.wire.outgoing.empty())
 
     async def mixed_drop(self, bot):

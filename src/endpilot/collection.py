@@ -1,7 +1,7 @@
 """Collect supplied blocks and drops using their observed world and pickup evidence."""
 
 import asyncio
-from collections.abc import Awaitable, Callable, Coroutine, Iterable
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from functools import partial
 import math
@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from .bot import Bot
 
 
-_ToolRefill = Callable[[BlockObservation], Awaitable[HarvestToolAcquisition | None]]
+_ToolRefill = Callable[[HarvestToolChest, BlockObservation], Awaitable[HarvestToolAcquisition | None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,7 +27,8 @@ class BlockCollection:
 
     Drops are new item actors first reported inside the target block. Their
     source may be indistinguishable on this stream. The collector and inventory
-    delta refer to a sole candidate. An unknown delta is None.
+    delta refer to a sole candidate. An unknown delta is None. Ordered refills
+    record each chest and its available acquisition evidence in tool_refill_attempts.
     """
 
     position: tuple[int, int, int]
@@ -41,6 +42,9 @@ class BlockCollection:
     approach: BlockApproach | None = None
     tool: HarvestTool | None = None
     tool_acquisition: HarvestToolAcquisition | None = field(default=None, kw_only=True)
+    tool_refill_attempts: tuple[tuple[HarvestToolChest, HarvestToolAcquisition | None], ...] = field(
+        default=(), kw_only=True,
+    )
     _pickup_confirmed: bool = field(default=False, kw_only=True, repr=False)
 
     @property
@@ -146,6 +150,32 @@ def _position(values) -> tuple[int, int, int]:
     return position
 
 
+def _snapshot_tool_chests(
+    tool_chest: HarvestToolChest | None, tool_chests: Sequence[HarvestToolChest] | None,
+) -> tuple[HarvestToolChest, ...] | None:
+    if tool_chest is not None and not isinstance(tool_chest, HarvestToolChest):
+        raise TypeError("tool_chest must be a HarvestToolChest")
+    if tool_chests is None:
+        return None
+    if tool_chest is not None:
+        raise ValueError("tool_chest and tool_chests are mutually exclusive")
+    if not isinstance(tool_chests, Sequence) or isinstance(tool_chests, (str, bytes, bytearray)):
+        raise TypeError("tool_chests must be a sequence of HarvestToolChest")
+    snapshot = tuple(tool_chests)
+    if any(not isinstance(chest, HarvestToolChest) for chest in snapshot):
+        raise TypeError("tool_chests must contain only HarvestToolChest entries")
+    return snapshot
+
+
+def _settled_refill_miss(acquisition: HarvestToolAcquisition | None) -> bool:
+    if acquisition is None or acquisition.transfer is not None:
+        return False
+    # A collection refill opens its own window. Harvest preserves this status
+    # only after the owned window's matching close completes normally.
+    return ((acquisition.status == "tool_unavailable" and acquisition.window is not None)
+            or (acquisition.status == "chest_approach_unreachable" and acquisition.window is None))
+
+
 def _confirmed_item_count(result: BlockCollection, item_id: int, *, item_name: str | None = None) -> int:
     if not result.pickup_confirmed:
         return 0
@@ -182,11 +212,11 @@ class _BlockCollector:
     async def collect_targets(
         self, bot: "Bot", positions: Iterable[tuple[int, int, int]], *, count: int | None = None,
         ticks: int = 160, search_radius: int = 8, timeout: float = 15, tool_chest: HarvestToolChest | None = None,
+        tool_chests: Sequence[HarvestToolChest] | None = None,
     ) -> BlockCollectionBatch:
         if count is not None and (not isinstance(count, int) or count < 0):
             raise ValueError("collection count must be a nonnegative integer")
-        if tool_chest is not None and not isinstance(tool_chest, HarvestToolChest):
-            raise TypeError("tool_chest must be a HarvestToolChest")
+        tool_chests = _snapshot_tool_chests(tool_chest, tool_chests)
         positions = tuple(dict.fromkeys(map(_position, positions)))[:count]
         progress = _BatchProgress(self.blocks.dimension_id, positions)
         try:
@@ -197,7 +227,7 @@ class _BlockCollector:
             before = tuple(self.blocks.observed_block(position) for position in positions)
             await self._run(self._collect_batch(
                 bot, progress, before, epoch, ticks=ticks, search_radius=search_radius, timeout=timeout,
-                tool_chest=tool_chest,
+                tool_chest=tool_chest, tool_chests=tool_chests,
             ))
         except (Exception, asyncio.CancelledError) as error:
             error.collection_progress = progress.snapshot()
@@ -207,37 +237,37 @@ class _BlockCollector:
     async def collect_by_count(
         self, bot: "Bot", names: str | int | Iterable[str] | Iterable[int], *, item_id: int, count: int,
         radius: int = 16, ticks: int = 160, search_radius: int = 8, timeout: float = 15,
-        tool_chest: HarvestToolChest | None = None,
+        tool_chest: HarvestToolChest | None = None, tool_chests: Sequence[HarvestToolChest] | None = None,
     ) -> CountedBlockCollection:
         return await self._collect_counted(
             bot, partial(self.blocks.find_blocks, names, radius=radius, limit=None),
             item_id=item_id, count=count, ticks=ticks, search_radius=search_radius, timeout=timeout,
-            tool_chest=tool_chest,
+            tool_chest=tool_chest, tool_chests=tool_chests,
         )
 
     async def collect_vein_by_count(
         self, bot: "Bot", seed: tuple[int, int, int], *, item_id: int, count: int,
         max_blocks: int, max_distance: int, flood_radius: int, ticks: int, search_radius: int, timeout: float,
-        tool_chest: HarvestToolChest | None = None,
+        tool_chest: HarvestToolChest | None = None, tool_chests: Sequence[HarvestToolChest] | None = None,
     ) -> CountedBlockCollection:
         return await self._collect_counted(
             bot, partial(self.blocks.find_block_vein, seed, max_blocks=max_blocks, max_distance=max_distance,
                          flood_radius=flood_radius),
             item_id=item_id, count=count, ticks=ticks, search_radius=search_radius, timeout=timeout,
-            tool_chest=tool_chest, report_completeness=True,
+            tool_chest=tool_chest, tool_chests=tool_chests, report_completeness=True,
         )
 
     async def _collect_counted(
         self, bot: "Bot", find_candidates: Callable[[], BlockSearchResult], *, item_id: int, count: int,
         ticks: int, search_radius: int, timeout: float, tool_chest: HarvestToolChest | None,
+        tool_chests: Sequence[HarvestToolChest] | None,
         report_completeness: bool = False,
     ) -> CountedBlockCollection:
         if not isinstance(item_id, int) or isinstance(item_id, bool) or item_id == 0:
             raise ValueError("collection item ID must be a nonzero integer")
         if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
             raise ValueError("collection count must be a positive integer")
-        if tool_chest is not None and not isinstance(tool_chest, HarvestToolChest):
-            raise TypeError("tool_chest must be a HarvestToolChest")
+        tool_chests = _snapshot_tool_chests(tool_chest, tool_chests)
         progress = _CountedProgress(self.blocks.dimension_id, item_id, count)
         try:
             self._check_connection()
@@ -253,7 +283,7 @@ class _BlockCollector:
             if observations:
                 await self._run(self._collect_batch(
                     bot, progress, observations, epoch, ticks=ticks, search_radius=search_radius,
-                    timeout=timeout, tool_chest=tool_chest,
+                    timeout=timeout, tool_chest=tool_chest, tool_chests=tool_chests,
                 ))
         except (Exception, asyncio.CancelledError) as error:
             error.collection_progress = progress.snapshot()
@@ -332,11 +362,14 @@ class _BlockCollector:
     async def _collect_batch(
         self, bot: "Bot", progress: _BatchProgress, observations: tuple[BlockObservation | None, ...], epoch: int, *,
         ticks: int, search_radius: int, timeout: float, tool_chest: HarvestToolChest | None,
+        tool_chests: tuple[HarvestToolChest, ...] | None,
     ) -> None:
         counted = progress if isinstance(progress, _CountedProgress) else None
-        refill = None if tool_chest is None else partial(
-            self._refill_tool, bot, tool_chest, dimension=progress.dimension_id, epoch=epoch,
-            ticks=ticks, search_radius=search_radius, timeout=timeout,
+        ordered_refill = tool_chests is not None
+        chests = tool_chests if tool_chests is not None else (tool_chest,) if tool_chest is not None else ()
+        refill = None if not chests else partial(
+            self._refill_tool, bot, dimension=progress.dimension_id, epoch=epoch,
+            ticks=ticks, search_radius=search_radius, timeout=timeout, ordered=ordered_refill,
         )
         async with self._lock:
             for position, before in zip(progress.positions, observations, strict=True):
@@ -344,7 +377,8 @@ class _BlockCollector:
                 self.blocks._check_mining_epoch(epoch)
                 result = await self._collect_one(
                     position, before, progress.dimension_id, ticks=ticks, search_radius=search_radius,
-                    timeout=timeout, epoch=epoch, progress=progress, refill=refill,
+                    timeout=timeout, epoch=epoch, progress=progress, refill=refill, refill_chests=chests,
+                    ordered_refill=ordered_refill,
                 )
                 progress.results.append(result)
                 progress.active = None
@@ -355,6 +389,11 @@ class _BlockCollector:
                 received = _confirmed_item_count(result, counted.item_id)
                 counted.collected_count += received
                 if result.status == "target_changed":
+                    acquisition = result.tool_acquisition
+                    if result.tool_refill_attempts and not (
+                        _settled_refill_miss(acquisition) or (acquisition is not None and acquisition.status == "equipped")
+                    ):
+                        break
                     self.blocks._check_mining_epoch(epoch)
                     continue
                 if (result.status != "collected" or result.timed_out or received == 0
@@ -448,7 +487,7 @@ class _BlockCollector:
 
     async def _refill_tool(
         self, bot: "Bot", chest: HarvestToolChest, target: BlockObservation, *, dimension: int, epoch: int,
-        ticks: int, search_radius: int, timeout: float,
+        ticks: int, search_radius: int, timeout: float, ordered: bool,
     ) -> HarvestToolAcquisition | None:
         chest_block = self.harvest._refill_chest(target, chest.position)
         if chest_block is None:
@@ -468,20 +507,54 @@ class _BlockCollector:
         if (busy := self.harvest._window_busy()) is not None:
             return HarvestToolAcquisition(busy)
         if route.status != "reached":
+            if (ordered and route.status == "unreachable"
+                    and self.harvest._refill_chest(target, chest.position) != chest_block):
+                return None
             status = {"unknown": "unobserved", "budget": "budget_exhausted"}.get(route.status, route.status)
             return HarvestToolAcquisition(f"chest_approach_{status}")
         match, = route.matches
         assert isinstance(match, BlockInteractionMatch) and match.position == chest.position
-        return await self.harvest._equip_from_chest(
-            bot, target.position, chest=chest.position, chest_slots=chest.chest_slots,
-            inventory_slots=chest.inventory_slots, face=match.face, click_pos=match.click_pos, timeout=timeout,
-            expected_target=target, expected_chest=chest_block, expected_epoch=epoch,
-        )
+        unsubscribe = None
+        window_replaced = False
+
+        def track_owned_window(owned):
+            nonlocal unsubscribe
+            packets = self.blocks.packets
+            close_id = packets.protocol.binding.ContainerClosePacket.ID
+
+            def observe_window(raw):
+                nonlocal window_replaced
+                window = self.harvest._containers.window
+                if window is not None and window is not owned:
+                    window_replaced = True
+                elif window is None and raw.packet_id == close_id:
+                    if int(packets.protocol.decode(raw).container_id) == owned.container_id:
+                        stop_observing()
+
+            # The close packet matches by ID. A replacement can reuse that ID
+            # and disappear before the acquisition returns.
+            stop_observing = packets.subscribe_raw(observe_window)
+            unsubscribe = stop_observing
+
+        try:
+            acquisition = await self.harvest._equip_from_chest(
+                bot, target.position, chest=chest.position, chest_slots=chest.chest_slots,
+                inventory_slots=chest.inventory_slots, face=match.face, click_pos=match.click_pos, timeout=timeout,
+                expected_target=target, expected_chest=chest_block, expected_epoch=epoch,
+                on_owned_window=track_owned_window if ordered else None,
+            )
+        finally:
+            if unsubscribe is not None:
+                unsubscribe()
+        if window_replaced and acquisition.status in ("equipped", "tool_unavailable"):
+            return replace(acquisition, status="window_changed")
+        return acquisition
 
     async def _collect_one(
         self, position: tuple[int, int, int], before: BlockObservation | None, dimension: int, *,
         ticks: int, search_radius: int, timeout: float, epoch: int | None = None,
         progress: _BatchProgress | _MixedProgress | None = None, refill: _ToolRefill | None = None,
+        refill_chests: tuple[HarvestToolChest, ...] = (), ordered_refill: bool = False,
     ) -> BlockCollection:
         if before is None or before.is_air is None:
             return BlockCollection(position, "target_unobserved", before)
@@ -508,6 +581,12 @@ class _BlockCollector:
                 return "target_changed"
             return None
 
+        def remember_refill(chest: HarvestToolChest, acquisition: HarvestToolAcquisition | None) -> None:
+            attempts = evidence.tool_refill_attempts
+            if ordered_refill:
+                attempts += ((chest, acquisition),)
+            remember(replace(evidence, tool_acquisition=acquisition, tool_refill_attempts=attempts))
+
         remember(evidence)
         while True:
             approach, match = await self._approach(position, ticks=ticks, search_radius=search_radius, timeout=timeout)
@@ -531,17 +610,28 @@ class _BlockCollector:
                 break
             if refill is None:
                 return replace(evidence, status="tool_unavailable")
-            try:
-                acquisition = await refill(before)
-            except (Exception, asyncio.CancelledError) as error:
-                remember(replace(evidence, tool_acquisition=getattr(error, "harvest_progress", None)))
-                if not isinstance(error, TimeoutError):
-                    raise
-                self._check_connection()
-                return replace(evidence, status="tool_timeout", timed_out=True)
-            remember(replace(evidence, tool_acquisition=acquisition))
-            if (status := check_target()) is not None:
-                return replace(evidence, status=status)
+            acquisition = None
+            for chest in refill_chests:
+                try:
+                    acquisition = await refill(chest, before)
+                except (Exception, asyncio.CancelledError) as error:
+                    remember_refill(chest, getattr(error, "harvest_progress", None))
+                    if not isinstance(error, TimeoutError):
+                        raise
+                    self._check_connection()
+                    return replace(evidence, status="tool_timeout", timed_out=True)
+                remember_refill(chest, acquisition)
+                status = check_target()
+                if status == "dimension_changed":
+                    return replace(evidence, status=status)
+                settled_miss = ordered_refill and _settled_refill_miss(acquisition)
+                equipped = acquisition is not None and acquisition.status == "equipped"
+                if ordered_refill and (settled_miss or equipped) and self.harvest._window_busy() is not None:
+                    return replace(evidence, status="tool_refill_failed")
+                if status is not None:
+                    return replace(evidence, status=status)
+                if not settled_miss:
+                    break
             if acquisition is None or acquisition.status == "tool_unavailable":
                 return replace(evidence, status="tool_unavailable")
             if acquisition.status != "equipped":
@@ -560,7 +650,8 @@ class _BlockCollector:
                 raise _BeforeStartRejected("unobserved" if error.status == "unknown" else "unreachable") from None
 
         def with_equipment(result: BlockCollection) -> BlockCollection:
-            return replace(result, approach=approach, tool=tool, tool_acquisition=evidence.tool_acquisition)
+            return replace(result, approach=approach, tool=tool, tool_acquisition=evidence.tool_acquisition,
+                           tool_refill_attempts=evidence.tool_refill_attempts)
 
         def record(result: BlockCollection) -> None:
             remember(with_equipment(result))
