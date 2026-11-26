@@ -17,6 +17,9 @@ from test_world_observation import Transport
 _IMPULSE_BLOCK = 22542
 _REPEATING_BLOCK = 22251
 _CHAIN_BLOCK = 18747
+# The same facing with conditional_bit cleared.
+_UNCONDITIONAL_IMPULSE_BLOCK = 22536
+_UNCONDITIONAL_CHAIN_BLOCK = 18741
 
 
 class CommandTests(unittest.IsolatedAsyncioTestCase):
@@ -83,13 +86,15 @@ class CommandBlockTests(unittest.IsolatedAsyncioTestCase):
         x, y, z = self.position
         return self.b.UpdateBlockPacket(pos=self.b.BlockPos(x=x, y=y, z=z), runtime_id=runtime_id, layer=0)
 
-    def actor(self, command="say previous command", *, position=None, output="", filtered_name=None):
+    def actor(self, command="say previous command", *, position=None, output="", filtered_name=None,
+              always_active=True, conditional=True, track_output=False):
         x, y, z = self.position if position is None else position
         data = nbt.CompoundTag({
             "id": nbt.StringTag("CommandBlock"), "x": nbt.IntTag(x), "y": nbt.IntTag(y), "z": nbt.IntTag(z),
-            "Command": nbt.StringTag(command), "auto": nbt.ByteTag(1), "conditionalMode": nbt.ByteTag(1),
+            "Command": nbt.StringTag(command), "auto": nbt.ByteTag(always_active),
+            "conditionalMode": nbt.ByteTag(conditional),
             "conditionMet": nbt.ByteTag(0), "powered": nbt.ByteTag(0), "CustomName": nbt.StringTag("Keep this name"),
-            "TrackOutput": nbt.ByteTag(0), "TickDelay": nbt.IntTag(12), "ExecuteOnFirstTick": nbt.ByteTag(1),
+            "TrackOutput": nbt.ByteTag(track_output), "TickDelay": nbt.IntTag(12), "ExecuteOnFirstTick": nbt.ByteTag(1),
             "LastOutput": nbt.StringTag(output),
         })
         if filtered_name is not None:
@@ -152,6 +157,75 @@ class CommandBlockTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(packet.track_output)
                 self.assertEqual(packet.tick_delay, 12)
                 self.assertTrue(packet.execute_on_first_tick)
+
+    async def test_command_block_explicit_mode_and_flags_require_matching_terrain_and_actor(self):
+        await self.deliver(self.block(), self.actor(self.command, output="cached"))
+        flags = {"always_active": False, "conditional": False, "track_output": True}
+
+        def report(output, **overrides):
+            return self.actor(self.command, output=output, **(flags | overrides))
+
+        async def receive():
+            malformed = report("wrong tag type")
+            data = nbt.CompoundTag(malformed.data)
+            data["TrackOutput"] = nbt.IntTag(1)
+            malformed.data = data
+            await self.deliver(
+                self.block(_UNCONDITIONAL_IMPULSE_BLOCK), report("old mode"),
+                self.block(_CHAIN_BLOCK), report("old conditional bit"),
+                self.block(_UNCONDITIONAL_CHAIN_BLOCK),
+                report("old auto", always_active=True),
+                report("old conditional flag", conditional=True),
+                report("old track output", track_output=False),
+                malformed, report("all requested settings"),
+            )
+
+        with self.during_command_send(receive):
+            result = await self.bot.set_command_block(self.position, self.command, mode="chain", timeout=1, **flags)
+
+        self.assertIsInstance(result, BlockEntityUpdate)
+        self.assertEqual((result.dimension_id, result.position), (0, self.position))
+        self.assertEqual(result.data["LastOutput"].value, "all requested settings")
+        self.assertEqual(result.data["Command"].value, self.command)
+        self.assertEqual(len(self.transport.sent), 1)
+        packet, = self.sent_commands()
+        self.assertEqual(packet.command, self.command)
+        self.assertEqual(packet.target.mode, self.b.CommandBlockMode.CHAIN)
+        self.assertTrue(packet.target.redstone_mode)
+        self.assertFalse(packet.target.is_conditional)
+        self.assertTrue(packet.track_output)
+
+    async def test_command_block_explicit_false_preserves_omitted_options(self):
+        filtered_name = "Filtered name"
+        await self.deliver(self.block(_REPEATING_BLOCK), self.actor(track_output=True, filtered_name=filtered_name))
+
+        async def receive():
+            await self.deliver(self.actor(self.command, always_active=False, track_output=True,
+                                          filtered_name=filtered_name))
+
+        with self.during_command_send(receive):
+            result = await self.bot.set_command_block(self.position, self.command, always_active=False, timeout=1)
+
+        self.assertEqual(result.data["auto"].value, 0)
+        self.assertEqual(len(self.transport.sent), 1)
+        packet, = self.sent_commands()
+        self.assertEqual(packet.target.mode, self.b.CommandBlockMode.REPEATING)
+        self.assertTrue(packet.target.redstone_mode)
+        self.assertTrue(packet.target.is_conditional)
+        self.assertTrue(packet.track_output)
+        self.assertEqual(packet.name, "Keep this name")
+        self.assertEqual(packet.filtered_name, filtered_name)
+        self.assertEqual(packet.tick_delay, 12)
+        self.assertTrue(packet.execute_on_first_tick)
+
+    async def test_command_block_rejects_invalid_edit_options_without_sending(self):
+        await self.deliver(self.block(), self.actor())
+
+        for kwargs in ({"mode": "normal"}, {"always_active": 1}, {"conditional": 0}, {"track_output": "false"}):
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                await self.bot.set_command_block(self.position, self.command, timeout=1, **kwargs)
+
+        self.assertEqual(self.transport.sent, [])
 
     async def test_command_block_rejection_and_zero_timeout_do_not_send(self):
         with self.assertRaises(RuntimeError):

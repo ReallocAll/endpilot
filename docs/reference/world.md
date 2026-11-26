@@ -54,17 +54,29 @@ dimension. On stock Bedrock Dedicated Server, give the bot operator
 permission and use creative mode in a world with cheats and command blocks
 enabled.
 
-In a world you control, set a message on an observed impulse block that
-requires redstone.
+Pass `mode` as `"impulse"`, `"repeating"`, or `"chain"`. The
+`always_active`, `conditional`, and `track_output` keywords take booleans.
+Omit any of these options or pass `None` to keep its observed value. Pass
+`False` to turn a boolean setting off.
+
+In a world you control, set a message and disable output tracking on an
+observed impulse block that requires redstone.
 
 ```python
-update = await bot.set_command_block((8, 220, 8), "say Test pulse received", timeout=15)
+update = await bot.set_command_block(
+    (8, 220, 8), "say Test pulse received", track_output=False, timeout=15
+)
 ```
 
-The action sends one edit, preserving the observed mode and settings. It
-returns a fresh `BlockEntityUpdate` once the server reports the requested text
-at that position in the same dimension. To run the command on the example
-block, supply a redstone pulse and meet any configured condition.
+The action sends one edit and preserves the other settings. It returns a
+fresh `BlockEntityUpdate` when a standalone block entity packet at the same
+position in the same dimension confirms the command text and requested
+boolean settings, and the observed block state matches the target mode. If
+you set `conditional` explicitly, the block state's conditional flag must
+also match.
+
+The server determines when the command runs. For the example block, supply
+a redstone pulse and meet any configured condition.
 
 If the deadline expires before confirmation, the call raises `TimeoutError`.
 Cancelling the action ends the wait. In either case, the server may still

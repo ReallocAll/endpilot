@@ -14,11 +14,12 @@ from .protocol import RawPacket
 _DISCONNECT_ERROR = "server disconnected while waiting for command feedback"
 _EDIT_DISCONNECT_ERROR = "connection ended during command block edit"
 _EDIT_DIMENSION_ERROR = "dimension changed during command block edit"
-_COMMAND_BLOCK_MODES = {
-    "minecraft:command_block": CommandBlockMode.NORMAL,
-    "minecraft:repeating_command_block": CommandBlockMode.REPEATING,
-    "minecraft:chain_command_block": CommandBlockMode.CHAIN,
+_COMMAND_BLOCK_TYPES = {
+    "impulse": ("minecraft:command_block", CommandBlockMode.NORMAL),
+    "repeating": ("minecraft:repeating_command_block", CommandBlockMode.REPEATING),
+    "chain": ("minecraft:chain_command_block", CommandBlockMode.CHAIN),
 }
+_COMMAND_BLOCK_MODES = dict(_COMMAND_BLOCK_TYPES.values())
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,14 +227,24 @@ class Commands:
                 waiting.cancel()
                 await asyncio.gather(waiting, return_exceptions=True)
 
-    async def set_command_block(self, blocks: Blocks, position: tuple[int, int, int], command: str,
-                                *, timeout: float) -> BlockEntityUpdate:
+    async def set_command_block(
+        self, blocks: Blocks, position: tuple[int, int, int], command: str, *,
+        timeout: float, mode: str | None = None, always_active: bool | None = None,
+        conditional: bool | None = None, track_output: bool | None = None,
+    ) -> BlockEntityUpdate:
         if (not isinstance(position, (tuple, list)) or len(position) != 3
                 or any(type(axis) is not int or not -(1 << 31) <= axis < (1 << 31) for axis in position)):
             raise ValueError("command block position must contain three signed 32-bit integers")
         position = tuple(position)
         if not isinstance(command, str):
             raise ValueError("command block command must be a string")
+        if mode is not None and (type(mode) is not str or mode not in _COMMAND_BLOCK_TYPES):
+            raise ValueError("command block mode must be 'impulse', 'repeating', or 'chain'")
+        for option, value in (
+            ("always_active", always_active), ("conditional", conditional), ("track_output", track_output),
+        ):
+            if value is not None and type(value) is not bool:
+                raise ValueError(f"command block {option} must be a bool")
         if not isfinite(timeout):
             raise ValueError("command block edit timeout must be finite")
         if timeout <= 0:
@@ -246,6 +257,7 @@ class Commands:
         failure: asyncio.Future[Exception] = loop.create_future()
         received: asyncio.Future[BlockEntityUpdate] = loop.create_future()
         send_started = False
+        target_seen = False
 
         def require_context():
             if failure.done():
@@ -261,16 +273,30 @@ class Commands:
         command.encode("utf-8")
         snapshot = _command_block_snapshot(blocks, position)
         initial_block, options = snapshot
+        if mode is None:
+            target_name = initial_block.name
+            target_mode = _COMMAND_BLOCK_MODES[target_name]
+        else:
+            target_name, target_mode = _COMMAND_BLOCK_TYPES[mode]
+        target_auto = not options.requires_redstone if always_active is None else always_active
+        target_conditional = options.conditional if conditional is None else conditional
+        target_track_output = options.track_output if track_output is None else track_output
+        expected_flags = ()
+        if any(option is not None for option in (mode, always_active, conditional, track_output)):
+            expected_flags = (
+                ("auto", target_auto), ("conditionalMode", target_conditional), ("TrackOutput", target_track_output),
+            )
+
         b = self.packets.protocol.binding
         update_type = b.CommandBlockUpdatePacket
         x, y, z = position
         target = update_type.BlockCommandData(
-            block_pos=b.BlockPos(x=x, y=y, z=z), mode=_COMMAND_BLOCK_MODES[initial_block.name],
-            redstone_mode=options.requires_redstone, is_conditional=options.conditional,
+            block_pos=b.BlockPos(x=x, y=y, z=z), mode=target_mode,
+            redstone_mode=not target_auto, is_conditional=target_conditional,
         )
         packet = update_type(
             target=target, command=command, last_output=options.last_output,
-            name=options.name, filtered_name=options.filtered_name, track_output=options.track_output,
+            name=options.name, filtered_name=options.filtered_name, track_output=target_track_output,
             tick_delay=options.tick_delay, execute_on_first_tick=options.execute_on_first_tick,
         )
 
@@ -282,11 +308,18 @@ class Commands:
             if "id" not in root or "Command" not in root:
                 return
             actor_id, text = root["id"], root["Command"]
-            if (isinstance(actor_id, nbt.StringTag) and actor_id.value == "CommandBlock"
-                    and isinstance(text, nbt.StringTag) and text.value == command):
-                block = blocks.observed_block_state(position)
-                if block is not None and block.name == initial_block.name:
-                    received.set_result(update)
+            if (not isinstance(actor_id, nbt.StringTag) or actor_id.value != "CommandBlock"
+                    or not isinstance(text, nbt.StringTag) or text.value != command):
+                return
+            block = blocks.observed_block_state(position)
+            if block is None or block.name != target_name:
+                return
+            for key, value in expected_flags:
+                if key not in root or not isinstance(tag := root[key], nbt.ByteTag) or tag.value != value:
+                    return
+            if conditional is not None and block.properties.get("conditional_bit") != target_conditional:
+                return
+            received.set_result(update)
 
         terrain_packets = (
             b.UpdateBlockPacket.ID, b.UpdateSubChunkBlocksPacket.ID, b.SubChunkPacket.ID,
@@ -294,11 +327,16 @@ class Commands:
         )
 
         def observe_terrain(raw: RawPacket):
+            nonlocal target_seen
             if failure.done() or raw.packet_id not in terrain_packets:
                 return
             if send_started:
                 block = blocks.observed_block_state(position)
-                if block is not None and block.name != initial_block.name:
+                if block is None:
+                    return
+                if block.name == target_name:
+                    target_seen = True
+                elif target_seen or block.name != initial_block.name:
                     failure.set_result(RuntimeError("command block target changed while waiting for its update"))
                 return
             # A replacement can clear the actor before a later packet describes a new one.

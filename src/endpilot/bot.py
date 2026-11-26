@@ -2404,21 +2404,27 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._commands.execute(command, timeout=timeout)
 
-    async def set_command_block(self, position: tuple[int, int, int], command: str, *,
-                                timeout: float = 15) -> BlockEntityUpdate:
-        """Set the exact command text of an observed command block on protocol 2225.
+    async def set_command_block(
+        self, position: tuple[int, int, int], command: str, *, timeout: float = 15,
+        mode: Literal["impulse", "repeating", "chain"] | None = None, always_active: bool | None = None,
+        conditional: bool | None = None, track_output: bool | None = None,
+    ) -> BlockEntityUpdate:
+        """Set the command text and selected settings of an observed command block on protocol 2225.
 
-        Send one edit preserving the impulse, repeating, or chain mode and the
-        observed settings. Return the next matching direct block entity update
-        within the deadline. The server decides whether to accept the edit.
-        The update reports observed text, without proving command execution.
+        A setting of None preserves its observed value. Send one edit and return
+        the next matching direct block entity update within the deadline. The server
+        decides whether to accept the edit. The update reports the observed edit,
+        without proving command execution.
         """
         if self.protocol.number != 2225:
             raise NotImplementedError("command block editing is supported on protocol 2225")
         commands, blocks = self._commands, self._blocks
         if commands is None or blocks is None:
             raise ConnectionError("player is not connected")
-        return await commands.set_command_block(blocks, position, command, timeout=timeout)
+        return await commands.set_command_block(
+            blocks, position, command, timeout=timeout, mode=mode, always_active=always_active,
+            conditional=conditional, track_output=track_output,
+        )
 
     @property
     def health(self) -> float | None:
