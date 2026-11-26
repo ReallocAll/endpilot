@@ -18,6 +18,33 @@ Known air has the name `minecraft:air` and an empty property mapping. The
 returns `None` for missing observations, unresolved IDs, unverified sequential
 IDs and unsupported protocol versions. It sends no packets.
 
+## Observe block entity updates
+
+`bot.observed_block_entity((x, y, z))` reads an independent native NBT copy
+from the current dimension's cache. An empty compound is a known value.
+`None` means there is no current observation.
+
+```python
+def on_update(event):
+    print(event.dimension_id, event.position, event.data)
+
+unsubscribe = bot.subscribe_block_entity_updates(on_update, position=(8, 64, 9), dimension_id=0)
+```
+
+Omit either filter to receive updates at any position or in any dimension
+the bot visits during the session. The synchronous callback runs after the
+cache and sign handling for each accepted standalone `BlockActorDataPacket`.
+Equal retransmissions each deliver their own event in packet order.
+The frozen `BlockEntityUpdate` holds the dimension ID, integer position, and
+a mutable native `CompoundTag` copy owned by this callback, including its
+nested tags.
+
+Delivery begins with the next dispatched packet after registration. Existing
+cache entries, retained login terrain, block replacements, evictions, and NBT
+in chunk payloads produce no events. Calling `unsubscribe()` stops delivery
+immediately and is safe to repeat. Delivery also ends with the session.
+Both APIs send no packets.
+
 ## Estimate a source-free script explosion
 
 On vanilla Bedrock 2225, use this synchronous query before a single

@@ -131,6 +131,15 @@ class BlockChange:
     after: BlockObservation
 
 
+@dataclass(frozen=True, slots=True)
+class BlockEntityUpdate:
+    """A direct block entity update with an independently mutable NBT root."""
+
+    dimension_id: int
+    position: tuple[int, int, int]
+    data: nbt.CompoundTag
+
+
 @dataclass(slots=True)
 class _ColumnCoverage:
     announced: bool = False
@@ -266,6 +275,9 @@ class Blocks:
         self._column_waiters: dict[tuple[int, int], list[_CoverageWaiter]] = {}
         self._column_observers: list[Callable[[ColumnCoverageEvent], None]] = []
         self._block_observers: list[Callable[[BlockChange], None]] = []
+        self._block_entity_observers: dict[object, Callable[[], None]] = {}
+        self._last_replayed_block_entity: RawPacket | None = None
+        self._applied_block_entity: tuple[RawPacket, int, tuple[int, int, int], nbt.CompoundTag] | None = None
         self._closed = False
 
     def start(
@@ -301,6 +313,8 @@ class Blocks:
         self._updates.clear()
         self._sub_chunks.clear()
         self._block_entities.clear()
+        self._last_replayed_block_entity = None
+        self._applied_block_entity = None
         self._published_bounds = None
         self._request_column = None
 
@@ -312,10 +326,14 @@ class Blocks:
         self._invalidate_columns(self.dimension_id, failure, lambda column: True)
         self._column_observers.clear()
         self._block_observers.clear()
+        for remove in self._block_entity_observers.values():
+            remove()
+        self._block_entity_observers.clear()
 
     def _on_packet(self, raw) -> None:
         if self._closed:
             return
+        self._applied_block_entity = None
         b = self.packets.protocol.binding
         if raw.packet_id == b.ChangeDimensionPacket.ID:
             self._invalidate_mining()
@@ -341,10 +359,16 @@ class Blocks:
         elif raw.packet_id == b.LevelChunkPacket.ID:
             self._observe_column(self.packets.protocol.decode(raw))
         elif raw.packet_id == b.BlockActorDataPacket.ID:
+            replaying = self._last_replayed_block_entity is not None
+            if raw is self._last_replayed_block_entity:
+                self._last_replayed_block_entity = None
             packet = self.packets.protocol.decode(raw)
             pos = (int(packet.pos.x), int(packet.pos.y), int(packet.pos.z))
             if self._column_is_published(pos[0] >> 4, pos[2] >> 4):
-                self._set_block_entity(pos, nbt.CompoundTag(packet.data))
+                root = nbt.CompoundTag(packet.data)
+                self._set_block_entity(pos, root)
+                if self._block_entity_observers and not replaying:
+                    self._applied_block_entity = (raw, self.dimension_id, pos, root)
         elif raw.packet_id == b.UpdateBlockPacket.ID:
             packet = self.packets.protocol.decode(raw)
             self._apply_update(packet, int(packet.layer))
@@ -712,6 +736,39 @@ class Blocks:
                 callback(change)
 
         return PacketConnection._subscribe(self._block_observers, filtered)
+
+    def subscribe_block_entity_updates(
+        self, callback: Callable[[BlockEntityUpdate], None], *,
+        position: tuple[int, int, int] | None = None, dimension_id: int | None = None,
+    ) -> Callable[[], None]:
+        if self._closed or self.packets._reader_end_result()[0]:
+            raise ConnectionError("world observation ended")
+        registrations = self._block_entity_observers
+        if not registrations:
+            # Retained login terrain is replayed before any newly received packets.
+            actor_id = self.packets.protocol.binding.BlockActorDataPacket.ID
+            self._last_replayed_block_entity = next(
+                (raw for raw in reversed(self.packets._replayed) if raw.packet_id == actor_id), None,
+            )
+        key = object()
+
+        def observe(raw):
+            applied = self._applied_block_entity
+            if applied is None or raw is not applied[0] or key not in registrations:
+                return
+            _, dimension, pos, root = applied
+            if ((position is None or position == pos)
+                    and (dimension_id is None or dimension_id == dimension)):
+                self._notify_observers((callback,), BlockEntityUpdate(dimension, pos, nbt.CompoundTag(root)))
+
+        def unsubscribe():
+            remove = registrations.pop(key, None)
+            if remove is not None:
+                remove()
+
+        # Join the raw dispatch snapshot so registration inside a raw callback starts with the next packet.
+        registrations[key] = self.packets.subscribe_raw(observe)
+        return unsubscribe
 
     def observed_block(self, position: tuple[int, int, int], *, layer: int = 0) -> BlockObservation | None:
         """Return the latest observation, or None until the server describes this layer."""

@@ -6,7 +6,7 @@ from .beds import BedObservation, PlayerRespawnPoint, SleepRejected
 from .biome_data import VanillaBiome, vanilla_biomes
 from .block_raycast import BlockRaycastResult, MiningFaceResult
 from .blocks import (
-    BlockChange, BlockMatch, BlockObservation, BlockSearchResult, BlockStateObservation, ColumnCoverage,
+    BlockChange, BlockEntityUpdate, BlockMatch, BlockObservation, BlockSearchResult, BlockStateObservation, ColumnCoverage,
     ColumnCoverageEvent, ColumnCoverageInvalidated, DimensionBounds, MiningFaceUnavailable, MiningTarget,
 )
 from .books import BookSnapshot
@@ -62,6 +62,7 @@ __all__ = [
     "BlockChange",
     "BlockCollection",
     "BlockCollectionBatch",
+    "BlockEntityUpdate",
     "BlockEvent",
     "BlockFaceGoal",
     "BlockFaceMatch",

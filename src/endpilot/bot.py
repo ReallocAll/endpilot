@@ -18,8 +18,8 @@ from .authentication import (
 from .beds import BedObservation, Beds, PlayerRespawnPoint
 from .block_raycast import BlockRaycastResult, MiningFaceResult
 from .blocks import (
-    Blocks, BlockChange, BlockMatch, BlockObservation, BlockSearchResult, BlockStateObservation, BlockUpdate,
-    ColumnCoverage, ColumnCoverageEvent, DimensionBounds, MiningTarget,
+    Blocks, BlockChange, BlockEntityUpdate, BlockMatch, BlockObservation, BlockSearchResult, BlockStateObservation,
+    BlockUpdate, ColumnCoverage, ColumnCoverageEvent, DimensionBounds, MiningTarget,
 )
 from .books import BookEdit, BookSnapshot, Books
 from .boss_bars import BossBar, BossBarEvent, BossBarEventKind, BossBars
@@ -1166,6 +1166,19 @@ class Bot:
         if self._blocks is None:
             raise RuntimeError("player has not joined")
         return self._blocks.observed_block_entity(position)
+
+    def subscribe_block_entity_updates(
+        self, callback: Callable[[BlockEntityUpdate], None], *,
+        position: tuple[int, int, int] | None = None, dimension_id: int | None = None,
+    ) -> Callable[[], None]:
+        """Observe future direct server block entity updates after the cache is updated.
+
+        The synchronous callback receives its own mutable NBT copy. Filters are
+        optional. The returned function stops delivery, as does session end.
+        """
+        if self._blocks is None:
+            raise RuntimeError("player has not joined")
+        return self._blocks.subscribe_block_entity_updates(callback, position=position, dimension_id=dimension_id)
 
     @property
     def dimension_bounds(self) -> DimensionBounds | None:

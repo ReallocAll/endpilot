@@ -10,7 +10,9 @@ import zlib
 
 from bedrock_protocol import nbt
 
-from endpilot import BlockObservation, BlockStateObservation, Bot, ColumnCoverageInvalidated, DimensionBounds
+from endpilot import (
+    BlockEntityUpdate, BlockObservation, BlockStateObservation, Bot, ColumnCoverageInvalidated, DimensionBounds,
+)
 from endpilot.compression import PacketConnection
 from endpilot.login import JoinSession
 from endpilot.protocol import RawPacket, read_batch, write_batch
@@ -35,7 +37,7 @@ class Transport:
 
 
 class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
-    async def connect(self, *, auto=False, hashed_runtime_ids=False, protocol=2225):
+    async def connect(self, *, auto=False, hashed_runtime_ids=False, protocol=2225, raw_observer=None):
         self.bot = Bot("Coverage", protocol=protocol)
         self.addAsyncCleanup(self.bot.close)
         self.b = self.bot.protocol.binding
@@ -44,6 +46,8 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
             compression_algorithm=self.b.PacketCompressionAlgorithm.ZLIB, compression_threshold=0,
         )
         packets = PacketConnection(self.transport, self.bot.protocol, settings)
+        if raw_observer is not None:
+            packets.subscribe_raw(raw_observer)
         session = JoinSession(packets, self.bot.identity, "http://127.0.0.1:19132")
         session.player_id, session.player_unique_id = 42, 7
         session.block_network_ids_are_hashes = hashed_runtime_ids
@@ -254,6 +258,143 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fresh["CustomName"].value, "first")
         self.assertEqual(self.transport.sent, [])
 
+    async def test_block_entity_updates_filter_copy_and_follow_cache_in_wire_order(self):
+        await self.connect()
+        position = (8, 20, 9)
+        await self.deliver(self.entity(8, "cached"))
+        seen, mutated, position_only, dimension_only = [], [], [], []
+
+        def mutate(update):
+            extra, item = update.data["Extra"], update.data["Items"][0]
+            extra["Long"] = nbt.Int64Tag(88)
+            item["Count"] = nbt.ByteTag(4)
+            update.data["Extra"], update.data["Items"] = extra, nbt.ListTag([item])
+            update.data["CustomName"] = nbt.StringTag("local")
+            mutated.append(update)
+
+        def observe(update):
+            seen.append((update, self.bot.observed_block_entity(update.position)))
+
+        self.bot.subscribe_block_entity_updates(mutate, position=position, dimension_id=0)
+        self.bot.subscribe_block_entity_updates(observe)
+        self.bot.subscribe_block_entity_updates(position_only.append, position=position)
+        self.bot.subscribe_block_entity_updates(dimension_only.append, dimension_id=1)
+        self.assertEqual(seen, [])
+
+        same = self.entity(8, "first")
+        await self.deliver(same, same, self.entity(9), self.b.ChangeDimensionPacket(dimension_id=1),
+                           self.entity(8, "next dimension"), self.entity(9, "neighbor"))
+
+        self.assertEqual([(event.dimension_id, event.position) for event, _ in seen],
+                         [(0, position), (0, position), (0, (9, 20, 9)), (1, position), (1, (9, 20, 9))])
+        self.assertEqual(len(mutated), 2)
+        self.assertEqual(position_only, [seen[i][0] for i in (0, 1, 3)])
+        self.assertEqual(dimension_only, [seen[i][0] for i in (3, 4)])
+        for event in mutated:
+            self.assertIsInstance(event, BlockEntityUpdate)
+            self.assertIsInstance(event.data, nbt.CompoundTag)
+            self.assertEqual(event.data["CustomName"].value, "local")
+            self.assertEqual(event.data["Extra"]["Long"].value, 88)
+            self.assertEqual(event.data["Items"][0]["Count"].value, 4)
+        with self.assertRaises(FrozenInstanceError):
+            mutated[0].dimension_id = 2
+        self.assertIsNot(mutated[0].data, mutated[1].data)
+        for event, cached in seen[:2]:
+            for data in (event.data, cached):
+                self.assertEqual(data["CustomName"].value, "first")
+                self.assertEqual(data["Extra"]["Long"].value, 1 << 40)
+                self.assertEqual(data["Items"][0]["Count"].value, 2)
+        self.assertEqual(list(seen[2][0].data.keys()), [])
+        self.assertEqual(list(seen[2][1].keys()), [])
+        self.assertEqual(seen[3][1]["CustomName"].value, "next dimension")
+        self.assertEqual(seen[4][1]["CustomName"].value, "neighbor")
+        self.assertEqual(self.transport.sent, [])
+
+    async def test_block_entity_updates_follow_sign_editor_invalidation(self):
+        await self.connect()
+        b = self.b
+        position = (8, 20, 9)
+        pos = b.BlockPos(x=8, y=20, z=9)
+        sign = nbt.CompoundTag({
+            "id": nbt.StringTag("Sign"), "IsWaxed": nbt.ByteTag(0),
+            "FrontText": nbt.CompoundTag({"Text": nbt.StringTag("front")}),
+            "BackText": nbt.CompoundTag({"Text": nbt.StringTag("back")}),
+        })
+        await self.deliver(b.BlockActorDataPacket(pos=pos, data=sign), b.OpenSignPacket(pos=pos, is_front_side=True))
+        self.assertIsNotNone(self.bot.sign_editor)
+        seen = []
+        self.bot.subscribe_block_entity_updates(lambda event: seen.append((event.position, self.bot.sign_editor)))
+        await self.deliver(self.entity(8, "replaced"))
+        self.assertEqual(seen, [(position, None)])
+        self.assertEqual(self.transport.sent, [])
+
+    async def test_block_entity_updates_register_and_unsubscribe_during_packet_dispatch(self):
+        early, late, recalled, removed = [], [], [], []
+        registered_early = False
+
+        def receive_early(raw):
+            nonlocal registered_early
+            if raw.packet_id == self.b.BlockActorDataPacket.ID and not registered_early:
+                registered_early = True
+                self.bot.subscribe_block_entity_updates(early.append)
+
+        await self.connect(raw_observer=receive_early)
+        loop = asyncio.get_running_loop()
+        errors = []
+        previous = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: errors.append(context))
+        self.addCleanup(loop.set_exception_handler, previous)
+
+        def first(event):
+            recalled.append(event.data["CustomName"].value)
+            if len(recalled) == 1:
+                unsubscribe_removed()
+                unsubscribe_removed()
+                self.bot.subscribe_block_entity_updates(late.append)
+                raise RuntimeError("observer failed")
+            if len(recalled) == 2:
+                raise asyncio.CancelledError()
+
+        unsubscribe_first = self.bot.subscribe_block_entity_updates(first)
+        unsubscribe_removed = self.bot.subscribe_block_entity_updates(removed.append)
+        await self.deliver(self.entity(8, "one"), self.entity(8, "two"), self.entity(8, "three"))
+        unsubscribe_first()
+        unsubscribe_first()
+        await self.deliver(self.entity(8, "four"))
+
+        self.assertEqual(recalled, ["one", "two", "three"])
+        self.assertEqual(removed, [])
+        for events in (early, late):
+            self.assertEqual([event.data["CustomName"].value for event in events], ["two", "three", "four"])
+        self.assertEqual([type(context["exception"]) for context in errors], [RuntimeError, asyncio.CancelledError])
+        self.assertTrue(all(context["callback"] is first for context in errors))
+        self.assertEqual(self.transport.sent, [])
+
+    async def test_block_entity_updates_stop_on_reader_failure_and_do_not_follow_rejoin(self):
+        with self.assertRaises(RuntimeError):
+            Bot().subscribe_block_entity_updates(lambda event: None)
+        await self.connect()
+        old, new = [], []
+        unsubscribe = self.bot.subscribe_block_entity_updates(old.append)
+        await self.deliver(self.entity(8, "before failure"))
+        self.transport.incoming.put_nowait(EOFError("reader ended"))
+        self.assertEqual((await self.bot.wait_for_session_end()).kind, "reader_end")
+        with self.assertRaises(ConnectionError):
+            self.bot.subscribe_block_entity_updates(old.append)
+        unsubscribe()
+        with self.assertRaisesRegex(EOFError, "reader ended"):
+            await self.bot.close()
+        await self.join_dimension_session(0)
+        self.bot.subscribe_block_entity_updates(new.append)
+        unsubscribe()
+        self.transport.incoming.put_nowait(write_batch((self.bot.protocol.encode(self.entity(8, "after rejoin")),)))
+        await asyncio.sleep(0)
+        self.assertEqual([event.data["CustomName"].value for event in old], ["before failure"])
+        self.assertEqual([event.data["CustomName"].value for event in new], ["after rejoin"])
+        await self.bot.close()
+        with self.assertRaises(RuntimeError):
+            self.bot.subscribe_block_entity_updates(new.append)
+
     async def test_block_entity_invalidates_on_main_layer_replacement_unload_dimension_and_disconnect(self):
         await self.connect()
         b = self.b
@@ -266,6 +407,8 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
             return b.UpdateSubChunkBlocksPacket(sub_chunk_block_position=pos,
                 blocks_changed=b.UpdateSubChunkBlocksChangedInfo(standards=standards, extras=extras))
 
+        updates = []
+        unsubscribe = self.bot.subscribe_block_entity_updates(updates.append)
         await self.deliver(main, self.entity(8, "before"), self.entity(9, "neighbor"))
         await self.deliver(b.UpdateBlockPacket(pos=pos, runtime_id=83, layer=1), changes(extras=[extra]))
         self.assertEqual(self.bot.observed_block_entity(one)["CustomName"].value, "before")
@@ -283,6 +426,11 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.observed_block_entity(two)["CustomName"].value, "new dimension")
         await self.deliver(b.DisconnectPacket(), self.entity(9, "after disconnect"))
         self.assertIsNone(self.bot.observed_block_entity(two))
+        self.assertEqual([update.data["CustomName"].value for update in updates],
+                         ["before", "neighbor", "replacement", "current", "new dimension"])
+        with self.assertRaises(ConnectionError):
+            self.bot.subscribe_block_entity_updates(updates.append)
+        unsubscribe()
 
     async def test_block_entity_section_without_cursor_clears_old_root_but_announcement_does_not(self):
         await self.connect()
@@ -304,6 +452,8 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
         neighbor = (24, 20, 9)
         await self.deliver(self.entity(24, "neighbor"))
         seen = []
+        updates = []
+        self.bot.subscribe_block_entity_updates(updates.append)
 
         def observed(event):
             roots = (self.bot.observed_block_entity(pos) for pos in (one, two))
@@ -318,6 +468,7 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             unsubscribe()
         self.assertEqual(seen, [("one", "two")])
+        self.assertEqual(updates, [])
         self.assertEqual(self.bot.observed_block_entity(neighbor)["CustomName"].value, "neighbor")
         self.assertIsNone(self.bot.observed_block_entity((25, 20, 9)))
         await self.deliver(self.entity_section(self.entity(8, "updated")))
@@ -348,10 +499,14 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
                     self.transport.incoming.put_nowait(write_batch((self.bot.protocol.encode(packet),)))
                 with patch("endpilot.transport.nethernet.connect", return_value=self.transport):
                     await self.bot.join_nethernet("http://127.0.0.1:19132", retain_initial_chunks=retain)
+                updates = []
+                self.bot.subscribe_block_entity_updates(updates.append)
                 marker = asyncio.create_task(self.bot.packets.wait_for_packet(b.SetTimePacket.ID, timeout=1))
                 await asyncio.sleep(0)
-                self.transport.incoming.put_nowait(write_batch((self.bot.protocol.encode(b.SetTimePacket()),)))
+                incoming = (self.entity(10, "live"), b.SetTimePacket())
+                self.transport.incoming.put_nowait(write_batch(map(self.bot.protocol.encode, incoming)))
                 await marker
+                self.assertEqual([update.data["CustomName"].value for update in updates], ["live"])
                 self.assertIsNone(self.bot.observed_block_entity((8, 20, 9)))
                 self.assertEqual(self.bot.observed_block_entity((9, 20, 9))["CustomName"].value, "current")
 
