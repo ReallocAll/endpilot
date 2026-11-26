@@ -85,6 +85,22 @@ class MiningFaceTests(unittest.IsolatedAsyncioTestCase):
 
         self.stream.send = accept
 
+    async def test_automatic_mining_after_a_sprint_jump_uses_the_settled_input_origin(self):
+        self.scene()
+        await self.bot.set_sprinting(True)
+        await self.bot.jump_forward(1)
+        for _ in range(12):
+            await self.movement._send_input(False)
+        self.assertNotEqual(self.stream.sent[-2].pos.z, self.stream.sent[-1].pos.z)
+        with self.assertRaisesRegex(MiningFaceUnavailable, "unknown"):
+            await self.bot.mine_block(TARGET, face=None)
+        for _ in range(32):
+            await self.movement._send_input(False)
+        self.assertEqual(self.stream.sent[-2].pos, self.stream.sent[-1].pos)
+        self.confirm_break_on_start()
+        update = await self.bot.mine_block(TARGET, face=None)
+        self.assertEqual(update, BlockUpdate(TARGET, HASHED_AIR_RUNTIME_ID, 0))
+
     async def test_read_only_geometry_and_auto_start_with_empty_hand_and_iron_pickaxe(self):
         self.scene()
         self.confirm_break_on_start()

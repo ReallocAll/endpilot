@@ -705,6 +705,22 @@ class Movement:
         eye = self._input_position if self._ray_pose_current and self._boat_input is None else None
         return eye, self._rotation
 
+    def _stationary_mining_pose(self):
+        eye, rotation = self.raycast_pose
+        if eye is None or not all(map(math.isfinite, eye)) or self._jump_floor_y is not None:
+            return None
+        directions = self._manual_directions()
+        if directions is not None and (any(directions) or self._velocity[0] or self._velocity[2]):
+            return None
+        dx, dz = self._sprint_jump_extra
+        if dx or dz:
+            # Sprint-jump drag can outlive any change to the float32 input position.
+            x, y, z = eye
+            vec = self.packets.protocol.binding.Vec3
+            if vec(x=x + dx, y=y, z=z + dz) != vec(x=x, y=y, z=z):
+                return None
+        return eye, rotation
+
     def _entity_cursor_pose(self) -> tuple[tuple[float, float, float], tuple[float, float]] | None:
         """Observed ordinary player head position and current input facing."""
         feet = self.observed_feet_position

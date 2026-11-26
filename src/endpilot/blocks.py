@@ -5,7 +5,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from heapq import nsmallest
-from math import atan2, degrees, dist, floor, hypot, isfinite, isqrt, prod
+from math import atan2, degrees, dist, floor, hypot, isqrt, prod
 from types import MappingProxyType
 from typing import Literal
 
@@ -1569,20 +1569,8 @@ class Blocks:
                 raise ValueError("mining target is outside ordinary reach")
         return block, eye, click
 
-    def _stationary_mining_pose(self):
-        eye, rotation = self.movement.raycast_pose
-        if eye is None or not all(map(isfinite, eye)):
-            return None
-        directions = self.movement._manual_directions()
-        velocity = self.movement.state.velocity
-        # The checked eye must also be the origin of the submitted action.
-        if (self.movement._jump_floor_y is not None or any(self.movement._sprint_jump_extra)
-                or (directions is not None and (any(directions) or velocity[0] or velocity[2]))):
-            return None
-        return eye, rotation
-
     def _has_mining_view_hit(self, target: MiningTarget) -> bool:
-        pose = self._stationary_mining_pose()
+        pose = self.movement._stationary_mining_pose()
         if pose is None:
             return False
         eye, (pitch, yaw) = pose
@@ -1609,7 +1597,7 @@ class Blocks:
         return (float(aim.x), float(aim.y)), status
 
     def _aim_mining_face(self, position, face, click_pos, *, encoded: bool = False) -> None:
-        pose = self._stationary_mining_pose()
+        pose = self.movement._stationary_mining_pose()
         if pose is None:
             raise MiningFaceUnavailable("unknown")
         eye, _ = pose
