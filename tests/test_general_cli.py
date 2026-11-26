@@ -11,7 +11,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import ANY, AsyncMock, patch
 
-from endpilot import BedrockCredentials, LoginRefused, ResourcePackDecision, Skin, _cli_terminal
+from endpilot import BedrockCredentials, LoginRefused, ResourcePackDecision, SessionEnd, Skin, _cli_terminal
 from endpilot import __main__ as cli
 from endpilot.__main__ import main
 from endpilot.authentication import OfflineIdentity
@@ -49,6 +49,31 @@ class GeneralCliTests(_CliTestCase):
         self.bot_factory.assert_called_once_with("EndPilot")
         self.bot.close.assert_awaited_once_with()
         self.assertEqual(self.stdout.getvalue().splitlines(), ["Joined.", "Disconnected."])
+
+    def test_join_hold_distinguishes_completion_peer_end_and_cancellation(self):
+        kicked = SessionEnd("server_disconnect", message="untrusted server text")
+        disconnected = "The server disconnected the player before the hold ended."
+        for outcome, snapshot, close_error, result, diagnostic in (
+            (TimeoutError(), None, None, 0, ""),
+            (kicked, kicked, None, 1, disconnected),
+            (TimeoutError(), kicked, None, 1, disconnected),
+            (SessionEnd("reader_end", error_type="EOFError"), None, EOFError("transport EOF"), 1,
+             "The connection ended before the hold ended."),
+            (asyncio.CancelledError(), None, None, 130, "Stopped."),
+        ):
+            with (self.subTest(outcome=outcome, snapshot=snapshot), redirect_stdout(StringIO()) as stdout,
+                  redirect_stderr(StringIO()) as stderr):
+                self.bot.wait_for_session_end = AsyncMock(
+                    side_effect=outcome if isinstance(outcome, BaseException) else None, return_value=outcome,
+                )
+                self.bot.session_end = snapshot
+                self.bot.close.reset_mock()
+                self.bot.close.side_effect = close_error
+                self.assertEqual(main(["join", "play.example:19132", "--hold", "0.01"]), result)
+                self.bot.wait_for_session_end.assert_awaited_once_with(timeout=0.01)
+                self.bot.close.assert_awaited_once_with()
+                self.assertEqual(stdout.getvalue().splitlines(), ["Joined."] if result else ["Joined.", "Disconnected."])
+                self.assertEqual(stderr.getvalue().splitlines(), [diagnostic] if diagnostic else [])
 
     def test_join_reports_login_refusal_and_closes_without_retrying(self):
         self.bot.join_address.side_effect = LoginRefused(

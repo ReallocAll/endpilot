@@ -180,6 +180,7 @@ async def _join(args, authorize_account=None, *, selected_account=None) -> None:
     else:
         bot = Bot("EndPilot", skin=_load_skin(args.skin, args.skin_model or "wide"))
 
+    hold_failure = None
     try:
         credential_provider = None
         if authorize_account is not None:
@@ -203,9 +204,24 @@ async def _join(args, authorize_account=None, *, selected_account=None) -> None:
             on_resource_packs=on_resource_packs,
         )
         _print_status("Joined.", flush=True)
-        await asyncio.sleep(args.hold)
+        if args.hold:
+            try:
+                end = await bot.wait_for_session_end(timeout=args.hold)
+            except TimeoutError:
+                end = bot.session_end
+            if end is not None:
+                message = ("The server disconnected the player before the hold ended."
+                           if end.kind == "server_disconnect" else "The connection ended before the hold ended.")
+                hold_failure = _CommandError(message)
     finally:
-        await bot.close()
+        try:
+            await bot.close()
+        except Exception as error:
+            if hold_failure is not None:
+                raise hold_failure from error
+            raise
+    if hold_failure is not None:
+        raise hold_failure
     _print_status("Disconnected.", flush=True)
 
 

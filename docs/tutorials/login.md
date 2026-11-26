@@ -47,7 +47,9 @@ python -m endpilot join raknet://127.0.0.1:19132 --hold 10
 ```
 
 After spawning, the CLI prints `Joined.` and then `Disconnected.` after the
-hold time. The default hold is two seconds. Press Ctrl+C to cancel.
+hold time. The default hold is two seconds. If the connection ends early, the
+command stops waiting, reports the disconnect and exits with status 1.
+Press Ctrl+C to cancel.
 Run `python -m endpilot join --help` for all join options. To join with a PNG
 skin, see [Load a skin at login](skins.md#load-a-skin-at-login).
 
