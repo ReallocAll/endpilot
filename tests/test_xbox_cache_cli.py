@@ -555,7 +555,7 @@ class XboxCacheCliTests(unittest.TestCase):
                                 resource_name=pack_name, chunk_id=0, byte_offset=0, data=data,
                             ),
                             b.ResourcePackStackPacket(texture_pack_ids_and_versions=[
-                                b.PackInstanceId(pack_id=pack_id, version="1.0.0"),
+                                b.PackInstanceId(pack_id=str(pack_id), version="1.0.0"),
                             ]),
                             b.StartGamePacket(runtime_id=11, entity_id=45),
                             b.PlayStatusPacket(status=b.PlayStatus.PLAYER_SPAWN),

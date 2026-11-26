@@ -149,9 +149,9 @@ class BlockSupportTests(unittest.TestCase):
             b"\x0eminecraft:test\x0a\x00\x08\x01a\x012\x03\x01z\x02\x00"
         ).hexdigest()
         with patch("endpilot.block_data._VANILLA_BLOCK_PROPERTIES_SHA256", expected):
-            self.assertTrue(matches_vanilla_palette(binding, checksum, [declared, air]))
-            self.assertFalse(matches_vanilla_palette(binding, 0, [declared, air]))
-            self.assertFalse(matches_vanilla_palette(binding, checksum, []))
+            self.assertTrue(matches_vanilla_palette(checksum, [declared, air]))
+            self.assertFalse(matches_vanilla_palette(0, [declared, air]))
+            self.assertFalse(matches_vanilla_palette(checksum, []))
             tag["z"] = nbt.IntTag(2)
             overridden = binding.ServerBlockProperty(name="minecraft:test", tag=tag)
-            self.assertFalse(matches_vanilla_palette(binding, checksum, [overridden, air]))
+            self.assertFalse(matches_vanilla_palette(checksum, [overridden, air]))

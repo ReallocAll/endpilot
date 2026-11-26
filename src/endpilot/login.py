@@ -580,7 +580,7 @@ class JoinSession:
                     # Vanilla also announces data-driven blocks. Use the static
                     # sequential palette only when the registry is confirmed.
                     self.has_custom_blocks = not matches_vanilla_palette(
-                        binding, game.server_block_type_registry_checksum, game.block_properties,
+                        game.server_block_type_registry_checksum, game.block_properties,
                     )
                 else:
                     self.has_custom_blocks = bool(game.block_properties)

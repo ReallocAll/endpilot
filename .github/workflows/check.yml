@@ -12,8 +12,7 @@ jobs:
           python-version: '3.12'
       - name: Install the native binding and SDK
         run: |
-          python -m pip install git+https://github.com/EndstoneMC/bedrock-protocol.git@1aa8ae119ccb0a4e60f693217d6dcdde00238d13
-          python -m pip install '.[nethernet,raknet,mcp]'
+          python -m pip install --only-binary=bedrock-protocol '.[nethernet,raknet,mcp]'
       - name: Test the SDK and run the offline example
         run: |
           python -m unittest discover -s tests -v

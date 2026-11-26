@@ -4,8 +4,29 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from importlib import import_module
 
+import bedrock_protocol
+from bedrock_protocol import v712, v924, v2168
+
 
 DEFAULT_PROTOCOL = 2225
+
+# These packet constructors use helper types declared in earlier codec modules.
+_HELPER_OWNERS = {
+    "ActorDataFlagComponent": {2193: v2168, 2225: v2168},
+    "CommandOutput": {2193: v712, 2225: v712},
+    "CommandOutputMessage": {2193: v712, 2225: v712},
+    "DataStoreChange": {2193: v712, 2225: v712},
+    "DataStoreRemoval": {2193: v712, 2225: v712},
+    "DataStoreUpdate": {2193: v924, 2225: v924},
+    "ItemReleaseInventoryTransaction": {2193: v2168},
+    "ItemStackRequestCereal": {2193: v2168},
+    "ItemStackRequestPacketData": {2193: v2168},
+    "ItemUseOnActorInventoryTransaction": {2193: v2168},
+    "LevelSettings": {2193: v2168},
+    "PassengerOfBlockArguments": {2193: v712, 2225: v712},
+    "SerializedSkinRef": {1001: v712, 2193: v2168},
+    "ServerConfigurationJoinInfo": {2193: v2168, 2225: v2168},
+}
 
 
 def _write_uint(value: int) -> bytes:
@@ -72,12 +93,35 @@ def write_batch(packets: Iterable[RawPacket]) -> bytes:
     return bytes(data)
 
 
+class _Binding:
+    """Expose the selected native codec and its packet classes by name."""
+
+    def __init__(self, number: int):
+        self._version = import_module(f"bedrock_protocol.v{number}")
+        self._packet_types = {packet.__name__: packet for packet in self._version.packets.values()}
+
+    def __getattr__(self, name: str):
+        if (packet := self._packet_types.get(name)) is not None:
+            return packet
+        try:
+            return getattr(self._version, name)
+        except AttributeError:
+            pass
+        owners = _HELPER_OWNERS.get(name)
+        if owners is not None and (owner := owners.get(self._version.VERSION)) is not None:
+            return getattr(owner, name)
+        helper = getattr(bedrock_protocol, name, None)
+        if isinstance(helper, type) and not hasattr(helper, "ID"):
+            return helper
+        raise AttributeError(name)
+
+
 class Protocol:
     """Use one upstream protocol binding for the lifetime of a connection."""
 
     def __init__(self, number: int = DEFAULT_PROTOCOL):
         self.number = number
-        self.binding = import_module(f"bedrock_protocol.v{number}")
+        self.binding = _Binding(number)
 
     def encode(self, packet) -> RawPacket:
         return RawPacket(type(packet).ID, self.binding.encode(packet))

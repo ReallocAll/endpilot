@@ -377,8 +377,15 @@ class ResourcePackExchange:
         self.plain_pack_stack = not any(toggle.enabled for toggle in packet.experiments.toggles)
         ordered = []
         for item in stack:
-            key = (item.pack_id, item.version)
-            loaded = self._loaded.get(key)
+            wire_id = item.pack_id.lower()
+            try:
+                pack_id = UUID(wire_id)
+            except ValueError:
+                raise ResourcePackError("server stack contains an invalid resource-pack ID") from None
+            # The previous codec accepted hyphenated and compact UUID spellings.
+            if wire_id not in (str(pack_id), pack_id.hex):
+                raise ResourcePackError("server stack contains an invalid resource-pack ID")
+            loaded = self._loaded.get((pack_id, item.version))
             if loaded is None:
                 raise ResourcePackError("server stack contains an unloaded resource pack")
             if item.subpack_name != loaded[0].subpack_name:

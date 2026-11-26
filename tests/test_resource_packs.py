@@ -157,7 +157,7 @@ class ResourcePackTests(unittest.IsolatedAsyncioTestCase):
     def stack(self, *pack_ids, subpacks=None):
         subpacks = {} if subpacks is None else subpacks
         return self.b.ResourcePackStackPacket(texture_pack_ids_and_versions=[
-            self.b.PackInstanceId(pack_id=pack_id, version="1.0.0", subpack_name=subpacks.get(pack_id, ""))
+            self.b.PackInstanceId(pack_id=str(pack_id), version="1.0.0", subpack_name=subpacks.get(pack_id, ""))
             for pack_id in pack_ids
         ])
 
@@ -192,7 +192,11 @@ class ResourcePackTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(decisions[0].required)
         self.assertEqual([(item.pack_id, item.version, item.size) for item in decisions[0].packs],
                          [(_FIRST, "1.0.0", 50), (_SECOND, "1.0.0", 50)])
-        first, second = archive_bytes(_FIRST, b"first"), archive_bytes(_SECOND, b"second")
+        first_title = "First resource pack"
+        first = archive_bytes(_FIRST, b"first", manifest_fields={
+            "header": {"name": first_title, "uuid": str(_FIRST), "version": [1, 0, 0]},
+        })
+        second = archive_bytes(_SECOND, b"second")
         split = len(first) - 15
         self.transport.deliver(self.metadata(_FIRST, first, split), self.metadata(_SECOND, second, len(second)))
         for pack_id, index, offset, data in (
@@ -205,13 +209,15 @@ class ResourcePackTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.bot.resource_pack_index)
 
         # Stack order, rather than download order, decides the selected file.
-        self.transport.deliver(self.stack(_SECOND, _FIRST))
+        self.transport.deliver(self.stack(str(_SECOND).upper(), _FIRST.hex))
         self.assertIsInstance((await self.outgoing()).response,
                               b.ResourcePackClientResponsePacket.ResourcePackStackFinished)
         self.start_game()
         await pending
         index = self.bot.resource_pack_index
         self.assertEqual(index.read(_MARKER), b"first")
+        header = json.loads(index.read("manifest.json"))["header"]
+        self.assertEqual((header["name"], UUID(header["uuid"])), (first_title, _FIRST))
         self.assertEqual([(pack.pack_id, pack.size, pack.sha256) for pack in index.packs], [
             (_SECOND, len(second), hashlib.sha256(second).hexdigest()),
             (_FIRST, len(first), hashlib.sha256(first).hexdigest()),
@@ -301,7 +307,7 @@ class ResourcePackTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(event.resolve_text(locale="de_DE", resource_pack_index=index))
         self.assertIsNone(lower.resolve_text(locale="en_US", resource_pack_index=index))
 
-    async def assert_invalid_stack_selection(self, subpack):
+    async def assert_invalid_stack(self, pack_id, subpack, message):
         pending = asyncio.create_task(self.join(lambda offer: ResourcePackDecision.ACCEPT))
         self.transport.deliver(self.info((_FIRST,), subpacks={_FIRST: "blue"}))
         await self.outgoing()
@@ -310,17 +316,26 @@ class ResourcePackTests(unittest.IsolatedAsyncioTestCase):
         })
         await self.deliver_complete_archive(_FIRST, data)
         self.assertIsInstance((await self.outgoing()).response, self.b.ResourcePackClientResponsePacket.DownloadingFinished)
-        self.transport.deliver(self.stack(_FIRST, subpacks={_FIRST: subpack}))
-        with self.assertRaisesRegex(ResourcePackError, "stack subpack does not match the offer"):
+        self.transport.deliver(self.stack(pack_id, subpacks={pack_id: subpack}))
+        with self.assertRaisesRegex(ResourcePackError, message):
             await pending
         self.assertIsNone(self.bot.resource_pack_index)
         self.assertTrue(self.transport.closed and self.transport.outgoing.empty())
 
     async def test_stack_cannot_change_an_offered_subpack_even_to_another_valid_choice(self):
-        await self.assert_invalid_stack_selection("green")
+        await self.assert_invalid_stack(_FIRST, "green", "stack subpack does not match the offer")
 
     async def test_stack_cannot_omit_the_offered_subpack_name(self):
-        await self.assert_invalid_stack_selection("")
+        await self.assert_invalid_stack(_FIRST, "", "stack subpack does not match the offer")
+
+    async def test_stack_rejects_an_invalid_pack_id(self):
+        await self.assert_invalid_stack("invalid-uuid", "blue", "invalid resource-pack ID")
+
+    async def test_stack_rejects_braces_around_a_loaded_pack_id(self):
+        await self.assert_invalid_stack(f"{{{_FIRST}}}", "blue", "invalid resource-pack ID")
+
+    async def test_stack_rejects_an_unloaded_pack_id(self):
+        await self.assert_invalid_stack(_SECOND, "blue", "unloaded resource pack")
 
     async def test_subpack_filtering_does_not_release_the_unpacked_budget_for_later_archives(self):
         first = archive_bytes(_FIRST, b"base", manifest_fields={"subpacks": _SUBPACKS}, files={

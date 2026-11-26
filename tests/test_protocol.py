@@ -3,6 +3,8 @@ import zlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import bedrock_protocol
+from bedrock_protocol import v898, v2168, v2193, v2225
 from cramjam import snappy
 
 from endpilot.compression import PacketConnection
@@ -11,17 +13,56 @@ from endpilot.protocol import Protocol, RawPacket, read_batch, write_batch
 
 class ProtocolTests(unittest.TestCase):
     def test_network_settings_and_unmodelled_packet_in_one_batch(self):
-        protocol = Protocol(2193)
-        request = protocol.binding.RequestNetworkSettingsPacket()
-        request.client_network_version = 2193
-        raw = RawPacket(0xFFF, b"custom")
-        batch = write_batch([protocol.encode(request), raw])
+        for protocol, number, wire_version in (
+            (Protocol(2193), 2193, "08 91"),
+            (Protocol(), 2225, "08 b1"),
+        ):
+            with self.subTest(protocol=number):
+                request = protocol.binding.RequestNetworkSettingsPacket()
+                request.client_network_version = protocol.number
+                raw = RawPacket(0xFFF, b"custom")
+                batch = write_batch([protocol.encode(request), raw])
 
-        # Length, varuint packet ID 193, then big-endian protocol 2193.
-        self.assertEqual(batch[:7], bytes.fromhex("06 c1 01 00 00 08 91"))
-        received, extension = read_batch(batch)
-        self.assertEqual(protocol.decode(received).client_network_version, 2193)
-        self.assertEqual(extension, raw)
+                # Length, varuint packet ID 193, then the big-endian protocol number.
+                self.assertEqual(batch[:7], bytes.fromhex(f"06 c1 01 00 00 {wire_version}"))
+                received, extension = read_batch(batch)
+                self.assertEqual(protocol.decode(received).client_network_version, number)
+                self.assertEqual(extension, raw)
+
+    def test_text_packet_uses_registered_class_and_version_codec(self):
+        for native in (v2193, v2225):
+            with self.subTest(protocol=native.VERSION):
+                protocol = Protocol(native.VERSION)
+                binding = protocol.binding
+                self.assertIs(binding.packets, native.packets)
+                self.assertIs(binding.encode, native.encode)
+                self.assertIs(binding.decode, native.decode)
+                self.assertIs(binding.TextPacket, v898.TextPacket)
+                raw = protocol.encode(binding.TextPacket())
+                self.assertIs(type(protocol.decode(raw)), v898.TextPacket)
+
+    def test_packet_from_later_protocol_is_absent(self):
+        self.assertIsNone(getattr(Protocol().binding, "ChatPacket", None))
+
+    def test_start_game_accepts_versioned_level_settings(self):
+        for protocol, settings_type in (
+            (Protocol(2193), v2168.LevelSettings),
+            (Protocol(), bedrock_protocol.LevelSettings),
+        ):
+            with self.subTest(protocol=protocol.number):
+                binding = protocol.binding
+                self.assertIs(binding.LevelSettings, settings_type)
+                start = binding.StartGamePacket(settings=binding.LevelSettings(commands_enabled=True))
+                self.assertTrue(start.settings.commands_enabled)
+
+    def test_start_game_round_trips_server_configuration_join_info(self):
+        for number in (2193, 2225):
+            with self.subTest(protocol=number):
+                protocol = Protocol(number)
+                binding = protocol.binding
+                start = binding.StartGamePacket(server_configuration_join_info=binding.ServerConfigurationJoinInfo())
+                decoded = protocol.decode(protocol.encode(start))
+                self.assertIs(type(decoded.server_configuration_join_info), v2168.ServerConfigurationJoinInfo)
 
     def test_partial_frame_cannot_consume_the_next_packet_header(self):
         with self.assertRaises(ValueError):

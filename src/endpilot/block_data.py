@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from functools import cache
 from importlib.resources import files
 
-from bedrock_protocol import nbt
+from bedrock_protocol import _core, nbt
 
 
 # StartGame on vanilla BDS 1.26.66.1 (53696234), whose state order matches the packaged palette.
@@ -21,13 +21,14 @@ _PISTON_FACINGS = {
 _STATE_TAGS = {"byte": nbt.ByteTag, "int": nbt.IntTag, "string": nbt.StringTag}
 
 
-def matches_vanilla_palette(binding, registry_checksum: int, block_properties) -> bool:
+def matches_vanilla_palette(registry_checksum: int, block_properties) -> bool:
     """Verify the sequential registry and exact built-in block declarations for 2225."""
     if registry_checksum != _VANILLA_REGISTRY_CHECKSUM:
         return False
     declaration = hashlib.sha256()
     for entry in sorted(block_properties, key=lambda item: item.name):
-        declaration.update(binding.encode(entry))
+        # StartGame block declarations use the structural codec.
+        declaration.update(_core.encode(2225, entry, mode=_core.SerializationMode.DEFAULT))
     return declaration.hexdigest() == _VANILLA_BLOCK_PROPERTIES_SHA256
 
 
