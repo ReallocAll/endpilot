@@ -7,7 +7,7 @@ from bedrock_protocol import nbt
 
 from endpilot import Bot
 from endpilot.block_data import vanilla_block_state
-from endpilot.protocol import write_batch
+from endpilot.protocol import RawPacket, write_batch
 
 
 class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
@@ -148,31 +148,57 @@ class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
         self.push(*packets)
         return await pending
 
+    async def test_single_trapped_chest_lid_needs_a_known_main_layer(self):
+        b = self.b
+        position = (5, 220, 10)
+        # Lid packet bodies and the main-layer runtime ID captured on vanilla 2225.
+        opened = RawPacket(b.BlockEventPacket.ID, bytes.fromhex("0ab803140202"))
+        closed = RawPacket(b.BlockEventPacket.ID, bytes.fromhex("0ab803140200"))
+        extra, main = (
+            self.bot.protocol.encode(b.UpdateBlockPacket(pos=self.pos(position), runtime_id=0x316625E3, layer=layer))
+            for layer in (1, 0)
+        )
+        async with asyncio.TaskGroup() as group:
+            generic = group.create_task(self.bot.wait_for_block_event(position, kind="block", timeout=1))
+            lid_open = group.create_task(self.bot.wait_for_block_event(position, kind="chest_open", timeout=1))
+            lid_close = group.create_task(self.bot.wait_for_block_event(position, kind="chest_close", timeout=1))
+            await asyncio.sleep(0)
+            self.incoming.put_nowait(write_batch((extra, opened, main, opened, closed)))
+
+        for waiter, kind, raw in ((generic, "block", opened), (lid_open, "chest_open", opened),
+                                  (lid_close, "chest_close", closed)):
+            event = waiter.result()
+            self.assertEqual((event.kind, event.position, event.chest_partner), (kind, position, None))
+            self.assertEqual(self.bot.protocol.encode(event.packet), raw)
+
     async def test_chest_partner_needs_two_current_reciprocal_roots_and_filters_original_position(self):
         b = self.b
         lead, partner = (3, 220, 7), (3, 220, 8)
         opened = b.BlockEventPacket(pos=self.pos(lead), b0=1, b1=1)
         closed = b.BlockEventPacket(pos=self.pos(partner), b0=1, b1=0)
-        partner_wait = asyncio.create_task(self.bot.wait_for_block_event(position=partner, timeout=1))
-        self.addCleanup(partner_wait.cancel)
-        event = await self.block_event(
-            b.UpdateBlockPacket(pos=self.pos(lead), runtime_id=0x2C383C60),
-            b.UpdateBlockPacket(pos=self.pos(partner), runtime_id=0x553014DD),
-            self.chest_root(lead, partner, 1), self.chest_root(partner, lead, 0), opened,
-            position=lead, kind="chest_open",
-        )
-        self.assertEqual((event.position, event.chest_partner, event.packet, event.piston_face),
-                         (lead, partner, opened, None))
-        self.assertFalse(partner_wait.done())
-        self.push(closed)
-        confirmed = await partner_wait
-        self.assertEqual((confirmed.position, confirmed.chest_partner, confirmed.kind, confirmed.packet),
-                         (partner, lead, "chest_close", closed))
+        for variant, lead_id, partner_id in (("ordinary", 0x2C383C60, 0x553014DD),
+                                             ("trapped", 0x316625E3, 0x499CF151)):
+            with self.subTest(variant=variant):
+                partner_wait = asyncio.create_task(self.bot.wait_for_block_event(position=partner, timeout=1))
+                self.addCleanup(partner_wait.cancel)
+                event = await self.block_event(
+                    b.UpdateBlockPacket(pos=self.pos(lead), runtime_id=lead_id),
+                    b.UpdateBlockPacket(pos=self.pos(partner), runtime_id=partner_id),
+                    self.chest_root(lead, partner, 1), self.chest_root(partner, lead, 0), opened,
+                    position=lead, kind="chest_open",
+                )
+                self.assertEqual((event.position, event.chest_partner, event.packet, event.piston_face),
+                                 (lead, partner, opened, None))
+                self.assertFalse(partner_wait.done())
+                self.push(closed)
+                confirmed = await partner_wait
+                self.assertEqual((confirmed.position, confirmed.chest_partner, confirmed.kind, confirmed.packet),
+                                 (partner, lead, "chest_close", closed))
 
     async def test_chest_partner_stays_unknown_without_current_matching_typed_chest_roots(self):
         b = self.b
         for index, reason in enumerate(("missing", "one_way", "same_lead", "wrong_type", "wrong_root_cell",
-                                        "trapped", "disconnected", "non_lid")):
+                                        "mixed_trapped_peer", "mixed_ordinary_peer", "disconnected", "non_lid")):
             with self.subTest(reason=reason):
                 pos = (5, 220, index)
                 peer = (7 if reason == "disconnected" else 6, 220, index)
@@ -188,9 +214,10 @@ class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
                         1 if reason == "same_lead" else 0, **override,
                     ))
                 event = await self.block_event(
-                    b.UpdateBlockPacket(pos=self.pos(pos), runtime_id=0x2C383C60),
+                    b.UpdateBlockPacket(pos=self.pos(pos),
+                                        runtime_id=0x316625E3 if reason == "mixed_ordinary_peer" else 0x2C383C60),
                     b.UpdateBlockPacket(pos=self.pos(peer),
-                                        runtime_id=0x499CF151 if reason == "trapped" else 0x2C383C60),
+                                        runtime_id=0x499CF151 if reason == "mixed_trapped_peer" else 0x2C383C60),
                     self.chest_root(pos, peer, 1), *sample,
                     b.BlockEventPacket(pos=self.pos(pos), b0=1, b1=2 if reason == "non_lid" else 1),
                 )

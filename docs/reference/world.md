@@ -183,10 +183,18 @@ and `molang_variables`. All observations carry the bot's dimension at receipt.
 
 `await bot.wait_for_block_event(position, kind="chest_open")` can filter by
 position and kind. Supported feedback includes raw block events, note sounds,
-single-chest lid changes where the block is known, piston arm states and start,
-progress and end of cracking. Note events expose `note_pitch` and
-`instrument_id`. A crack-end packet with an all-zero position has
-`event.position` set to `None`. Its native `packet.pos` remains available.
+chest lid changes, piston arm states and start, progress and end of cracking.
+Note events expose `note_pitch` and `instrument_id`. A crack-end packet with
+an all-zero position has `event.position` set to `None`. Its native
+`packet.pos` remains available.
+
+In protocol 2225, `chest_open` and `chest_close` apply when the observed main
+layer at the packet's position is `minecraft:chest` or
+`minecraft:trapped_chest` and the packet reports a lid change. When the block
+type is unknown, the event kind is `block`. For a double chest,
+`event.chest_partner` gives the other half's position when both cells have the
+same chest block type and current, reciprocal chest block entity data.
+Otherwise it is `None`. The position filter uses the packet's position.
 
 For a protocol 2225 `PistonArm` packet, `event.position` is the piston base.
 `event.piston_attached_blocks` is an immutable tuple of signed, absolute

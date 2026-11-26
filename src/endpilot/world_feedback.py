@@ -158,7 +158,7 @@ class WorldFeedback:
         block = self.blocks.observed_block(position)
         return None if block is None else self.blocks._vanilla_state(block.runtime_id)
 
-    def _chest_partner(self, position: _Cell) -> _Cell | None:
+    def _chest_partner(self, position: _Cell, chest_name: str) -> _Cell | None:
         first = _chest_pair(self.blocks.observed_block_entity(position), position)
         if first is None:
             return None
@@ -166,7 +166,7 @@ class WorldFeedback:
         if abs(partner[0] - position[0]) + abs(partner[2] - position[2]) != 1:
             return None
         state = self._block_state(partner)
-        if state is None or state.name != "minecraft:chest":
+        if state is None or state.name != chest_name:
             return None
         return partner if _chest_pair(self.blocks.observed_block_entity(partner), partner) == (position, 1 - lead) else None
 
@@ -180,9 +180,9 @@ class WorldFeedback:
             kind = "block"
             if self._is_2225 and packet.b0 == 1 and packet.b1 in (0, 1):
                 state = self._block_state(position)
-                if state is not None and state.name == "minecraft:chest":
+                if state is not None and state.name in ("minecraft:chest", "minecraft:trapped_chest"):
                     kind = "chest_open" if packet.b1 == 1 else "chest_close"
-                    chest_partner = self._chest_partner(position)
+                    chest_partner = self._chest_partner(position, state.name)
         elif packet.ID == b.BlockActorDataPacket.ID:
             tag = packet.data
             actor_id = tag["id"] if "id" in tag else None
