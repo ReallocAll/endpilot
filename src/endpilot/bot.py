@@ -2625,6 +2625,19 @@ class Bot:
             action=action, player_uuid=player_uuid, timeout=timeout,
         )
 
+    def subscribe_player_list_updates(
+        self, callback: Callable[[tuple[PlayerListChange, ...]], None], *,
+        action: Literal["add", "remove"] | None = None, player_uuid: UUID | None = None,
+    ) -> Callable[[], None]:
+        """Call back with matching changes in packet order after each live roster update.
+
+        Returns an idempotent unsubscribe function for the synchronous callback.
+        The subscription ends with the current session.
+        """
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return self._entities.subscribe_player_list_updates(callback, action=action, player_uuid=player_uuid)
+
     async def wait_for_player_skin_update(
         self, player_uuid: UUID, *, timeout: float | None = 15,
     ) -> PlayerSkinSnapshot | None:
@@ -2632,6 +2645,18 @@ class Bot:
         if self._entities is None:
             raise RuntimeError("player has not joined")
         return await self._entities.wait_for_player_skin_update(player_uuid, timeout=timeout)
+
+    def subscribe_player_skin_updates(
+        self, callback: Callable[[PlayerListEntry], None], *, player_uuid: UUID | None = None,
+    ) -> Callable[[], None]:
+        """Call back with the updated roster entry after each live skin packet for a listed UUID.
+
+        Returns an idempotent unsubscribe function for the synchronous callback.
+        The subscription ends with the current session.
+        """
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return self._entities.subscribe_player_skin_updates(callback, player_uuid=player_uuid)
 
     @property
     def observed_entities(self) -> tuple[EntityState, ...]:

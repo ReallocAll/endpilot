@@ -109,6 +109,32 @@ UUID. An add includes the player's metadata and can update an existing entry.
 A remove provides the UUID. The wait raises `TimeoutError` at its deadline or
 `ConnectionError` if the stream ends first.
 
+`bot.subscribe_player_list_updates(callback, action=..., player_uuid=...)`
+calls back once per live player-list packet with a nonempty tuple of matching
+`PlayerListChange` snapshots in packet order. By the time the callback runs,
+`observed_players` and affected entity identities reflect the whole packet.
+Repeated adds and removals of unlisted UUIDs are delivered as received.
+Omit either filter to accept any value for it. Visibility and dimension
+changes leave roster membership alone.
+
+`bot.subscribe_player_skin_updates(callback, player_uuid=...)` calls back
+with the updated `PlayerListEntry` after each live skin packet applied to a
+listed UUID. Omit the filter to receive updates for any listed player.
+Repeated and empty reports are delivered, with `entry.skin` set to `None`
+for an empty report. Skins carried by a player-list add are available in the
+add entry and through `observed_players`.
+
+Both subscriptions receive future packets during the joined session. Use
+`observed_players` to read the roster and skins already observed during join.
+Callbacks run synchronously on the packet reader, and the immutable snapshots
+can be retained. Callback failures go to the event loop's exception handler.
+The subscriptions send no packets and return idempotent unsubscribe functions.
+A UUID filter stays active across dimension changes and when that UUID leaves
+and later rejoins the roster. Subscriptions end when the server disconnects,
+the packet reader stops, or the bot closes. Registration raises `RuntimeError`
+before joining or after closing the bot, and `ConnectionError` after the joined
+connection ends.
+
 Run `python examples/observe_player_list.py URL --action add`, then join the
 same server from a second client with a different name after
 `player_list_watcher_ready` appears.

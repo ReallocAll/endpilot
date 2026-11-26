@@ -424,6 +424,8 @@ class Entities:
         self._own_runtime_id = own_runtime_id
         self._own_entity_id = own_entity_id
         self._players_by_uuid: dict[UUID, PlayerListEntry] = {}
+        self._player_list_observers: list[Callable[[tuple[PlayerListChange, ...]], None]] = []
+        self._player_skin_observers: list[Callable[[PlayerListEntry], None]] = []
         self._last_skin_update: tuple[RawPacket, UUID] | None = None
         self._player_runtime_by_uuid: dict[UUID, int] = {}
         self._player_uuid_by_runtime: dict[int, UUID] = {}
@@ -478,6 +480,8 @@ class Entities:
         self._closed = True
         self._last_pickup = None
         self._last_skin_update = None
+        self._player_list_observers.clear()
+        self._player_skin_observers.clear()
         self._end_movement_waiters(ConnectionError, "entity session is closed", _cause)
         self._clear_player_equipment(ConnectionError, "entity session is closed", _cause)
         for observers in (self._swing_observers, self._health_observers, self._actor_event_observers,
@@ -519,6 +523,24 @@ class Entities:
         await self.packets.wait_for_packet(binding.PlayerListPacket.ID, match=matches, timeout=timeout)
         return changes
 
+    def subscribe_player_list_updates(
+        self, callback: Callable[[tuple[PlayerListChange, ...]], None], *,
+        action: Literal["add", "remove"] | None, player_uuid: UUID | None,
+    ) -> Callable[[], None]:
+        self._require_live()
+
+        def observe(changes: tuple[PlayerListChange, ...]) -> None:
+            if action is not None or player_uuid is not None:
+                changes = tuple(
+                    change for change in changes
+                    if (action is None or change.action == action)
+                    and (player_uuid is None or change.uuid == player_uuid)
+                )
+            if changes:
+                callback(changes)
+
+        return self.packets._subscribe(self._player_list_observers, observe)
+
     async def wait_for_player_skin_update(
         self, player_uuid: UUID, *, timeout: float | None,
     ) -> PlayerSkinSnapshot | None:
@@ -540,6 +562,17 @@ class Entities:
             (binding.PlayerSkinPacket.ID, binding.DisconnectPacket.ID), match=matches, timeout=timeout,
         )
         return skin
+
+    def subscribe_player_skin_updates(
+        self, callback: Callable[[PlayerListEntry], None], *, player_uuid: UUID | None,
+    ) -> Callable[[], None]:
+        self._require_live()
+
+        def observe(player: PlayerListEntry) -> None:
+            if player_uuid is None or player.uuid == player_uuid:
+                callback(player)
+
+        return self.packets._subscribe(self._player_skin_observers, observe)
 
     def snapshot(self) -> tuple[EntityState, ...]:
         """Snapshot actors observed since subscription; not a world entity scan."""
@@ -1335,8 +1368,12 @@ class Entities:
             self._item_names = {int(item.id): str(item.name) for item in packet.items}
         elif raw.packet_id == b.PlayerListPacket.ID:
             packet = self.packets.protocol.decode(raw)
+            observers = tuple(self._player_list_observers)
+            observed_changes = [] if observers else None
             for entry in packet.entries:
                 change = _player_list_change(entry)
+                if observed_changes is not None:
+                    observed_changes.append(change)
                 runtime_id = self._player_runtime_by_uuid.get(change.uuid)
                 if change.player is not None:
                     self._players_by_uuid[change.uuid] = change.player
@@ -1382,13 +1419,17 @@ class Entities:
                         self._forget_links(removed.entity_id)
                     if runtime_id is not None:
                         self._forget_runtime(runtime_id)
+            if observed_changes:
+                self.packets._notify(observers, tuple(observed_changes))
         elif raw.packet_id == b.PlayerSkinPacket.ID:
             packet = self.packets.protocol.decode(raw)
             listed = self._players_by_uuid.get(packet.uuid)
             if listed is not None:
                 skin = _player_skin_snapshot(getattr(packet, "skin", None))
-                self._players_by_uuid[packet.uuid] = replace(listed, skin=skin)
+                updated = replace(listed, skin=skin)
+                self._players_by_uuid[packet.uuid] = updated
                 self._last_skin_update = raw, packet.uuid
+                self.packets._notify(self._player_skin_observers, updated)
         elif raw.packet_id == b.AddPlayerPacket.ID:
             player = self.packets.protocol.decode(raw)
             for link in player.links:
