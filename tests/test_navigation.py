@@ -359,6 +359,28 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                         solid = y == 99 or pos == self.TARGET or pos in blocked
                         self.set_block(pos, self.STONE if solid else self.AIR)
 
+    async def test_flat_navigation_can_leave_but_not_enter_magma(self):
+        self.prepare_terrain()
+        self.set_block((1, 99, 0), 0x6680F5C9)  # magma
+        with self.assertRaisesRegex(RuntimeError, "no route"):
+            await self.bot.navigate_to((1, 100, 0), search_radius=1)
+        self.assertFalse(self.stream.sent)
+        self.set_block((1, 99, 0), self.STONE)
+        self.set_block((0, 99, 0), 0x6680F5C9)
+        self.assertGreater(await self.bot.navigate_to((1, 100, 0), search_radius=1), 0)
+
+    async def test_flat_navigation_stops_if_the_next_cell_floods(self):
+        self.prepare_terrain()
+
+        def flood():
+            if self.up in self.stream.sent[-1].input_data:
+                self.set_block((1, 100, 0), 0x483B8B2A, layer=1)  # water
+                self.stream.on_send = None
+
+        self.stream.on_send = flood
+        self.assertEqual(await self.bot.navigate_to((1, 100, 0), ticks=20), 1)
+        self.assertFalse(any(self.up in p.input_data for p in self.stream.sent[1:]))
+
     def prepare_descent(self, target=(3, 99, 0)):
         solids = {(0, 99, 0), (1, 98, 0), (2, 98, 0), target}
         for x in range(-3, 4):

@@ -1309,7 +1309,14 @@ class Blocks:
         if floor is not None and floor.is_air is True:
             return False
         support = None if floor is None else self._vanilla_state(floor.runtime_id)
-        return None if support is None else support.unit_cube and not support.unsafe_support
+        if support is None:
+            return None
+        if support.unit_cube:
+            return not support.unsafe_support
+        # A dry upper slab has the same standing plane as a full cube.
+        if support.name.endswith("_slab") and support.outline == (0, 0.5, 0, 1, 1, 1):
+            return self._stance_air(self.observed_block(position, layer=1))
+        return False
 
     def _placement_support(self, position: tuple[int, int, int]) -> bool | None:
         main = self.observed_block(position)

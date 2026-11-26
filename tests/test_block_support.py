@@ -35,6 +35,7 @@ class BlockSupportTests(unittest.TestCase):
         self.install(HEAD, AIR)
         self.install(FLOOR, GLASS)
         if explicit_extra:
+            self.install(FLOOR, AIR, layer=1)
             self.install(POSITION, AIR, layer=1)
             self.install(HEAD, AIR, layer=1)
 
@@ -53,7 +54,7 @@ class BlockSupportTests(unittest.TestCase):
             ("oak log facing horizontally", (0xF253CAD8, 1900), True),
             ("double slab", (0x0A53C99B, 6877), True),
             ("bottom slab", (0xA3BE7E64, 10165), False),
-            ("top slab", (0x670AF759, 10166), False),
+            ("top slab", (0x670AF759, 10166), True),
             ("stairs", (0xF8B309F3, 1858), False),
             ("fence", (0x195BFACD, 14806), False),
             ("water", WATER, False),
@@ -83,6 +84,12 @@ class BlockSupportTests(unittest.TestCase):
                 self.assertIsNone(self.blocks._flat_stance(POSITION))
                 self.install(HEAD, AIR, layer=1)
                 self.assertIs(self.blocks._flat_stance(POSITION), True)
+                self.install(FLOOR, (0x670AF759, 10166))  # Upper oak slab
+                self.install(FLOOR, WATER, layer=1)
+                self.assertIs(self.blocks._flat_stance(POSITION), False)
+                self.install(FLOOR, UNKNOWN, layer=1)
+                self.assertIsNone(self.blocks._flat_stance(POSITION))
+                self.install(FLOOR, AIR, layer=1)
                 self.install(POSITION, UNKNOWN)
                 self.assertIsNone(self.blocks._flat_stance(POSITION))
                 self.install(HEAD, GLASS)

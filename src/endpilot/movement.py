@@ -1919,25 +1919,6 @@ class Movement:
 
 
     @classmethod
-    def _flat_route(cls, blocks, start, goal, feet_y, radius):
-        """Find a route through observed, two-block-high air above known floor."""
-        def clear(cell):
-            x, z = cell
-            body = blocks.observed_block((x, feet_y, z))
-            head = blocks.observed_block((x, feet_y + 1, z))
-            floor = blocks.observed_block((x, feet_y - 1, z))
-            return (body is not None and body.is_air is True
-                    and head is not None and head.is_air is True
-                    and floor is not None and floor.is_air is False)
-
-        if not clear(start):
-            raise RuntimeError("starting terrain is not known walkable")
-        route = cls._find_flat_route(start, {goal}, clear, start, radius)
-        if route is None:
-            raise RuntimeError("no route through observed flat terrain")
-        return route
-
-    @classmethod
     def _find_flat_route(cls, start, goals, clear, origin, radius):
         def neighbors(cell):
             for dx, dz in _HORIZONTAL_STEPS:
@@ -1971,7 +1952,8 @@ class Movement:
         """Walk to a block's center on observed flat ground.
 
         Unknown cells are impassable. Return submitted moving input frames,
-        not a server-confirmed arrival. Stop/cancellation releases input.
+        not a server-confirmed arrival. On 2225, enter only cells classified as
+        safe standing terrain by goal navigation. Stop/cancellation releases input.
         """
         async with self._action_lock:
             if self._closing:
@@ -1986,7 +1968,24 @@ class Movement:
                 raise ValueError("flat navigation cannot change elevation")
             start = (math.floor(x), math.floor(z))
             goal = (math.floor(target[0]), math.floor(target[2]))
-            route = self._flat_route(blocks, start, goal, feet_y, search_radius)
+
+            def clear(cell):
+                x, z = cell
+                # The occupied start is not a destination: allow walking off a hazard.
+                if cell != start and self.packets.protocol.number == 2225:
+                    return blocks._flat_stance((x, feet_y, z)) is True
+                body = blocks.observed_block((x, feet_y, z))
+                head = blocks.observed_block((x, feet_y + 1, z))
+                floor = blocks.observed_block((x, feet_y - 1, z))
+                return (body is not None and body.is_air is True
+                        and head is not None and head.is_air is True
+                        and floor is not None and floor.is_air is False)
+
+            if not clear(start):
+                raise RuntimeError("starting terrain is not known walkable")
+            route = self._find_flat_route(start, {goal}, clear, start, search_radius)
+            if route is None:
+                raise RuntimeError("no route through observed flat terrain")
             self._clear_manual_input()
             self._stop_requested = False
             done = self._active_done = asyncio.Event()
@@ -2003,12 +2002,7 @@ class Movement:
                         if math.hypot(waypoint[0] - px, waypoint[2] - pz) <= 0.12:
                             break
                         # Do not enter a cell that changed or became unknown.
-                        body = blocks.observed_block((cell_x, feet_y, cell_z))
-                        head = blocks.observed_block((cell_x, feet_y + 1, cell_z))
-                        floor = blocks.observed_block((cell_x, feet_y - 1, cell_z))
-                        if (body is None or body.is_air is not True
-                                or head is None or head.is_air is not True
-                                or floor is None or floor.is_air is not False):
+                        if not clear((cell_x, cell_z)):
                             return submitted
                         await self.look_at(waypoint)
                         await self._send_input(True)
