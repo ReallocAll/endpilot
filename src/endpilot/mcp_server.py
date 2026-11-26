@@ -6,6 +6,7 @@ from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, TypedDict
 
+from ._join_address import _parse_join_address
 from .blocks import BlockChange, BlockUpdate
 from .bot import Bot
 from .inventory import HeldItemStack
@@ -127,10 +128,8 @@ class MCPPlayer:
             bot = Bot(name)
             try:
                 if url.startswith("raknet://"):
-                    host, separator, port = url.removeprefix("raknet://").rpartition(":")
-                    if not separator:
-                        host, port = port, "19132"
-                    await bot.join_raknet(host, int(port))
+                    target = _parse_join_address(url)
+                    await bot.join_raknet(target.host, target.port)
                 else:
                     await bot.join_nethernet(url)
             except BaseException:

@@ -151,6 +151,22 @@ class MCPPlayerTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "connect a player"):
                 await player.place_against(2, 99, 0)
 
+    async def test_connect_raknet_addresses_use_the_sdk_endpoint_rules(self):
+        with patch("endpilot.mcp_server.Bot", FakeBot):
+            player = MCPPlayer()
+            for address, endpoint in (
+                ("raknet://[::1]", ("::1", 19132)),
+                ("raknet://[::1]:19140", ("::1", 19140)),
+                ("raknet://127.0.0.1", ("127.0.0.1", 19132)),
+                ("http://localhost:19132/signaling", "http://localhost:19132/signaling"),
+            ):
+                with self.subTest(address=address):
+                    await player.connect(address)
+                    try:
+                        self.assertEqual(player.bot.url, endpoint)
+                    finally:
+                        await player.disconnect()
+
     async def test_disconnect_cancels_pending_block_wait(self):
         with patch("endpilot.mcp_server.Bot", FakeBot):
             player = MCPPlayer()
