@@ -760,9 +760,14 @@ class Entities:
             for state in self._by_runtime.values():
                 if state.runtime_id == self._own_runtime_id or state.entity_id == self._own_entity_id:
                     continue
-                feet, supported = self._cursor_feet(state, binding)
                 body = self._cursor_bodies.get(state.runtime_id)
                 width, height = (None, None) if body is None else body.size
+                if (state.actor_type == "minecraft:item" and width is not None and height is not None
+                        and state.entity_id not in self._rides):
+                    # Item coordinates anchor the box bottom; bound uncertainty without selecting the item.
+                    feet, supported = state.position, False
+                else:
+                    feet, supported = self._cursor_feet(state, binding)
                 if feet is None or not all(map(math.isfinite, feet)):
                     unresolved.append(_UNBOUNDED_BOX)
                     continue
@@ -964,6 +969,9 @@ class Entities:
                 instance = self._actor_instances.get(runtime_id)
                 if instance is not None:
                     instance.feet_known = False
+                state = self._by_runtime.get(runtime_id)
+                if state is not None and state.actor_type == "minecraft:item":
+                    self._cursor_bodies.pop(runtime_id, None)
             else:
                 self._unresolved_ride_epoch += 1
                 self._unresolved_ride_changes.append((self._unresolved_ride_epoch, rider))
@@ -1221,7 +1229,13 @@ class Entities:
             runtime_id = int(packet.id)
             body = self._cursor_bodies.get(runtime_id)
             if body is not None:
-                self._cursor_bodies[runtime_id] = _cursor_body(packet.packed_items.data, b, body)
+                body = _cursor_body(packet.packed_items.data, b, body)
+                if (self._by_runtime[runtime_id].actor_type == "minecraft:item"
+                        and _player_flag(body.flags, b.ActorFlags.RIDING)):
+                    # Metadata can report a ride without a link; its end does not supply a new anchor.
+                    self._cursor_bodies.pop(runtime_id)
+                else:
+                    self._cursor_bodies[runtime_id] = body
             view = self._player_views.get(runtime_id)
             if view is not None:
                 words = _player_flag_words(packet.packed_items.data, b, view.flags)
@@ -1287,7 +1301,13 @@ class Entities:
         elif raw.packet_id == b.SetActorLinkPacket.ID:
             self._observe_link(self.packets.protocol.decode(raw).link)
         elif raw.packet_id == b.AddItemActorPacket.ID:
-            self._record(self._item_state(self.packets.protocol.decode(raw)))
+            packet = self.packets.protocol.decode(raw)
+            state = self._item_state(packet)
+            self._record(state)
+            if getattr(self.packets.protocol, "number", None) == 2225:
+                body = _cursor_body(packet.data.data, b)
+                if not _player_flag(body.flags, b.ActorFlags.RIDING):
+                    self._cursor_bodies[state.runtime_id] = body
         elif raw.packet_id == b.AddPaintingPacket.ID:
             painting = _painting_snapshot(self.packets.protocol.decode(raw))
             self._record(EntityState(
@@ -1382,6 +1402,9 @@ class Entities:
                 position = (float(move.pos.x), float(move.pos.y), float(move.pos.z))
                 if instance is not None:
                     instance.feet_known = False
+                if state.actor_type == "minecraft:item":
+                    # Only the spawn and delta references are verified for drops.
+                    self._cursor_bodies.pop(runtime_id, None)
             else:
                 axes = move.new_position_x, move.new_position_y, move.new_position_z
                 position = tuple(

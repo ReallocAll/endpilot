@@ -224,6 +224,71 @@ class EntityCursorPacketTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.query(), EntityCursorResult("miss", 0))
         self.assertEqual(initial.entity.entity_id, 108)
 
+    async def test_drop_blocks_cursor_only_if_its_observed_bounds_could_intervene(self):
+        await self.view()
+        self.spawn_actor()
+        cow = self.query()
+        self.assertEqual(cow.status, "hit")
+        b = self.b
+
+        def drop(**dimensions):
+            self.deliver(b.AddItemActorPacket(
+                id=109, runtime_id=9, pos=self.vec(6, 221.4, 13.5),
+                data=self.metadata(**dimensions),
+            ))
+
+        drop(width=0.25, height=0.25)
+        self.assertEqual(self.query(), cow)
+        self.delta(9, z=8.5)
+        self.assertEqual(self.query(), EntityCursorResult("unknown", 0))
+        self.delta(9, z=13.5)
+        self.assertEqual(self.query(), cow)
+        for kind in (b.ActorLinkType.PASSENGER, b.ActorLinkType.NONE):
+            self.deliver(b.SetActorLinkPacket(link=b.ActorLink(a=110, b=109, type=kind)))
+            self.assertEqual(self.query(), EntityCursorResult("unknown", 0))
+        drop(width=0.25, height=0.25)
+        self.assertEqual(self.query(), cow)
+        self.deliver(b.MoveActorAbsolutePacket(move_data=b.MoveActorAbsoluteData(
+            runtime_id=9, pos=self.vec(6, 221.4, 13.5),
+        )))
+        self.deliver(b.SetActorDataPacket(id=9, packed_items=self.metadata(width=0.25, height=0.25)))
+        self.assertEqual(self.query(), EntityCursorResult("unknown", 0))
+
+        drop(width=0.25, height=0.25)
+        self.assertEqual(self.query(), cow)
+        drop(width=0.25)
+        self.assertEqual(self.query(), EntityCursorResult("unknown", 0))
+
+    async def test_riding_metadata_invalidates_drop_bounds_until_a_fresh_spawn(self):
+        await self.view()
+        self.spawn_actor()
+        cow = self.query()
+        self.assertEqual(cow.status, "hit")
+        b = self.b
+        riding = 1 << int(b.ActorFlags.RIDING)
+
+        def drop(flags=0):
+            self.deliver(b.AddItemActorPacket(
+                id=109, runtime_id=9, pos=self.vec(6, 221.4, 13.5),
+                data=self.metadata(width=0.25, height=0.25, low=flags),
+            ))
+
+        for riding_at_spawn in (True, False):
+            with self.subTest(riding_at_spawn=riding_at_spawn):
+                drop(riding if riding_at_spawn else 0)
+                if not riding_at_spawn:
+                    self.assertEqual(self.query(), cow)
+                    self.deliver(b.SetActorDataPacket(id=9, packed_items=self.metadata(low=riding, high=None)))
+                self.assertEqual(self.query(), EntityCursorResult("unknown", 0))
+
+                self.deliver(b.SetActorDataPacket(
+                    id=9, packed_items=self.metadata(width=0.25, height=0.25),
+                ))
+                self.delta(9, z=13)
+                self.assertEqual(self.query(), EntityCursorResult("unknown", 0))
+                drop()
+                self.assertEqual(self.query(), cow)
+
     async def test_unsupported_body_only_makes_relevant_candidate_uncertain(self):
         await self.view()
         self.spawn_actor()
