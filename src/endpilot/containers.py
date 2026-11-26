@@ -10,7 +10,7 @@ from bedrock_protocol import nbt
 
 from .anvil import AnvilPreview, _estimate_anvil
 from .block_data import _catalog
-from .blocks import FACE_OFFSETS, Blocks
+from .blocks import FACE_OFFSETS, Blocks, BlockStateObservation
 from .compression import PacketConnection
 from .entities import Entities, EntityState
 from .inventory import (
@@ -220,6 +220,13 @@ class Containers:
             if state is not None:
                 self._window_block_name = state.name
         return self._window_block_name
+
+    def _observed_window_block_state(self, window: ContainerWindow) -> BlockStateObservation | None:
+        """Read the current primary block state for this active window."""
+        if (self.window is window and window.entity_unique_id == -1
+                and window.position is not None and self._blocks is not None):
+            return self._blocks.observed_block_state(window.position, layer=0)
+        return None
 
     def _container_slot_name(self, window: ContainerWindow, slot: int) -> str:
         if window.container_type == "ANVIL":

@@ -167,6 +167,22 @@ opened by `interact_entity()` supports the same transfers when it is bound
 to the observed cart. Use `range(5)` for the cart side of `transfer_range()`
 or call `transfer_item()` to use the whole window.
 
+## Transfer through dispensers, droppers, and powered hoppers
+
+Open the block with `open_container()` and wait for
+`wait_for_container_slots()`. The bot needs an observation of the primary
+block at the window position. Use `range(9)` for the dispenser or dropper
+side of `transfer_range()`, and `range(5)` for the hopper side. Narrow
+the range to select particular slots, or call `transfer_item()` to wait for
+and use the full window.
+
+Power a block hopper before transferring and keep it powered during the
+operation. You can check `bot.observed_block_state(position)` for
+`minecraft:hopper` with `properties["toggle_bit"] == 1`. A known unpowered
+hopper raises `RuntimeError` and an unknown state returns `unobserved`.
+If the observed block, power, or window changes before a step is sent,
+the result is `window_changed` and keeps any earlier confirmed steps.
+
 ## Choose ranges and interpret partial results
 
 - With `direction="take"`, the source range is in the open container and

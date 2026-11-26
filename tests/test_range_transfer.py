@@ -2,7 +2,7 @@ import asyncio
 from contextlib import ExitStack
 from copy import copy
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from endpilot import (
     Bot, HeldItemStack, ItemRegistrySnapshot, RangeTransferResult, RangeTransferStep, transfer_item, transfer_range,
@@ -24,6 +24,13 @@ IRON_PICKAXE = 1233
 DIAMOND = 1234
 STICK = 1235
 POSITION = (1, 100, 0)
+POWERED_HOPPER = 1981605110
+UNPOWERED_HOPPER = 3036911681
+UTILITY_LAYOUTS = (
+    ("DISPENSER", "minecraft:dispenser", None, 9),
+    ("DROPPER", "minecraft:dropper", None, 9),
+    ("HOPPER", "minecraft:hopper", POWERED_HOPPER, 5),
+)
 
 
 class RangePacketStream(PacketStream):
@@ -53,13 +60,13 @@ class RangeTransferTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.bot.close)
         self.observe_block("minecraft:chest")
 
-    def observe_block(self, name, position=POSITION, *, runtime_id=None):
+    def observe_block(self, name, position=POSITION, *, runtime_id=None, layer=0):
         palette, by_hash = _catalog()
         if runtime_id is None:
             runtime_id = next(key for key, index in by_hash.items()
                               if palette[index] is not None and palette[index].name == name)
         x, y, z = position
-        self.emit(self.b.UpdateBlockPacket(pos=self.b.BlockPos(x=x, y=y, z=z), runtime_id=runtime_id, layer=0))
+        self.emit(self.b.UpdateBlockPacket(pos=self.b.BlockPos(x=x, y=y, z=z), runtime_id=runtime_id, layer=layer))
 
     def emit(self, packet):
         self.stream.emit(self.bot.protocol.encode(packet))
@@ -70,18 +77,24 @@ class RangeTransferTests(unittest.IsolatedAsyncioTestCase):
         return descriptor
 
     def open_chest(self, *slots, position=POSITION, entity_unique_id=-1, width=27):
+        self.open_window("CONTAINER", *slots, position=position, entity_unique_id=entity_unique_id, width=width)
+
+    def open_window(self, window_type, *slots, width, position=POSITION, entity_unique_id=-1):
         b = self.b
         x, y, z = position
-        self.emit(b.ContainerOpenPacket(container_id=2, type=b.ContainerType.CONTAINER,
+        self.emit(b.ContainerOpenPacket(container_id=2, type=b.ContainerType[window_type],
                                         pos=b.BlockPos(x=x, y=y, z=z), entity_unique_id=entity_unique_id))
         if width is not None:
-            self.content(*slots, width=width)
+            # Stock utility windows use the default full name (0) on content packets.
+            name = CHEST if window_type == "CONTAINER" else "ANVIL_INPUT_CONTAINER"
+            self.content(*slots, width=width, name=name)
 
-    def content(self, *slots, width):
+    def content(self, *slots, width, inventory_id=2, name=CHEST):
         b = self.b
         self.assertLessEqual(len(slots), width)
-        self.emit(b.InventoryContentPacket(inventory_id=2, slots=(*slots, *(self.stack() for _ in range(width - len(slots)))),
-                                           full_container_name=b.FullContainerName(name=b.ContainerEnumName.LEVEL_ENTITY_CONTAINER),
+        self.emit(b.InventoryContentPacket(inventory_id=inventory_id,
+                                           slots=(*slots, *(self.stack() for _ in range(width - len(slots)))),
+                                           full_container_name=b.FullContainerName(name=b.ContainerEnumName[name]),
                                            storage_item=self.stack()))
 
     def set_slot(self, inventory, index, stack):
@@ -1124,6 +1137,162 @@ class RangeTransferTests(unittest.IsolatedAsyncioTestCase):
                     await self.transfer(1, chest=range(1), player=range(9, 10))
                 self.assertEqual(raised.exception.transfer_progress, RangeTransferResult(1, (), "unconfirmed"))
                 self.assertEqual(self.outgoing(), [])
+
+    async def test_utility_block_ranges_and_whole_window_use_native_addresses(self):
+        original_send = self.stream.send
+        for window_type, block, runtime_id, width in UTILITY_LAYOUTS:
+            with self.subTest(window_type=window_type):
+                self.stream.send = original_send
+                self.stream.sent.clear()
+                self.observe_block(block, runtime_id=runtime_id)
+                end = width - 1
+                slots = [self.stack() for _ in range(width)]
+                slots[0], slots[end] = self.stack(STICK, 4, 16), self.stack(PAPER, 63, 17)
+                self.open_window(window_type, *slots, width=width)
+                self.player_slot(35, self.stack(PAPER, 3, 31))
+                self.answer(
+                    ((end, 35, 3, 17, 31), [(CHEST, end, 60, 17), (PLAYER, 35, 6, 31)]),
+                    ((35, end, 4, 31, 17), [(PLAYER, 35, 2, 31), (CHEST, end, 64, 17)]),
+                    ((35, 1, 2, 31, 0), [(PLAYER, 35, 0, None), (CHEST, 1, 2, 32)]),
+                )
+                taken = await self.transfer(3, chest=range(end, width), player=range(35, 36))
+                stored = await transfer_item(self.bot, direction="put", item="minecraft:paper", count=6)
+                self.assertEqual((taken.confirmed_count, taken.stop_reason), (3, "complete"))
+                self.assertEqual((stored.confirmed_count, stored.stop_reason), (6, "complete"))
+                self.assertEqual((self.bot.container_slots[0].stack_size, self.bot.container_slots[1].stack_size,
+                                  self.bot.container_slots[end].stack_size, self.bot.inventory_slots[35].stack_size),
+                                 (4, 2, 64, 0))
+                actions = []
+                for packet in self.stream.sent:
+                    encoded = self.bot.protocol.decode(self.bot.protocol.encode(packet))
+                    request, = encoded.requests
+                    action, = request.actions
+                    actions.append((type(action).__name__, self.action(request), tuple(
+                        (int(slot.full_container_name.name), slot.full_container_name.dynamic_id)
+                        for slot in (action.source, action.destination)
+                    )))
+                self.assertEqual(actions, [
+                    ("TakeActionData", (end, 35, 3, 17, 31), ((7, None), (12, None))),
+                    ("PlaceActionData", (35, end, 4, 31, 17), ((12, None), (7, None))),
+                    ("PlaceActionData", (35, 1, 2, 31, 0), ((12, None), (7, None))),
+                ])
+
+    async def test_utility_layouts_require_matching_full_content_and_enforce_bounds(self):
+        self.player_slot(9, self.stack())
+        for window_type, block, runtime_id, width in UTILITY_LAYOUTS:
+            with self.subTest(window_type=window_type):
+                self.observe_block(block, runtime_id=runtime_id)
+                self.open_window(window_type, width=None)
+                self.set_slot(2, width - 1, self.stack(PAPER, 3, 17))
+                self.content(self.stack(PAPER, 3, 17), width=width, inventory_id=3)
+                self.assertEqual(await self.transfer(1), RangeTransferResult(1, (), "unobserved"))
+
+                waiting = self.start(transfer_item(self.bot, direction="take", item="minecraft:paper", count=1))
+                await asyncio.sleep(0)
+                self.assertFalse(waiting.done())
+                self.content(width=width)
+                self.set_slot(2, width, self.stack(PAPER, 3, 17))
+                self.assertEqual(await asyncio.wait_for(waiting, 1), RangeTransferResult(1, (), "source_exhausted"))
+                for direction in ("take", "put"):
+                    with self.assertRaisesRegex(ValueError, rf"0\.\.{width}"):
+                        await self.transfer(1, direction=direction, chest=range(width, width + 1))
+
+                for wrong_width in (width - 1, width + 1):
+                    self.content(self.stack(PAPER, 3, 17), width=wrong_width)
+                    with self.assertRaisesRegex(RuntimeError, "unsupported slot count"):
+                        await self.transfer(1)
+                    with self.assertRaisesRegex(RuntimeError, "unsupported slot count"):
+                        await transfer_item(self.bot, direction="take", item="minecraft:paper", count=1)
+        self.assertEqual(self.outgoing(), [])
+
+    async def test_utility_block_identity_and_hopper_power_are_checked_before_matching(self):
+        match = Mock(return_value=True)
+        self.player_slot(9, self.stack(PAPER, 2, 31))
+        for window_type, block, runtime_id, width in UTILITY_LAYOUTS:
+            with self.subTest(window_type=window_type):
+                self.observe_block(block, runtime_id=runtime_id)
+                for entity_unique_id in (0, -42):
+                    self.open_window(window_type, width=width, entity_unique_id=entity_unique_id)
+                    with self.assertRaisesRegex(RuntimeError, "block storage container|bound to a hopper minecart"):
+                        await transfer_item(self.bot, direction="put", item="minecraft:paper", count=1, match=match)
+                self.open_window(window_type, width=width)
+                self.observe_block("minecraft:chest")
+                with self.assertRaisesRegex(RuntimeError, block):
+                    await transfer_item(self.bot, direction="put", item="minecraft:paper", count=1, match=match)
+
+        position = (3, 100, 0)
+        self.observe_block("minecraft:hopper", position, runtime_id=POWERED_HOPPER, layer=1)
+        self.open_window("HOPPER", self.stack(PAPER, 2, 17), position=position, width=5)
+        options = dict(direction="take", item="minecraft:paper", count=1, match=match)
+        ranges = dict(source_slots=range(1), destination_slots=range(9, 10))
+        self.assertEqual(await transfer_range(self.bot, **options, **ranges), RangeTransferResult(1, (), "unobserved"))
+        self.assertEqual(await transfer_item(self.bot, **options), RangeTransferResult(1, (), "unobserved"))
+
+        self.observe_block("minecraft:hopper", position, runtime_id=UNPOWERED_HOPPER)
+        with self.assertRaisesRegex(RuntimeError, "powered"):
+            await transfer_range(self.bot, **options, **ranges)
+        with self.assertRaisesRegex(RuntimeError, "powered"):
+            await transfer_item(self.bot, **options)
+        match.assert_not_called()
+        self.assertEqual(self.outgoing(), [])
+
+        # Exact transfers retain their behavior when a block hopper is unpowered.
+        self.answer(((0, 10, 1, 17, 0), [(CHEST, 0, 1, 17), (PLAYER, 10, 1, 41)]))
+        exact = await self.bot.take_from_container(0, 10)
+        self.assertEqual(exact.result.name, "SUCCESS")
+        self.assertEqual(self.action_addresses(self.outgoing()[0]), (CHEST, PLAYER))
+
+    async def test_utility_range_rechecks_binding_at_write_and_keeps_confirmed_prefix(self):
+        original_send = self.stream.send
+        for change, window_type, block, runtime_id, width in (
+            ("power", *UTILITY_LAYOUTS[2]),
+            ("window", *UTILITY_LAYOUTS[0]),
+            ("block", *UTILITY_LAYOUTS[0]),
+            ("width", *UTILITY_LAYOUTS[1]),
+        ):
+            with self.subTest(change=change):
+                self.stream.send = original_send
+                self.stream.sent.clear()
+                self.observe_block(block, runtime_id=runtime_id)
+                self.open_window(window_type, self.stack(PAPER, 1, 17), self.stack(PAPER, 3, 18), width=width)
+                window = self.bot.open_window
+                self.player_slot(9, self.stack())
+                self.answer(
+                    ((0, 9, 1, 17, 0), [(CHEST, 0, 0, None), (PLAYER, 9, 1, 31)]),
+                    ((1, 9, 1, 18, 31), [(CHEST, 1, 2, 18), (PLAYER, 9, 2, 31)]),
+                )
+                send = self.stream.send
+                entered, release = asyncio.Event(), asyncio.Event()
+
+                async def hold_second(packet, **kwargs):
+                    if self.outgoing():
+                        entered.set()
+                        await release.wait()
+                    await send(packet, **kwargs)
+
+                with patch.object(self.stream, "send", hold_second):
+                    task = self.start(self.transfer(2))
+                    await asyncio.wait_for(entered.wait(), 1)
+                    slots = tuple(self.bot.container_slots[index] for index in range(width))
+                    if change == "power":
+                        self.observe_block(block, runtime_id=UNPOWERED_HOPPER)
+                    elif change == "window":
+                        self.open_window(window_type, *slots, width=width)
+                        self.assertEqual(self.bot.open_window, window)
+                        self.assertIsNot(self.bot.open_window, window)
+                    elif change == "block":
+                        self.observe_block("minecraft:dropper")
+                    else:
+                        self.content(*slots, width=width + 1)
+                        self.content(*slots, width=width)
+                    release.set()
+                    result = await asyncio.wait_for(task, 1)
+
+                request, = self.outgoing()
+                self.assertEqual(result, RangeTransferResult(2, (
+                    RangeTransferStep(0, 9, 1, 1, int(request.client_request_id.raw_id), "SUCCESS"),
+                ), "window_changed"))
+                self.assertEqual((self.bot.container_slots[1].stack_size, self.bot.inventory_slots[9].stack_size), (3, 1))
 
     async def test_sparse_slot_reports_do_not_establish_container_width(self):
         self.open_chest(width=None)

@@ -253,8 +253,8 @@ class EntityRangeTransferTests(unittest.IsolatedAsyncioTestCase):
     async def test_block_hopper_remains_available_for_exact_transfer(self):
         await self.deliver(self.opened(-1, "HOPPER"), self.contents((4, 5, 31), count=5))
         await self.player_slots((9, 0, None))
-        with self.assertRaisesRegex(RuntimeError, "bound to a hopper minecart"):
-            await self.transfer(1, cart=range(4, 5))
+        self.assertEqual(await self.transfer(1, cart=range(4, 5)), RangeTransferResult(1, (), "unobserved"))
+        self.assertEqual(self.requests(), [])
         taking, request = await self.request(self.bot.take_from_container(4, 9, 2))
         self.assert_action(request, 2, (CART, 4, 31), (PLAYER, 9, 0))
         await self.verdict(request, (CART, 4, 3, 31), (PLAYER, 9, 2, 41))

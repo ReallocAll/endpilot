@@ -20,6 +20,11 @@ if TYPE_CHECKING:
 _SINGLE_CONTAINER_SIZE = 27
 _DOUBLE_CHEST_SIZE = 54
 _TRANSFER_BLOCKS = ("minecraft:chest", "minecraft:barrel")
+_UTILITY_BLOCK_LAYOUTS = {
+    "DISPENSER": ("minecraft:dispenser", 9),
+    "DROPPER": ("minecraft:dropper", 9),
+    "HOPPER": ("minecraft:hopper", 5),
+}
 _PLAYER_SIZE = 36
 _MAX_STEP = 255
 
@@ -148,10 +153,12 @@ async def transfer_range(
     match: Callable[[HeldItemStack], bool] | None = None,
     timeout: float = 15,
 ) -> RangeTransferResult:
-    """Move a registered item through the currently open chest, barrel or minecart.
+    """Move a registered item between the open storage window and main inventory.
 
     A double chest uses the 54-slot order reported by its active window.
     Chest and hopper minecarts require matching 27-slot and 5-slot windows.
+    Dispensers and droppers require matching 9-slot windows. A block hopper
+    requires a matching 5-slot window and an observed powered state.
     Optional match is a pure synchronous predicate on immutable source stacks
     with the requested item ID. It can run again before planning each step.
     A window change during matching stops the transfer before the next send.
@@ -178,8 +185,8 @@ async def transfer_item(
 ) -> RangeTransferResult:
     """Move up to count of a registered item between the active container and main inventory.
 
-    Wait for the contents of the open chest, barrel, chest minecart or hopper
-    minecart, then use its full slot range and all 36 main inventory slots.
+    Use the same storage windows as transfer_range. Wait for the open window's
+    contents, then use its full slot range and all 36 main inventory slots.
     The timeout covers the content wait and all item requests. A replacement
     window stops the operation, and a zero count completes immediately.
     The optional match and server-confirmed result follow transfer_range.
@@ -227,16 +234,48 @@ async def _transfer_range(
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout if whole_window else None
         window = bot.open_window
-        if window is None or window.container_type not in ("CONTAINER", "HOPPER"):
-            raise RuntimeError("open an ordinary chest or barrel before transferring items")
+        if window is None or window.container_type not in ("CONTAINER", *_UTILITY_BLOCK_LAYOUTS):
+            raise RuntimeError("open a supported storage container before transferring items")
         containers, inventory = bot._containers, bot._inventory
         entity = containers._entity_container
         minecart_slot_count = None if entity is None else entity.minecart_slot_count(window)
-        if window.container_type == "HOPPER":
+        utility_layout = _UTILITY_BLOCK_LAYOUTS.get(window.container_type)
+        if window.container_type == "HOPPER" and window.entity_unique_id != -1:
             if minecart_slot_count is None:
                 raise RuntimeError("the active hopper window must be bound to a hopper minecart")
             if not entity.is_visible():
                 return result("window_changed")
+            utility_layout = None
+        block_slots, player_slots = (
+            (destination_slots, source_slots) if into_container else (source_slots, destination_slots)
+        )
+        container_range_name = "destination_slots" if into_container else "source_slots"
+
+        if utility_layout is not None:
+            utility_name, utility_width = utility_layout
+            if window.entity_unique_id != -1 or window.position is None or entity is not None:
+                raise RuntimeError("the active window must identify a block storage container")
+            if not whole_window:
+                _check_range(block_slots, utility_width, container_range_name)
+            observed = containers._observed_window_block_state(window)
+            if observed is None:
+                return result("unobserved")
+            if observed.name != utility_name:
+                raise RuntimeError(f"the active window must match an observed {utility_name} block")
+            if utility_name == "minecraft:hopper":
+                powered = observed.properties.get("toggle_bit")
+                if powered == 0:
+                    raise RuntimeError("the block hopper must be powered before transferring items")
+                if powered != 1:
+                    return result("unobserved")
+
+        def utility_is_current():
+            if containers._entity_container is not None:
+                return False
+            observed = containers._observed_window_block_state(window)
+            return (observed is not None and observed.name == utility_name
+                    and (utility_name != "minecraft:hopper" or observed.properties.get("toggle_bit") == 1))
+
         slot_count = containers._observed_window_slot_count(window)
         if whole_window and slot_count is None:
             try:
@@ -245,12 +284,15 @@ async def _transfer_range(
                 return result(str(stopped))
             if bot._containers is not containers or bot._inventory is not inventory or containers.window is not window:
                 return result("window_changed")
+            if utility_layout is not None and not utility_is_current():
+                return result("window_changed")
             slot_count = containers._observed_window_slot_count(window)
-        block_slots, player_slots = (
-            (destination_slots, source_slots) if into_container else (source_slots, destination_slots)
-        )
-        container_range_name = "destination_slots" if into_container else "source_slots"
-        if window.entity_unique_id == -1:
+        if utility_layout is not None:
+            if slot_count is None:
+                return result("unobserved")
+            if slot_count != utility_width:
+                raise RuntimeError(f"the active {utility_name} window has an unsupported slot count")
+        elif window.entity_unique_id == -1:
             if window.position is None:
                 raise RuntimeError("open an ordinary chest or barrel before transferring items")
             if not whole_window and slot_count == _SINGLE_CONTAINER_SIZE:
@@ -290,6 +332,7 @@ async def _transfer_range(
         def window_is_current():
             return (bot._containers is containers and bot._inventory is inventory
                     and containers.window is window and containers._layout_token is layout
+                    and (utility_layout is None or utility_is_current())
                     and (entity is None or (containers._entity_container is entity and entity.is_visible())))
 
         registry = bot.item_registry
@@ -361,12 +404,12 @@ async def _transfer_range(
             try:
                 reply = await containers._transfer(
                     origin, target, amount, into_container=into_container, timeout=time_left,
-                    block_container=container_name if entity is None else None,
+                    block_container=container_name if entity is None and utility_layout is None else None,
                     _expected_slots=(source_stack, destination_stack),
                     _expected_slot_count=slot_count,
                     _on_unconfirmed=mark_unconfirmed,
-                    _range_window_current=(window_is_current if whole_window or entity is not None or match is not None
-                                           or before_write is not None else None),
+                    _range_window_current=(window_is_current if whole_window or utility_layout is not None
+                                           or entity is not None or match is not None or before_write is not None else None),
                     _before_range_write=before_write,
                 )
             except _InventoryMoveNotSubmitted as stopped:
