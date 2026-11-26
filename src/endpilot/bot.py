@@ -363,7 +363,7 @@ class Bot:
         )
         self._signs = Signs(session.packets, self._blocks, self._movement, self._inventory, session.player_id)
         self._chat = Chat(session.packets, session.identity.name)
-        self._titles = Titles(session.packets)
+        self._titles = Titles(session.packets, session._end_state)
         self._commands = Commands(
             session.packets, session.identity.uuid, session.player_unique_id,
             initial_catalog=session.command_catalog_packet, initial_commands_enabled=session.commands_enabled,
@@ -2338,6 +2338,14 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._titles.wait_for_event(kind=kind, timeout=timeout)
 
+    def subscribe_titles(
+        self, callback: Callable[[TitleEvent], None], *, kind: TitleKind | None = None,
+    ) -> Callable[[], None]:
+        """Run a synchronous callback for matching titles and return an idempotent unsubscribe."""
+        if self._titles is None:
+            raise RuntimeError("player has not joined")
+        return self._titles.subscribe(callback, kind=kind)
+
     @property
     def command_catalog(self) -> CommandCatalog | None:
         """Return the latest immutable command advertisement, if available."""
@@ -2996,14 +3004,14 @@ class Bot:
         beds, self._beds = self._beds, None
         collector, self._block_collector = self._block_collector, None
         chat, self._chat = self._chat, None
+        titles, self._titles = self._titles, None
         boss_bars, self._boss_bars = self._boss_bars, None
         forms, self._forms = self._forms, None
         self._harvest_tools = None
         close_component(collector)
         signs, self._signs = self._signs, None
-        for component in (signs, boss_bars, forms, beds, blocks, creative, enchanting, containers, chat):
+        for component in (signs, boss_bars, forms, beds, blocks, creative, enchanting, containers, chat, titles):
             close_component(component)
-        self._titles = None
         commands, self._commands = self._commands, None
         close_component(commands)
         entities, self._entities = self._entities, None

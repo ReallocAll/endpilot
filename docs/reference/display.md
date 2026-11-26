@@ -80,7 +80,15 @@ after the wait begins. Pass `kind="title"`, `"subtitle"`, `"actionbar"`,
 triggering the server action. The event records receipt of a packet by the bot.
 A deadline raises `TimeoutError` and a stream that ends first raises `ConnectionError`.
 
-Text events carry `text` and an optional server-supplied `filtered_text`.
+Use `bot.subscribe_titles(callback, kind="actionbar")` to observe a sequence of
+title events. Omit `kind` to observe all six kinds. The synchronous callback
+receives an immutable `TitleEvent` for each matching packet dispatched after
+registration, in wire order. Call the returned function to unsubscribe immediately,
+including during delivery. Subscriptions end when the bot closes, the server
+sends a disconnect packet, or the packet reader stops.
+
+Title, subtitle, and action bar events carry `text` and an optional
+server-supplied `filtered_text`.
 `text_object=True` marks a Bedrock text-object string, preserved as supplied by
 the server. The `kind` filter matches both plain text and text objects for the
 selected title kind. `times` events carry `fade_in_ticks`, `stay_ticks`, and
@@ -92,7 +100,8 @@ from the server console after the example prints `title_watcher_ready`.
 [Title example](../../examples/observe_title.py)
 
 Use `bot.wait_for_title(kind="actionbar")` for the native title actionbar packet.
-Text packets of kind `TIP` are available through `bot.wait_for_text()`.
+Use `bot.subscribe_text(callback, kind=TextPacketType.TIP)` or
+`bot.wait_for_text(kind=TextPacketType.TIP)` for tips carried by text packets.
 
 ## Observe boss bars
 
