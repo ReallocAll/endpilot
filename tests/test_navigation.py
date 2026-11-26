@@ -66,7 +66,9 @@ class Sink:
     def start_receiving(self):
         pass
 
-    async def send(self, packet):
+    async def send(self, packet, *, _before_send=None):
+        if _before_send is not None:
+            _before_send()
         self.sent.append(packet)
         if self.on_send is not None:
             self.on_send()
