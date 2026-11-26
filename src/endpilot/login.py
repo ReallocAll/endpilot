@@ -470,7 +470,10 @@ class JoinSession:
                     speed = movement_speed_attribute(packet)
                     if speed is not None:
                         movement_speeds[runtime_id] = speed
-                if runtime_id == self.player_id and any(
+                if runtime_id != self.player_id:
+                    # Replay checks the target after StartGame establishes our runtime ID.
+                    self.entity_packets.append(raw)
+                elif any(
                     attribute.name in VITAL_ATTRIBUTES for attribute in packet.attribute_data
                 ):
                     self.player_state_packets.append(raw)

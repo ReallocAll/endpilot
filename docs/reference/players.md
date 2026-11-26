@@ -184,6 +184,52 @@ whose instance leaves view or is replaced. A dimension change ends pending
 waits with `RuntimeError`. A deadline raises `TimeoutError`, and connection
 end raises `ConnectionError` in pending waits and ends all subscriptions.
 
+## Observe remote entity attributes
+
+Each `EntityState` from `bot.observed_entities` has an immutable `attributes`
+tuple for the current remote instance. An actor spawn can report attribute names
+and their minimum, current, and maximum values. A player spawn starts with an
+empty tuple. Later attribute packets replace entries by exact name and preserve
+entries omitted from the packet. The tuple contains the last values the server
+sent, which can become stale.
+
+Each `EntityAttribute` has `name`, `min_value`, `current_value`, `max_value`,
+`default_min_value`, `default_value`, `default_max_value`, and `modifiers`.
+Omitted defaults are `None`. An actor spawn omits the modifier list, giving
+`modifiers=None`. An update reporting an empty modifier list gives
+`modifiers=()`. Each `EntityAttributeModifier` carries `id`, `name`, `amount`,
+the numeric `operation` and `operand`, and the `serialize` flag.
+
+```python
+sheep = next((entity for entity in bot.observed_entities
+              if entity.actor_type == "minecraft:sheep"), None)
+if sheep is not None:
+    for attribute in sheep.attributes:
+        print(attribute.name, attribute.current_value)
+
+    update = await bot.wait_for_entity_attribute_update(runtime_id=sheep.runtime_id)
+    for attribute in update.entity.attributes:
+        if attribute.name in update.names:
+            print(update.tick, attribute.name, attribute.current_value)
+```
+
+`bot.subscribe_entity_attribute_updates(callback, runtime_id=...)` calls a
+synchronous callback with an `EntityAttributeUpdate` after each matching update
+packet is applied, including repeated values and empty reports. Spawn reports
+only initialize the snapshot. The event contains the immutable `entity`
+snapshot at that packet, the packet's `tick`, and `names` in first occurrence
+order. When a name occurs more than once, the last entry supplies its value.
+Both methods send no packets. The subscription returns an idempotent unsubscribe
+function, and the wait accepts `timeout=None` for no deadline.
+
+Omit `runtime_id` to observe any tracked remote entity. A runtime filter binds
+the current instance and raises `LookupError` for a local or unobserved target.
+Removal or replacement ends its filtered subscription and raises `LookupError`
+in its pending wait. Dimension changes end filtered subscriptions and raise
+`RuntimeError` in all pending waits. Unfiltered subscriptions continue across
+dimension changes. A deadline raises `TimeoutError`. Disconnection ends all
+subscriptions and raises `ConnectionError` in pending waits.
+
 ## Observe native entity actor events
 
 `bot.subscribe_entity_actor_events(callback, runtime_id=..., event_id=...)`

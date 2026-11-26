@@ -47,6 +47,32 @@ class PaintingSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class EntityAttributeModifier:
+    """One server-reported modifier, with numeric operation and operand codes."""
+
+    id: str
+    name: str
+    amount: float
+    operation: int
+    operand: int
+    serialize: bool
+
+
+@dataclass(frozen=True, slots=True)
+class EntityAttribute:
+    """A server-reported attribute, with None for fields omitted by the packet."""
+
+    name: str
+    min_value: float
+    current_value: float
+    max_value: float
+    default_min_value: float | None = None
+    default_value: float | None = None
+    default_max_value: float | None = None
+    modifiers: tuple[EntityAttributeModifier, ...] | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class EntityState:
     """Immutable actor state, with details from item and painting packets.
 
@@ -57,6 +83,9 @@ class EntityState:
 
     ``gliding`` is the latest server-reported glide flag for this visible remote
     player instance. ``None`` means the flag is unknown or does not apply.
+
+    ``attributes`` holds the latest server report for each observed attribute of
+    this actor instance. An empty tuple means no attributes have been observed.
     """
 
     entity_id: int
@@ -74,6 +103,7 @@ class EntityState:
     painting: PaintingSnapshot | None = None
     last_observed_offhand: HeldItemStack | None = None
     gliding: bool | None = None
+    attributes: tuple[EntityAttribute, ...] = ()
 
 
 _MovementWaiters = dict[asyncio.Future[EntityState | BaseException], Callable[[EntityState], bool]]
@@ -109,6 +139,15 @@ class EntityActorEvent:
     event_id: int
     data: int
     fire_at_position: tuple[float, float, float] | None
+
+
+@dataclass(frozen=True, slots=True)
+class EntityAttributeUpdate:
+    """One attribute update and the entity snapshot after it was applied."""
+
+    entity: EntityState
+    names: tuple[str, ...]
+    tick: int
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -386,6 +425,7 @@ class Entities:
         self._swing_observers: list[_EntityObserver[EntitySwing]] = []
         self._health_observers: list[_EntityObserver[EntityHealthEvent]] = []
         self._actor_event_observers: list[_EntityObserver[EntityActorEvent]] = []
+        self._attribute_observers: list[_EntityObserver[EntityAttributeUpdate]] = []
         self._glide_observers: list[Callable[[EntityState], None]] = []
         self._unidentified_equipment_since: dict[int, int] = {}
         # AddPlayer can identify an instance before its unique ID appears in EntityState.
@@ -424,7 +464,8 @@ class Entities:
         self._last_skin_update = None
         self._end_movement_waiters(ConnectionError, "entity session is closed", _cause)
         self._clear_player_equipment(ConnectionError, "entity session is closed", _cause)
-        for observers in (self._swing_observers, self._health_observers, self._actor_event_observers):
+        for observers in (self._swing_observers, self._health_observers, self._actor_event_observers,
+                          self._attribute_observers):
             self._end_entity_observers(observers, lambda _: True, ConnectionError, "entity session is closed", _cause)
         self._glide_observers.clear()
         self._actor_instances.clear()
@@ -566,6 +607,20 @@ class Entities:
         self._require_actor_event_target(runtime_id, event_id)
         return await self._wait_for_entity_event(self._actor_event_observers, runtime_id, timeout, kind=event_id)
 
+    def subscribe_entity_attribute_updates(
+        self, callback: Callable[[EntityAttributeUpdate], None], *, runtime_id: int | None = None,
+    ) -> Callable[[], None]:
+        self._require_live()
+        self._require_remote_event_target(runtime_id)
+        return self.packets._subscribe(self._attribute_observers, _EntityObserver(runtime_id, callback))
+
+    async def wait_for_entity_attribute_update(
+        self, *, runtime_id: int | None = None, timeout: float | None = 15,
+    ) -> EntityAttributeUpdate:
+        self._require_live()
+        self._require_remote_event_target(runtime_id)
+        return await self._wait_for_entity_event(self._attribute_observers, runtime_id, timeout)
+
     async def _wait_for_entity_event[Event](
         self, observers: list[_EntityObserver[Event]], runtime_id: int | None, timeout: float | None,
         *, kind: EntityHealthEventKind | int | None = None,
@@ -649,6 +704,36 @@ class Entities:
             event = EntityActorEvent(state, event_id, int(packet.data), fire_at_position)
             self._notify_entity_observers(actor_event_observers, event, runtime_id,
                                           "entity actor event observer failed", kind=event_id)
+
+    def _observe_attribute_update(self, raw: RawPacket) -> None:
+        packet = self.packets.protocol.decode(raw)
+        runtime_id = int(packet.runtime_id)
+        state = self._by_runtime.get(runtime_id)
+        if runtime_id == self._own_runtime_id or state is None:
+            return
+
+        updated: dict[str, EntityAttribute] = {}
+        for attribute in packet.attribute_data:
+            name = str(attribute.name)
+            updated[name] = EntityAttribute(
+                name, float(attribute.min_value), float(attribute.current_value), float(attribute.max_value),
+                default_min_value=getattr(attribute, "default_min_value", None),
+                default_value=float(attribute.default_value),
+                default_max_value=getattr(attribute, "default_max_value", None),
+                modifiers=tuple(EntityAttributeModifier(
+                    str(modifier.id), str(modifier.name), float(modifier.amount),
+                    int(modifier.operation), int(modifier.operand), bool(modifier.serialize),
+                ) for modifier in attribute.modifiers),
+            )
+        if updated:
+            attributes = {attribute.name: attribute for attribute in state.attributes}
+            attributes.update(updated)
+            state = replace(state, attributes=tuple(attributes.values()))
+            self._by_runtime[runtime_id] = state
+        if self._attribute_observers:
+            event = EntityAttributeUpdate(state, tuple(updated), int(packet.tick))
+            self._notify_entity_observers(self._attribute_observers, event, runtime_id,
+                                          "entity attribute observer failed")
 
     @staticmethod
     def _notify_entity_observers[Event](
@@ -1116,6 +1201,10 @@ class Entities:
             # Link callbacks can register observers while the previous actor is still visible.
             self._forget_entity_observers(self._health_observers, runtime_id)
             self._forget_entity_observers(self._actor_event_observers, runtime_id)
+            self._forget_entity_observers(self._attribute_observers, runtime_id)
+            if not new_instance and state.attributes:
+                # A conflicting roster identity must not inherit the previous actor's reports.
+                state = replace(state, attributes=())
         self._by_runtime[runtime_id] = state
         if new_instance:
             self._forget_player_equipment(runtime_id)
@@ -1139,6 +1228,7 @@ class Entities:
         self._forget_entity_observers(self._swing_observers, runtime_id)
         self._forget_entity_observers(self._health_observers, runtime_id)
         self._forget_entity_observers(self._actor_event_observers, runtime_id)
+        self._forget_entity_observers(self._attribute_observers, runtime_id)
         self._forget_player_equipment(runtime_id)
         state = self._by_runtime.pop(runtime_id, None)
         self._actor_instances.pop(runtime_id, None)
@@ -1172,6 +1262,8 @@ class Entities:
             self._observe_swing(raw)
         elif raw.packet_id == b.ActorEventPacket.ID:
             self._observe_actor_event(raw)
+        elif raw.packet_id == b.UpdateAttributesPacket.ID:
+            self._observe_attribute_update(raw)
         elif raw.packet_id == b.ItemRegistryPacket.ID:
             packet = self.packets.protocol.decode(raw)
             self._item_names = {int(item.id): str(item.name) for item in packet.items}
@@ -1214,6 +1306,7 @@ class Entities:
                             elif equipment.entity_id != entity_id:
                                 self._forget_player_equipment(runtime_id)
                                 self._player_views.pop(runtime_id, None)
+                                state = self._by_runtime[runtime_id]
                                 if state.last_observed_offhand is not None or state.gliding is not None:
                                     self._by_runtime[runtime_id] = replace(state, last_observed_offhand=None, gliding=None)
                 else:
@@ -1323,25 +1416,34 @@ class Entities:
                 ))
         elif raw.packet_id == b.AddActorPacket.ID:
             actor = self.packets.protocol.decode(raw)
+            runtime_id = int(actor.runtime_id)
             owner = None
             if actor.actor_type == "minecraft:fishing_hook":
                 owner = next((int(entry.payload.value) for entry in actor.data.data
                               if int(entry.id) == int(b.ActorDataIDs.OWNER)
                               and isinstance(entry.payload, b.DataItemInt64Payload)), None)
             is_boat = actor.actor_type == "minecraft:boat"
+            spawn_attributes = getattr(actor, "attributes", ()) if runtime_id != self._own_runtime_id else ()
+            attributes: dict[str, EntityAttribute] = {}
+            for attribute in spawn_attributes:
+                name = str(attribute.name)
+                attributes[name] = EntityAttribute(
+                    name, float(attribute.min_value), float(attribute.current_value), float(attribute.max_value),
+                )
             self._record(EntityState(
-                int(actor.entity_id), int(actor.runtime_id), actor.actor_type,
+                int(actor.entity_id), runtime_id, actor.actor_type,
                 (float(actor.pos.x), float(actor.pos.y), float(actor.pos.z)),
                 owner_entity_id=None if owner == -1 else owner,
                 boat_rotation=(float(actor.rot.x), float(actor.rot.y)) if is_boat else None,
                 boat_velocity=(float(actor.velocity.x), float(actor.velocity.y), float(actor.velocity.z))
                 if is_boat else (0.0, 0.0, 0.0),
+                attributes=tuple(attributes.values()),
             ))
             if (actor.actor_type in _ACTOR_SPAWN_FEET_TYPES
                     and getattr(actor, "passenger_of_block_data", None) is not None):
-                self._actor_instances[int(actor.runtime_id)].feet_known = False
+                self._actor_instances[runtime_id].feet_known = False
             if actor.actor_type in _CURSOR_BODY_TYPES and getattr(self.packets.protocol, "number", None) == 2225:
-                self._cursor_bodies[int(actor.runtime_id)] = _cursor_body(actor.data.data, b)
+                self._cursor_bodies[runtime_id] = _cursor_body(actor.data.data, b)
             for link in actor.links:
                 self._observe_link(link)
         elif raw.packet_id == b.SetActorLinkPacket.ID:
@@ -1376,6 +1478,8 @@ class Entities:
                                        RuntimeError, "dimension changed while waiting for an entity health event")
             self._end_entity_observers(self._actor_event_observers, dimension_bound,
                                        RuntimeError, "dimension changed while waiting for an entity actor event")
+            self._end_entity_observers(self._attribute_observers, dimension_bound,
+                                       RuntimeError, "dimension changed while waiting for an entity attribute update")
             self._by_runtime.clear()
             self._actor_instances.clear()
             self._cursor_bodies.clear()
