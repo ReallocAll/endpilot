@@ -29,9 +29,10 @@ Save `timeline.next_index` before triggering an action and pass it as the
 inclusive cursor to `timeline.received(name, since=cursor)`. For commands,
 `await bot.send_command(command)` completes after submission.
 `await bot.execute_command(command)` also waits for the next command-style
-server text. That text carries no request ID. Verify the intended effect from a
-separate world, inventory, or server observation.
-[Timeline tests](../../tests/test_qa.py) · [Command tests](../../tests/test_commands.py)
+server text. A server disconnect received before that text raises
+`ConnectionError`. The text carries no request ID. Verify the intended effect
+from a separate world, inventory, or server observation.
+[Timeline tests](../../tests/test_qa.py) · [Command tests](../../tests/test_commands.py) · [Session tests](../../tests/test_session_termination.py)
 
 ## Run the MCP server
 

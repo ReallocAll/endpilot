@@ -26,7 +26,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             ))
 
         async def wait(packet_id, *, match, timeout):
-            self.assertEqual(packet_id, text.ID)
+            self.assertEqual(packet_id, (text.ID, b.DisconnectPacket.ID))
             self.assertEqual(timeout, 5)
             self.assertFalse(match(incoming(TextPacketType.SYSTEM_MESSAGE, "unrelated system text")))
             self.assertFalse(match(incoming(TextPacketType.RAW, "unrelated raw text")))

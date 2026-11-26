@@ -5,6 +5,7 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 from unittest.mock import patch
 
+from bedrock_protocol import TextPacketType
 from endpilot import BlockObservation, Bot, LoginRefused, PlacementResult, SessionEnd
 from endpilot.blocks import HASHED_AIR_RUNTIME_ID
 from endpilot.movement import Movement
@@ -60,6 +61,159 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
     async def connect(self, wire, **options):
         with patch("endpilot.transport.nethernet.connect", return_value=wire):
             await self.bot.join_nethernet("http://127.0.0.1:19132", timeout=1, **options)
+
+    def command_text(self, kind, message):
+        text = self.b.TextPacket
+        return text(localize=False, body=text.MessageOnly(type=kind, message=message),
+                    xuid="", platform_id="", filtered_message=None)
+
+    def command_requests(self, wire):
+        return [packet.command for packet in wire.sent if isinstance(packet, self.b.CommandRequestPacket)]
+
+    def command_task(self, command):
+        executing = asyncio.create_task(self.bot.execute_command(command, timeout=10))
+
+        async def drain():
+            executing.cancel()
+            await asyncio.gather(executing, return_exceptions=True)
+
+        self.addAsyncCleanup(drain)
+        return executing
+
+    async def start_command(self, command):
+        sent = asyncio.Event()
+
+        def observe_send(packet_id):
+            if packet_id == self.b.CommandRequestPacket.ID:
+                sent.set()
+
+        unsubscribe = self.bot.packets.subscribe_sent(observe_send)
+        try:
+            executing = self.command_task(command)
+            await asyncio.wait_for(sent.wait(), 1)
+        finally:
+            unsubscribe()
+        self.assertFalse(executing.done())
+        return executing
+
+    async def test_command_feedback_ends_on_kick_with_live_reader_and_same_bot_can_rejoin(self):
+        wire = self.wire()
+        await self.connect(wire)
+        packets = self.bot.packets
+        baseline = set(packets._subscribers)
+        executing = await self.start_command("/say first")
+        queued = self.command_task("/say queued")
+        await asyncio.sleep(0)
+        self.assertFalse(queued.done())
+        self.assertEqual(self.command_requests(wire), ["/say first"])
+        callbacks = set(packets._subscribers) - baseline
+        self.assertEqual(len(callbacks), 1)
+
+        wire.push(self.disconnect("Kicked during feedback", filtered="Filtered reason"))
+        ended = await self.bot.wait_for_session_end(timeout=1)
+        self.assertEqual(ended, SessionEnd("server_disconnect", 55, "KICKED",
+                                           "Kicked during feedback", "Filtered reason"))
+        error = "^server disconnected while waiting for command feedback$"
+        for task in (executing, queued, self.command_task("/say late")):
+            with self.assertRaisesRegex(ConnectionError, error):
+                await asyncio.wait_for(task, 1)
+        self.assertEqual(self.command_requests(wire), ["/say first"])
+        self.assertFalse(set(packets._subscribers) - baseline)
+        self.assertFalse(packets._reader_task.done())
+        self.assertFalse(wire.closed)
+        self.assertIs(self.bot.session_end, ended)
+
+        await self.bot.close()
+        self.assertTrue(wire.closed)
+        self.assertIs(self.bot.session_end, ended)
+        replacement = self.wire(player_id=42)
+        await self.connect(replacement)
+        self.assertIsNone(self.bot.session_end)
+        self.assertIsNot(self.bot.packets, packets)
+        executing = await self.start_command("/say reopened")
+        reply = '{"rawtext":[{"text":"reopened"}]}'
+        replacement.push(self.command_text(TextPacketType.TEXT_OBJECT, reply))
+        feedback = await asyncio.wait_for(executing, 1)
+        self.assertEqual((feedback.body.type, feedback.body.message), (TextPacketType.TEXT_OBJECT, reply))
+        self.assertEqual(self.command_requests(replacement), ["/say reopened"])
+
+    async def test_first_command_feedback_or_kick_wins_in_same_batch(self):
+        reply = '{"rawtext":[{"text":"command feedback"}]}'
+        text = self.command_text(TextPacketType.TEXT_OBJECT, reply)
+        system = self.command_text(TextPacketType.SYSTEM_MESSAGE, "unrelated system text")
+        kick = self.disconnect("Kicked in the feedback batch")
+        for feedback_first in (True, False):
+            with self.subTest(feedback_first=feedback_first):
+                wire = self.wire()
+                await self.connect(wire)
+                executing = await self.start_command("/say first")
+                ordered = (text, kick) if feedback_first else (kick, text)
+                wire.incoming.put_nowait(write_batch(wire.protocol.encode(packet) for packet in (system, *ordered)))
+                ended = await self.bot.wait_for_session_end(timeout=1)
+                self.assertEqual(ended.reason_name, "KICKED")
+                if feedback_first:
+                    feedback = await asyncio.wait_for(executing, 1)
+                    self.assertEqual((feedback.body.type, feedback.body.message), (TextPacketType.TEXT_OBJECT, reply))
+                else:
+                    message = "^server disconnected while waiting for command feedback$"
+                    with self.assertRaisesRegex(ConnectionError, message):
+                        await asyncio.wait_for(executing, 1)
+                await self.bot.close()
+
+    async def test_kick_during_command_wait_prearming_prevents_send(self):
+        wire = self.wire()
+        await self.connect(wire)
+        packets = self.bot.packets
+        # Let the reader reach its live wire wait before scheduling the command and the kick.
+        marker = self.b.SetTimePacket(time=42)
+        reading = asyncio.create_task(packets.wait_for_packet(marker.ID, timeout=1))
+        await asyncio.sleep(0)
+        wire.push(marker)
+        await reading
+
+        baseline = set(packets._subscribers)
+        executing = self.command_task("/say during kick")
+        wire.push(self.disconnect("Kicked before submission"))
+        with self.assertRaisesRegex(ConnectionError, "^server disconnected while waiting for command feedback$"):
+            await asyncio.wait_for(executing, 1)
+        self.assertEqual(self.command_requests(wire), [])
+        self.assertFalse(set(packets._subscribers) - baseline)
+
+    async def test_command_cancellation_during_wait_prearming_releases_subscription(self):
+        wire = self.wire()
+        await self.connect(wire)
+        packets = self.bot.packets
+        baseline = tuple(packets._subscribers)
+        executing = self.command_task("/say cancelled")
+        await asyncio.sleep(0)
+        executing.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await executing
+        self.assertEqual(tuple(packets._subscribers), baseline)
+        self.assertEqual(self.command_requests(wire), [])
+
+    async def test_command_feedback_distinguishes_reader_failure_and_local_close(self):
+        for eof in (None, EOFError("peer ended the receive stream")):
+            with self.subTest(eof=eof):
+                wire = self.wire()
+                await self.connect(wire)
+                executing = await self.start_command("/say waiting")
+                if eof is None:
+                    await self.bot.close()
+                    message = "^packet stream closed while waiting$"
+                    ended = SessionEnd("local_close")
+                else:
+                    wire.incoming.put_nowait(eof)
+                    message = "^packet stream lost while waiting$"
+                    ended = SessionEnd("reader_end", error_type="EOFError")
+                with self.assertRaisesRegex(ConnectionError, message) as raised:
+                    await asyncio.wait_for(executing, 1)
+                self.assertIs(raised.exception.__cause__, eof)
+                self.assertEqual(self.bot.session_end, ended)
+                if eof is not None:
+                    with self.assertRaises(EOFError) as closing:
+                        await self.bot.close()
+                    self.assertIs(closing.exception, eof)
 
     def placement_block(self, pos, runtime_id):
         b = self.b

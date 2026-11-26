@@ -9,6 +9,9 @@ from bedrock_protocol import TextPacketType
 from .protocol import RawPacket
 
 
+_DISCONNECT_ERROR = "server disconnected while waiting for command feedback"
+
+
 @dataclass(frozen=True, slots=True)
 class CommandCatalogEntry:
     """A published name and the aliases referenced by its advertisement."""
@@ -33,6 +36,7 @@ class Commands:
         self.player_uuid = player_uuid
         self.player_unique_id = player_unique_id
         self._lock = asyncio.Lock()
+        self._server_disconnected = False
         self._catalog: CommandCatalog | None = None
         self._commands_enabled = initial_commands_enabled
         self._subscriptions = ()
@@ -96,6 +100,7 @@ class Commands:
         elif raw.packet_id == binding.SetCommandsEnabledPacket.ID:
             self._commands_enabled = bool(protocol.decode(raw).commands_enabled)
         elif raw.packet_id == binding.DisconnectPacket.ID:
+            self._server_disconnected = True
             self.close()
 
     def _request(self, command: str):
@@ -124,22 +129,33 @@ class Commands:
         CommandOutputPacket. Commands from this player are serialized, but other
         server text can still interleave: inspect the feedback and server effect.
         """
-        text = self.packets.protocol.binding.TextPacket
+        binding = self.packets.protocol.binding
+        text = binding.TextPacket
+        disconnect = binding.DisconnectPacket.ID
         packet = self._request(command)
 
         def matches(raw):
+            if raw.packet_id == disconnect:
+                return True
             body = self.packets.protocol.decode(raw).body
             return isinstance(body, text.MessageOnly) and body.type == TextPacketType.TEXT_OBJECT
 
         async with self._lock:
+            if self._server_disconnected:
+                raise ConnectionError(_DISCONNECT_ERROR)
             # Arm before send: a quick server response must not be lost.
             waiting = asyncio.create_task(self.packets.wait_for_packet(
-                text.ID, match=matches, timeout=timeout,
+                (text.ID, disconnect), match=matches, timeout=timeout,
             ))
-            await asyncio.sleep(0)
             try:
+                await asyncio.sleep(0)
+                if self._server_disconnected:
+                    raise ConnectionError(_DISCONNECT_ERROR)
                 await self.packets.send(packet)
-                return self.packets.protocol.decode(await waiting)
+                response = await waiting
+                if response.packet_id == disconnect:
+                    raise ConnectionError(_DISCONNECT_ERROR)
+                return self.packets.protocol.decode(response)
             finally:
                 waiting.cancel()
                 await asyncio.gather(waiting, return_exceptions=True)
