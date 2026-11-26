@@ -190,7 +190,10 @@ class CollectAndStoreStdioTests(unittest.IsolatedAsyncioTestCase):
                 await session.initialize()
                 tools = {tool.name: tool for tool in (await session.list_tools()).tools}
                 baseline = {tool.name: tool for tool in await create_server().list_tools()}
-                names = {"start_collect_and_store", "observe_collect_and_store", "stop_collect_and_store"}
+                names = {
+                    "find_observed_blocks", "start_collect_and_store",
+                    "observe_collect_and_store", "stop_collect_and_store",
+                }
                 self.assertEqual(set(tools), set(baseline) | names)
                 self.assertEqual({name: tools[name] for name in baseline}, baseline)
                 self.assertEqual(set(tools["start_collect_and_store"].input_schema["required"]),

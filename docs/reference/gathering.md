@@ -210,8 +210,11 @@ python -m examples.collect_and_store_mcp
 
 Call `connect` once with the server URL and player name. If terrain is
 missing, use `request_sub_chunk` to request the sections along the route
-and `observed_block` to check the targets and chest. Call
-`start_collect_and_store` with the following arguments.
+and `observed_block` to check the chest. To discover nearby ore without its
+coordinates, call `find_observed_blocks` with `{"name": "diamond_ore"}`. It
+returns up to 16 positions within eight blocks without requesting terrain.
+An empty result with `complete: false` does not rule out more ore. Pass the
+returned `positions` and the known chest to `start_collect_and_store`.
 
 ```json
 {

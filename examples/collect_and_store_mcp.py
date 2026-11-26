@@ -21,6 +21,11 @@ if TYPE_CHECKING:
     from mcp.server.mcpserver import MCPServer
 
 
+class _ObservedBlocks(TypedDict):
+    positions: list[tuple[int, int, int]]
+    complete: bool
+
+
 class _Start(TypedDict):
     started: bool
 
@@ -85,6 +90,11 @@ class _CollectAndStoreTools:
             return self._player.connected_bot()
         except RuntimeError as error:
             raise ToolError(str(error)) from error
+
+    async def find_observed_blocks(self, name: str) -> _ObservedBlocks:
+        """Find up to 16 cached blocks by name within 8 blocks without loading terrain."""
+        result = self._connected_bot().find_blocks(name, radius=8, limit=16)
+        return {"positions": [match.position for match in result.matches], "complete": result.complete}
 
     async def start_collect_and_store(
         self, positions: list[tuple[int, int, int]], item: str | int, chest: tuple[int, int, int],
@@ -161,6 +171,7 @@ class _CollectAndStoreTools:
 def register_tools(server: "MCPServer", player: MCPPlayer) -> None:
     """Add the named task to a server using its existing connected player."""
     tools = _CollectAndStoreTools(player)
+    server.tool()(tools.find_observed_blocks)
     server.tool()(tools.start_collect_and_store)
     server.tool()(tools.observe_collect_and_store)
     server.tool()(tools.stop_collect_and_store)
