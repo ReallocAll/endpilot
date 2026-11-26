@@ -120,6 +120,10 @@ class ColumnCoverageInvalidated(RuntimeError):
         super().__init__(f"column coverage invalidated: {reason}")
 
 
+_CoverageSelection = tuple[tuple[tuple[int, int], range], ...]
+_CoverageWaiter = tuple[_CoverageSelection, asyncio.Future[tuple[ColumnCoverage, ...]]]
+
+
 @dataclass(frozen=True, slots=True)
 class BlockChange:
     dimension_id: int
@@ -259,7 +263,7 @@ class Blocks:
         self._unsubscribe_end = None
         self._request_column: Callable[[tuple[int, int], range], None] | None = None
         self._coverage: dict[tuple[int, int], _ColumnCoverage] = {}
-        self._column_waiters: dict[tuple[int, int], list[tuple[range, asyncio.Future[ColumnCoverage]]]] = {}
+        self._column_waiters: dict[tuple[int, int], list[_CoverageWaiter]] = {}
         self._column_observers: list[Callable[[ColumnCoverageEvent], None]] = []
         self._block_observers: list[Callable[[BlockChange], None]] = []
         self._closed = False
@@ -547,12 +551,13 @@ class Blocks:
             return
         kind = "coverage" if state.received else "loaded"
         state.received.add(y)
-        waiters = self._column_waiters.get(column, ())
-        if waiters or self._column_observers:
+        for columns, future in self._column_waiters.get(column, ()):
+            if not future.done():
+                snapshots = self._coverage_if_ready(columns)
+                if snapshots is not None:
+                    future.set_result(snapshots)
+        if self._column_observers:
             snapshot = self._snapshot(column, self.dimension_id, state)
-            for sections, future in waiters:
-                if not future.done() and all(index in state.received for index in sections):
-                    future.set_result(snapshot)
             self._notify_observers(self._column_observers, ColumnCoverageEvent(kind, snapshot))
 
     def _block_entity(self, position: tuple[int, int, int]) -> nbt.CompoundTag | None:
@@ -642,27 +647,51 @@ class Blocks:
     async def wait_for_column_coverage(
         self, column: tuple[int, int], sections: range, *, timeout: float = 15,
     ) -> ColumnCoverage:
-        self._validate_column(column)
-        if not isinstance(sections, range) or sections.step != 1 or not -128 <= sections.start < sections.stop <= 128:
-            raise ValueError("sections must be a nonempty ascending range within [-128, 128)")
+        snapshot, = await self._wait_for_coverage(((column, sections),), timeout)
+        return snapshot
+
+    async def wait_for_terrain_coverage(
+        self, columns: Mapping[tuple[int, int], range], *, timeout: float = 15,
+    ) -> tuple[ColumnCoverage, ...]:
+        if not isinstance(columns, Mapping):
+            raise TypeError("columns must be a mapping of column coordinates to section ranges")
+        selection = tuple(columns.items())
+        if not selection:
+            raise ValueError("columns must not be empty")
+        return await self._wait_for_coverage(selection, timeout)
+
+    def _coverage_if_ready(self, columns: _CoverageSelection) -> tuple[ColumnCoverage, ...] | None:
+        for column, sections in columns:
+            state = self._coverage.get(column)
+            if state is None or not all(y in state.received for y in sections):
+                return None
+        return tuple(self._snapshot(column, self.dimension_id, self._coverage[column]) for column, _ in columns)
+
+    async def _wait_for_coverage(self, columns: _CoverageSelection, timeout: float) -> tuple[ColumnCoverage, ...]:
+        for column, sections in columns:
+            self._validate_column(column)
+            if not isinstance(sections, range) or sections.step != 1 or not -128 <= sections.start < sections.stop <= 128:
+                raise ValueError("sections must be a nonempty ascending range within [-128, 128)")
         if self._closed:
             raise ConnectionError("world observation ended")
-        if not self._column_is_published(*column):
+        if any(not self._column_is_published(*column) for column, _ in columns):
             raise ColumnCoverageInvalidated("unloaded")
-        snapshot = self._snapshot(column, self.dimension_id, self._coverage.get(column))
-        if all(y in snapshot.received_section_ys for y in sections):
-            return snapshot
+        snapshots = self._coverage_if_ready(columns)
+        if snapshots is not None:
+            return snapshots
         future = asyncio.get_running_loop().create_future()
-        entry = (sections, future)
-        waiters = self._column_waiters.setdefault(column, [])
-        waiters.append(entry)
+        entry = (columns, future)
+        for column, _ in columns:
+            self._column_waiters.setdefault(column, []).append(entry)
         try:
             async with asyncio.timeout(timeout):
                 return await future
         finally:
-            waiters.remove(entry)
-            if not waiters:
-                del self._column_waiters[column]
+            for column, _ in columns:
+                waiters = self._column_waiters[column]
+                waiters.remove(entry)
+                if not waiters:
+                    del self._column_waiters[column]
 
     def subscribe_column_coverage(self, callback: Callable[[ColumnCoverageEvent], None]) -> Callable[[], None]:
         if self._closed:

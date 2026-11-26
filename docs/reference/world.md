@@ -84,6 +84,39 @@ Matches are ordered by squared distance, then X, Y, and Z. `limit` caps
 matches after filtering, and `find_block()` uses `limit=1` with the same
 coverage rules. Both methods return a `BlockSearchResult` and send no packets.
 
+## Wait for terrain coverage
+
+Use `bot.column_coverage((chunk_x, chunk_z))` to read one column's current
+`ColumnCoverage`. To wait for several columns with different section ranges,
+pass a nonempty mapping.
+
+```python
+coverage = await bot.wait_for_terrain_coverage({
+    (1, 0): range(10, 12),
+    (0, 0): range(13, 14),
+}, timeout=15)
+```
+
+Keys are integer chunk coordinate pairs. Each value is a nonempty `range`
+with step 1 and section Y indices in `[-128, 128)`. A section spans 16 blocks
+vertically. For one column, `await bot.wait_for_column_coverage(column, sections)`
+returns a single snapshot under the same rules.
+
+The wait records the mapping's entries when it starts. It returns a tuple
+of immutable `ColumnCoverage` snapshots in input order once every selected
+section is cached at the same time in the current dimension. Each snapshot
+includes the column's full coverage at that point. Server-confirmed all-air
+sections count. Announcements, requests and individual block updates leave
+section coverage pending. Both waits send zero packets and return immediately
+when coverage is already ready, including with `timeout=0`.
+
+A selected column outside the known publication area or evicted during the
+wait raises `ColumnCoverageInvalidated` with reason `"unloaded"`, even if
+that column was already ready. A `ChangeDimension` packet raises the same
+exception with reason `"dimension_changed"`. An ended packet stream raises
+`ConnectionError`. The timeout applies to the entire wait and raises
+`TimeoutError`. Cancellation is local to the caller.
+
 ## Observe dimension changes
 
 `bot.is_changing_dimension` reports whether the local player has an active

@@ -1,7 +1,7 @@
 """Public player entry point; game state delegates to the relevant feature."""
 
 import asyncio
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from math import inf
 from re import Pattern, fullmatch
@@ -1297,6 +1297,20 @@ class Bot:
         if self._blocks is None:
             raise RuntimeError("player has not joined")
         return await self._blocks.wait_for_column_coverage(column, sections, timeout=timeout)
+
+    async def wait_for_terrain_coverage(
+        self, columns: Mapping[tuple[int, int], range], *, timeout: float = 15,
+    ) -> tuple[ColumnCoverage, ...]:
+        """Wait for all selected sections to be cached together in the current dimension.
+
+        Pass a nonempty mapping from integer (chunk x, chunk z) pairs to ascending
+        section Y ranges. Return immutable snapshots in mapping order without
+        sending requests. Unload and dimension change raise ColumnCoverageInvalidated,
+        and an ended packet stream raises ConnectionError.
+        """
+        if self._blocks is None:
+            raise RuntimeError("player has not joined")
+        return await self._blocks.wait_for_terrain_coverage(columns, timeout=timeout)
 
     def subscribe_column_coverage(self, callback: Callable[[ColumnCoverageEvent], None]) -> Callable[[], None]:
         """Observe future loaded, coverage growth and unloaded events synchronously."""

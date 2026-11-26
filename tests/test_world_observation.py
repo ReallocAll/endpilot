@@ -3,6 +3,7 @@ from dataclasses import FrozenInstanceError
 from hashlib import sha256
 from itertools import product
 from pathlib import Path
+from types import MappingProxyType
 import unittest
 from unittest.mock import patch
 import zlib
@@ -57,10 +58,10 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
     def published(self, x):
         return self.b.NetworkChunkPublisherUpdatePacket(position=self.b.BlockPos(x=x, y=0, z=0), radius=32)
 
-    def air(self, *sections):
+    def air(self, *sections, column=(0, 0), dimension=0):
         b = self.b
         return b.SubChunkPacket(
-            dimension_type=0, center_pos=b.SubChunkPos(x=0, y=0, z=0),
+            dimension_type=dimension, center_pos=b.SubChunkPos(x=column[0], y=0, z=column[1]),
             sub_chunk_data=[b.SubChunkPacket.SubChunkPacketData(
                 sub_chunk_pos_offset=b.SubChunkPacket.SubChunkPosOffset(x=0, y=y, z=0),
                 result=b.SubChunkPacket.SubChunkRequestResult.SUCCESS_ALL_AIR,
@@ -623,6 +624,146 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.column_coverage(column).received_section_ys, (4,))
         self.assertEqual(self.transport.sent, [])
         unsubscribe()
+
+    async def test_terrain_coverage_returns_ordered_fresh_snapshots(self):
+        await self.connect()
+        b = self.b
+        first, second = (0, 0), (1, 0)
+        selection = {first: range(0, 1)}
+        wait = self.bot.wait_for_terrain_coverage(MappingProxyType(selection))
+        selection.clear()
+        expected = {second: range(4, 6), first: range(6, 7)}
+        selection.update(expected)
+        waiting = asyncio.create_task(wait)
+        self.addCleanup(waiting.cancel)
+        await asyncio.sleep(0)
+        selection.clear()
+
+        await self.deliver(
+            self.published(0),
+            b.LevelChunkPacket(pos=b.ChunkPos(x=1, z=0), dimension_id=0, client_request_sub_chunk_limit=-1),
+            b.UpdateBlockPacket(pos=b.BlockPos(x=17, y=80, z=1), runtime_id=42),
+            self.air(5, column=second, dimension=1),
+        )
+        self.assertEqual(self.transport.sent, [])
+        await self.bot.request_sub_chunk((17, 80, 1))
+        announced = self.bot.column_coverage(second)
+        self.assertTrue(announced.announced)
+        self.assertEqual(announced.requested_section_ys, (5,))
+        self.assertEqual(announced.received_section_ys, ())
+        self.assertEqual(self.bot.observed_block((17, 80, 1)).runtime_id, 42)
+        await self.deliver(self.air(6))
+        await asyncio.sleep(0)
+        self.assertEqual(self.bot.column_coverage(first).received_section_ys, (6,))
+        self.assertFalse(waiting.done())
+        await self.deliver(self.air(7), self.air(4, column=second))
+        await asyncio.sleep(0)
+        self.assertFalse(waiting.done())
+
+        await self.deliver(self.air(5, column=second))
+        snapshots = await asyncio.wait_for(waiting, 1)
+        self.assertIsInstance(snapshots, tuple)
+        self.assertEqual(tuple(snapshot.column for snapshot in snapshots), tuple(expected))
+        self.assertEqual(tuple(snapshot.dimension_id for snapshot in snapshots), (0, 0))
+        self.assertEqual(tuple(snapshot.received_section_ys for snapshot in snapshots), ((4, 5), (6, 7)))
+        self.assertEqual(snapshots[0].requested_section_ys, (5,))
+        self.assertTrue(self.bot.observed_block((17, 80, 1)).is_air)
+        self.assertEqual(await self.bot.wait_for_terrain_coverage(expected, timeout=0), snapshots)
+        with self.assertRaises(FrozenInstanceError):
+            snapshots[1].announced = True
+        await self.deliver(self.air(8))
+        self.assertEqual(snapshots[1].received_section_ys, (6, 7))
+        self.assertEqual(self.bot.column_coverage(first).received_section_ys, (6, 7, 8))
+        self.assertEqual(len(self.transport.sent), 1)
+
+    async def test_terrain_coverage_invalidates_when_a_ready_column_is_evicted(self):
+        await self.connect()
+        first, second = (-2, 0), (0, 0)
+        selected = {first: range(4, 5), second: range(6, 7)}
+        await self.deliver(self.published(0))
+        waiting = asyncio.create_task(self.bot.wait_for_terrain_coverage(selected))
+        unaffected = asyncio.create_task(self.bot.wait_for_column_coverage(second, selected[second]))
+        self.addCleanup(waiting.cancel)
+        self.addCleanup(unaffected.cancel)
+        await asyncio.sleep(0)
+
+        await self.deliver(self.air(4, column=first))
+        await asyncio.sleep(0)
+        self.assertEqual(self.bot.column_coverage(first).received_section_ys, (4,))
+        self.assertFalse(waiting.done())
+        await self.deliver(self.published(32), self.air(6))
+        with self.assertRaises(ColumnCoverageInvalidated) as invalidated:
+            await asyncio.wait_for(waiting, 1)
+        self.assertEqual(invalidated.exception.reason, "unloaded")
+        self.assertEqual((await asyncio.wait_for(unaffected, 1)).received_section_ys, (6,))
+        self.assertEqual(self.bot.column_coverage(first).received_section_ys, ())
+        with self.assertRaises(ColumnCoverageInvalidated) as outside:
+            await self.bot.wait_for_terrain_coverage({second: selected[second], first: selected[first]}, timeout=0)
+        self.assertEqual(outside.exception.reason, "unloaded")
+
+        await self.deliver(self.published(0))
+        with self.assertRaises(TimeoutError):
+            await self.bot.wait_for_terrain_coverage(selected, timeout=0)
+        await self.deliver(self.air(4, column=first))
+        snapshots = await self.bot.wait_for_terrain_coverage(selected, timeout=0)
+        self.assertEqual(tuple(snapshot.received_section_ys for snapshot in snapshots), ((4,), (6,)))
+        self.assertEqual(self.transport.sent, [])
+
+    async def test_terrain_coverage_rejects_invalid_selections(self):
+        await self.connect()
+        with self.assertRaises(TypeError):
+            await self.bot.wait_for_terrain_coverage([((0, 0), range(0, 1))])
+        for selected in (
+            {}, {(0, 0): range(0, 1), (True, 1): range(0, 1)}, {(0,): range(0, 1)}, {"0,0": range(0, 1)},
+            {(0, 0): [0]}, {(0, 0): range(0)}, {(0, 0): range(0, 3, 2)}, {(0, 0): range(1, 0, -1)},
+            {(0, 0): range(-129, 1)}, {(0, 0): range(0, 129)},
+        ):
+            with self.subTest(selected=selected), self.assertRaises(ValueError):
+                await self.bot.wait_for_terrain_coverage(selected, timeout=0)
+        self.assertEqual(self.transport.sent, [])
+
+    async def test_terrain_coverage_timeout_and_cancellation_leave_other_waits_active(self):
+        await self.connect()
+        selected = {(0, 0): range(4, 5), (1, 0): range(6, 7)}
+        waiting = asyncio.create_task(self.bot.wait_for_terrain_coverage(selected))
+        cancelled = asyncio.create_task(self.bot.wait_for_terrain_coverage(selected))
+        self.addCleanup(waiting.cancel)
+        self.addCleanup(cancelled.cancel)
+        await asyncio.sleep(0)
+        cancelled.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled
+        with self.assertRaises(TimeoutError):
+            await self.bot.wait_for_terrain_coverage(selected, timeout=0)
+        await self.deliver(self.air(6, column=(1, 0)), self.air(4))
+        snapshots = await asyncio.wait_for(waiting, 1)
+        self.assertEqual(tuple(snapshot.column for snapshot in snapshots), tuple(selected))
+        self.assertEqual(self.transport.sent, [])
+
+    async def test_terrain_coverage_ends_on_dimension_packet_or_reader_failure(self):
+        await self.connect()
+        selected = {(0, 0): range(4, 5), (1, 0): range(6, 7)}
+        waiting = asyncio.create_task(self.bot.wait_for_terrain_coverage(selected))
+        self.addCleanup(waiting.cancel)
+        await asyncio.sleep(0)
+        await self.deliver(self.air(4), self.b.ChangeDimensionPacket(dimension_id=0))
+        with self.assertRaises(ColumnCoverageInvalidated) as invalidated:
+            await asyncio.wait_for(waiting, 1)
+        self.assertEqual(invalidated.exception.reason, "dimension_changed")
+
+        ended = asyncio.create_task(self.bot.wait_for_terrain_coverage(selected))
+        self.addCleanup(ended.cancel)
+        await asyncio.sleep(0)
+        failure = EOFError("reader ended")
+        self.transport.incoming.put_nowait(failure)
+        with self.assertRaises(ConnectionError) as disconnected:
+            await asyncio.wait_for(ended, 1)
+        self.assertIs(disconnected.exception.__cause__, failure)
+        with self.assertRaises(ConnectionError):
+            await self.bot.wait_for_terrain_coverage(selected)
+        self.assertEqual(self.transport.sent, [])
+        with self.assertRaisesRegex(EOFError, "reader ended"):
+            await self.bot.close()
 
     async def test_block_changes_capture_packet_order_and_filter_dimension_and_layer(self):
         await self.connect()
