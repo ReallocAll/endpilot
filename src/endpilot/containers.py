@@ -10,7 +10,9 @@ from bedrock_protocol import nbt
 
 from .anvil import AnvilPreview, _estimate_anvil
 from .block_data import _catalog
-from .blocks import FACE_OFFSETS, Blocks, BlockStateObservation
+from .blocks import (
+    FACE_OFFSETS, HASHED_UNKNOWN_RUNTIME_ID, Blocks, BlockStateObservation, ColumnCoverageInvalidated,
+)
 from .compression import PacketConnection
 from .entities import Entities, EntityState
 from .inventory import (
@@ -655,6 +657,7 @@ class Containers:
         _click_pos: tuple[float, float, float] | None = None,
         _before_click: Callable[[], None] | None = None,
         _on_observed: Callable[[ContainerWindow], None] | None = None,
+        _observe_target: bool = False,
     ) -> ContainerWindow:
         """Return only after BDS sends ContainerOpenPacket for the clicked block."""
         owns_window = _on_observed is not None
@@ -664,19 +667,99 @@ class Containers:
         self._block_open_requests += 1
         self._owned_block_opening = owns_window
         try:
-            return await self._open_block(position, blocks, face, timeout, _click_pos, _before_click, _on_observed)
+            return await self._open_block(position, blocks, face, timeout, _click_pos, _before_click, _on_observed,
+                                          observe_target=_observe_target)
         finally:
             self._block_open_requests -= 1
             self._owned_block_opening = False
 
-    async def _open_block(self, position, blocks, face, timeout, click_pos, _before_click, _on_observed):
-        b = self.packets.protocol.binding
+    async def _open_block(self, position, blocks, face, timeout, click_pos, _before_click, _on_observed, *,
+                          observe_target):
+        protocol = self.packets.protocol
+        b = protocol.binding
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
+        observe_target = observe_target and protocol.number == 2225
+        epoch = self.movement._dimension_epoch if observe_target else None
+
+        def same_dimension():
+            return epoch is None or self.movement._dimension_epoch == epoch
+
+        def require_dimension():
+            if not same_dimension():
+                raise ColumnCoverageInvalidated("dimension_changed")
+
+        def placeholder(block):
+            return (block is not None and blocks.hashed_runtime_ids
+                    and block.runtime_id == HASHED_UNKNOWN_RUNTIME_ID)
+
+        def unresolved(block):
+            return block is None or block.runtime_id is None or placeholder(block)
+
         await self.movement.wait_for_position_sync(timeout)
+        require_dimension()
+        requestable = None
+        if observe_target and unresolved(blocks.observed_block(position)):
+            requestable = blocks._requestable_column(position)
+        if requestable is not None:
+            def same_column():
+                return blocks._requestable_column(position) is requestable
+
+            def require_column():
+                require_dimension()
+                if not same_column():
+                    raise ColumnCoverageInvalidated("unloaded")
+
+            def terrain_changed(raw):
+                return (raw.packet_id == b.DisconnectPacket.ID or not same_dimension()
+                        or not same_column() or not unresolved(blocks.observed_block(position)))
+
+            terrain_packets = (
+                b.SubChunkPacket.ID, b.LevelChunkPacket.ID, b.UpdateBlockPacket.ID, b.UpdateSubChunkBlocksPacket.ID,
+                b.NetworkChunkPublisherUpdatePacket.ID, b.ChangeDimensionPacket.ID, b.DisconnectPacket.ID,
+            )
+            try:
+                if deadline is not None and loop.time() >= deadline:
+                    raise TimeoutError
+                async with asyncio.timeout_at(deadline):
+                    # Coverage can describe an old section without the target's primary layer.
+                    terrain = asyncio.create_task(self.packets.wait_for_packet(
+                        terrain_packets, timeout=None, match=terrain_changed,
+                    ))
+                    try:
+                        await asyncio.sleep(0)
+                        require_column()
+                        if unresolved(blocks.observed_block(position)):
+                            if deadline is not None and loop.time() >= deadline:
+                                raise TimeoutError
+                            await blocks.request_sub_chunk(position)
+                            raw = await terrain
+                            if raw.packet_id == b.DisconnectPacket.ID:
+                                raise ConnectionError("server disconnected while observing the container target")
+                        require_column()
+                    finally:
+                        terrain.cancel()
+                        await asyncio.gather(terrain, return_exceptions=True)
+                if deadline is not None:
+                    timeout = max(0, deadline - loop.time())
+            except TimeoutError:
+                raise TimeoutError(f"target terrain at {position} was not observed before opening") from None
         submitted = False
         opened = None
 
         def before_click():
             nonlocal submitted
+            require_dimension()
+            if observe_target:
+                target = blocks.observed_block(position)
+                if requestable is not None:
+                    require_column()
+                    if unresolved(target) or target.is_air is True:
+                        raise RuntimeError(f"no observed container target at {position}; no click was sent")
+                    if deadline is not None and loop.time() >= deadline:
+                        raise TimeoutError("container open timed out before clicking")
+                elif placeholder(target):
+                    raise RuntimeError(f"no observed container target at {position}; no click was sent")
             if _before_click is not None:
                 _before_click()
             submitted = True
@@ -709,11 +792,13 @@ class Containers:
             await asyncio.sleep(0)
             # Use the origin of the latest input, including any correction
             # received while registering the window waiter.
-            await self.click_block(position, blocks, face=face, click_pos=click_pos, _before_send=(
-                before_click if _on_observed is not None or _before_click is not None else None
-            ))
+            guard_click = observe_target or _on_observed is not None or _before_click is not None
+            await self.click_block(position, blocks, face=face, click_pos=click_pos,
+                                   _before_send=before_click if guard_click else None)
             if _on_observed is None:
-                return self._decode_open(await pending)
+                raw = await pending
+                require_dimension()
+                return self._decode_open(raw)
             raw = await asyncio.shield(pending)
             if raw.packet_id == b.DisconnectPacket.ID:
                 raise ConnectionError("server disconnected while opening the chest")
@@ -732,7 +817,7 @@ class Containers:
             if not pending.done():
                 pending.cancel()
                 await asyncio.gather(pending, return_exceptions=True)
-            elif _on_observed is not None and not pending.cancelled():
+            elif (observe_target or _on_observed is not None) and not pending.cancelled():
                 pending.exception()
 
     async def open_entity(self, runtime_id: int, entities: Entities, *, timeout: float = 15) -> ContainerWindow:

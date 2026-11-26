@@ -143,6 +143,7 @@ class BlockEntityUpdate:
 @dataclass(slots=True)
 class _ColumnCoverage:
     announced: bool = False
+    requestable_sections: range = range(0)
     pending: set[int] = field(default_factory=set)
     requested: set[int] = field(default_factory=set)
     received: set[int] = field(default_factory=set)
@@ -508,6 +509,7 @@ class Blocks:
         state = self._coverage.setdefault(column, _ColumnCoverage())
         state.announced = True
         state.biomes = ()
+        state.requestable_sections = range(0)
         bounds = self._section_range(self.dimension_id)
         if bounds is None or packet.cache_enabled:
             return
@@ -521,9 +523,10 @@ class Blocks:
                 except ValueError:
                     # A failed biome decode leaves block announcements and requests intact.
                     pass
+            stop = upper if limit == -1 else min(upper, lower + int(limit))
+            state.requestable_sections = range(lower, stop)
             if self._request_column is not None:
-                stop = upper if limit == -1 else min(upper, lower + int(limit))
-                self._request_column(column, range(lower, stop))
+                self._request_column(column, state.requestable_sections)
             return
         count = int(packet.sub_chunks_count)
         if not 0 < count <= upper - lower:
@@ -1461,6 +1464,11 @@ class Blocks:
         if False in required:
             return False
         return True if all(required) else None
+
+    def _requestable_column(self, position: tuple[int, int, int]) -> _ColumnCoverage | None:
+        x, y, z = position
+        state = self._coverage.get((x >> 4, z >> 4))
+        return state if state is not None and y >> 4 in state.requestable_sections else None
 
     async def request_sub_chunk(self, position: tuple[int, int, int]) -> None:
         """Request the 16³ section containing position; submission is not a response."""

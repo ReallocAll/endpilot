@@ -2007,10 +2007,14 @@ class Bot:
     async def open_container(
         self, position: tuple[int, int, int], *, face: int = 1, timeout: float = 15
     ) -> ContainerWindow:
-        """Use a block and wait for the server's container-open response."""
+        """Use a block and wait for the server's container-open response.
+
+        On protocol 2225, request an announced but unobserved target section
+        within the opening timeout before clicking. No click is retried.
+        """
         if self._containers is None or self._blocks is None:
             raise RuntimeError("player has not joined")
-        return await self._containers.open(position, self._blocks, face=face, timeout=timeout)
+        return await self._containers.open(position, self._blocks, face=face, timeout=timeout, _observe_target=True)
 
     async def open_entity_container(self, runtime_id: int, *, timeout: float = 15) -> ContainerWindow:
         """Open an observed chest or hopper minecart with a known identity.

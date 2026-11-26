@@ -5,13 +5,16 @@ from unittest.mock import AsyncMock, patch
 
 from endpilot import Bot, ItemRegistrySnapshot
 from endpilot.block_data import _catalog
+from endpilot.blocks import ColumnCoverageInvalidated, HASHED_UNKNOWN_RUNTIME_ID
 from endpilot.compression import PacketConnection
 from endpilot.harvest import HarvestTool, equip_harvest_tool_from_chest
+from endpilot.inventory import _InventoryMoveNotSubmitted
 from endpilot.login import JoinSession
 
 from test_container_take import item
 from test_harvest import DIAMOND_ORE, DIRT, enchantment_data
 from test_range_transfer import RangePacketStream
+from test_subchunks import solid_sub_chunk
 
 
 TARGET = (3, 100, 0)
@@ -242,6 +245,175 @@ class HarvestChestRefillTests(unittest.IsolatedAsyncioTestCase):
         finally:
             public_open.cancel()
             await asyncio.gather(public_open, return_exceptions=True)
+
+    def announce_cold_chest(self):
+        b = self.b
+        runtime_id = self.bot.observed_block(CHEST).runtime_id
+        self.bot._blocks._updates.pop((*CHEST, 0))
+        self.emit(b.LevelChunkPacket(
+            pos=b.ChunkPos(x=0, z=0), dimension_id=0, cache_enabled=False,
+            sub_chunks_count=0, client_request_sub_chunk_limit=-1,
+        ))
+        return runtime_id
+
+    def supply_section(self, raw):
+        b = self.b
+        sub = b.SubChunkPacket
+        self.emit(sub(center_pos=b.SubChunkPos(x=0, y=0, z=0), sub_chunk_data=[
+            sub.SubChunkPacketData(sub_chunk_pos_offset=sub.SubChunkPosOffset(x=0, y=6, z=0),
+                                   result=sub.SubChunkRequestResult.SUCCESS,
+                                   serialized_sub_chunk=raw),
+        ]))
+
+    async def test_public_open_requests_cold_section_before_its_only_click(self):
+        b = self.b
+        runtime_id = self.announce_cold_chest()
+        requested = asyncio.Event()
+
+        def server(packet):
+            if isinstance(packet, b.SubChunkRequestPacket):
+                requested.set()
+            elif isinstance(packet, b.InventoryTransactionPacket):
+                self.assertEqual(packet.variant_transaction.target_block_id, runtime_id)
+                self.open_storage()
+        self.after_write = server
+        opened = asyncio.create_task(self.bot.open_container(CHEST, face=2, timeout=1))
+        try:
+            await asyncio.wait_for(requested.wait(), 0.3)
+            with self.assertRaisesRegex(_InventoryMoveNotSubmitted, "window_busy"):
+                await self.bot._containers.open(CHEST, self.bot._blocks, _on_observed=lambda _: None)
+            packet, = self.stream.sent
+            offset, = packet.sub_chunk_pos_offsets
+            self.assertEqual((offset.x, offset.y, offset.z), (0, 6, 0))
+            self.supply_section(solid_sub_chunk(runtime_id))
+            self.assertEqual((await opened).position, CHEST)
+            self.assertEqual([type(packet) for packet in self.stream.sent], [
+                b.SubChunkRequestPacket, b.InventoryTransactionPacket,
+            ])
+        finally:
+            opened.cancel()
+            await asyncio.gather(opened, return_exceptions=True)
+
+    async def test_public_open_times_out_before_click_if_terrain_remains_unknown(self):
+        self.announce_cold_chest()
+        for _ in range(2):
+            with self.assertRaisesRegex(TimeoutError, "terrain"):
+                await self.bot.open_container(CHEST, timeout=0.15)
+        with self.assertRaisesRegex(TimeoutError, "terrain"):
+            await self.bot.open_container(CHEST, timeout=0)
+        self.assertEqual([type(packet) for packet in self.stream.sent], [self.b.SubChunkRequestPacket] * 2)
+
+    async def test_public_open_does_not_click_if_section_cannot_describe_the_target(self):
+        self.announce_cold_chest()
+        self.after_write = lambda _: self.supply_section(bytes((9, 0, 6)))
+        with self.assertRaisesRegex(TimeoutError, "terrain"):
+            await self.bot.open_container(CHEST, timeout=0.05)
+        self.assertEqual([type(packet) for packet in self.stream.sent], [self.b.SubChunkRequestPacket])
+
+    async def test_public_open_does_not_click_after_its_column_unloads(self):
+        b = self.b
+        runtime_id = self.announce_cold_chest()
+        self.after_write = lambda _: self.supply_section(solid_sub_chunk(runtime_id))
+        wait = self.stream.wait_for_packet
+
+        async def unload_while_registering(packet_id, **kwargs):
+            if packet_id == b.ContainerOpenPacket.ID:
+                self.emit(b.NetworkChunkPublisherUpdatePacket(position=b.BlockPos(x=48, y=0, z=0), radius=16))
+            return await wait(packet_id, **kwargs)
+        self.stream.wait_for_packet = unload_while_registering
+        with self.assertRaisesRegex(RuntimeError, "unloaded"):
+            await self.bot.open_container(CHEST, timeout=1)
+        self.assertEqual([type(packet) for packet in self.stream.sent], [b.SubChunkRequestPacket])
+
+    async def test_public_open_never_clicks_a_new_dimension_after_position_sync(self):
+        b = self.b
+        movement = self.bot._movement
+        movement._updated.clear()
+        waiting = asyncio.Event()
+        wait = self.stream.wait_for_packet
+
+        async def observe_wait(packet_ids, **kwargs):
+            waiting.set()
+            return await wait(packet_ids, **kwargs)
+        self.stream.wait_for_packet = observe_wait
+        self.after_write = lambda _: self.open_storage()
+        opening = asyncio.create_task(self.bot.open_container(CHEST, timeout=1))
+        await asyncio.wait_for(waiting.wait(), 0.5)
+        self.assertEqual(self.stream.sent, [])
+        self.emit(b.ChangeDimensionPacket(dimension_id=1, pos=b.Vec3(x=1, y=101.62, z=0.5),
+                                          loading_screen_id=1))
+        self.block(CHEST, 3463497305)
+        with self.assertRaises(ColumnCoverageInvalidated) as error:
+            await opening
+        self.assertEqual(error.exception.reason, "dimension_changed")
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_public_open_refreshes_unknown_hash_without_sending_it(self):
+        b = self.b
+        runtime_id = self.announce_cold_chest()
+        self.block(CHEST, HASHED_UNKNOWN_RUNTIME_ID)
+
+        def server(packet):
+            if isinstance(packet, b.SubChunkRequestPacket):
+                self.supply_section(solid_sub_chunk(runtime_id))
+            else:
+                self.assertEqual(packet.variant_transaction.target_block_id, runtime_id)
+                self.open_storage()
+        self.after_write = server
+        self.assertEqual((await self.bot.open_container(CHEST, timeout=1)).position, CHEST)
+        self.assertEqual([type(packet) for packet in self.stream.sent], [
+            b.SubChunkRequestPacket, b.InventoryTransactionPacket,
+        ])
+
+    async def test_public_open_does_not_complete_on_old_empty_coverage(self):
+        b = self.b
+        runtime_id = self.announce_cold_chest()
+        self.supply_section(bytes((9, 0, 6)))
+        self.assertEqual(self.bot.column_coverage((0, 0)).received_section_ys, (6,))
+        requested = asyncio.Event()
+
+        def server(packet):
+            if isinstance(packet, b.SubChunkRequestPacket):
+                requested.set()
+            else:
+                self.assertEqual(packet.variant_transaction.target_block_id, runtime_id)
+                self.open_storage()
+        self.after_write = server
+        opening = asyncio.create_task(self.bot.open_container(CHEST, timeout=1))
+        try:
+            await asyncio.wait_for(requested.wait(), 0.5)
+            # Give the old coverage-based path time to register its open waiter.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            self.assertFalse(opening.done())
+            packet, = self.stream.sent
+            self.assertIsInstance(packet, b.SubChunkRequestPacket)
+            self.supply_section(solid_sub_chunk(runtime_id))
+            self.assertEqual((await opening).position, CHEST)
+            self.assertEqual([type(packet) for packet in self.stream.sent], [
+                b.SubChunkRequestPacket, b.InventoryTransactionPacket,
+            ])
+        finally:
+            opening.cancel()
+            await asyncio.gather(opening, return_exceptions=True)
+
+    async def test_public_open_cancellation_does_not_click_or_reserve_the_next_open(self):
+        b = self.b
+        runtime_id = self.announce_cold_chest()
+        requested = asyncio.Event()
+        self.after_write = lambda _: requested.set()
+        opening = asyncio.create_task(self.bot.open_container(CHEST, timeout=1))
+        await asyncio.wait_for(requested.wait(), 0.5)
+        opening.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await opening
+        self.supply_section(solid_sub_chunk(runtime_id))
+        self.assertEqual([type(packet) for packet in self.stream.sent], [b.SubChunkRequestPacket])
+        self.after_write = lambda _: self.open_storage()
+        self.assertEqual((await self.bot.open_container(CHEST)).position, CHEST)
+        self.assertEqual([type(packet) for packet in self.stream.sent], [
+            b.SubChunkRequestPacket, b.InventoryTransactionPacket,
+        ])
 
     async def test_unknown_rule_sparse_inventory_and_unknown_item_leave_shortage_unobserved(self):
         self.block(TARGET, 0x12345678)
