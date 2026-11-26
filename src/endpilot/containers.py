@@ -1,13 +1,14 @@
 """Container interaction and authoritative window-open observation."""
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import cast
 from weakref import ref
 
 from bedrock_protocol import nbt
 
+from .anvil import AnvilPreview, _estimate_anvil
 from .block_data import _catalog
 from .blocks import FACE_OFFSETS, Blocks
 from .compression import PacketConnection
@@ -125,6 +126,11 @@ def _same_stack(before, current):
 
 def _same_slot(before, current):
     return before is current or (_same_stack(before, current) and before.stack_size == current.stack_size)
+
+
+def _validate_anvil_name(new_name: str | None) -> None:
+    if new_name is not None and (not isinstance(new_name, str) or not new_name):
+        raise ValueError("new_name must be a nonempty string or None")
 
 
 class Containers:
@@ -301,6 +307,8 @@ class Containers:
             self._slots.pop(index, None)
         else:
             self._slots[index] = item
+            if not corrected or item is not previous:
+                self._unconfirmed_transfer_slots.discard(index)
         self._slots_updated.set()
 
     def _observe_window_slot(self, inventory_id, index, item, before):
@@ -909,6 +917,30 @@ class Containers:
             source_slot, destination_slot, amount, into_container=True, timeout=timeout
         )
 
+    def preview_anvil(
+        self, new_name: str | None, item_names: Mapping[int, str], *, game_mode,
+    ) -> AnvilPreview | None:
+        _validate_anvil_name(new_name)
+        protocol = self.packets.protocol
+        if protocol.number != 2225 or game_mode != protocol.binding.GameType.SURVIVAL:
+            return None
+        window, slots = self.window, self._slots
+        if window is None or window.container_type != "ANVIL" or slots is None:
+            return None
+        if not self._unconfirmed_transfer_slots.isdisjoint(_ANVIL_SLOTS):
+            return None
+        primary = _stack_snapshot(slots.get(1))
+        material = _stack_snapshot(slots.get(2))
+        if primary is None or not primary.item_id or material is None:
+            return None
+        if not material.item_id:
+            material = None
+        primary_name = item_names.get(primary.item_id)
+        material_name = None if material is None else item_names.get(material.item_id)
+        if primary_name is None or (material is not None and material_name is None):
+            return None
+        return _estimate_anvil(primary, primary_name, material, material_name, new_name)
+
     async def apply_anvil(
         self, destination_slot: int, new_name: str | None, *,
         material_count: int | None = None, timeout: float,
@@ -919,8 +951,7 @@ class Containers:
             raise RuntimeError("open an observed anvil first")
         if type(destination_slot) is not int or not 0 <= destination_slot < 36:
             raise ValueError("destination must be a player inventory slot")
-        if new_name is not None and (not isinstance(new_name, str) or not new_name):
-            raise ValueError("new_name must be a nonempty string or None")
+        _validate_anvil_name(new_name)
         if material_count is not None and (type(material_count) is not int or not 1 <= material_count <= 255):
             raise ValueError("material_count must be an integer between 1 and 255")
         player_slot = self.inventory.slots.get(destination_slot)
@@ -970,6 +1001,7 @@ class Containers:
         )
 
         origins = {}
+        submitted_inputs = {}
 
         def before_send():
             if self.window is not window or self._slots is None:
@@ -982,9 +1014,14 @@ class Containers:
             if not _same_slot(player_slot, current):
                 raise RuntimeError("the result slot changed before submission")
             origins.update(self._anvil_origins)
+            submitted_inputs.update(
+                (index, self._slots[index]) for index, item in inputs.items() if item is not None and item.id
+            )
 
         def apply(response):
             before = {} if self.window is window and self._slot_observers else None
+            success = response.result.name == "SUCCESS"
+            missing_inputs = set(submitted_inputs) if success else set()
             for container in response.containers or ():
                 label = container.full_container_name.name.name
                 for slot in container.slots:
@@ -995,11 +1032,12 @@ class Containers:
                         current = self._slots.get(index)
                         if not slot.amount or (current is not None and current.id):
                             self._set_anvil_slot(index, _response_item(b, current, current, slot), before, corrected=True)
+                            missing_inputs.discard(index)
                     elif label in _PLAYER_CONTAINERS and index == destination_slot:
                         current = self.inventory.slots.get(index)
                         if not _same_slot(player_slot, current):
                             continue
-                        if response.result.name == "SUCCESS" and slot.amount:
+                        if success and slot.amount:
                             # Ordinary anvil operations preserve the item type.
                             # The verdict gives name and damage, but no item NBT.
                             output = b.SerializedNetworkItemStackDescriptor(
@@ -1010,6 +1048,12 @@ class Containers:
                             self.inventory._set_slot(index, _response_item(b, output, output, slot))
                         elif not slot.amount:
                             self.inventory._set_slot(index, _response_item(b, current, current, slot))
+            if self.window is window and self._slots is not None:
+                for index in missing_inputs:
+                    # A later descriptor is fresh even when its fields match the old stack.
+                    if (self._anvil_origins.get(index) is origins.get(index)
+                            and self._slots.get(index) is submitted_inputs[index]):
+                        self._unconfirmed_transfer_slots.add(index)
             self._notify_slot_changes(window, before)
 
         return await self.inventory._request_item_stack(request, apply, timeout=timeout, before_send=before_send)
@@ -1125,6 +1169,7 @@ class Containers:
             prepare_request()
 
         anvil_origins = {}
+        anvil_observation = None
         observed_quantities: dict[_TransferEndpoint, int] = {}
         entity_changes: dict[_TransferEndpoint, object] = {}
         entity_range = _range_window_current is not None and entity_container is not None
@@ -1166,12 +1211,14 @@ class Containers:
                 _on_unconfirmed()
 
         def before_anvil_transfer():
+            nonlocal anvil_observation
             if self.window is not window or self._slots is None:
                 raise RuntimeError("the anvil window changed before submission")
             if (not _same_slot(original_chest, self._slots.get(chest_slot))
                     or not _same_slot(original_player, self.inventory.slots.get(player_slot))):
                 raise RuntimeError("anvil transfer slots changed before submission")
             anvil_origins.update(self._anvil_origins)
+            anvil_observation = self._slots.get(chest_slot)
 
         def window_is_current():
             return (self.window is window and self._layout_token is layout
@@ -1265,7 +1312,13 @@ class Containers:
                             self.inventory._set_slot(index, updated)
             if success:
                 if chest_receipts != 1:
-                    if block_endpoint is not None:
+                    if window.container_type == "ANVIL":
+                        # An omitted correction cannot invalidate a newer slot observation.
+                        if (window_is_current() and self._slots is not None
+                                and self._anvil_origins.get(chest_slot) is anvil_origins.get(chest_slot)
+                                and self._slots.get(chest_slot) is anvil_observation):
+                            self._unconfirmed_transfer_slots.add(chest_slot)
+                    elif block_endpoint is not None:
                         self._unconfirmed_block_slots.add(block_endpoint)
                     elif window_is_current():
                         self._unconfirmed_transfer_slots.add(chest_slot)

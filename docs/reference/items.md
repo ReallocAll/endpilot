@@ -72,6 +72,44 @@ button index from the current choices with `await bot.enchant(button)`. Use
 the verdict and subsequent item observations to confirm the result. The
 verdict can omit item metadata.
 
+## Preview anvil costs
+
+Open an anvil in Survival on protocol 2225. Stage the item in slot `1` and
+any material in slot `2` with `put_into_container`, then wait for the server's
+verdicts. `bot.preview_anvil(new_name=None)` uses observed item metadata in
+slot order for supported vanilla equipment, repairs and enchanted books.
+An `AnvilPreview` gives the level cost as `level_cost` and the number of items
+consumed from slot `2` as `material_count`.
+
+The preview sends no packets and requires neither a known experience level
+nor a destination slot. It returns `None` when an input slot or required item
+metadata is unknown, the anvil operation falls outside the supported rules,
+or the current window, protocol, or game mode is unsupported. If a successful
+request leaves a slot unconfirmed, subsequent previews return `None` until
+a new slot observation or a valid server correction confirms the slot.
+
+Use the same `new_name` for the preview and `apply_anvil`, either `None` or a
+nonempty string. For an unnamed diamond sword, supplying only `Diamond Sword`
+returns `None`. The comparison uses the vanilla default label across login
+locales. During a repair, omitting `new_name` can restore the default name and
+add a level to the cost. Pass the exact existing custom name to preserve it.
+
+Pass a positive `material_count` from the preview to `apply_anvil`. Omit
+that argument for a rename with an empty material slot. The commit requires a
+confirmed empty main inventory slot.
+
+```python
+preview = bot.preview_anvil()
+if preview is not None and preview.material_count > 0:
+    print(preview.level_cost)
+    verdict = await bot.apply_anvil(destination_slot, material_count=preview.material_count)
+    print(verdict.result.name)
+```
+
+BDS determines whether the operation succeeds, what it costs, and what items
+remain. Use its verdict and subsequent inventory observations to confirm the
+result.
+
 ## Read, edit and sign books
 
 `bot.get_book(slot)` reads the latest observed writable or signed book in a main

@@ -1,19 +1,44 @@
 import asyncio
+from dataclasses import FrozenInstanceError
 import unittest
+from unittest.mock import patch
 
-from endpilot import Bot
+from endpilot import AnvilPreview, Bot
 from endpilot.containers import Containers
 from endpilot.creative_inventory import CreativeInventory
 from endpilot.inventory import Inventory
 from endpilot.player_state import PlayerState
+from endpilot.protocol import write_batch
 
 from test_blocks import PacketStream
 from test_container_take import item
+from test_scheduled_input import ManualClock, Wire
 
 
 PLAYER = "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER"
 INPUT = "ANVIL_INPUT_CONTAINER"
 MATERIAL = "ANVIL_MATERIAL_CONTAINER"
+DAMAGE_8_USER_DATA = b"\xff\xff\x01\x0a\0\0\x03\x06\0Damage\x08\0\0\0" + bytes(9)
+
+
+def stack_response(b, request, *rows, result="SUCCESS"):
+    containers = []
+    if result == "SUCCESS":
+        for label, index, count, net_id, name, damage in rows:
+            containers.append(b.ItemStackResponseContainerInfo(
+                full_container_name=b.FullContainerName(name=b.ContainerEnumName[label], dynamic_id=None),
+                slots=[b.ItemStackResponseSlotInfo(
+                    requested_slot=index, slot=index, amount=count,
+                    item_stack_net_id=None if net_id is None else b.ItemStackNetId(raw_id=net_id),
+                    custom_name=b.RedactableString(unredacted_string=name, redacted_string=None),
+                    durability_correction=damage,
+                )],
+            ))
+    return b.ItemStackResponseInfo(
+        client_request_id=request.client_request_id,
+        result=b.ItemStackNetResult[result],
+        containers=containers if result == "SUCCESS" else None,
+    )
 
 
 class AnvilTests(unittest.IsolatedAsyncioTestCase):
@@ -64,28 +89,8 @@ class AnvilTests(unittest.IsolatedAsyncioTestCase):
                 return self.wire.sent.pop(0).requests[0]
         self.fail("no item-stack request was sent")
 
-    def response(self, request, *rows, result="SUCCESS"):
-        b = self.b
-        containers = []
-        if result == "SUCCESS":
-            for label, index, count, net_id, name, damage in rows:
-                containers.append(b.ItemStackResponseContainerInfo(
-                    full_container_name=b.FullContainerName(name=b.ContainerEnumName[label], dynamic_id=None),
-                    slots=[b.ItemStackResponseSlotInfo(
-                        requested_slot=index, slot=index, amount=count,
-                        item_stack_net_id=None if net_id is None else b.ItemStackNetId(raw_id=net_id),
-                        custom_name=b.RedactableString(unredacted_string=name, redacted_string=None),
-                        durability_correction=damage,
-                    )],
-                ))
-        return b.ItemStackResponseInfo(
-            client_request_id=request.client_request_id,
-            result=b.ItemStackNetResult[result],
-            containers=containers if result == "SUCCESS" else None,
-        )
-
     def reply(self, request, *rows, result="SUCCESS"):
-        self.emit(self.b.ItemStackResponsePacket(responses=[self.response(request, *rows, result=result)]))
+        self.emit(self.b.ItemStackResponsePacket(responses=[stack_response(self.b, request, *rows, result=result)]))
 
     async def test_public_staging_and_rename_preserve_only_server_confirmed_data(self):
         b = self.b
@@ -277,8 +282,8 @@ class AnvilTests(unittest.IsolatedAsyncioTestCase):
         sent_second = await self.next_request()
         self.ui(material=item(b, 320, 6, 10))
         self.emit(b.ItemStackResponsePacket(responses=[
-            self.response(sent_second, (MATERIAL, 2, 5, 11, "", 0)),
-            self.response(sent_first, (MATERIAL, 2, 4, 12, "", 0)),
+            stack_response(b, sent_second, (MATERIAL, 2, 5, 11, "", 0)),
+            stack_response(b, sent_first, (MATERIAL, 2, 4, 12, "", 0)),
         ]))
         self.assertEqual([(await first).containers[0].slots[0].amount,
                           (await second).containers[0].slots[0].amount], [4, 5])
@@ -332,3 +337,208 @@ class AnvilTests(unittest.IsolatedAsyncioTestCase):
         self.reply(request, (INPUT, 1, 0, None, "", 0), (PLAYER, 5, 1, 12, "Observed slot", 0))
         self.assertEqual((await applying).result.name, "SUCCESS")
         self.assertEqual(self.bot.inventory_slots[5].net_id_variant, 12)
+
+
+class AnvilPreviewTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.enterContext(ManualClock().patch_scheduler())
+        self.bot = Bot("PreviewAnvil", protocol=2225)
+        self.addAsyncCleanup(self.bot.close)
+        self.b = b = self.bot.protocol.binding
+        self.wire = Wire(self.bot.protocol)
+        for packet in (
+            b.NetworkSettingsPacket(compression_algorithm=b.PacketCompressionAlgorithm.NONE),
+            b.StartGamePacket(runtime_id=7, entity_id=17, entity_game_type=b.GameType.SURVIVAL),
+            b.PlayStatusPacket(status=b.PlayStatus.PLAYER_SPAWN),
+        ):
+            self.wire.push(packet)
+        with patch("endpilot.transport.nethernet.connect", return_value=self.wire):
+            await self.bot.join_nethernet("http://127.0.0.1:19132", timeout=1)
+        self.wire.sent.clear()
+
+    async def deliver(self, *packets):
+        marker = self.b.SetTimePacket()
+        received = asyncio.create_task(self.bot.packets.wait_for_packet(marker.ID, timeout=1))
+        await asyncio.sleep(0)
+        self.wire.incoming.put_nowait(write_batch(self.bot.protocol.encode(packet) for packet in (*packets, marker)))
+        await received
+
+    def window_packet(self, kind="ANVIL"):
+        b = self.b
+        return b.ContainerOpenPacket(container_id=2, type=b.ContainerType[kind],
+                                     pos=b.BlockPos(x=1, y=100, z=0), entity_unique_id=-1)
+
+    def ui_packet(self, *slots):
+        b = self.b
+        return b.InventoryContentPacket(
+            inventory_id=b.ContainerID.PLAYER_ONLY_UI, slots=[item(b), *slots], storage_item=item(b),
+            full_container_name=b.FullContainerName(name=b.ContainerEnumName[INPUT], dynamic_id=None),
+        )
+
+    def registry_packet(self, item_id=-41):
+        return self.b.ItemRegistryPacket(items=[self.b.ItemData(id=item_id, name="minecraft:diamond_sword")])
+
+    def sword(self, net_id=None, *, data=b"\0" * 10):
+        stack = item(self.b, -41, 1, net_id)
+        stack.user_data_buffer = data
+        return stack
+
+    async def stage_inputs(self, primary, material):
+        b = self.b
+        await self.deliver(
+            self.registry_packet(), self.window_packet(), self.ui_packet(primary, material),
+            b.InventorySlotPacket(inventory_id=b.ContainerID.INVENTORY, slot=4, item=item(b)),
+        )
+
+    async def submit(self, operation):
+        sent = asyncio.Event()
+        unsubscribe = self.bot.packets.subscribe_sent(
+            lambda packet_id: sent.set() if packet_id == self.b.ItemStackRequestPacket.ID else None,
+        )
+        pending = asyncio.create_task(operation)
+        try:
+            await asyncio.wait_for(sent.wait(), timeout=1)
+        finally:
+            unsubscribe()
+        request, = self.wire.sent[-1].requests
+        return pending, request
+
+    async def complete(self, submitted, *rows, result="SUCCESS"):
+        pending, request = submitted
+        verdict = stack_response(self.b, request, *rows, result=result)
+        await self.deliver(self.b.ItemStackResponsePacket(responses=[verdict]))
+        self.assertEqual((await pending).result.name, result)
+
+    async def test_rename_cost_uses_observed_item_registry_without_experience_destination_or_stack_id(self):
+        b = self.b
+        await self.deliver(self.window_packet(), self.ui_packet(self.sword(), item(b)))
+        self.assertIsNone(self.bot.preview_anvil("New name"))
+        await self.deliver(self.registry_packet())
+        self.assertIsNone(self.bot.experience_level)
+        self.assertEqual(self.bot.inventory_slots, {})
+        preview = self.bot.preview_anvil("New name")
+        self.assertEqual(preview, AnvilPreview(level_cost=1, material_count=0))
+        self.assertIsNone(self.bot.preview_anvil("Diamond Sword"))
+        self.assertEqual(self.bot.preview_anvil("   "), AnvilPreview(level_cost=1, material_count=0))
+        with self.assertRaises(FrozenInstanceError):
+            preview.level_cost = 2
+        await self.deliver(self.registry_packet(41))
+        self.assertIsNone(self.bot.preview_anvil("New name"))
+        self.assertEqual(self.wire.sent, [])
+
+    async def test_preview_requires_both_slots_in_the_current_anvil_window(self):
+        b = self.b
+        primary = self.sword(11)
+        await self.deliver(self.registry_packet(), self.window_packet(), self.ui_packet(primary, item(b)))
+        self.assertEqual(self.bot.preview_anvil("New name"), AnvilPreview(1, 0))
+        await self.deliver(b.ContainerClosePacket(container_id=2, container_type=b.ContainerType.ANVIL))
+        self.assertIsNone(self.bot.preview_anvil("New name"))
+        await self.deliver(self.window_packet())
+        self.assertIsNone(self.bot.preview_anvil("New name"))
+        await self.deliver(self.ui_packet(primary))
+        self.assertIsNone(self.bot.preview_anvil("New name"))
+        await self.deliver(b.InventorySlotPacket(inventory_id=2, slot=1, item=item(b)))
+        self.assertEqual(self.bot.preview_anvil("New name"), AnvilPreview(1, 0))
+        await self.deliver(self.window_packet("CONTAINER"))
+        self.assertIsNone(self.bot.preview_anvil("New name"))
+        self.assertEqual(self.wire.sent, [])
+
+    async def test_preview_rejects_unknown_metadata_and_non_survival_mode(self):
+        b = self.b
+        primary = self.sword(11, data=b"")
+        await self.deliver(self.registry_packet(), self.window_packet(), self.ui_packet(primary, item(b)))
+        self.assertIsNone(self.bot.preview_anvil("New name"))
+        await self.deliver(self.ui_packet(self.sword(11), item(b)))
+        self.assertEqual(self.bot.preview_anvil("New name"), AnvilPreview(1, 0))
+        await self.deliver(b.SetPlayerGameTypePacket(player_game_type=b.GameType.CREATIVE))
+        self.assertIsNone(self.bot.preview_anvil("New name"))
+        for invalid in ("", 1):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "nonempty string"):
+                self.bot.preview_anvil(invalid)
+        self.assertEqual(self.wire.sent, [])
+        await self.bot.close()
+        with self.assertRaisesRegex(RuntimeError, "player has not joined"):
+            self.bot.preview_anvil("New name")
+
+    async def test_preview_waits_for_fresh_input_after_take_omits_source_correction(self):
+        b = self.b
+        primary = self.sword(11)
+        await self.stage_inputs(primary, item(b))
+        self.assertEqual(self.bot.preview_anvil("New name"), AnvilPreview(1, 0))
+        taking = await self.submit(self.bot.take_from_container(1, 4))
+        await self.complete(taking, (PLAYER, 4, 1, 12, "", 0))
+        self.assertEqual(self.bot.container_slots[1].net_id_variant, 11)
+        self.assertIsNone(self.bot.preview_anvil("New name"))
+        await self.deliver(b.InventorySlotPacket(inventory_id=2, slot=0, item=primary))
+        self.assertEqual(self.bot.preview_anvil("New name"), AnvilPreview(1, 0))
+
+    async def test_preview_waits_when_staging_omits_previously_empty_material_correction(self):
+        b = self.b
+        await self.stage_inputs(self.sword(11), item(b))
+        await self.deliver(b.InventorySlotPacket(inventory_id=b.ContainerID.INVENTORY, slot=0, item=self.sword(12)))
+        self.assertEqual(self.bot.preview_anvil("New name"), AnvilPreview(1, 0))
+        staging = await self.submit(self.bot.put_into_container(0, 2))
+        await self.complete(staging, (PLAYER, 0, 0, None, "", 0))
+        self.assertEqual(self.bot.container_slots[2].id, 0)
+        self.assertIsNone(self.bot.preview_anvil("New name"))
+        await self.deliver(b.InventorySlotPacket(inventory_id=2, slot=1, item=item(b)))
+        self.assertEqual(self.bot.preview_anvil("New name"), AnvilPreview(1, 0))
+
+    async def test_preview_keeps_newer_input_when_take_omits_correction(self):
+        b = self.b
+        for new_id in (11, 21):
+            with self.subTest(new_id=new_id):
+                await self.stage_inputs(self.sword(11), item(b))
+                taking = await self.submit(self.bot.take_from_container(1, 4))
+                await self.deliver(b.InventorySlotPacket(inventory_id=2, slot=0, item=self.sword(new_id)))
+                await self.complete(taking, (PLAYER, 4, 1, 12, "", 0))
+                self.assertEqual(self.bot.container_slots[1].net_id_variant, new_id)
+                self.assertEqual(self.bot.preview_anvil("New name"), AnvilPreview(1, 0))
+
+    async def test_preview_recovers_when_transfer_verdict_confirms_material_empty(self):
+        b = self.b
+        diamonds = item(b, 42, 2, 12)
+        diamonds.user_data_buffer = bytes(10)
+        await self.stage_inputs(self.sword(11, data=DAMAGE_8_USER_DATA), diamonds)
+        await self.deliver(
+            b.ItemRegistryPacket(items=[*self.registry_packet().items, b.ItemData(id=42, name="minecraft:diamond")]),
+            b.InventorySlotPacket(inventory_id=b.ContainerID.INVENTORY, slot=5, item=item(b)),
+        )
+        self.assertEqual(self.bot.preview_anvil(), AnvilPreview(1, 1))
+        first = await self.submit(self.bot.take_from_container(2, 4))
+        second = await self.submit(self.bot.take_from_container(2, 5))
+        await self.complete(first, (PLAYER, 4, 1, 13, "", 0))
+        self.assertIsNone(self.bot.preview_anvil())
+        await self.complete(second, (MATERIAL, 2, 0, None, "", 0), (PLAYER, 5, 1, 14, "", 0))
+        self.assertEqual(self.bot.container_slots[2].id, 0)
+        self.assertEqual(self.bot.preview_anvil("New name"), AnvilPreview(1, 0))
+
+    async def test_preview_requires_omitted_apply_material_even_with_confirmed_primary(self):
+        b = self.b
+        for full_response in (True, False):
+            with self.subTest(full_response=full_response):
+                await self.stage_inputs(self.sword(11, data=DAMAGE_8_USER_DATA), self.sword(12, data=DAMAGE_8_USER_DATA))
+                self.assertEqual(self.bot.preview_anvil(), AnvilPreview(2, 1))
+                applying = await self.submit(self.bot.apply_anvil(4))
+                material = [(MATERIAL, 2, 0, None, "", 0)] if full_response else []
+                await self.complete(applying, (INPUT, 1, 0, None, "", 0), (PLAYER, 4, 1, 13, "", 0), *material)
+                self.assertEqual(self.bot.container_slots[1].id, 0)
+                self.assertEqual(self.bot.container_slots[2].id, 0 if full_response else -41)
+                new_input = self.sword(21, data=DAMAGE_8_USER_DATA)
+                await self.deliver(b.InventorySlotPacket(inventory_id=2, slot=0, item=new_input))
+                self.assertEqual(self.bot.preview_anvil("New name"), AnvilPreview(1, 0) if full_response else None)
+                await self.deliver(self.ui_packet(new_input, item(b)))
+                self.assertEqual(self.bot.preview_anvil("New name"), AnvilPreview(1, 0))
+
+    async def test_preview_survives_apply_failure_and_a_newer_identical_observation(self):
+        b = self.b
+        primary = self.sword(11)
+        await self.stage_inputs(primary, item(b))
+        applying = await self.submit(self.bot.apply_anvil(4, "New name"))
+        await self.complete(applying, result="INVALID_CRAFT_RESULT")
+        self.assertEqual(self.bot.preview_anvil("New name"), AnvilPreview(1, 0))
+
+        applying = await self.submit(self.bot.apply_anvil(4, "New name"))
+        await self.deliver(self.ui_packet(primary, item(b)))
+        await self.complete(applying, (PLAYER, 4, 1, 12, "New name", 0))
+        self.assertEqual(self.bot.preview_anvil("New name"), AnvilPreview(1, 0))

@@ -10,6 +10,7 @@ from uuid import UUID
 from bedrock_protocol import GeneratorType, nbt
 
 from ._join_address import _parse_join_address
+from .anvil import AnvilPreview
 from .authentication import (
     BedrockCredentialProvider, DEFAULT_LOCALE, OfflineIdentity, _OnlineIdentity, acquire_online_identity,
 )
@@ -1745,6 +1746,20 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._containers.wait_for_slots(timeout=timeout)
 
+    def preview_anvil(self, new_name: str | None = None) -> AnvilPreview | None:
+        """Estimate the level cost and material count for the current anvil inputs.
+
+        The preview uses observed vanilla item data in Survival on protocol 2225.
+        It returns None for missing observations or unsupported operations. It
+        sends no packets and works without a known experience level or destination.
+        Use the same new_name for preview and submission, either None or a
+        nonempty string.
+        """
+        session = self._session
+        if self._containers is None or session is None:
+            raise RuntimeError("player has not joined")
+        return self._containers.preview_anvil(new_name, session.item_names, game_mode=self.game_mode)
+
     async def apply_anvil(
         self, destination_slot: int, new_name: str | None = None, *,
         material_count: int | None = None, timeout: float = 15,
@@ -1753,7 +1768,8 @@ class Bot:
 
         Stage the item in slot 1 and any material in slot 2 using
         put_into_container. The destination must be an observed empty slot.
-        An omitted name keeps the name during a repair or combination.
+        Omitting the name during a repair can restore the item's default name
+        and add a level to the cost. Pass the existing custom name to keep it.
         Supply material_count when you know the amount the recipe requires.
         The default submits the entire staged material stack. BDS validates
         the requested amount and the cost. Read the verdict for name and damage

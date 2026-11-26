@@ -1,5 +1,6 @@
 """Python SDK for headless Bedrock players."""
 
+from .anvil import AnvilPreview
 from .authentication import BedrockCredentialProvider, BedrockCredentials
 from .beds import BedObservation, PlayerRespawnPoint, SleepRejected
 from .biome_data import VanillaBiome, vanilla_biomes
@@ -53,6 +54,7 @@ from .world_feedback import BlockEvent, ParticleEvent, SoundEvent, SoundKind
 __all__ = [
     "AllGoal",
     "AnyGoal",
+    "AnvilPreview",
     "BedrockCredentialProvider",
     "BedrockCredentials",
     "BedObservation",
