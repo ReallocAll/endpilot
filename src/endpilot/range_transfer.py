@@ -522,6 +522,28 @@ async def transfer_inventory_range(
             step = RangeTransferStep(origin, target, amount, None, None, None)
             steps.append(step)
             overlapped = False
+
+            def record_reply(reply):
+                observed = replace(step, request_id=int(reply.client_request_id.raw_id), verdict=reply.result.name)
+                steps[-1] = observed
+                if not window_is_current():
+                    return "window_changed"
+                if observed.verdict != "SUCCESS":
+                    steps[-1] = replace(observed, confirmed=0)
+                    return "rejected"
+                if overlapped:
+                    return "unconfirmed"
+
+                source_after = _receipt_count(reply, _PLAYER_CONTAINERS, origin)
+                destination_after = _receipt_count(reply, _PLAYER_CONTAINERS, target)
+                if source_after is None or destination_after is None:
+                    return "unconfirmed"
+                moved = source[origin].stack_size - source_after
+                if not 0 < moved <= amount or moved != destination_after - destination[target].stack_size:
+                    return "unconfirmed"
+                steps[-1] = replace(observed, confirmed=moved)
+                return None
+
             try:
                 reply = await inventory.move_item(
                     origin, target, amount, timeout=time_left, _window_is_current=window_is_current,
@@ -531,29 +553,19 @@ async def transfer_inventory_range(
             except _InventoryMoveNotSubmitted as stopped:
                 steps.pop()
                 return result(str(stopped))
+            except (TimeoutError, asyncio.CancelledError) as error:
+                receipt = getattr(error, "_item_stack_response", None)
+                if receipt is not None:
+                    record_reply(receipt)
+                raise
             if reply is None:
                 steps.pop()
                 return result("unconfirmed")
 
-            step = replace(step, request_id=int(reply.client_request_id.raw_id), verdict=reply.result.name)
-            steps[-1] = step
-            if not window_is_current():
-                return result("window_changed")
-            if step.verdict != "SUCCESS":
-                steps[-1] = replace(step, confirmed=0)
-                return result("rejected")
-            if overlapped:
-                return result("unconfirmed")
-
-            source_after = _receipt_count(reply, _PLAYER_CONTAINERS, origin)
-            destination_after = _receipt_count(reply, _PLAYER_CONTAINERS, target)
-            if source_after is None or destination_after is None:
-                return result("unconfirmed")
-            moved = source[origin].stack_size - source_after
-            if not 0 < moved <= amount or moved != destination_after - destination[target].stack_size:
-                return result("unconfirmed")
-            steps[-1] = replace(step, confirmed=moved)
-            remaining -= moved
+            stop = record_reply(reply)
+            if stop is not None:
+                return result(stop)
+            remaining -= steps[-1].confirmed
         return result("complete")
     except (Exception, asyncio.CancelledError) as error:
         error.transfer_progress = result("cancelled" if isinstance(error, asyncio.CancelledError) else "unconfirmed")

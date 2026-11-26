@@ -207,6 +207,26 @@ class InventoryRangeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await retry).confirmed_count, 1)
         self.assertEqual(len(self.requests), 1)
 
+    async def test_cancel_from_slot_observer_preserves_the_applied_partial_receipt(self):
+        await self.seed(slot9=self.paper(3, 20))
+        moving = self.start(count=3)
+        request = await self.request()
+        unsubscribe = self.bot.subscribe_inventory_changes(
+            lambda change: moving.cancel("stop after slot update"), slot=18,
+        )
+        try:
+            await self.correct(request, (9, 1, 20), (18, 2, 21))
+        finally:
+            unsubscribe()
+        with self.assertRaisesRegex(asyncio.CancelledError, "stop after slot update") as failure:
+            await moving
+        progress = failure.exception.transfer_progress
+        step, = progress.steps
+        self.assertEqual((progress.stop_reason, progress.confirmed_count), ("cancelled", 2))
+        self.assertEqual((step.request_id, step.verdict, step.requested, step.confirmed),
+                         (request.client_request_id.raw_id, "SUCCESS", 3, 2))
+        self.assertEqual(len(self.requests), 1)
+
     async def test_cancelled_sent_move_holds_endpoints_until_its_late_verdict(self):
         await self.seed(slot9=self.paper(3, 20))
         moving = self.start()
