@@ -42,6 +42,12 @@ An unknown tag or an inventory that cannot supply the requested ingredients
 raises before sending an item request.
 [Recipe-book example](../../examples/craft_recipe.py)
 
+To undo part of a manually staged grid without closing the screen, use
+`await bot.return_crafting_ingredient(32, 9, amount=1)`. This returns one
+item from workbench grid slot 32 to main inventory slot 9 if BDS accepts the
+request. Use grid slots 28–31 in the personal inventory or 32–40 in a
+workbench, and check the returned server verdict before continuing to craft.
+
 ## Observe enchanting choices
 
 `bot.enchantment_seed_at_join` is the signed 32-bit seed reported when the bot joined

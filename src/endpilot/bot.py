@@ -721,6 +721,15 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._recipes.stage_grid(source_slot, grid_slot, amount, timeout=timeout)
 
+    async def return_crafting_ingredient(self, grid_slot: int, destination_slot: int, amount: int = 1, *,
+                                         timeout: float = 15):
+        """Return an observed grid ingredient to main inventory; return the matching BDS verdict."""
+        if self._recipes is None:
+            raise RuntimeError("player has not joined")
+        if not 0 <= destination_slot < 36:
+            raise ValueError("destination slot must be in the main inventory (0..35)")
+        return await self._recipes.return_grid(grid_slot, destination_slot, amount, timeout=timeout)
+
     async def craft_recipe_grid(self, recipe_id: str | int, destination_slot: int, *,
                                 times: int = 1, timeout: float = 15):
         """Craft from server-observed grid inputs; return BDS's item-stack verdict."""

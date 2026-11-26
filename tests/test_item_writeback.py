@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock
 
+from endpilot import Bot
 from endpilot.compression import PacketConnection
 from endpilot.containers import Containers
 from endpilot.inventory import Inventory
@@ -51,7 +52,9 @@ class ItemWritebackTests(unittest.IsolatedAsyncioTestCase):
         b = self.binding
         original_send = self.stream.send
 
-        async def send(packet):
+        async def send(packet, *, _before_send=None):
+            if _before_send is not None:
+                _before_send()
             await original_send(packet)
             request = packet.requests[0]
             if before is not None:
@@ -287,6 +290,49 @@ class ItemWritebackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.inventory._qa_response(returned).result.name, "SUCCESS")
         self.assertEqual(self.inventory.slots[20].stack_size, 2)
         self.assertEqual(self.recipes._grid_slots[28].stack_size, 0)
+
+    async def test_public_return_takes_only_the_excess_in_the_same_workbench(self):
+        self.open_window("WORKBENCH")
+        window = self.containers.window
+        bot = Bot("Crafting")
+        bot._recipes = self.recipes
+        self.change_slot(124, 32, item(self.binding, 1, 2, 23))
+        self.recipes.load(SimpleNamespace(clear_recipes=True, shapeless_recipes=[server_recipe()]))
+        send = self.stream.send
+        self.reply_to_request([(GRID, 32, 1, 23), (PLAYER, 10, 1, 51)])
+
+        reply = await bot.return_crafting_ingredient(32, 10)
+        take, = self.stream.sent[-1].requests[0].actions
+        self.assertIsInstance(take, self.binding.ItemStackRequestCereal.TakeActionData)
+        self.assertEqual((take.source.full_container_name.name.name, take.source.slot, take.source.net_id_variant,
+                          take.destination.full_container_name.name.name, take.destination.slot, take.amount),
+                         (GRID, 32, 23, PLAYER, 10, 1))
+        returned = self.inventory.slots[10]
+        self.assertEqual((reply.result.name, returned.id, returned.stack_size), ("SUCCESS", 1, 1))
+
+        self.stream.send = send
+        self.reply_to_request([(GRID, 32, 0, None), (PLAYER, 11, 4, 52)])
+        crafted = await bot.craft_recipe_grid(19, 11)
+        consume = next(a for a in self.stream.sent[-1].requests[0].actions
+                       if isinstance(a, self.binding.ItemStackRequestCereal.ConsumeActionData))
+        self.assertEqual((consume.amount, consume.source.net_id_variant), (1, 23))
+        self.assertIs(self.containers.window, window)
+        output = self.inventory.slots[11]
+        self.assertEqual((crafted.result.name, output.id, output.stack_size), ("SUCCESS", 2, 4))
+
+    async def test_public_return_does_not_send_after_workbench_is_replaced(self):
+        self.open_window("WORKBENCH")
+        bot = Bot("Crafting")
+        bot._recipes = self.recipes
+        self.change_slot(124, 32, item(self.binding, 1, 2, 23))
+        self.reply_to_request([])
+        returning = asyncio.create_task(bot.return_crafting_ingredient(32, 10))
+        await asyncio.sleep(0)
+        self.open_window("WORKBENCH")
+        self.change_slot(124, 32, item(self.binding, 1, 2, 24))
+        with self.assertRaisesRegex(RuntimeError, "crafting window changed"):
+            await returning
+        self.assertEqual(self.stream.sent, [])
 
     async def test_drop_returns_verdict_and_keeps_a_later_same_slot_packet(self):
         b = self.binding

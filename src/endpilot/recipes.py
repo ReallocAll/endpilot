@@ -568,6 +568,8 @@ class Recipes:
 
     async def _transfer_grid(self, player_slot, grid_slot, amount, *, into_grid, timeout, queued):
         window = self._sync_grid_window()
+        if not into_grid and (window is None or window.container_type not in ("INVENTORY", "WORKBENCH")):
+            raise RuntimeError("open the inventory screen or a workbench before returning crafting inputs")
         if window is None:
             raise RuntimeError("open the inventory screen before staging crafting inputs")
         inventory = self.inventory
@@ -631,7 +633,30 @@ class Recipes:
                         current = self._grid_slots.get(index)
                         self._set_grid_slot(index, correct(current, original_grid, slot))
 
-        return await inventory._request_item_stack(request, apply, timeout=timeout, queued=queued)
+        def check_return_window():
+            if self.containers.window is not window:
+                raise RuntimeError("the crafting window changed before returning ingredients")
+
+        public_return = not into_grid and not queued
+        expected = (_stack_snapshot(original_grid), _stack_snapshot(original_player)) if public_return else None
+
+        def check_return_write():
+            nonlocal original_grid, original_player
+            check_return_window()
+            grid_item = self._grid_slots.get(grid_slot)
+            player_item = inventory.slots.get(player_slot)
+            if (_stack_snapshot(grid_item), _stack_snapshot(player_item)) != expected:
+                raise RuntimeError("crafting transfer slots changed before returning ingredients")
+            owner = inventory._pending_requests[request_id]
+            if any(pending is not owner for pending in inventory._requests_for_endpoints({(None, player_slot)})):
+                raise RuntimeError("the player slot has a pending item-stack request")
+            original_grid, original_player = grid_item, player_item
+
+        return await inventory._request_item_stack(
+            request, apply, timeout=timeout, queued=queued,
+            before_send=check_return_window if not into_grid and queued else None,
+            _at_write=check_return_write if public_return else None,
+        )
 
     async def craft_grid(self, recipe_id: str | int, destination_slot: int, *,
                          times: int = 1, timeout: float = 15, _queued: bool = False):

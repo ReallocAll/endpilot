@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from endpilot import Bot
-from endpilot.protocol import write_batch
+from endpilot.protocol import read_batch, write_batch
 
 
 class RecipeDiscoveryTests(unittest.IsolatedAsyncioTestCase):
@@ -80,6 +80,109 @@ class RecipeDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         transport = SimpleNamespace(recv=self.incoming.get, send=AsyncMock(), close=AsyncMock())
         with patch("endpilot.transport.nethernet.connect", return_value=transport):
             await self.bot.join_nethernet("http://127.0.0.1:19132", timeout=1)
+
+    def watch_item_requests(self, on_request):
+        b = self.b
+
+        def sent(packet_id):
+            if packet_id == b.ItemStackRequestPacket.ID:
+                raw, = read_batch(self.bot.packets.transport.send.await_args.args[0])
+                request, = self.bot.protocol.decode(raw).requests
+                on_request(request)
+
+        self.addCleanup(self.bot.packets.subscribe_sent(sent))
+
+    def answer_item_request(self, request, *, rows=(), succeeds=False):
+        b = self.b
+        self.deliver(b.ItemStackResponsePacket(responses=[b.ItemStackResponseInfo(
+            client_request_id=request.client_request_id,
+            result=b.ItemStackNetResult.SUCCESS if succeeds else b.ItemStackNetResult.ERROR,
+            containers=[b.ItemStackResponseContainerInfo(
+                full_container_name=b.FullContainerName(name=b.ContainerEnumName[container]),
+                slots=[b.ItemStackResponseSlotInfo(requested_slot=slot, slot=slot, amount=count,
+                                                  item_stack_net_id=b.ItemStackNetId(raw_id=net_id))],
+            ) for container, slot, count, net_id in rows] or None,
+        )]))
+
+    def crafting_slot(self, inventory_id, slot, item_id, count, net_id=None):
+        b = self.b
+        return b.InventorySlotPacket(inventory_id=inventory_id, slot=slot,
+            item=b.SerializedNetworkItemStackDescriptor(id=item_id, stack_size=count, net_id_variant=net_id))
+
+    async def test_public_return_rechecks_slots_at_transport_write(self):
+        b = self.b
+        await self.join(False)
+        await self.delivered(b.ContainerOpenPacket(container_id=7, type=b.ContainerType.WORKBENCH))
+        wire = []
+
+        def respond(request):
+            take, = request.actions
+            wire.append((take.source.net_id_variant, take.destination.net_id_variant))
+            self.answer_item_request(request)
+
+        self.watch_item_requests(respond)
+        send = self.bot.packets.send
+
+        for changed in (self.crafting_slot(124, 32, 1, 2, 41),
+                        self.crafting_slot(b.ContainerID.INVENTORY, 10, 1, 1, 81)):
+            with self.subTest(slot=changed.slot):
+                await self.delivered(self.crafting_slot(124, 32, 1, 2, 23),
+                                     self.crafting_slot(b.ContainerID.INVENTORY, 10, 0, 0))
+
+                async def revise(packet, **kwargs):
+                    if isinstance(packet, b.ItemStackRequestPacket):
+                        await self.delivered(changed)
+                    return await send(packet, **kwargs)
+
+                with (patch.object(self.bot.packets, "send", revise),
+                      self.assertRaisesRegex(RuntimeError, "slots changed")):
+                    await self.bot.return_crafting_ingredient(32, 10, timeout=1)
+                self.assertEqual(wire, [])
+
+    async def test_public_return_avoids_only_inventory_slots_with_pending_trade(self):
+        from bedrock_protocol import nbt
+
+        b = self.b
+        await self.join(False)
+        await self.delivered(b.UpdateTradePacket(
+            container_id=7, type=b.ContainerType.TRADE, size=0, trader_tier=0,
+            entity_unique_id=42, last_trading_player=1, display_name="Librarian",
+            use_new_trade_screen=True, using_economy_trade=False,
+            data=nbt.CompoundTag({"Recipes": nbt.ListTag([], int(nbt.Type.COMPOUND))}),
+        ), self.crafting_slot(b.ContainerID.INVENTORY, 10, 1, 2, 81))
+        requests = []
+        staged = asyncio.Event()
+
+        def respond(request):
+            requests.append(request)
+            if len(requests) == 1:
+                staged.set()
+            elif request.actions[0].destination.slot == 11:
+                self.answer_item_request(request, succeeds=True, rows=(
+                    ("CRAFTING_INPUT_CONTAINER", 32, 1, 23),
+                    ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 11, 1, 90),
+                ))
+            else:
+                self.answer_item_request(request)
+
+        self.watch_item_requests(respond)
+        pending = asyncio.create_task(self.bot.stage_trade_ingredient(10, 1, timeout=2))
+        try:
+            await asyncio.wait_for(staged.wait(), 1)
+            await self.delivered(b.ContainerOpenPacket(container_id=7, type=b.ContainerType.WORKBENCH),
+                                 self.crafting_slot(124, 32, 1, 2, 23),
+                                 self.crafting_slot(b.ContainerID.INVENTORY, 11, 0, 0))
+            with self.assertRaisesRegex(RuntimeError, "pending item-stack request"):
+                await self.bot.return_crafting_ingredient(32, 10, timeout=1)
+            self.assertEqual([req.client_request_id.raw_id for req in requests], [-1])
+            reply = await self.bot.return_crafting_ingredient(32, 11, timeout=1)
+            self.assertEqual(reply.result.name, "SUCCESS")
+            self.assertEqual(self.bot.inventory_slots[11].stack_size, 1)
+            self.assertEqual([req.actions[0].destination.slot for req in requests[1:]], [11])
+            self.assertFalse(pending.done())
+        finally:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
 
     async def test_shapes_aux_and_overlapping_inventory_assignments(self):
         await self.join(False)
