@@ -12,7 +12,6 @@ from bedrock_source import SOURCE_REVISION, load_json
 DATA = Path(__file__).resolve().parents[1] / "src/endpilot/data"
 _LIQUIDS = {"minecraft:water", "minecraft:flowing_water", "minecraft:lava", "minecraft:flowing_lava"}
 _DYNAMIC = {
-    "minecraft:trapped_chest",
     "minecraft:piston", "minecraft:sticky_piston", "minecraft:piston_arm_collision",
     "minecraft:sticky_piston_arm_collision", "minecraft:moving_block",  # Moving/extended geometry.
 }

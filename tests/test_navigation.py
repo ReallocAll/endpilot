@@ -2934,29 +2934,34 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_interaction_goal_resolves_an_observed_chest_with_an_observed_ray(self):
         chest, missing = (2, 101, 0), (1, 101, 0)
+        cases = (("trapped_chest", 1235022161), ("chest", 3162850062))
         self.prepare_interaction_terrain(chest, unknown=(missing,))
-        self.set_block(chest, 3162850062)
         goal = BlockInteractionGoal(chest)
         rules = NavigationRules(search_radius=0, vertical_radius=0)
         self.assertIsNone(self.bot.observed_block_entity(chest))
-        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unknown")
-        result = await self.bot.navigate(goal, rules=rules)
-        self.assertEqual((result.status, result.frames), ("unknown", 0))
+        for family, runtime_id in cases:
+            with self.subTest(family=family, missing=missing):
+                self.set_block(chest, runtime_id)
+                self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unknown")
+                result = await self.bot.navigate(goal, rules=rules)
+                self.assertEqual((result.status, result.frames), ("unknown", 0))
+                self.assertEqual(self.stream.sent, [])
 
         self.set_block(missing, self.AIR)
-        matches = self.bot.plan_navigation(goal, rules=rules).matches
-        self.assertEqual(len(matches), 1)
-        match = matches[0]
-        self.assertEqual((match.position, match.face), (chest, 4))
-        # Stock 1.26.66.1 rays measure a .025 west inset and a .95000005 top.
-        for actual, expected in zip(match.click_pos, (.025, .95000005 / 2, .5), strict=True):
-            self.assertAlmostEqual(actual, expected, delta=1e-6)
-        result = await self.bot.navigate(goal, rules=rules, ticks=0)
-        self.assertEqual((result.status, result.matches), ("reached", matches))
-
-        self.set_block(chest, 1235022161)  # Trapped chest remains unresolved.
-        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unknown")
-        self.assertEqual(self.stream.sent, [])
+        for family, runtime_id in cases:
+            with self.subTest(family=family):
+                self.set_block(chest, runtime_id)
+                plan = self.bot.plan_navigation(goal, rules=rules)
+                self.assertEqual((plan.status, plan.endpoint), ("found", (0, 100, 0)))
+                self.assertEqual(len(plan.matches), 1)
+                match = plan.matches[0]
+                self.assertEqual((match.position, match.face), (chest, 4))
+                # Stock 1.26.66.1 rays measure a .025 west inset and a .95 top.
+                for actual, expected in zip(match.click_pos, (.025, .475, .5), strict=True):
+                    self.assertAlmostEqual(actual, expected, delta=1e-6)
+                result = await self.bot.navigate(goal, rules=rules, ticks=0)
+                self.assertEqual((result.status, result.frames, result.matches), ("reached", 0, plan.matches))
+                self.assertEqual(self.stream.sent, [])
 
     async def test_interaction_goal_matches_a_thin_outline_in_a_composite(self):
         button, behind = (2, 101, 0), (-1, 100, 0)

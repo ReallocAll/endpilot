@@ -112,16 +112,18 @@ class BlockRaycastTests(unittest.IsolatedAsyncioTestCase):
         hit = self.bot.raycast_block(max_distance=3.5)
         self.assertEqual(hit, BlockRaycastResult("hit", 0, barrel, 4, (0., 0.5, 0.5), 3.5))
 
-    async def test_ordinary_chest_outlines_use_the_same_inset_in_both_id_modes(self):
+    async def test_chest_outlines_use_the_same_inset_in_both_id_modes(self):
         chest = (-13, 221, -9)
         cases = (
-            (True, (741882976, 1429214429, 3162850062, 2001328343)),
-            (False, (20183, 20184, 20185, 20186)),
+            ("chest", True, (741882976, 1429214429, 3162850062, 2001328343)),
+            ("chest", False, (20183, 20184, 20185, 20186)),
+            ("trapped_chest", True, (1235022161, 1655451298, 828777955, 3798198968)),
+            ("trapped_chest", False, (14627, 14628, 14629, 14630)),
         )
-        for hashed, orientations in cases:
+        for family, hashed, orientations in cases:
             self.blocks.hashed_runtime_ids = hashed
             for runtime_id in orientations:
-                with self.subTest(hashed=hashed, runtime_id=runtime_id):
+                with self.subTest(family=family, hashed=hashed, runtime_id=runtime_id):
                     self.air_section()
                     self.update(chest, runtime_id)
                     self.move((-14.5, 221.94, -8.5))
