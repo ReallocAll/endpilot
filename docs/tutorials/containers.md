@@ -157,8 +157,15 @@ python transfer_paper.py --minecart
 The script selects the observed cart, passes its current runtime ID to
 `open_entity_container()`, and prints the entity unique ID from the matching
 server window. The same take, return, range transfer, and reopen checks
-apply. For range transfers the cart must remain observed as the same entity
-throughout. The entity open call supports chest minecarts.
+apply. Transfers require the cart to remain observed as the same entity.
+
+For a hopper minecart, select an observed `minecraft:hopper_minecart` and
+pass its runtime ID to `open_entity_container()`. The server opens a
+`HOPPER` window with the cart's unique ID. Wait for its five slots with
+`wait_for_container_slots()` before taking or putting by slot. A window
+opened by `interact_entity()` supports the same transfers when it is bound
+to the observed cart. Use `range(5)` for the cart side of `transfer_range()`
+or call `transfer_item()` to use the whole window.
 
 ## Choose ranges and interpret partial results
 
@@ -167,6 +174,7 @@ throughout. The entity open call supports chest minecarts.
   `direction="put"`, supply those ranges in the opposite order.
 - Use forward, half-open ranges within the observed window's slots.
   Ordinary single chests, barrels, and chest minecarts use `range(27)`.
+  Hopper minecarts use `range(5)`.
   A double chest uses its server-reported 54-slot order. Main inventory
   slots are in `range(36)`. For `transfer_inventory_range()`, open the
   player inventory screen and use two non-overlapping main inventory ranges.

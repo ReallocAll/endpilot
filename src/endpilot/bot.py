@@ -1986,10 +1986,11 @@ class Bot:
         return await self._containers.open(position, self._blocks, face=face, timeout=timeout)
 
     async def open_entity_container(self, runtime_id: int, *, timeout: float = 15) -> ContainerWindow:
-        """Open an observed chest minecart with a known identity.
+        """Open an observed chest or hopper minecart with a known identity.
 
         Return the matching server-opened window. Use wait_for_container_slots
         for its contents, then take_from_container or put_into_container by slot.
+        Hopper minecart transfers require an observed five-slot window.
         """
         if self._containers is None or self._entities is None:
             raise RuntimeError("player has not joined")

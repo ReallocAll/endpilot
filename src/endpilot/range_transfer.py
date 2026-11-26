@@ -148,9 +148,10 @@ async def transfer_range(
     match: Callable[[HeldItemStack], bool] | None = None,
     timeout: float = 15,
 ) -> RangeTransferResult:
-    """Move a registered item through the currently open chest, barrel or chest minecart.
+    """Move a registered item through the currently open chest, barrel or minecart.
 
     A double chest uses the 54-slot order reported by its active window.
+    Chest and hopper minecarts require matching 27-slot and 5-slot windows.
     Optional match is a pure synchronous predicate on immutable source stacks
     with the requested item ID. It can run again before planning each step.
     A window change during matching stops the transfer before the next send.
@@ -177,8 +178,8 @@ async def transfer_item(
 ) -> RangeTransferResult:
     """Move up to count of a registered item between the active container and main inventory.
 
-    Wait for the contents of the open chest, barrel or chest minecart, then
-    use its full server-reported slot range and all 36 main inventory slots.
+    Wait for the contents of the open chest, barrel, chest minecart or hopper
+    minecart, then use its full slot range and all 36 main inventory slots.
     The timeout covers the content wait and all item requests. A replacement
     window stops the operation, and a zero count completes immediately.
     The optional match and server-confirmed result follow transfer_range.
@@ -226,10 +227,16 @@ async def _transfer_range(
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout if whole_window else None
         window = bot.open_window
-        if window is None or window.container_type != "CONTAINER":
+        if window is None or window.container_type not in ("CONTAINER", "HOPPER"):
             raise RuntimeError("open an ordinary chest or barrel before transferring items")
         containers, inventory = bot._containers, bot._inventory
-        entity = None
+        entity = containers._entity_container
+        minecart_slot_count = None if entity is None else entity.minecart_slot_count(window)
+        if window.container_type == "HOPPER":
+            if minecart_slot_count is None:
+                raise RuntimeError("the active hopper window must be bound to a hopper minecart")
+            if not entity.is_visible():
+                return result("window_changed")
         slot_count = containers._observed_window_slot_count(window)
         if whole_window and slot_count is None:
             try:
@@ -257,19 +264,16 @@ async def _transfer_range(
                                                           or slot_count != _DOUBLE_CHEST_SIZE):
                 raise RuntimeError("the active chest or barrel has an unsupported slot count")
         else:
-            entity = containers._entity_container
-            if entity is not None and not entity.is_visible():
+            if entity is not None and (containers._entity_container is not entity or not entity.is_visible()):
                 return result("window_changed")
-            actor = None if entity is None else entity.entities.get(entity.runtime_id)
-            if (actor is None or actor.actor_type != "minecraft:chest_minecart" or actor.entity_id != window.entity_unique_id
-                    or entity.entity_id != window.entity_unique_id):
-                raise RuntimeError("open an ordinary chest or barrel, or a bound chest minecart")
+            if minecart_slot_count is None:
+                raise RuntimeError("open an ordinary chest or barrel, or a bound chest minecart or hopper minecart")
             if not whole_window:
-                _check_range(block_slots, _SINGLE_CONTAINER_SIZE, container_range_name)
+                _check_range(block_slots, minecart_slot_count, container_range_name)
             if slot_count is None:
                 return result("unobserved")
-            if slot_count != _SINGLE_CONTAINER_SIZE:
-                raise RuntimeError("the active chest minecart has an unsupported slot count")
+            if slot_count != minecart_slot_count:
+                raise RuntimeError("the active minecart has an unsupported slot count")
         if whole_window:
             block_slots, player_slots = range(slot_count), range(_PLAYER_SIZE)
             source_slots, destination_slots = (
