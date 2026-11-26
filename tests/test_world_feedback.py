@@ -123,6 +123,8 @@ class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((played_note.result().note_pitch, played_note.result().instrument_id), (1, 1))
         self.assertIsNone(crack.result().position)
         self.assertEqual(crack.result().packet, ended)
+        for event in (ambiguous, opened, piston, played_note, crack):
+            self.assertIsNone(event.result().piston_attached_blocks)
 
     async def test_pending_observation_ends_on_close(self):
         waiting = asyncio.create_task(self.bot.wait_for_sound())
@@ -207,10 +209,46 @@ class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual((event.dimension_id, event.kind, event.chest_partner), (1, "chest_close", None))
 
-    def piston_arm(self, position, stage):
+    def piston_arm(self, position, stage, **fields):
         return self.b.BlockActorDataPacket(pos=self.pos(position), data=nbt.CompoundTag({
-            "id": nbt.StringTag("PistonArm"), "State": nbt.ByteTag(stage),
+            "id": nbt.StringTag("PistonArm"), "State": nbt.ByteTag(stage), **fields,
         }))
+
+    async def test_piston_attached_blocks_preserve_signed_coordinates_and_packet_order(self):
+        b = self.b
+        position = (7, 220, -3)
+        sources = ((8, -32, -6), (-4, 220, 9), (20, 221, -11))
+        attached = nbt.ListTag([nbt.IntTag(axis) for cell in sources for axis in cell])
+        other_actor = b.BlockActorDataPacket(pos=self.pos(position), data=nbt.CompoundTag({
+            "id": nbt.StringTag("Chest"), "State": nbt.ByteTag(1), "AttachedBlocks": attached,
+        }))
+        for stage, kind in ((1, "piston_extending"), (9, "piston")):
+            with self.subTest(stage=stage):
+                arm = self.piston_arm(position, stage, AttachedBlocks=attached)
+                event = await self.block_event(other_actor, arm, position=position)
+                self.assertEqual((event.kind, event.position, event.piston_face, event.packet),
+                                 (kind, position, None, arm))
+                self.assertEqual(event.piston_attached_blocks, sources)
+                event.packet.data = nbt.CompoundTag({"AttachedBlocks": nbt.ListTag([])})
+                self.assertEqual(event.piston_attached_blocks, sources)
+
+    async def test_piston_attached_blocks_distinguish_empty_reports_from_unknown(self):
+        position = (1, 220, 5)
+        ints = [nbt.IntTag(value) for value in (-4, 220, 8, 9)]
+        for stage, kind, fields, expected in (
+            (1, "piston_extending", {"AttachedBlocks": nbt.ListTag(ints[:3])}, ((-4, 220, 8),)),
+            (2, "piston_extended", {"AttachedBlocks": nbt.ListTag([])}, ()),
+            (0, "piston_retracted", {"AttachedBlocks": nbt.ListTag([], int(nbt.Type.INT))}, ()),
+            (3, "piston_retracting", {}, None),
+            (3, "piston_retracting", {"AttachedBlocks": nbt.IntArrayTag([-4, 220, 8])}, None),
+            (3, "piston_retracting", {"AttachedBlocks": nbt.ListTag(ints)}, None),
+            (3, "piston_retracting", {"AttachedBlocks": nbt.ListTag([nbt.ShortTag(1)] * 3)}, None),
+        ):
+            with self.subTest(stage=stage, fields=fields):
+                arm = self.piston_arm(position, stage, **fields)
+                event = await self.block_event(arm, position=position, kind=kind)
+                self.assertEqual(event.packet, arm)
+                self.assertEqual(event.piston_attached_blocks, expected)
 
     async def test_piston_face_matches_base_states_and_preserves_each_raw_phase(self):
         b = self.b

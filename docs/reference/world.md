@@ -188,6 +188,18 @@ progress and end of cracking. Note events expose `note_pitch` and
 `instrument_id`. A crack-end packet with an all-zero position has
 `event.position` set to `None`. Its native `packet.pos` remains available.
 
+For a protocol 2225 `PistonArm` packet, `event.position` is the piston base.
+`event.piston_attached_blocks` is an immutable tuple of signed, absolute
+`(x, y, z)` source block positions in the order reported by that packet's
+`AttachedBlocks` list. A valid empty list gives `()`. Missing or malformed
+lists and other kinds of block feedback give `None`. The list is available
+independently of the piston phase and `event.piston_face`.
+
+In observed vanilla 2225 moves, the source positions are reported on
+`piston_extending` and on `piston_retracting` when a sticky piston pulls blocks.
+The final `piston_extended` and `piston_retracted` packets report an empty list.
+Read block updates to confirm where the blocks finish.
+
 ## Read and edit signs
 
 `bot.observed_sign(position)` returns the observed front text, back text,

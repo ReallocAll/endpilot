@@ -33,6 +33,17 @@ def _chest_pair(root, position: _Cell) -> tuple[_Cell, int] | None:
     return (root["pairx"].value, position[1], root["pairz"].value), lead
 
 
+def _piston_attached_blocks(root) -> tuple[_Cell, ...] | None:
+    attached = root["AttachedBlocks"] if "AttachedBlocks" in root else None
+    if type(attached) is not nbt.ListTag or len(attached) % 3:
+        return None
+    coordinates = tuple(attached)
+    if any(type(coordinate) is not nbt.IntTag for coordinate in coordinates):
+        return None
+    return tuple((coordinates[i].value, coordinates[i + 1].value, coordinates[i + 2].value)
+                 for i in range(0, len(coordinates), 3))
+
+
 @dataclass(frozen=True, slots=True)
 class SoundEvent:
     """One incoming sound packet, with its decoded fields in ``packet``."""
@@ -72,6 +83,7 @@ class BlockEvent:
     packet: object
     chest_partner: _Cell | None = None
     piston_face: int | None = None
+    piston_attached_blocks: tuple[_Cell, ...] | None = None
 
     @property
     def note_pitch(self) -> int | None:
@@ -163,6 +175,7 @@ class WorldFeedback:
         position = _xyz(packet.pos)
         chest_partner = None
         piston_face = None
+        piston_attached_blocks = None
         if packet.ID == b.BlockEventPacket.ID:
             kind = "block"
             if self._is_2225 and packet.b0 == 1 and packet.b1 in (0, 1):
@@ -175,6 +188,7 @@ class WorldFeedback:
             actor_id = tag["id"] if "id" in tag else None
             if not isinstance(actor_id, nbt.StringTag) or actor_id.value != "PistonArm":
                 return None
+            piston_attached_blocks = _piston_attached_blocks(tag)
             state = tag["State"] if "State" in tag else None
             kind = _PISTON_STATES.get(state.value, "piston") if isinstance(state, nbt.ByteTag) else "piston"
             if kind != "piston":
@@ -192,7 +206,7 @@ class WorldFeedback:
             if packet.sound_event != "note":
                 return None
             kind = "note"
-        return BlockEvent(kind, dimension, position, packet, chest_partner, piston_face)
+        return BlockEvent(kind, dimension, position, packet, chest_partner, piston_face, piston_attached_blocks)
 
     async def wait_for_block_event(self, position: _Position | None, kind: str | None, timeout: float) -> BlockEvent:
         return await self._wait(
