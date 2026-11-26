@@ -243,7 +243,7 @@ def _device_cache_state(cache, app, client_id, result, expected_account_id) -> t
             "home_account_id": candidate, "environment": _AUTHORITY_HOST,
             "client_id": client_id, "realm": app.authority.tenant,
         }, now=0))
-        if (("client_info" not in result or reported_account_id == candidate)
+        if (reported_account_id in (None, candidate)
                 and any(entry.get("secret") == result["access_token"] for entry in access_tokens)):
             account_id = candidate
     if expected_account_id is not None and (

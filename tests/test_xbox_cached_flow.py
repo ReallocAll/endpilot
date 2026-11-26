@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import threading
 from unittest import skipUnless
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs
 
 from endpilot import BedrockCredentials, xbox
@@ -25,13 +25,13 @@ class XboxCachedFlowTests(_MsalTestCase):
     def remembered(self):
         return XboxCredentialProvider(CLIENT_ID, on_device_code=self.display, remember_account=True)
 
-    def token(self, *, uid="fake-user", refresh="fake-refresh-one", expires=3600):
+    def token(self, *, uid="fake-user", utid="fake-tenant", refresh="fake-refresh-one", expires=3600):
         reply = {
             "access_token": ACCESS_TOKEN, "expires_in": expires, "token_type": "Bearer",
             "scope": "XboxLive.signin", "device_code": MACHINE_CODE, "user_code": CODE,
         }
         if uid:
-            reply["client_info"] = base64.urlsafe_b64encode(json.dumps({"uid": uid, "utid": "fake-tenant"}).encode()).decode()
+            reply["client_info"] = base64.urlsafe_b64encode(json.dumps({"uid": uid, "utid": utid}).encode()).decode()
         if refresh:
             reply["refresh_token"] = refresh
         return self.httpx.Response(200, json=reply)
@@ -40,6 +40,17 @@ class XboxCachedFlowTests(_MsalTestCase):
         data = json.loads(account_cache_path(CLIENT_ID).read_bytes())
         self.assertEqual(data["home_account_id"], ACCOUNT)
         return json.loads(data["serialized_cache"])
+
+    def device_result_with_client_info(self, client_info):
+        from msal import PublicClientApplication
+
+        redeem = PublicClientApplication.acquire_token_by_device_flow
+
+        def report(app, *args, **kwargs):
+            result = redeem(app, *args, **kwargs)
+            return dict(result, client_info=client_info)
+
+        return patch.object(PublicClientApplication, "acquire_token_by_device_flow", new=report)
 
     async def test_default_application_authorizes_and_forgets_only_its_separate_cache(self):
         requests, _, _ = self.authority(self.token(), self.token())
@@ -135,6 +146,60 @@ class XboxCachedFlowTests(_MsalTestCase):
             self.assertEqual((token, exchanged_key), (ACCESS_TOKEN, key))
             self.verify.assert_awaited_with(client, self.credentials, key)
         self.assertEqual([str(request.url) for request in requests], [METADATA, DEVICE, TOKEN] * 2)
+
+    async def test_add_with_incomplete_client_info_saves_and_silently_reuses_verified_account(self):
+        from endpilot.xbox import _cache
+
+        requests, _, _ = self.authority(self.token(utid=""))
+        profile = ("12345", "Local Player")
+        verify_account = AsyncMock(return_value=profile)
+        path = account_cache_path(CLIENT_ID)
+        with patch.object(xbox._verify, "verify_account", new=verify_account, create=True):
+            self.assertEqual(await self.provider._credentials_for_account(public_key(), add=True),
+                             (self.credentials, profile, False))
+            record, = _cache.load_accounts(path)
+            self.assertEqual((record.home_account_id, record.xuid, record.gamertag), ("fake-user.", *profile))
+
+            before = path.read_bytes()
+            headless = XboxCredentialProvider(CLIENT_ID)
+            self.assertEqual(await headless._credentials_for_account(public_key(), xuid=profile[0]),
+                             (self.credentials, profile, False))
+            self.assertEqual(path.read_bytes(), before)
+
+        self.assertEqual([str(request.url) for request in requests], [METADATA, DEVICE, TOKEN, METADATA])
+        self.display.assert_called_once()
+        self.assertEqual(verify_account.await_count, 2)
+
+    async def test_add_with_conflicting_client_info_verifies_without_saving(self):
+        self.authority(self.token())
+        profile = ("12345", "Local Player")
+        verify_account = AsyncMock(return_value=profile)
+        client_info = self.token(uid="other-user").json()["client_info"]
+        with (self.device_result_with_client_info(client_info),
+              patch.object(xbox._verify, "verify_account", new=verify_account, create=True)):
+            self.assertEqual(await self.provider._credentials_for_account(public_key(), add=True),
+                             (self.credentials, profile, True))
+
+        verify_account.assert_awaited_once()
+        self.assertFalse(account_cache_path(CLIENT_ID).exists())
+
+    async def test_selected_legacy_account_requires_complete_device_client_info(self):
+        denied = self.httpx.Response(400, json={"error": "invalid_grant"})
+        self.authority(self.token(expires=0), denied, self.token())
+        await self.remembered()(public_key())
+        path = account_cache_path(CLIENT_ID)
+        before = path.read_bytes()
+        self.exchange.reset_mock()
+        client_info = self.token(utid="").json()["client_info"]
+        verify_account = AsyncMock()
+        with (self.device_result_with_client_info(client_info),
+              patch.object(xbox._verify, "verify_account", new=verify_account, create=True)):
+            with self.assertRaisesRegex(XboxReauthenticationRequired, "could not confirm the selected account"):
+                await self.provider._credentials_for_account(public_key(), legacy_account_id=ACCOUNT)
+
+        self.exchange.assert_not_awaited()
+        verify_account.assert_not_awaited()
+        self.assertEqual(path.read_bytes(), before)
 
     async def test_ambiguous_account_authorizes_once_and_preserves_previous_cache(self):
         from msal import PublicClientApplication
