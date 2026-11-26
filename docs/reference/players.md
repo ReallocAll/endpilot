@@ -124,3 +124,27 @@ delivers the same `EntitySwing` values to a synchronous callback and returns
 an unsubscribe function. A filtered subscription ends when its actor leaves
 view or the dimension changes. An observed swing reports the animation.
 Use separate observations to confirm a hit or damage.
+
+## Observe entity hurt and death
+
+`await bot.wait_for_entity_health_event(kind="hurt", runtime_id=runtime_id)`
+waits for a received hurt event for the remote entity currently tracked under
+that runtime ID. Use `kind="death"` to wait for death, or omit `kind` to accept
+both. Omit `runtime_id` to observe any tracked remote entity. An
+`EntityHealthEvent` contains the event `kind` and the immutable `entity`
+snapshot at that packet. Actor events supply no damage amount or remaining
+health through this API. Use `wait_for_death` to observe the local player's
+death.
+
+`bot.subscribe_entity_health_events(callback, kind=..., runtime_id=...)`
+applies the same filters and delivers events to a synchronous callback. It
+returns an idempotent unsubscribe function. Runtime filters bind the current
+instance, so a filtered subscription ends when the entity leaves view, its
+runtime ID is reused, or the dimension changes. A subscription without a
+runtime filter continues across dimension changes. Both methods send no packets.
+
+An unsupported `kind` raises `ValueError`. A runtime filter for the local
+player or an unobserved entity raises `LookupError`, as does a pending wait
+whose instance leaves view or is replaced. A dimension change ends pending
+waits with `RuntimeError`. A deadline raises `TimeoutError`, and connection
+end raises `ConnectionError` in pending waits and ends all subscriptions.

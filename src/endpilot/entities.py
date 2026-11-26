@@ -89,11 +89,23 @@ class EntitySwing:
     hand: HandSlot | int | None
 
 
+EntityHealthEventKind = Literal["hurt", "death"]
+
+
+@dataclass(frozen=True, slots=True)
+class EntityHealthEvent:
+    """A received actor hurt or death event with its packet-time snapshot."""
+
+    kind: EntityHealthEventKind
+    entity: EntityState
+
+
 @dataclass(frozen=True, slots=True, eq=False)
-class _SwingObserver:
+class _EntityObserver[Event]:
     runtime_id: int | None
-    callback: Callable[[EntitySwing], None]
-    waiter: asyncio.Future[EntitySwing] | None = None
+    callback: Callable[[Event], None]
+    waiter: asyncio.Future[Event] | None = None
+    kind: EntityHealthEventKind | None = None
 
 
 def _decode_unknown_swing_source(protocol, raw: RawPacket):
@@ -356,7 +368,8 @@ class Entities:
         self._cursor_bodies: dict[int, _CursorBody] = {}
         self._player_equipment: dict[int, PlayerEquipmentSnapshot] = {}
         self._equipment_waiters: dict[int, set[asyncio.Future[PlayerEquipmentSnapshot]]] = {}
-        self._swing_observers: list[_SwingObserver] = []
+        self._swing_observers: list[_EntityObserver[EntitySwing]] = []
+        self._health_observers: list[_EntityObserver[EntityHealthEvent]] = []
         self._glide_observers: list[Callable[[EntityState], None]] = []
         self._unidentified_equipment_since: dict[int, int] = {}
         # AddPlayer can identify an instance before its unique ID appears in EntityState.
@@ -394,7 +407,8 @@ class Entities:
         self._last_pickup = None
         self._end_movement_waiters(ConnectionError, "entity session is closed", _cause)
         self._clear_player_equipment(ConnectionError, "entity session is closed", _cause)
-        self._end_swing_observers(lambda _: True, ConnectionError, "entity session is closed", _cause)
+        for observers in (self._swing_observers, self._health_observers):
+            self._end_entity_observers(observers, lambda _: True, ConnectionError, "entity session is closed", _cause)
         self._glide_observers.clear()
         self._actor_instances.clear()
         self._cursor_bodies.clear()
@@ -460,31 +474,58 @@ class Entities:
         self, callback: Callable[[EntitySwing], None], *, runtime_id: int | None = None,
     ) -> Callable[[], None]:
         self._require_swing_target(runtime_id)
-        observer = _SwingObserver(runtime_id, callback)
+        observer = _EntityObserver(runtime_id, callback)
         return self.packets._subscribe(self._swing_observers, observer)
 
     async def wait_for_entity_swing(
         self, *, runtime_id: int | None = None, timeout: float | None = 15,
     ) -> EntitySwing:
         self._require_swing_target(runtime_id)
+        return await self._wait_for_entity_event(self._swing_observers, runtime_id, timeout)
+
+    def _require_health_event_target(self, kind: EntityHealthEventKind | None, runtime_id: int | None) -> None:
+        self._require_live()
+        if kind not in (None, "hurt", "death"):
+            raise ValueError("kind must be 'hurt' or 'death'")
+        if runtime_id is not None and (runtime_id == self._own_runtime_id or runtime_id not in self._actor_instances):
+            raise LookupError("remote entity is not currently observed")
+
+    def subscribe_entity_health_events(
+        self, callback: Callable[[EntityHealthEvent], None], *,
+        kind: EntityHealthEventKind | None = None, runtime_id: int | None = None,
+    ) -> Callable[[], None]:
+        self._require_health_event_target(kind, runtime_id)
+        return self.packets._subscribe(self._health_observers, _EntityObserver(runtime_id, callback, kind=kind))
+
+    async def wait_for_entity_health_event(
+        self, *, kind: EntityHealthEventKind | None = None, runtime_id: int | None = None, timeout: float | None = 15,
+    ) -> EntityHealthEvent:
+        self._require_health_event_target(kind, runtime_id)
+        return await self._wait_for_entity_event(self._health_observers, runtime_id, timeout, kind=kind)
+
+    async def _wait_for_entity_event[Event](
+        self, observers: list[_EntityObserver[Event]], runtime_id: int | None, timeout: float | None,
+        *, kind: EntityHealthEventKind | None = None,
+    ) -> Event:
         future = asyncio.get_running_loop().create_future()
 
-        def observe(event):
+        def observe(event: Event) -> None:
             if not future.done():
                 future.set_result(event)
 
-        unsubscribe = self.packets._subscribe(self._swing_observers, _SwingObserver(runtime_id, observe, future))
+        unsubscribe = self.packets._subscribe(observers, _EntityObserver(runtime_id, observe, future, kind))
         try:
             async with asyncio.timeout(timeout):
                 return await future
         finally:
             unsubscribe()
 
-    def _end_swing_observers(self, matches, error_type, message, cause=None):
-        for observer in tuple(self._swing_observers):
+    @staticmethod
+    def _end_entity_observers(observers, matches, error_type, message, cause=None):
+        for observer in tuple(observers):
             if not matches(observer):
                 continue
-            self._swing_observers.remove(observer)
+            observers.remove(observer)
             waiter = observer.waiter
             if waiter is not None and not waiter.done():
                 error = error_type(message)
@@ -492,9 +533,9 @@ class Entities:
                 waiter.set_exception(error)
                 waiter.exception()
 
-    def _forget_entity_swings(self, runtime_id):
-        self._end_swing_observers(lambda observer: observer.runtime_id == runtime_id,
-                                  LookupError, "entity is no longer observed")
+    def _forget_entity_observers(self, observers, runtime_id: int) -> None:
+        self._end_entity_observers(observers, lambda observer: observer.runtime_id == runtime_id,
+                                   LookupError, "entity is no longer observed")
 
     def _observe_swing(self, raw: RawPacket) -> None:
         if not self._swing_observers:
@@ -515,14 +556,43 @@ class Entities:
         runtime_id = int(packet.runtime_id)
         event = EntitySwing(runtime_id, self._swing_entity_id(runtime_id), self._by_runtime.get(runtime_id), source,
                             getattr(packet, "hand_slot", None))
-        for observer in tuple(self._swing_observers):
+        self._notify_entity_observers(self._swing_observers, event, runtime_id, "entity swing observer failed")
+
+    def _observe_health_event(self, raw: RawPacket) -> None:
+        if not self._health_observers:
+            return
+        protocol = self.packets.protocol
+        packet = protocol.decode(raw)
+        types = protocol.binding.ActorEvent
+        kind: EntityHealthEventKind
+        if packet.event_id == types.HURT:
+            kind = "hurt"
+        elif packet.event_id == types.DEATH:
+            kind = "death"
+        else:
+            return
+        runtime_id = int(packet.runtime_id)
+        state = self._by_runtime.get(runtime_id)
+        if runtime_id == self._own_runtime_id or state is None:
+            return
+        self._notify_entity_observers(self._health_observers, EntityHealthEvent(kind, state), runtime_id,
+                                      "entity health observer failed", kind=kind)
+
+    @staticmethod
+    def _notify_entity_observers[Event](
+        observers: list[_EntityObserver[Event]], event: Event, runtime_id: int, message: str,
+        *, kind: EntityHealthEventKind | None = None,
+    ) -> None:
+        for observer in tuple(observers):
             if observer.runtime_id is not None and observer.runtime_id != runtime_id:
+                continue
+            if observer.kind is not None and observer.kind != kind:
                 continue
             try:
                 observer.callback(event)
             except (Exception, asyncio.CancelledError) as error:
                 asyncio.get_running_loop().call_exception_handler({
-                    "message": "entity swing observer failed", "exception": error, "callback": observer.callback,
+                    "message": message, "exception": error, "callback": observer.callback,
                 })
 
     def player_equipment(self, runtime_id: int) -> PlayerEquipmentSnapshot | None:
@@ -923,9 +993,10 @@ class Entities:
         known_id = self._swing_entity_id(runtime_id)
         # A conflicting roster ID can appear in the snapshot without claiming that identity.
         entity_id = (state.entity_id or unlisted_entity_id) if identity_matches else None
-        if new_instance or (known_id is not None and state.entity_id and known_id != state.entity_id):
+        replaced = new_instance or (known_id is not None and state.entity_id and known_id != state.entity_id)
+        if replaced:
             self._end_movement_waiters(LookupError, "entity is no longer observed", runtime_id=runtime_id)
-            self._forget_entity_swings(runtime_id)
+            self._forget_entity_observers(self._swing_observers, runtime_id)
         if previous is not None and self._runtime_by_id.get(previous.entity_id) == runtime_id:
             if previous.entity_id != entity_id:
                 self._forget_links(previous.entity_id)
@@ -946,6 +1017,9 @@ class Entities:
                 self._forget_runtime(previous_unlisted)
             if state.entity_id:
                 self._runtime_by_id[entity_id] = runtime_id
+        if replaced:
+            # Link callbacks can register observers while the previous actor is still visible.
+            self._forget_entity_observers(self._health_observers, runtime_id)
         self._by_runtime[runtime_id] = state
         if new_instance:
             self._forget_player_equipment(runtime_id)
@@ -966,7 +1040,8 @@ class Entities:
 
     def _forget_runtime(self, runtime_id: int) -> None:
         self._end_movement_waiters(LookupError, "entity is no longer observed", runtime_id=runtime_id)
-        self._forget_entity_swings(runtime_id)
+        self._forget_entity_observers(self._swing_observers, runtime_id)
+        self._forget_entity_observers(self._health_observers, runtime_id)
         self._forget_player_equipment(runtime_id)
         state = self._by_runtime.pop(runtime_id, None)
         self._actor_instances.pop(runtime_id, None)
@@ -998,6 +1073,8 @@ class Entities:
             self._end_session()
         elif raw.packet_id == b.AnimatePacket.ID:
             self._observe_swing(raw)
+        elif raw.packet_id == b.ActorEventPacket.ID:
+            self._observe_health_event(raw)
         elif raw.packet_id == b.ItemRegistryPacket.ID:
             packet = self.packets.protocol.decode(raw)
             self._item_names = {int(item.id): str(item.name) for item in packet.items}
@@ -1171,10 +1248,16 @@ class Entities:
             self._dimension_epoch += 1
             self._last_pickup = None
             self._end_movement_waiters(RuntimeError, "dimension changed while waiting for entity movement")
-            self._end_swing_observers(lambda observer: observer.runtime_id is not None or observer.waiter is not None,
-                                      RuntimeError, "dimension changed while waiting for an entity swing")
+
+            def dimension_bound(observer):
+                return observer.runtime_id is not None or observer.waiter is not None
+
+            self._end_entity_observers(self._swing_observers, dimension_bound,
+                                       RuntimeError, "dimension changed while waiting for an entity swing")
             self._clear_player_equipment(LookupError, "remote player is no longer observed")
             self._clear_links()
+            self._end_entity_observers(self._health_observers, dimension_bound,
+                                       RuntimeError, "dimension changed while waiting for an entity health event")
             self._by_runtime.clear()
             self._actor_instances.clear()
             self._cursor_bodies.clear()
