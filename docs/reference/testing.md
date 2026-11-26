@@ -56,6 +56,8 @@ move within reach of a support block with an observed empty target next to it.
 In Python, pass the support coordinates and face to `await bot.place_block()`.
 Supply either `expected_runtime_id` from the current session or a fully
 qualified vanilla `expected_block_name` such as `"minecraft:stone"`.
+Use `BlockPlacementGoal(destination)` to find a stance and get the support,
+face, and click point for an adjacent placement. [Navigation tutorial](../tutorials/navigation.md#navigate-to-place-a-block)
 
 By default, the target is the observed air cell adjacent to the clicked face.
 Pass `replace=True` to target the clicked cell when its main layer is known

@@ -13,7 +13,8 @@ from bedrock_protocol import nbt
 
 from .block_data import VanillaBlockState, _catalog, _vanilla_state_properties, vanilla_block_state
 from .block_raycast import (
-    BlockRaycastResult, MiningFaceResult, OutlineObservation, trace_blocks, trace_blocks_towards, trace_mining_face,
+    BlockRaycastResult, MiningFaceResult, OutlineObservation, _UNIT_BOX, trace_blocks, trace_blocks_towards,
+    trace_mining_face,
 )
 from .compression import PacketConnection
 from .protocol import RawPacket
@@ -1223,6 +1224,18 @@ class Blocks:
             return False
         support = None if floor is None else self._vanilla_state(floor.runtime_id)
         return None if support is None else support.unit_cube and not support.unsafe_support
+
+    def _placement_support(self, position: tuple[int, int, int]) -> bool | None:
+        main = self.observed_block(position)
+        extra = self.observed_block(position, layer=1)
+        if (main is not None and main.is_air is True) or (extra is not None and extra.is_air is False):
+            return False
+        state = None if main is None else self._vanilla_state(main.runtime_id)
+        if state is not None and (not state.unit_cube or state.outline not in (None, _UNIT_BOX)):
+            return False
+        if state is None or state.outline is None or extra is None or extra.is_air is None:
+            return None
+        return True
 
     def _flat_stance(self, position: tuple[int, int, int]) -> bool | None:
         """Classify clearance and support for standing at this block's center."""

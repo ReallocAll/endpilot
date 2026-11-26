@@ -8,7 +8,7 @@ from itertools import count
 import math
 from typing import Literal
 
-from .block_raycast import BlockRaycastResult, _block_interaction_probe, _validate_distance
+from .block_raycast import BlockRaycastResult, _UNIT_BOX, _block_interaction_probe, _validate_distance
 from .blocks import FACE_OFFSETS
 
 
@@ -127,6 +127,20 @@ class BlockInteractionGoal:
 
 
 @dataclass(frozen=True, slots=True)
+class BlockPlacementGoal:
+    """Stand where a clear ray hits a full cube's face adjoining the air destination."""
+
+    destination: Cell
+    max_distance: float = 5.0
+
+    def __post_init__(self):
+        object.__setattr__(self, "destination", _cell(self.destination))
+        distance = float(self.max_distance)
+        _validate_distance(distance)
+        object.__setattr__(self, "max_distance", distance)
+
+
+@dataclass(frozen=True, slots=True)
 class EntityNearGoal:
     """Stand near a player or ordinary villager with observed feet, by session unique ID."""
 
@@ -161,7 +175,7 @@ class AllGoal:
 
 type NavigationGoal = (
     FootGoal | XZGoal | NearXZGoal | YGoal | NearGoal | BlockFaceGoal | BlockInteractionGoal |
-    EntityNearGoal | AnyGoal | AllGoal
+    BlockPlacementGoal | EntityNearGoal | AnyGoal | AllGoal
 )
 
 
@@ -236,6 +250,13 @@ class BlockInteractionMatch(BlockFaceMatch):
     """A verified surface point in the target block's local coordinates."""
 
     click_pos: Point
+
+
+@dataclass(frozen=True, slots=True)
+class BlockPlacementMatch(BlockInteractionMatch):
+    """A click on ``position`` and ``face`` targeting the adjacent ``destination``."""
+
+    destination: Cell
 
 
 def _aim_point(matches: tuple[BlockFaceMatch, ...]) -> Point | None:
@@ -316,9 +337,13 @@ class _GoalState:
             return True, (BlockFaceMatch(goal.position, face),)
         if self.interaction_probe is not None:
             x, y, z = cell
+            if isinstance(goal, BlockPlacementGoal) and goal.destination in (cell, (x, y + 1, z)):
+                return False, ()
             hit = self.interaction_probe(eye if eye is not None else (x + 0.5, y + 1.62, z + 0.5))
             if hit.status == "hit":
                 assert hit.position is not None and hit.face is not None and hit.click_pos is not None
+                if isinstance(goal, BlockPlacementGoal):
+                    return True, (BlockPlacementMatch(hit.position, hit.face, hit.click_pos, goal.destination),)
                 return True, (BlockInteractionMatch(hit.position, hit.face, hit.click_pos),)
             return (None if hit.status == "unknown" else False), ()
 
@@ -334,6 +359,48 @@ class _GoalState:
         return (None if any(value is None for value, _ in values) else False), ()
 
 
+def _block_placement_probe(goal: BlockPlacementGoal, blocks) -> Callable[[Point], BlockRaycastResult]:
+    dimension = blocks.dimension_id
+    miss = BlockRaycastResult("miss", dimension)
+    unknown = BlockRaycastResult("unknown", dimension)
+    layers = tuple(blocks.observed_block(goal.destination, layer=layer) for layer in (0, 1))
+    if any(block is not None and block.is_air is False for block in layers):
+        return lambda _eye: miss
+    destination_known = all(block is not None and block.is_air is True for block in layers)
+
+    candidates = []
+    x, y, z = goal.destination
+    for face, (dx, dy, dz) in FACE_OFFSETS.items():
+        support = (x - dx, y - dy, z - dz)
+        supported = blocks._placement_support(support)
+        if supported is False:
+            continue
+        confirmed = destination_known and supported is True
+        outline_at = blocks._outline_at
+        if not confirmed:
+            # Test feasibility under the missing observations a placement would require.
+            def outline_at(position, support=support, supported=supported):
+                if position == goal.destination and not destination_known:
+                    return (), False
+                if position == support and supported is None:
+                    return _UNIT_BOX, False
+                return blocks._outline_at(position)
+        probe = _block_interaction_probe(support, dimension_id=dimension, max_distance=goal.max_distance,
+                                         outline_at=outline_at, required_face=face)
+        candidates.append((confirmed, probe))
+
+    def trace(eye):
+        unresolved = False
+        for confirmed, probe in candidates:
+            hit = probe(eye)
+            if hit.status == "hit" and confirmed:
+                return hit
+            unresolved |= hit.status != "miss"
+        return unknown if unresolved else miss
+
+    return trace
+
+
 def _resolve_goal(goal: NavigationGoal, blocks, entity_feet: Callable[[int], Point | None]) -> _GoalState:
     if isinstance(goal, BlockFaceGoal):
         block = blocks.observed_block(goal.position)
@@ -343,6 +410,8 @@ def _resolve_goal(goal: NavigationGoal, blocks, entity_feet: Callable[[int], Poi
         probe = _block_interaction_probe(goal.position, dimension_id=blocks.dimension_id,
                                          max_distance=goal.max_distance, outline_at=blocks._outline_at)
         return _GoalState(goal, interaction_probe=probe)
+    if isinstance(goal, BlockPlacementGoal):
+        return _GoalState(goal, interaction_probe=_block_placement_probe(goal, blocks))
     if isinstance(goal, NearGoal):
         return _GoalState(goal, point=goal.position)
     if isinstance(goal, EntityNearGoal):

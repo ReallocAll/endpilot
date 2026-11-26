@@ -187,11 +187,11 @@ def _outline_is_screened(eye, low, high, dimension_id, max_distance, outline_at)
 
 def _block_interaction_probe(
     position: Position, *, dimension_id: int, max_distance: float,
-    outline_at: Callable[[Position], OutlineObservation],
+    outline_at: Callable[[Position], OutlineObservation], required_face: int | None = None,
 ) -> Callable[[Point], BlockRaycastResult]:
     """Prepare a target's face samples for one synchronous goal evaluation."""
     probe = _target_face_probe(position, dimension_id=dimension_id, max_distance=max_distance,
-                               outline_at=outline_at, prove_known_screen=False)
+                               outline_at=outline_at, prove_known_screen=False, required_face=required_face)
     miss = BlockRaycastResult("miss", dimension_id)
     unknown = BlockRaycastResult("unknown", dimension_id)
 
@@ -220,6 +220,7 @@ def _target_face_probe(
     position: Position, *, dimension_id: int, max_distance: float,
     outline_at: Callable[[Position], OutlineObservation], prove_known_screen: bool,
     check_sample: Callable[[BlockRaycastResult], Literal["hit", "miss", "unknown"]] | None = None,
+    required_face: int | None = None,
 ) -> Callable[[Point | None], tuple[MiningFaceStatus, BlockRaycastResult | None]]:
     outline, overhang = outline_at(position)
     if outline == ():
@@ -254,10 +255,12 @@ def _target_face_probe(
         unresolved = False
         for axis, (lower, upper) in enumerate(samples):
             if origin[axis] < low[axis]:
-                points = lower
+                face, points = _FACES[axis][0], lower
             elif origin[axis] > high[axis]:
-                points = upper
+                face, points = _FACES[axis][1], upper
             else:
+                continue
+            if required_face is not None and face != required_face:
                 continue
             for point in points:
                 # A point inside a facing face is the first possible target surface.
@@ -267,7 +270,8 @@ def _target_face_probe(
                     continue
                 hit = _trace_blocks(origin, direction, dimension_id, max_distance, outline_at,
                                     direction_length_squared=length_squared, stop_at_point=True)
-                if hit.status == "hit" and hit.position == position:
+                if (hit.status == "hit" and hit.position == position
+                        and (required_face is None or hit.face == required_face)):
                     status = "hit" if check_sample is None else check_sample(hit)
                     if status == "hit":
                         return "hit", hit

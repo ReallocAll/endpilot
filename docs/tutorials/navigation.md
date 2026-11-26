@@ -122,6 +122,36 @@ The bot moves out from behind the obstacle and reports `reached`. The aim
 identifies the furnace, and the server's window contents report
 `Furnace output: 4`. The window confirms that the click opened the furnace.
 
+## Navigate to place a block
+
+Use `BlockPlacementGoal` with the destination cell for an ordinary adjacent
+placement. Navigation looks for a clear, in-range hit on a supporting face
+that adjoins that cell. It requires observed air in both destination layers,
+a trusted vanilla full-cube collision shape and outline on the support, and
+observed air in the support's extra layer. The stance leaves the destination
+clear of the bot's feet and head.
+
+With the desired block item selected in survival mode, pass the final match to
+`place_block()`. The match's `destination` identifies the target, and `position`
+identifies the clicked support.
+
+```python
+from endpilot import BlockPlacementGoal
+
+goal = BlockPlacementGoal((10, 220, 8))
+route = await bot.navigate(goal)
+if route.status == "reached":
+    hit, = route.matches
+    placement = await bot.place_block(
+        against=hit.position, face=hit.face, click_pos=hit.click_pos,
+        expected_block_name="minecraft:stone",
+    )
+    print(hit.destination, placement.reason, placement.world_change)
+```
+
+Navigation completes at the aiming stance. `place_block()` attempts the click
+and reports the resulting server observations. [Placement reference](../reference/testing.md#place-a-block)
+
 ## Stop a route
 
 Run the same script with `--stop` and repeat the setup. The script asks the
@@ -169,6 +199,7 @@ cleanup. Time spent in the callback counts toward `timeout`.
 | `NearGoal((x, y, z), radius)` | A three-dimensional distance from the bottom center of the candidate feet block to a world point. |
 | `BlockFaceGoal(position)` | A stance at a horizontal face of an observed block on the same level. Pass the resulting position and face to `open_container()` when approaching an ordinary chest. |
 | `BlockInteractionGoal(position, max_distance=5.0)` | A clear ray to one of the sampled aim points on a supported block outline. The match includes `click_pos` for `use_item_on()`. |
+| `BlockPlacementGoal(destination, max_distance=5.0)` | A clear ray to a supported face adjoining the observed air destination. The match includes `position`, `face`, and `click_pos` for `place_block()`. |
 | `EntityNearGoal(entity.entity_id, radius)` | A stance near an observed remote player or ordinary villager in the current session, identified by its unique ID. A target that leaves view becomes unknown. |
 | `AnyGoal((goal_a, goal_b))`, `AllGoal((goal_a, goal_b))` | An endpoint satisfying any or all children. Matching block faces follow the child order. |
 
@@ -186,8 +217,8 @@ from the start, and `NavigationCosts` weights walking, ascent, and descent.
 
 Both planning and execution can return `unknown` when missing observations
 could affect the result, or `unreachable` when the bounded search rules out
-a route. For an interaction goal, `unreachable` applies to the sampled aim
-points within the search bounds. Request missing terrain with
+a route. For interaction and placement goals, `unreachable` applies to the
+sampled aim points within the search bounds. Request missing terrain with
 `request_sub_chunk()` and wait for the observations before planning again.
 
 Execution can replan as the terrain or goal changes. Replans share the

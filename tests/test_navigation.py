@@ -12,8 +12,8 @@ from bedrock_protocol import nbt
 
 from endpilot import (
     AllGoal, AnyGoal, BlockApproach, BlockFaceGoal, BlockFaceMatch, BlockInteractionGoal, BlockInteractionMatch,
-    Bot, DimensionTransition, EntityNearGoal, FootGoal, NavigationCosts, NavigationResult, NavigationRules, NearGoal,
-    NearXZGoal, XZGoal, YGoal,
+    BlockPlacementGoal, BlockPlacementMatch, Bot, DimensionTransition, EntityNearGoal, FootGoal, NavigationCosts,
+    NavigationResult, NavigationRules, NearGoal, NearXZGoal, XZGoal, YGoal,
 )
 from endpilot.blocks import Blocks
 from endpilot.compression import PacketConnection
@@ -2686,6 +2686,156 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
     def prepare_interaction_terrain(self, target, *, blocked=(), unknown=()):
         floor = ((x, 99, z) for x in range(-4, 5) for z in range(-4, 5))
         self.prepare_multilevel(target, (*floor, *blocked), 4, unknown=unknown)
+
+    async def test_placement_goal_routes_to_the_face_adjoining_the_destination(self):
+        support, destination, missing = (2, 101, 0), (2, 101, 1), (1, 101, 0)
+        self.prepare_interaction_terrain(support, unknown=(missing,))
+        goal = BlockPlacementGoal(destination)
+        start_only = NavigationRules(search_radius=0, vertical_radius=0)
+        interaction = BlockInteractionGoal(support)
+        self.assertEqual(self.bot.plan_navigation(interaction, rules=start_only).status, "unknown")
+        self.assertEqual(self.bot.plan_navigation(goal, rules=start_only).status, "unreachable")
+
+        self.set_block(missing, self.AIR)
+        hit, = self.bot.plan_navigation(interaction, rules=start_only).matches
+        self.assertEqual(hit.face, 4)
+        self.assertEqual(self.bot.plan_navigation(goal, rules=start_only).status, "unreachable")
+        result = await self.bot.navigate(goal, rules=start_only)
+        self.assertEqual((result.status, result.frames, result.matches), ("unreachable", 0, ()))
+
+        rules = NavigationRules(search_radius=2, vertical_radius=0)
+        pose = self.bot.rotation
+        plan = self.bot.plan_navigation(goal, rules=rules)
+        match = BlockPlacementMatch(support, 3, (0.5, 0.5, 1.0), destination)
+        self.assertEqual((plan.status, plan.endpoint, plan.matches), ("found", (0, 100, 1), (match,)))
+        self.assertEqual((self.stream.sent, self.bot.rotation), ([], pose))
+
+        result = await self.bot.navigate(goal, rules=rules)
+        self.assertEqual((result.status, result.stand_position, result.matches), ("reached", plan.endpoint, (match,)))
+        self.assertGreater(result.frames, 0)
+        ray = self.bot.raycast_block()
+        self.assertEqual((ray.status, ray.position, ray.face), ("hit", support, 3))
+        self.assertTrue(all(isinstance(frame, self.binding.PlayerAuthInputPacket) and frame.item_use_transaction is None
+                            for frame in self.stream.sent))
+
+    async def test_placement_goal_distinguishes_missing_destination_support_and_view(self):
+        support, destination, missing = (3, 101, 0), (2, 101, 0), (1, 101, 0)
+        self.prepare_interaction_terrain(support, unknown=(destination,))
+        goal = BlockPlacementGoal(destination)
+        too_far = BlockPlacementGoal(destination, max_distance=1)
+        rules = NavigationRules(search_radius=0, vertical_radius=0)
+
+        async def expect_status(status):
+            plan = self.bot.plan_navigation(goal, rules=rules)
+            self.assertEqual((plan.status, plan.matches), (status, ()))
+            result = await self.bot.navigate(goal, rules=rules)
+            self.assertEqual((result.status, result.frames, result.matches), (status, 0, ()))
+
+        await expect_status("unknown")  # The ray would work if the destination were air.
+        self.assertEqual(self.bot.plan_navigation(too_far, rules=rules).status, "unreachable")
+        self.set_block(support, self.AIR)
+        await expect_status("unreachable")  # No support even if the missing destination were air.
+        self.set_block(support, self.STONE)
+        self.set_block(missing, self.STONE)
+        await expect_status("unreachable")  # A known blocker screens the desired face.
+
+        self.set_block(destination, self.STONE)
+        self.set_block(missing, self.AIR)
+        await expect_status("unreachable")
+        self.set_block(destination, self.AIR)
+        self.set_block(missing, 0xFFFFFFFE)
+        await expect_status("unknown")  # Desired face ray still crosses missing terrain.
+        self.set_block(missing, self.AIR)
+
+        self.set_block(destination, 0xFFFFFFFE, layer=1)
+        await expect_status("unknown")
+        self.set_block(destination, 0x483B8B2A, layer=1)  # Source water.
+        await expect_status("unreachable")
+        self.set_block(destination, self.AIR, layer=1)
+
+        self.set_block(support, 0xFFFFFFFE)
+        await expect_status("unknown")
+        self.assertEqual(self.bot.plan_navigation(too_far, rules=rules).status, "unreachable")
+        self.set_block(support, self.AIR)
+        await expect_status("unreachable")
+        self.assertEqual(self.bot.plan_navigation(goal, rules=NavigationRules(max_expansions=0)).status, "budget")
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_placement_goal_requires_full_collision_outline_and_empty_support_layer(self):
+        support, destination = (3, 101, 0), (2, 101, 0)
+        self.prepare_interaction_terrain(support)
+        goal = BlockPlacementGoal(destination)
+        rules = NavigationRules(search_radius=0, vertical_radius=0)
+        for name, runtime_id in (
+            ("trial spawner", 3330348502),  # Full collision, slightly inset outline.
+            ("spruce stairs", 1187134793),  # Full outline, noncube collision.
+        ):
+            with self.subTest(support=name):
+                self.set_block(support, runtime_id)
+                self.assertEqual(self.bot.plan_navigation(BlockInteractionGoal(support), rules=rules).status, "found")
+                self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unreachable")
+        self.set_block(support, self.STONE)
+        self.set_block(support, 0x483B8B2A, layer=1)
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unreachable")
+        self.set_block(support, 0xFFFFFFFE, layer=1)
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unknown")
+        self.set_block(support, self.AIR, layer=1)
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "found")
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_placement_goal_prefers_a_confirmed_face_over_an_unresolved_alternative(self):
+        east, below, destination = (3, 101, 0), (2, 100, 0), (2, 101, 0)
+        self.prepare_interaction_terrain(east, blocked=(below,))
+        self.set_block(below, 0xFFFFFFFE, layer=1)
+        goal = BlockPlacementGoal(destination)
+        rules = NavigationRules(search_radius=0, vertical_radius=0)
+        side = BlockPlacementMatch(east, 4, (0.0, 0.5, 0.5), destination)
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).matches, (side,))
+        result = await self.bot.navigate(goal, rules=rules, ticks=0)
+        self.assertEqual((result.status, result.matches), ("reached", (side,)))
+
+        self.set_block(below, self.AIR, layer=1)
+        top = BlockPlacementMatch(below, 1, (0.5, 1.0, 0.5), destination)
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).matches, (top,))
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_placement_goal_excludes_the_standing_feet_and_head_cells(self):
+        self.prepare_interaction_terrain((1, 101, 0))
+        rules = NavigationRules(search_radius=0, vertical_radius=0)
+        for destination, point, support, face in (
+            ((0, 100, 0), (0.5, 100.0, 0.5), (0, 99, 0), 1),
+            ((0, 101, 0), (1.0, 101.5, 0.5), (1, 101, 0), 4),
+        ):
+            with self.subTest(destination=destination):
+                hit = self.bot.raycast_block_towards(point)
+                self.assertEqual((hit.status, hit.position, hit.face), ("hit", support, face))
+                goal = BlockPlacementGoal(destination)
+                self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unreachable")
+                result = await self.bot.navigate(goal, rules=rules, ticks=0)
+                self.assertEqual((result.status, result.frames, result.matches), ("unreachable", 0, ()))
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_placement_goal_rechecks_a_corrected_eye_after_movement(self):
+        support, destination = (3, 101, 0), (2, 101, 0)
+        self.prepare_interaction_terrain(support)
+        goal = BlockPlacementGoal(destination, max_distance=1.61)
+        rules = NavigationRules(search_radius=1, vertical_radius=0)
+        plan = self.bot.plan_navigation(goal, rules=rules)
+        self.assertEqual((plan.status, plan.endpoint), ("found", (1, 100, 0)))
+        shifted = False
+
+        def shift_eye_during_release():
+            nonlocal shifted
+            frame = self.stream.sent[-1]
+            if not shifted and self.moving_input() and self.up not in frame.input_data:
+                shifted = True
+                self.correct_position(1.39, 101.62, 0.5, on_ground=True, tick=frame.client_tick)
+
+        self.stream.on_send = shift_eye_during_release
+        result = await self.bot.navigate(goal, rules=rules)
+        self.assertTrue(shifted)
+        self.assertEqual((result.status, result.stand_position, result.matches), ("unreachable", None, ()))
+        self.assert_released()
 
     async def test_interaction_goal_rejects_occlusion_and_returns_a_clickable_side(self):
         target, wall = (2, 101, 0), (1, 101, 0)
