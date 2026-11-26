@@ -31,7 +31,11 @@ _MAX_STEP = 255
 
 @dataclass(frozen=True, slots=True)
 class RangeTransferStep:
-    """Requested movement and its matching server evidence, when available."""
+    """Requested movement and its matching server evidence, when available.
+
+    After a wait times out or is cancelled, a request ID without a verdict
+    identifies a request that may still complete. It does not confirm a write.
+    """
 
     source_slot: int
     destination_slot: int
@@ -419,6 +423,8 @@ async def _transfer_range(
                 receipt = getattr(error, "_item_stack_response", None)
                 if receipt is not None:
                     record_reply(receipt)
+                elif (request_id := getattr(error, "_item_stack_request_id", None)) is not None:
+                    steps[-1] = replace(step, request_id=request_id)
                 raise
             if reply is None:
                 # The single-step path declined the conflicting request before sending.
@@ -557,6 +563,8 @@ async def transfer_inventory_range(
                 receipt = getattr(error, "_item_stack_response", None)
                 if receipt is not None:
                     record_reply(receipt)
+                elif (request_id := getattr(error, "_item_stack_request_id", None)) is not None:
+                    steps[-1] = replace(step, request_id=request_id)
                 raise
             if reply is None:
                 steps.pop()

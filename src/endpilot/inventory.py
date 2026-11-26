@@ -583,12 +583,16 @@ class Inventory:
             async with asyncio.timeout(timeout):
                 return await asyncio.shield(reply)
         except (TimeoutError, asyncio.CancelledError) as error:
-            if _range_step and reply.done() and not reply.cancelled() and reply.exception() is None:
-                # The matching verdict has already finished applying in the packet reader.
-                error._item_stack_response = reply.result()
             if (_wait_for or _at_write is not None) and not pending.submitted and self._pending_requests.pop(request_id, None) is pending:
                 task.cancel()
                 reply.cancel()
+            if _range_step:
+                if reply.done() and not reply.cancelled() and reply.exception() is None:
+                    # The matching verdict has already finished applying in the packet reader.
+                    error._item_stack_response = reply.result()
+                elif pending.submitted or not reply.done():
+                    # A write may have started or still be queued.
+                    error._item_stack_request_id = request_id
             raise
 
     def _qa_response(self, request_id: int):

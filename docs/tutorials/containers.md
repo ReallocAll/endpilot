@@ -202,9 +202,21 @@ the result is `window_changed` and keeps any earlier confirmed steps.
   Check `stop_reason` and `steps` even when some items moved. For example,
   `destination_full` can follow successful steps when the remaining items
   do not fit. Predicate errors, wait failures, and cancellation can carry
-  `transfer_progress` on the original exception. A step with `confirmed=None`
-  may still receive a server verdict. Inspect the latest observations before
-  retrying.
+  `transfer_progress` on the original exception. This snapshot does not change
+  if a late reply updates the slots.
+- After a timeout or cancellation, a step without a `request_id` never went
+  out. An ID with no `verdict` means the request may still be sent or receive a
+  reply, not that the server received it. `verdict="SUCCESS"` with
+  `confirmed=None` means the server accepted the request but the available
+  slot evidence cannot establish how many items moved.
+- Before retrying an unsettled step, check `bot.session_end`, the active
+  `bot.open_window`, and the latest `bot.inventory_slots` and
+  `bot.container_slots`; do not blindly replay the original count.
+  If necessary, watch for fresh observations with
+  `subscribe_inventory_changes()` or `subscribe_container_slot_changes()`.
+  For packet-level diagnostics, subscribe before the transfer with
+  `bot.packets.subscribe_raw()` and match the decoded
+  `ItemStackResponsePacket` by the step's request ID in that session.
 
 To walk to a block and choose the interaction face before opening the
 container, see [Plan and execute navigation](navigation.md).

@@ -771,7 +771,8 @@ class RangeTransferTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(type(observed.exception), error_type)
                 progress = observed.exception.transfer_progress
                 self.assertEqual(progress.confirmed_count, 1)
-                self.assertEqual(progress.steps[-1], RangeTransferStep(1, 9, 2, None, None, None))
+                request_id = self.outgoing()[-1].client_request_id.raw_id
+                self.assertEqual(progress.steps[-1], RangeTransferStep(1, 9, 2, None, request_id, None))
                 self.assertEqual(progress.stop_reason, "cancelled" if cancel else "unconfirmed")
                 self.reply(self.outgoing()[-1], [(CHEST, 1, 0, None), (PLAYER, 9, 3, 31)])
                 self.assertEqual(self.bot.inventory_slots[9].stack_size, 3)
@@ -907,7 +908,8 @@ class RangeTransferTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(error) as caught:
                     await asyncio.wait_for(old, 1)
                 progress = caught.exception.transfer_progress
-                self.assertEqual(progress.steps, (RangeTransferStep(0, 9, 1, None, None, None),))
+                request_id = request.client_request_id.raw_id
+                self.assertEqual(progress.steps, (RangeTransferStep(0, 9, 1, None, request_id, None),))
                 self.assertEqual(progress.stop_reason, "cancelled" if cancel else "unconfirmed")
                 blocked = await asyncio.wait_for(self.transfer(2, item_name="minecraft:snowball", chest=range(1),
                                                                player=range(9, 10)), 1)

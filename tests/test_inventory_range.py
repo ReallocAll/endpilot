@@ -199,7 +199,8 @@ class InventoryRangeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError) as failure:
             await moving
         progress = failure.exception.transfer_progress
-        self.assertEqual((progress.stop_reason, progress.steps[0].confirmed), ("cancelled", None))
+        step, = progress.steps
+        self.assertEqual((progress.stop_reason, step.request_id, step.confirmed), ("cancelled", None, None))
         release.set()
         retry = self.start()
         request = await self.request()
@@ -227,15 +228,32 @@ class InventoryRangeTests(unittest.IsolatedAsyncioTestCase):
                          (request.client_request_id.raw_id, "SUCCESS", 3, 2))
         self.assertEqual(len(self.requests), 1)
 
-    async def test_cancelled_sent_move_holds_endpoints_until_its_late_verdict(self):
+    async def test_cancel_during_write_preserves_id_and_holds_endpoints_until_late_verdict(self):
         await self.seed(slot9=self.paper(3, 20))
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def hold_write():
+            entered.set()
+            await release.wait()
+
+        self.wire.before_send = hold_write
         moving = self.start()
-        first = await self.request()
+        await asyncio.wait_for(entered.wait(), 2)
         moving.cancel()
-        with self.assertRaises(asyncio.CancelledError):
+        with self.assertRaises(asyncio.CancelledError) as failure:
             await moving
+        progress = failure.exception.transfer_progress
+        step, = progress.steps
+        self.assertEqual((step.confirmed, step.verdict, progress.stop_reason), (None, None, "cancelled"))
         self.assertEqual((await self.start()).stop_reason, "unconfirmed")
+        self.assertEqual(self.requests, [])
+
+        self.wire.before_send = None
+        release.set()
+        first = await self.request()
+        self.assertEqual(step.request_id, first.client_request_id.raw_id)
         await self.correct(first, (9, 2, 20), (18, 1, 21))
+        self.assertEqual((progress.confirmed_count, step.confirmed, step.verdict), (0, None, None))
         retry = self.start()
         second = await self.request(1)
         self.assertEqual(second.actions[0].destination.net_id_variant, 21)
