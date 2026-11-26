@@ -13,6 +13,7 @@ from bedrock_protocol import ActorSwingSource, DecodeError, HandSlot, PlayerList
 from .entity_cursor import Box, expanded_box, trace_entities
 from .expression import animation
 from .inventory import HeldItemStack
+from .player_state import PlayerEffect, _effect_from_packet
 from .protocol import RawPacket, _read_uint
 from .skin import PlayerSkinSnapshot, _player_skin_snapshot
 
@@ -86,6 +87,9 @@ class EntityState:
 
     ``attributes`` holds the latest server report for each observed attribute of
     this actor instance. An empty tuple means no attributes have been observed.
+
+    ``status_effects`` holds effects observed through MobEffect packets for this
+    actor instance, ordered by effect ID. Durations are the last reported values.
     """
 
     entity_id: int
@@ -104,6 +108,7 @@ class EntityState:
     last_observed_offhand: HeldItemStack | None = None
     gliding: bool | None = None
     attributes: tuple[EntityAttribute, ...] = ()
+    status_effects: tuple[PlayerEffect, ...] = ()
 
 
 _MovementWaiters = dict[asyncio.Future[EntityState | BaseException], Callable[[EntityState], bool]]
@@ -147,6 +152,16 @@ class EntityAttributeUpdate:
 
     entity: EntityState
     names: tuple[str, ...]
+    tick: int
+
+
+@dataclass(frozen=True, slots=True)
+class EntityEffectUpdate:
+    """One MobEffect packet and the entity snapshot after it was applied."""
+
+    entity: EntityState
+    action: Literal["add", "update", "remove"]
+    effect: PlayerEffect
     tick: int
 
 
@@ -426,6 +441,7 @@ class Entities:
         self._health_observers: list[_EntityObserver[EntityHealthEvent]] = []
         self._actor_event_observers: list[_EntityObserver[EntityActorEvent]] = []
         self._attribute_observers: list[_EntityObserver[EntityAttributeUpdate]] = []
+        self._effect_observers: list[_EntityObserver[EntityEffectUpdate]] = []
         self._glide_observers: list[Callable[[EntityState], None]] = []
         self._unidentified_equipment_since: dict[int, int] = {}
         # AddPlayer can identify an instance before its unique ID appears in EntityState.
@@ -465,7 +481,7 @@ class Entities:
         self._end_movement_waiters(ConnectionError, "entity session is closed", _cause)
         self._clear_player_equipment(ConnectionError, "entity session is closed", _cause)
         for observers in (self._swing_observers, self._health_observers, self._actor_event_observers,
-                          self._attribute_observers):
+                          self._attribute_observers, self._effect_observers):
             self._end_entity_observers(observers, lambda _: True, ConnectionError, "entity session is closed", _cause)
         self._glide_observers.clear()
         self._actor_instances.clear()
@@ -621,6 +637,20 @@ class Entities:
         self._require_remote_event_target(runtime_id)
         return await self._wait_for_entity_event(self._attribute_observers, runtime_id, timeout)
 
+    def subscribe_entity_effect_updates(
+        self, callback: Callable[[EntityEffectUpdate], None], *, runtime_id: int | None = None,
+    ) -> Callable[[], None]:
+        self._require_live()
+        self._require_remote_event_target(runtime_id)
+        return self.packets._subscribe(self._effect_observers, _EntityObserver(runtime_id, callback))
+
+    async def wait_for_entity_effect_update(
+        self, *, runtime_id: int | None = None, timeout: float | None = 15,
+    ) -> EntityEffectUpdate:
+        self._require_live()
+        self._require_remote_event_target(runtime_id)
+        return await self._wait_for_entity_event(self._effect_observers, runtime_id, timeout)
+
     async def _wait_for_entity_event[Event](
         self, observers: list[_EntityObserver[Event]], runtime_id: int | None, timeout: float | None,
         *, kind: EntityHealthEventKind | int | None = None,
@@ -734,6 +764,38 @@ class Entities:
             event = EntityAttributeUpdate(state, tuple(updated), int(packet.tick))
             self._notify_entity_observers(self._attribute_observers, event, runtime_id,
                                           "entity attribute observer failed")
+
+    def _observe_effect_update(self, raw: RawPacket) -> None:
+        protocol = self.packets.protocol
+        packet = protocol.decode(raw)
+        runtime_id = int(packet.runtime_id)
+        state = self._by_runtime.get(runtime_id)
+        if runtime_id == self._own_runtime_id or state is None:
+            return
+
+        events = protocol.binding.MobEffectPacket.Event
+        action: Literal["add", "update", "remove"]
+        match packet.event_id:
+            case events.ADD:
+                action = "add"
+            case events.UPDATE:
+                action = "update"
+            case events.REMOVE:
+                action = "remove"
+            case _:
+                return
+
+        effect = _effect_from_packet(packet)
+        effects = {entry.id: entry for entry in state.status_effects}
+        if action == "remove":
+            effects.pop(effect.id, None)
+        else:
+            effects[effect.id] = effect
+        state = replace(state, status_effects=tuple(effects[effect_id] for effect_id in sorted(effects)))
+        self._by_runtime[runtime_id] = state
+        if self._effect_observers:
+            event = EntityEffectUpdate(state, action, effect, int(packet.tick))
+            self._notify_entity_observers(self._effect_observers, event, runtime_id, "entity effect observer failed")
 
     @staticmethod
     def _notify_entity_observers[Event](
@@ -1202,9 +1264,10 @@ class Entities:
             self._forget_entity_observers(self._health_observers, runtime_id)
             self._forget_entity_observers(self._actor_event_observers, runtime_id)
             self._forget_entity_observers(self._attribute_observers, runtime_id)
-            if not new_instance and state.attributes:
+            self._forget_entity_observers(self._effect_observers, runtime_id)
+            if not new_instance and (state.attributes or state.status_effects):
                 # A conflicting roster identity must not inherit the previous actor's reports.
-                state = replace(state, attributes=())
+                state = replace(state, attributes=(), status_effects=())
         self._by_runtime[runtime_id] = state
         if new_instance:
             self._forget_player_equipment(runtime_id)
@@ -1229,6 +1292,7 @@ class Entities:
         self._forget_entity_observers(self._health_observers, runtime_id)
         self._forget_entity_observers(self._actor_event_observers, runtime_id)
         self._forget_entity_observers(self._attribute_observers, runtime_id)
+        self._forget_entity_observers(self._effect_observers, runtime_id)
         self._forget_player_equipment(runtime_id)
         state = self._by_runtime.pop(runtime_id, None)
         self._actor_instances.pop(runtime_id, None)
@@ -1264,6 +1328,8 @@ class Entities:
             self._observe_actor_event(raw)
         elif raw.packet_id == b.UpdateAttributesPacket.ID:
             self._observe_attribute_update(raw)
+        elif raw.packet_id == b.MobEffectPacket.ID:
+            self._observe_effect_update(raw)
         elif raw.packet_id == b.ItemRegistryPacket.ID:
             packet = self.packets.protocol.decode(raw)
             self._item_names = {int(item.id): str(item.name) for item in packet.items}
@@ -1480,6 +1546,8 @@ class Entities:
                                        RuntimeError, "dimension changed while waiting for an entity actor event")
             self._end_entity_observers(self._attribute_observers, dimension_bound,
                                        RuntimeError, "dimension changed while waiting for an entity attribute update")
+            self._end_entity_observers(self._effect_observers, dimension_bound,
+                                       RuntimeError, "dimension changed while waiting for an entity effect update")
             self._by_runtime.clear()
             self._actor_instances.clear()
             self._cursor_bodies.clear()

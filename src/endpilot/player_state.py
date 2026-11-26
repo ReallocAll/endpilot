@@ -45,6 +45,13 @@ class PlayerEffect:
     ambient: bool
 
 
+def _effect_from_packet(packet) -> PlayerEffect:
+    return PlayerEffect(
+        int(packet.effect_id), int(packet.effect_amplifier), int(packet.effect_duration_ticks),
+        bool(packet.show_particles), bool(packet.ambient),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PlayerAbilities:
     """Effective server ability bits. None denotes an undefined flight ability."""
@@ -301,15 +308,12 @@ class PlayerState:
         elif raw.packet_id == b.MobEffectPacket.ID:
             packet = self.packets.protocol.decode(raw)
             if packet.runtime_id == self.runtime_id:
-                effect_id = int(packet.effect_id)
                 events = b.MobEffectPacket.Event
                 if packet.event_id in (events.ADD, events.UPDATE):
-                    self._effects[effect_id] = PlayerEffect(
-                        effect_id, int(packet.effect_amplifier), int(packet.effect_duration_ticks),
-                        bool(packet.show_particles), bool(packet.ambient),
-                    )
+                    effect = _effect_from_packet(packet)
+                    self._effects[effect.id] = effect
                 elif packet.event_id == events.REMOVE:
-                    self._effects.pop(effect_id, None)
+                    self._effects.pop(int(packet.effect_id), None)
 
     async def wait_for_health_update(self, timeout: float = 15) -> float:
         """Return the next server health update, not a locally predicted value."""

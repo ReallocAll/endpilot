@@ -230,6 +230,49 @@ in its pending wait. Dimension changes end filtered subscriptions and raise
 dimension changes. A deadline raises `TimeoutError`. Disconnection ends all
 subscriptions and raises `ConnectionError` in pending waits.
 
+## Observe remote entity effects
+
+Each `EntityState` from `bot.observed_entities` has an immutable `status_effects`
+tuple sorted by numeric effect ID. It starts empty for each newly visible
+remote instance. An add or update stores the reported effect by ID, and a
+remove drops that ID. The SDK retains the last reported `duration_ticks`
+until a later packet changes or removes the entry. The duration can become
+stale as time passes.
+
+`bot.subscribe_entity_effect_updates(callback, runtime_id=...)` calls a
+synchronous callback with an `EntityEffectUpdate` after each matching
+`MobEffect` add, update, or remove packet, including repeats and removals of
+an unrecorded ID. It returns an idempotent unsubscribe function.
+`await bot.wait_for_entity_effect_update(runtime_id=..., timeout=15)` waits
+for the next matching update. Use `timeout=None` to wait without a deadline.
+Both methods send no packets.
+
+Each update has the immutable `entity` snapshot after the packet was applied,
+the `action` (`"add"`, `"update"`, or `"remove"`), and the packet's `tick`.
+This tick can be zero and is independent of the bot's input ticks. The `effect`
+is a `PlayerEffect` with `id`, `amplifier`, `duration_ticks`, `show_particles`,
+and `ambient` copied from the packet. Remove packets can carry a nonzero duration.
+
+```python
+update = await bot.wait_for_entity_effect_update()
+print(update.entity.runtime_id, update.action, update.effect.id)
+print(update.entity.status_effects)
+```
+
+Omit `runtime_id` to observe any tracked remote entity. A runtime filter binds
+the current instance and raises `LookupError` for a local or unobserved target.
+Removal or replacement ends the filtered subscription and raises `LookupError`
+in its pending wait. Dimension changes end filtered subscriptions and raise
+`RuntimeError` in all pending waits. Unfiltered subscriptions continue across
+dimensions. A deadline raises `TimeoutError`. Disconnection ends all
+subscriptions and raises `ConnectionError` in pending waits.
+
+The tuple covers `MobEffect` packets received while that actor instance was
+visible. A server can report some effects only in actor metadata. For example,
+stock BDS 1.26.66 sent visible Fire Resistance on a sheep through metadata
+alone. Those changes remain available through raw packets. An empty tuple means
+there are no effects currently recorded from `MobEffect` packets for the actor.
+
 ## Observe native entity actor events
 
 `bot.subscribe_entity_actor_events(callback, runtime_id=..., event_id=...)`

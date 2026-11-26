@@ -493,9 +493,12 @@ class JoinSession:
                     self.movement_packets.append(raw)
                 else:
                     self.entity_packets.append(raw)
-            elif self.player_id is not None and raw.packet_id == binding.MobEffectPacket.ID:
-                if protocol.decode(raw).runtime_id == self.player_id:
+            elif raw.packet_id == binding.MobEffectPacket.ID:
+                if self.player_id is not None and protocol.decode(raw).runtime_id == self.player_id:
                     self.player_state_packets.append(raw)
+                else:
+                    # Keep the effect in wire order with spawns, removals and dimension changes.
+                    self.entity_packets.append(raw)
             elif raw.packet_id == binding.SetSpawnPositionPacket.ID:
                 packet = protocol.decode(raw)
                 if packet.spawn_pos_type == binding.SpawnPositionType.WORLD_SPAWN:

@@ -34,9 +34,9 @@ from .creative_inventory import CreativeCatalog, CreativeClearResult, CreativeEn
 from .dimension_transition import DimensionTransition
 from .enchanting import Enchanting, EnchantOption
 from .entities import (
-    Entities, EntityActorEvent, EntityAttributeUpdate, EntityCursorResult, EntityHealthEvent, EntityHealthEventKind,
-    EntityMovement, EntitySpawn, EntityState, EntitySwing, ItemPickup, PlayerEquipmentSnapshot, PlayerListChange,
-    PlayerListEntry, VehicleLink, VehicleLinkChange,
+    Entities, EntityActorEvent, EntityAttributeUpdate, EntityCursorResult, EntityEffectUpdate, EntityHealthEvent,
+    EntityHealthEventKind, EntityMovement, EntitySpawn, EntityState, EntitySwing, ItemPickup, PlayerEquipmentSnapshot,
+    PlayerListChange, PlayerListEntry, VehicleLink, VehicleLinkChange,
 )
 from .expression import skin_packet
 from .fishing import Fishing, FishingResult
@@ -2992,6 +2992,30 @@ class Bot:
         if self._entities is None:
             raise RuntimeError("player has not joined")
         return self._entities.subscribe_entity_attribute_updates(callback, runtime_id=runtime_id)
+
+    async def wait_for_entity_effect_update(
+        self, *, runtime_id: int | None = None, timeout: float | None = 15,
+    ) -> EntityEffectUpdate:
+        """Wait for the next effect packet applied to a tracked remote entity.
+
+        A runtime filter binds the current instance. This wait ends if that
+        instance leaves view, the dimension changes, or the connection closes.
+        """
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return await self._entities.wait_for_entity_effect_update(runtime_id=runtime_id, timeout=timeout)
+
+    def subscribe_entity_effect_updates(
+        self, callback: Callable[[EntityEffectUpdate], None], *, runtime_id: int | None = None,
+    ) -> Callable[[], None]:
+        """Observe received effect updates and return an idempotent unsubscribe function.
+
+        The callback is synchronous. A runtime-filtered subscription ends
+        when that instance leaves view or the dimension changes.
+        """
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return self._entities.subscribe_entity_effect_updates(callback, runtime_id=runtime_id)
 
     async def wait_for_entity_movement(
         self, runtime_id: int, *, timeout: float = 15
