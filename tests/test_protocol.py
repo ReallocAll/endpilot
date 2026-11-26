@@ -1,9 +1,11 @@
 import unittest
 import zlib
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
-from endpilot.compression import MAX_DECOMPRESSED_BATCH_SIZE, PacketConnection
+from cramjam import snappy
 
+from endpilot.compression import PacketConnection
 from endpilot.protocol import Protocol, RawPacket, read_batch, write_batch
 
 
@@ -45,12 +47,14 @@ def _connection(message, algorithm=0):
 
 
 class CompressedBatchTests(unittest.IsolatedAsyncioTestCase):
-    async def test_zlib_and_none_batches_preserve_raw_packets(self):
+    async def test_negotiated_compression_preserves_raw_packets(self):
         packet = RawPacket(0x3FF, b"valid payload")
         frame = write_batch([packet])
         for wire, algorithm in (
             (b"\x00" + _deflate(frame), 0),
             (b"\xff" + frame, 0),
+            (b"\x01\x10\x3c" + frame, 1),  # Raw Snappy: 16-byte output, one literal.
+            (b"\xff" + frame, 1),
             (frame, 65535),
         ):
             with self.subTest(algorithm=algorithm, prefix=wire[:1]):
@@ -68,7 +72,26 @@ class CompressedBatchTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(ValueError):
                     await _connection(wire).recv_raw()
 
-    async def test_zlib_rejects_expansion_beyond_batch_limit(self):
-        frame = write_batch([RawPacket(1, b"x" * MAX_DECOMPRESSED_BATCH_SIZE)])
+    async def test_snappy_sends_raw_blocks_only_when_smaller(self):
+        connection = _connection(b"", 1)
+        send = connection.transport.send = AsyncMock()
+        for body, header in ((b"x" * 512, 1), (b"x", 255)):
+            packet = RawPacket(1, body)
+            await connection.send(packet)
+            frame, = send.await_args.args
+            self.assertEqual(frame[0], header)
+            payload = bytes(snappy.decompress_raw(frame[1:])) if header == 1 else frame[1:]
+            self.assertEqual(payload, write_batch([packet]))
+
+    async def test_invalid_or_mismatched_snappy_frame_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "invalid compressed batch"):
-            await _connection(b"\x00" + _deflate(frame)).recv_raw()
+            await _connection(b"\x01\x10\x3c\x0f", 1).recv_raw()
+        with self.assertRaisesRegex(ValueError, "unexpected compression header"):
+            await _connection(b"\x01\x02\x04\x01\x01", 0).recv_raw()
+
+    async def test_compressed_batches_reject_expansion_beyond_batch_limit(self):
+        frame = write_batch([RawPacket(1, b"x" * 512)])
+        for algorithm, wire in ((0, _deflate(frame)), (1, snappy.compress_raw(frame))):
+            with patch("endpilot.compression.MAX_DECOMPRESSED_BATCH_SIZE", len(frame) - 1):
+                with self.assertRaisesRegex(ValueError, "invalid compressed batch"):
+                    await _connection(bytes([algorithm]) + wire, algorithm).recv_raw()

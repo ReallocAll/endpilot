@@ -4,6 +4,8 @@ import asyncio
 from collections import deque
 import zlib
 
+from cramjam import DecompressionError, snappy
+
 from .client_clock import ClientClock
 from .protocol import RawPacket, read_batch, write_batch
 from .qa import PacketTimeline
@@ -32,7 +34,7 @@ class PacketConnection:
         self._waiters = deque()
         self._reader_task = None
         self._read_start: asyncio.Event | None = None
-        if self.algorithm not in (0, 65535):
+        if self.algorithm not in (0, 1, 65535):
             raise NotImplementedError(f"compression algorithm {self.algorithm} is not supported")
 
     async def send(self, packet, *, _before_send=None) -> None:
@@ -46,9 +48,11 @@ class PacketConnection:
         data = write_batch([raw])
         if self.algorithm != 65535:
             if self.threshold > 0 and len(data) >= self.threshold:
-                compressor = zlib.compressobj(level=7, wbits=-15)
-                compressed = compressor.compress(data) + compressor.flush()
-                data = b"\x00" + compressed if len(compressed) < len(data) else b"\xff" + data
+                if self.algorithm == 0:
+                    compressed = zlib.compress(data, level=7, wbits=-15)
+                else:
+                    compressed = snappy.compress_raw(data)
+                data = bytes([self.algorithm]) + compressed if len(compressed) < len(data) else b"\xff" + data
             else:
                 data = b"\xff" + data
         if _before_send is not None:
@@ -70,6 +74,8 @@ class PacketConnection:
                 if not data:
                     raise ConnectionError("empty compressed batch")
                 algorithm, data = data[0], data[1:]
+                if algorithm not in (self.algorithm, 255):
+                    raise ValueError(f"unexpected compression header {algorithm}")
                 if algorithm == 0:
                     decoder = zlib.decompressobj(wbits=-15)
                     try:
@@ -83,8 +89,13 @@ class PacketConnection:
                         or decoder.unconsumed_tail
                     ):
                         raise ValueError("invalid compressed batch")
-                elif algorithm != 255:
-                    raise ValueError(f"unexpected compression header {algorithm}")
+                elif algorithm == 1:
+                    try:
+                        if snappy.decompress_raw_len(data) > MAX_DECOMPRESSED_BATCH_SIZE:
+                            raise ValueError("invalid compressed batch")
+                        data = snappy.decompress_raw(data)
+                    except DecompressionError as error:
+                        raise ValueError("invalid compressed batch") from error
             self._pending.extend(read_batch(data))
         raw = self._pending.popleft()
         if self._timeline is not None:
