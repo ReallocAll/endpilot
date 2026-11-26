@@ -85,6 +85,18 @@ count. `results` contains the evidence for each attempted or skipped block.
 An interrupted call attaches its evidence to the exception as
 `collection_progress`.
 
+`await bot.collect_vein_by_count(seed, item_id=diamond_id, count=3)` uses
+`find_block_vein` to snapshot connected blocks from `seed` in breadth-first
+order. It accepts the same `max_blocks`, `max_distance`, and `flood_radius`
+bounds as the search. `search_complete` describes that initial search. The
+bot attempts the known candidates even if the search was incomplete and
+uses the same count and stopping rules as `collect_by_count`. An unresolved
+seed within the dimension's bounds yields an empty result with
+`search_complete=False`. Observed air or a position outside the known height
+yields an empty result with `search_complete=True`. An interrupted call
+includes the initial search completeness in `collection_progress` if the
+search finished. `collect_by_count` leaves `search_complete` as `None`.
+
 ## Collect blocks and existing drops together
 
 Pass block coordinates and current item snapshots from `bot.observed_drops`

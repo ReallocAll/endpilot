@@ -971,6 +971,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
                          (second, "collected", PLAYER, 2))
         self.assertEqual((result.item_id, result.requested_count, result.collected_count, result.active),
                          (OAK_LOG_ITEM, 1, 2, None))
+        self.assertIsNone(result.search_complete)
         self.assertEqual(bot.inventory_count(OAK_LOG_ITEM), 3)
         self.assertEqual(bot.observed_block(late).runtime_id, OAK_LOG_BLOCK)
         self.assertEqual(bot.observed_block(third).runtime_id, OAK_LOG_BLOCK)
@@ -1108,6 +1109,98 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         for count in (0, -1, 1.5, True):
             with self.subTest(count=count), self.assertRaisesRegex(ValueError, "positive integer"):
                 await self.collect_logs(bot, count=count)
+        self.assert_no_more_collection_inputs()
+
+    def collect_vein_logs(self, bot, *, count, max_blocks=100):
+        return asyncio.create_task(bot.collect_vein_by_count(
+            TARGET, item_id=OAK_LOG_ITEM, count=count, max_blocks=max_blocks,
+            ticks=0, search_radius=0, timeout=1,
+        ))
+
+    async def test_counted_vein_attempts_only_the_admitted_connected_blocks(self):
+        positions = TARGET, THIRD_TARGET, SECOND_TARGET
+        isolated, late, other = (0, 100, 3), (-1, 100, 3), (-1, 100, 2)
+        other_log_state = 825916963
+        bot = await self.log_bot(TARGET, SECOND_TARGET, isolated)
+        await self.emit(self.block(other_log_state, position=THIRD_TARGET), self.block(ORE, position=other))
+        task = self.collect_vein_logs(bot, count=4)
+        await self.expect_batch_start(TARGET)
+        await self.emit(self.block(OAK_LOG_BLOCK, position=late))
+        await self.finish_batch_break(TARGET, runtime_id=101, total=1, item_id=OAK_LOG_ITEM)
+        for total, position in enumerate(positions[1:], 2):
+            await self.expect_batch_start(position)
+            await self.finish_batch_break(position, runtime_id=100 + total, total=total, item_id=OAK_LOG_ITEM)
+
+        result = await asyncio.wait_for(task, 1)
+        self.assertEqual((result.positions, result.collected_count, result.search_complete), (positions, 3, True))
+        self.assertEqual([(row.position, row.status) for row in result.results],
+                         [(position, "collected") for position in positions])
+        self.assertEqual(bot.observed_block(isolated).runtime_id, OAK_LOG_BLOCK)
+        self.assertEqual(bot.observed_block(late).runtime_id, OAK_LOG_BLOCK)
+        self.assertEqual(bot.observed_block(other).runtime_id, ORE)
+        self.assert_no_more_collection_inputs()
+
+    async def test_counted_vein_stops_after_actual_gain_from_an_incomplete_search(self):
+        bot = await self.log_bot(TARGET, SECOND_TARGET, THIRD_TARGET)
+        await self.emit(self.slot(2, OAK_LOG_ITEM, 3))
+        task = self.collect_vein_logs(bot, count=1, max_blocks=2)
+        await self.expect_batch_start(TARGET)
+        await self.finish_batch_break(TARGET, runtime_id=101, total=5, item_id=OAK_LOG_ITEM, count=2)
+
+        result = await asyncio.wait_for(task, 1)
+        self.assertEqual((result.positions, result.requested_count, result.collected_count, result.search_complete),
+                         ((TARGET, THIRD_TARGET), 1, 2, False))
+        attempt, = result.results
+        self.assertEqual((attempt.position, attempt.status, attempt.collector_id, attempt.inventory_delta),
+                         (TARGET, "collected", PLAYER, 2))
+        self.assertEqual(bot.observed_block(THIRD_TARGET).runtime_id, OAK_LOG_BLOCK)
+        self.assertEqual(bot.observed_block(SECOND_TARGET).runtime_id, OAK_LOG_BLOCK)
+        self.assert_no_more_collection_inputs()
+
+    async def test_counted_vein_distinguishes_unknown_seeds_from_air_without_sending(self):
+        bot = await self.log_bot(TARGET)
+        for seed, complete in (((5, 100, 3), False), ((-2, 100, 4), True)):
+            with self.subTest(seed=seed):
+                result = await bot.collect_vein_by_count(seed, item_id=OAK_LOG_ITEM, count=1)
+                self.assertEqual(result, CountedBlockCollection(
+                    0, (), (), item_id=OAK_LOG_ITEM, requested_count=1, collected_count=0, search_complete=complete,
+                ))
+                self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_counted_vein_rejects_invalid_timeouts_before_sending(self):
+        bot = await self.log_bot(TARGET)
+        for timeout in (math.inf, -math.inf, math.nan, 0, -1, None):
+            with self.subTest(timeout=timeout):
+                with self.assertRaisesRegex(ValueError, "timeout must be finite and positive"):
+                    await asyncio.wait_for(bot.collect_vein_by_count(
+                        TARGET, item_id=OAK_LOG_ITEM, count=1, timeout=timeout,
+                    ), 1)
+                self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_counted_vein_cancellation_keeps_search_and_pickup_evidence(self):
+        bot = await self.log_bot(TARGET, SECOND_TARGET, THIRD_TARGET)
+        task = self.collect_vein_logs(bot, count=3, max_blocks=2)
+        await self.expect_batch_start(TARGET)
+        await self.finish_batch_break(TARGET, runtime_id=101, total=1, item_id=OAK_LOG_ITEM)
+        await self.expect_batch_start(THIRD_TARGET)
+        self.wire.emit(
+            self.block(HASHED_AIR_RUNTIME_ID, position=THIRD_TARGET),
+            self.drop(102, position=(-2.5, 100.5, 2.5), item_id=OAK_LOG_ITEM), self.take(102),
+        )
+        self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
+
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError) as interrupted:
+            await asyncio.wait_for(task, 1)
+        progress = interrupted.exception.collection_progress
+        self.assertEqual((progress.positions, progress.collected_count, progress.search_complete),
+                         ((TARGET, THIRD_TARGET), 1, False))
+        first, = progress.results
+        self.assertEqual((first.position, first.status), (TARGET, "collected"))
+        active = progress.active
+        self.assertEqual((active.position, active.status, active.collector_id, active.inventory_delta),
+                         (THIRD_TARGET, "inventory_unconfirmed", PLAYER, 0))
+        self.assertFalse(bot._block_collector._lock.locked())
         self.assert_no_more_collection_inputs()
 
     async def mixed_drop(self, bot):

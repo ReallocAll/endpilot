@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import contextmanager
+from math import inf
 from re import Pattern, fullmatch
 from typing import Any, Literal
 from uuid import UUID
@@ -2061,6 +2062,28 @@ class Bot:
         return await self._block_collector.collect_by_count(
             names, item_id=item_id, count=count, radius=radius, ticks=ticks,
             search_radius=search_radius, timeout=timeout,
+        )
+
+    async def collect_vein_by_count(
+        self, seed: tuple[int, int, int], *, item_id: int, count: int, max_blocks: int = 100,
+        max_distance: int = 16, flood_radius: int = 1, ticks: int = 160,
+        search_radius: int = 8, timeout: float = 15,
+    ) -> CountedBlockCollection:
+        """Collect a positive count of one item from an observed block vein.
+
+        Snapshot the candidates in find_block_vein order and attempt known
+        matches even when search_complete is false. Count confirmed
+        main-inventory gains for item_id, including a pickup that exceeds
+        count. Each attempt requires a finite positive timeout. Exceptions
+        carry known collection_progress.
+        """
+        if self._block_collector is None:
+            raise RuntimeError("player has not joined")
+        if timeout is None or not 0 < timeout < inf:
+            raise ValueError("collection timeout must be finite and positive")
+        return await self._block_collector.collect_vein_by_count(
+            seed, item_id=item_id, count=count, max_blocks=max_blocks, max_distance=max_distance,
+            flood_radius=flood_radius, ticks=ticks, search_radius=search_radius, timeout=timeout,
         )
 
     async def collect_mixed_targets(

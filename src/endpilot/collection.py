@@ -7,7 +7,7 @@ from functools import partial
 import math
 from typing import TYPE_CHECKING
 
-from .blocks import BlockObservation, Blocks, MiningFaceUnavailable, _ORDINARY_MINING_REACH
+from .blocks import BlockObservation, BlockSearchResult, Blocks, MiningFaceUnavailable, _ORDINARY_MINING_REACH
 from .entities import Entities, EntityState, ItemPickup
 from .harvest import HarvestTool, HarvestToolAcquisition, HarvestToolChest, HarvestTools
 from .inventory_observation import _InventoryObservation
@@ -65,11 +65,15 @@ class BlockCollectionBatch:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CountedBlockCollection(BlockCollectionBatch):
-    """Candidate snapshot and confirmed main-inventory gains for one item ID."""
+    """Candidate snapshot and confirmed main-inventory gains for one item ID.
+
+    search_complete records the admission-time completeness of a vein search.
+    """
 
     item_id: int
     requested_count: int
     collected_count: int
+    search_complete: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +116,7 @@ class _CountedProgress(_BatchProgress):
         self.item_id = item_id
         self.requested_count = requested_count
         self.collected_count = 0
+        self.search_complete: bool | None = None
 
     def snapshot(self) -> CountedBlockCollection:
         active_count = 0 if self.active is None else _confirmed_item_count(self.active, self.item_id)
@@ -119,6 +124,7 @@ class _CountedProgress(_BatchProgress):
             self.dimension_id, self.positions, tuple(self.results), self.active,
             item_id=self.item_id, requested_count=self.requested_count,
             collected_count=self.collected_count + active_count,
+            search_complete=self.search_complete,
         )
 
 
@@ -205,6 +211,26 @@ class _BlockCollector:
         self, names: str | int | Iterable[str] | Iterable[int], *, item_id: int, count: int,
         radius: int = 16, ticks: int = 160, search_radius: int = 8, timeout: float = 15,
     ) -> CountedBlockCollection:
+        return await self._collect_counted(
+            partial(self.blocks.find_blocks, names, radius=radius, limit=None),
+            item_id=item_id, count=count, ticks=ticks, search_radius=search_radius, timeout=timeout,
+        )
+
+    async def collect_vein_by_count(
+        self, seed: tuple[int, int, int], *, item_id: int, count: int,
+        max_blocks: int, max_distance: int, flood_radius: int, ticks: int, search_radius: int, timeout: float,
+    ) -> CountedBlockCollection:
+        return await self._collect_counted(
+            partial(self.blocks.find_block_vein, seed, max_blocks=max_blocks, max_distance=max_distance,
+                    flood_radius=flood_radius),
+            item_id=item_id, count=count, ticks=ticks, search_radius=search_radius, timeout=timeout,
+            report_completeness=True,
+        )
+
+    async def _collect_counted(
+        self, find_candidates: Callable[[], BlockSearchResult], *, item_id: int, count: int,
+        ticks: int, search_radius: int, timeout: float, report_completeness: bool = False,
+    ) -> CountedBlockCollection:
         if not isinstance(item_id, int) or isinstance(item_id, bool) or item_id == 0:
             raise ValueError("collection item ID must be a nonzero integer")
         if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
@@ -213,9 +239,11 @@ class _BlockCollector:
         try:
             self._check_connection()
             epoch = self.blocks._mining_epoch
-            matches = self.blocks.find_blocks(names, radius=radius, limit=None).matches
+            search = find_candidates()
+            if report_completeness:
+                progress.search_complete = search.complete
             observations = tuple(
-                before for match in matches if (before := self.blocks.observed_block(match.position)) is not None
+                before for match in search.matches if (before := self.blocks.observed_block(match.position)) is not None
                 and before.is_air is False
             )
             progress.positions = tuple(before.position for before in observations)
