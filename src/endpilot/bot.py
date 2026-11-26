@@ -1887,9 +1887,13 @@ class Bot:
     async def place_block(
         self, against: tuple[int, int, int], *, face: int,
         expected_runtime_id: int | None = None, expected_block_name: str | None = None,
-        click_pos: tuple[float, float, float] | None = None, timeout: float = 15,
+        replace: bool = False, click_pos: tuple[float, float, float] | None = None, timeout: float = 15,
     ) -> PlacementResult:
-        """Attempt survival placement at the target adjacent to the support face.
+        """Attempt survival placement with one click on ``against``.
+
+        By default, the target is observed air adjacent to the support face.
+        Clicking observed vanilla short grass requires ``replace=True``,
+        which targets the clicked cell. A failed target precondition sends no click.
 
         Supply exactly one expected value, a runtime ID from this session or
         a fully qualified vanilla block name. Name matching resolves the
@@ -1903,7 +1907,7 @@ class Bot:
         return await observe_placement(
             containers, blocks, creative, against,
             face=face, expected_runtime_id=expected_runtime_id, expected_block_name=expected_block_name,
-            click_pos=click_pos, timeout=timeout,
+            replace=replace, click_pos=click_pos, timeout=timeout,
         )
 
     async def open_container(

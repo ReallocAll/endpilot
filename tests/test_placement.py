@@ -16,6 +16,7 @@ from test_scheduled_input import Wire
 SUPPORT, TARGET = (4, 90, 7), (4, 91, 7)
 SUPPORT_ID, PLACED_ID = 776, 777
 FURNACE_ITEM_STATE, FURNACE_PLACED_STATE = 3463497305, 4038254352
+STONE, SHORT_GRASS = 2150698529, 2827903781
 
 
 class PlacementTests(unittest.IsolatedAsyncioTestCase):
@@ -116,6 +117,53 @@ class PlacementTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(self.wire.sent), 1)
         self.assertFalse(self.blocks._block_observers)
 
+    async def test_replace_short_grass_observes_the_clicked_cell_and_selected_slot(self):
+        await self.deliver(self.block(SUPPORT, SHORT_GRASS), self.block(TARGET, FURNACE_PLACED_STATE),
+                           self.slot(4, block_runtime_id=STONE))
+        pending = await self.arm(replace=True, expected_block_name="minecraft:stone")
+        sent, = self.wire.sent
+        tx = sent.variant_transaction
+        self.assertEqual((tx.pos.x, tx.pos.y, tx.pos.z), SUPPORT)
+        self.assertEqual((tx.click_pos.x, tx.click_pos.y, tx.click_pos.z), (0.25, 1, 0.75))
+        self.assertEqual((tx.face, tx.slot, tx.target_block_id), (1, 0, SHORT_GRASS))
+        self.assertEqual(tx.action_type, self.b.ItemUseInventoryTransaction.ActionType.PLACE)
+
+        await self.deliver(self.block(TARGET, STONE), self.block(SUPPORT, STONE, layer=1),
+                           self.block(SUPPORT, FURNACE_PLACED_STATE), self.block(SUPPORT, STONE),
+                           self.slot(3, slot=1, net_id=30, block_runtime_id=STONE))
+        self.assertFalse(pending.done())
+        await self.deliver(self.block(SUPPORT, SHORT_GRASS), self.block(SUPPORT, STONE))
+        self.assertFalse(pending.done())
+        await self.deliver(self.slot(3, net_id=22, block_runtime_id=STONE))
+
+        result = await pending
+        self.assertEqual((result.submitted, result.reason, result.target), (True, "observations_complete", SUPPORT))
+        before, after = result.world_change.before, result.world_change.after
+        self.assertEqual((before.position, before.layer, before.runtime_id), (SUPPORT, 0, SHORT_GRASS))
+        self.assertEqual((after.position, after.layer, after.runtime_id), (SUPPORT, 0, STONE))
+        self.assertEqual((result.inventory_change.before.count, result.inventory_change.after.count), (4, 3))
+        self.assertEqual(result.inventory_change.after.net_id, 22)
+        self.assertEqual(len(self.wire.sent), 1)
+
+    async def test_replace_requires_known_short_grass_in_the_clicked_main_layer(self):
+        unknown = (7, 90, 7)
+        result = await self.bot.place_block(unknown, face=1, replace=True, expected_runtime_id=FURNACE_PLACED_STATE)
+        self.assertEqual((result.submitted, result.reason, result.target), (False, "precondition_failed", unknown))
+
+        for runtime_id in (SUPPORT_ID, STONE):
+            with self.subTest(runtime_id=runtime_id):
+                await self.deliver(self.block(SUPPORT, runtime_id), self.block(SUPPORT, SHORT_GRASS, layer=1))
+                result = await self.place(replace=True, expected_runtime_id=FURNACE_PLACED_STATE)
+                self.assertEqual((result.submitted, result.reason, result.target),
+                                 (False, "precondition_failed", SUPPORT))
+        self.assertEqual(self.wire.sent, [])
+
+    async def test_default_placement_does_not_send_a_click_on_short_grass(self):
+        await self.deliver(self.block(SUPPORT, SHORT_GRASS))
+        result = await self.place()
+        self.assertEqual((result.submitted, result.reason, result.target), (False, "precondition_failed", TARGET))
+        self.assertEqual(self.wire.sent, [])
+
     async def test_name_matches_new_primary_state_but_integer_keeps_exact_state(self):
         for expected in ({"expected_block_name": "minecraft:furnace"}, {"expected_runtime_id": FURNACE_ITEM_STATE}):
             with self.subTest(expected=expected):
@@ -192,9 +240,15 @@ class PlacementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((result.inventory_change.before.count, result.inventory_change.after.item_id), (1, 0))
 
     async def test_selected_stack_or_target_change_before_submission_sends_zero(self):
-        for correction in (self.slot(2), self.block(TARGET, PLACED_ID)):
-            with self.subTest(packet=type(correction).__name__):
-                await self.deliver(self.slot(4), self.block(TARGET))
+        scenarios = (
+            (False, self.slot(2)),
+            (False, self.block(TARGET, PLACED_ID)),
+            (True, self.block(SUPPORT, STONE)),
+        )
+        for replace, correction in scenarios:
+            with self.subTest(replace=replace, packet=type(correction).__name__):
+                await self.deliver(self.slot(4), self.block(TARGET),
+                                   self.block(SUPPORT, SHORT_GRASS if replace else SUPPORT_ID))
                 entering = asyncio.Event()
                 ready = asyncio.Event()
 
@@ -203,9 +257,9 @@ class PlacementTests(unittest.IsolatedAsyncioTestCase):
                     await ready.wait()
 
                 self.movement.wait_for_position_sync.side_effect = sync
-                pending = asyncio.create_task(self.place())
+                pending = asyncio.create_task(self.place(replace=replace, expected_runtime_id=PLACED_ID))
                 self.addAsyncCleanup(self.stop_task, pending)
-                await entering.wait()
+                await asyncio.wait_for(entering.wait(), 0.5)
                 await self.deliver(correction)
                 ready.set()
                 result = await pending

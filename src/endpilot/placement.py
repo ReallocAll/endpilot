@@ -55,6 +55,7 @@ async def observe_placement(
     face: int,
     expected_runtime_id: int | None = None,
     expected_block_name: str | None = None,
+    replace: bool = False,
     click_pos: tuple[float, float, float] | None = None,
     timeout: float = 15,
 ) -> PlacementResult:
@@ -79,13 +80,13 @@ async def observe_placement(
     binding = packets.protocol.binding
     dx, dy, dz = FACE_OFFSETS[face]
     x, y, z = against
-    target = x + dx, y + dy, z + dz
+    target = (x, y, z) if replace else (x + dx, y + dy, z + dz)
     dimension = blocks.dimension_id
     held = inventory.held_item
     slot, before = held.slot, held.observed_item
     selection_revision = inventory.selection_revision
-    support = blocks.observed_block(against)
-    baseline = blocks.observed_block(target)
+    clicked = blocks.observed_block(against)
+    baseline = clicked if replace else blocks.observed_block(target)
     submitted = False
     world_change = None
     inventory_change = None
@@ -101,9 +102,13 @@ async def observe_placement(
         return result("dimension_changed")
     if (creative.game_mode != binding.GameType.SURVIVAL
         or before is None or before.item_id == 0 or before.count <= 0 or held.predicted_count is not None
-        or support is None or support.is_air is not False or support.runtime_id is None
-        or baseline is None or baseline.is_air is not True
+        or clicked is None or clicked.is_air is not False or clicked.runtime_id is None
+        or baseline is None or (not replace and baseline.is_air is not True)
         or (expected_runtime_id is not None and baseline.runtime_id == expected_runtime_id)):
+        return result("precondition_failed")
+    clicked_state = blocks._vanilla_state(clicked.runtime_id)
+    is_short_grass = clicked_state is not None and clicked_state.name == "minecraft:short_grass"
+    if replace != is_short_grass:
         return result("precondition_failed")
     if timeout == 0:
         return result("timed_out")
@@ -124,9 +129,14 @@ async def observe_placement(
 
     def on_block(change: BlockChange) -> None:
         nonlocal world_change
-        if (submitted is True and not finished.done() and world_change is None
-            and change.before is not None and change.before.is_air is True
-            and change.after.is_air is not True and matches_expected(change.after.runtime_id)):
+        if submitted is not True or finished.done() or world_change is not None:
+            return
+        if replace:
+            if change.before != baseline or change.after.is_air is not False:
+                return
+        elif change.before is None or change.before.is_air is not True or change.after.is_air is True:
+            return
+        if matches_expected(change.after.runtime_id):
             world_change = change
             if inventory_change is not None:
                 finish("observations_complete")
@@ -166,7 +176,8 @@ async def observe_placement(
         if (finished.done() or creative.game_mode != binding.GameType.SURVIVAL
             or inventory.selection_revision != selection_revision
             or current.slot != slot or current.observed_item != before or current.predicted_count is not None
-            or blocks.observed_block(against) != support or blocks.observed_block(target) != baseline):
+            or blocks.observed_block(against) != clicked
+            or (not replace and blocks.observed_block(target) != baseline)):
             raise _PreconditionChanged
         submitted = None
 

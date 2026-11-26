@@ -57,6 +57,19 @@ In Python, pass the support coordinates and face to `await bot.place_block()`.
 Supply either `expected_runtime_id` from the current session or a fully
 qualified vanilla `expected_block_name` such as `"minecraft:stone"`.
 
+By default, the target is the observed air cell adjacent to the clicked face.
+Pass `replace=True` to target the clicked cell when its main layer is known
+to contain vanilla `minecraft:short_grass`.
+
+```python
+result = await bot.place_block(
+    grass_position, face=1, expected_block_name="minecraft:stone", replace=True,
+)
+```
+
+A replacement request without that observation or a default request on known
+short grass returns `precondition_failed` before sending a click.
+
 The MCP tool `observed_block(x, y, z, layer=0)` reads the cache without
 requesting terrain. The result shows `observed: false` for unknown blocks and
 `is_air: true` for observed air. Use the MCP tool
