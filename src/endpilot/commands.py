@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from math import isfinite
 import uuid
 
-from bedrock_protocol import TextPacketType, nbt
+from bedrock_protocol import CommandBlockMode, TextPacketType, nbt
 
 from .blocks import Blocks, BlockEntityUpdate, BlockStateObservation
 from .protocol import RawPacket
@@ -14,7 +14,11 @@ from .protocol import RawPacket
 _DISCONNECT_ERROR = "server disconnected while waiting for command feedback"
 _EDIT_DISCONNECT_ERROR = "connection ended during command block edit"
 _EDIT_DIMENSION_ERROR = "dimension changed during command block edit"
-_IMPULSE_COMMAND_BLOCK = "minecraft:command_block"
+_COMMAND_BLOCK_MODES = {
+    "minecraft:command_block": CommandBlockMode.NORMAL,
+    "minecraft:repeating_command_block": CommandBlockMode.REPEATING,
+    "minecraft:chain_command_block": CommandBlockMode.CHAIN,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,8 +53,8 @@ def _command_block_snapshot(
     blocks: Blocks, position: tuple[int, int, int],
 ) -> tuple[BlockStateObservation, _CommandBlockOptions]:
     block = blocks.observed_block_state(position)
-    if block is None or block.name != _IMPULSE_COMMAND_BLOCK:
-        raise RuntimeError("a normal impulse command block must be observed at the target position")
+    if block is None or block.name not in _COMMAND_BLOCK_MODES:
+        raise RuntimeError("a supported command block must be observed at the target position")
     root = blocks.observed_block_entity(position)
     actor_id = root["id"] if root is not None and "id" in root else None
     if not isinstance(actor_id, nbt.StringTag) or actor_id.value != "CommandBlock":
@@ -261,7 +265,7 @@ class Commands:
         update_type = b.CommandBlockUpdatePacket
         x, y, z = position
         target = update_type.BlockCommandData(
-            block_pos=b.BlockPos(x=x, y=y, z=z), mode=b.CommandBlockMode.NORMAL,
+            block_pos=b.BlockPos(x=x, y=y, z=z), mode=_COMMAND_BLOCK_MODES[initial_block.name],
             redstone_mode=options.requires_redstone, is_conditional=options.conditional,
         )
         packet = update_type(
@@ -281,7 +285,7 @@ class Commands:
             if (isinstance(actor_id, nbt.StringTag) and actor_id.value == "CommandBlock"
                     and isinstance(text, nbt.StringTag) and text.value == command):
                 block = blocks.observed_block_state(position)
-                if block is not None and block.name == _IMPULSE_COMMAND_BLOCK:
+                if block is not None and block.name == initial_block.name:
                     received.set_result(update)
 
         terrain_packets = (
@@ -294,7 +298,7 @@ class Commands:
                 return
             if send_started:
                 block = blocks.observed_block_state(position)
-                if block is not None and block.name != _IMPULSE_COMMAND_BLOCK:
+                if block is not None and block.name != initial_block.name:
                     failure.set_result(RuntimeError("command block target changed while waiting for its update"))
                 return
             # A replacement can clear the actor before a later packet describes a new one.

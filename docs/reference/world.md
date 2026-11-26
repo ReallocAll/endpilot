@@ -45,24 +45,26 @@ in chunk payloads produce no events. Calling `unsubscribe()` stops delivery
 immediately and is safe to repeat. Delivery also ends with the session.
 Both APIs send no packets.
 
-## Edit a pulse command block
+## Edit a command block
 
 On protocol 2225, use `bot.set_command_block()` to change the command text of
-an ordinary pulse command block. The bot needs a current observation of the
-block and its block entity in the current dimension. On stock Bedrock
-Dedicated Server, give the bot operator permission and use creative mode in
-a world with cheats and command blocks enabled.
+an existing impulse, repeating, or chain command block. The bot needs a
+current observation of the block and its block entity in the current
+dimension. On stock Bedrock Dedicated Server, give the bot operator
+permission and use creative mode in a world with cheats and command blocks
+enabled.
 
-In a world you control, set a message on the observed pulse block.
+In a world you control, set a message on an observed impulse block that
+requires redstone.
 
 ```python
 update = await bot.set_command_block((8, 220, 8), "say Test pulse received", timeout=15)
 ```
 
-The action sends one edit using the observed settings. It returns a fresh
-`BlockEntityUpdate` once the server reports the requested text at that
-position in the same dimension. To run the command, supply a redstone pulse
-and meet any condition configured on the block.
+The action sends one edit, preserving the observed mode and settings. It
+returns a fresh `BlockEntityUpdate` once the server reports the requested text
+at that position in the same dimension. To run the command on the example
+block, supply a redstone pulse and meet any configured condition.
 
 If the deadline expires before confirmation, the call raises `TimeoutError`.
 Cancelling the action ends the wait. In either case, the server may still

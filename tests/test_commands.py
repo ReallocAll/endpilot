@@ -13,6 +13,12 @@ from endpilot.protocol import Protocol, read_batch, write_batch
 from test_world_observation import Transport
 
 
+# Conditional command block states in the protocol 2225 sequential palette.
+_IMPULSE_BLOCK = 22542
+_REPEATING_BLOCK = 22251
+_CHAIN_BLOCK = 18747
+
+
 class CommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_command_sends_typed_request_and_observes_bds_text_feedback(self):
         protocol = Protocol(2193)
@@ -73,7 +79,7 @@ class CommandBlockTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.join_nethernet(address)
         await self.deliver(b.SetPlayerGameTypePacket(player_game_type=b.GameType.CREATIVE))
 
-    def block(self, runtime_id=22542):  # Conditional minecraft:command_block in the 2225 palette.
+    def block(self, runtime_id=_IMPULSE_BLOCK):
         x, y, z = self.position
         return self.b.UpdateBlockPacket(pos=self.b.BlockPos(x=x, y=y, z=z), runtime_id=runtime_id, layer=0)
 
@@ -110,38 +116,47 @@ class CommandBlockTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_command_block_uses_fresh_receipt_during_send_and_preserves_settings(self):
         filtered_name = "Filtered name"
-        await self.deliver(self.block(), self.actor(self.command, output="cached", filtered_name=filtered_name))
+        mode = self.b.CommandBlockMode
 
         async def receive():
             await self.deliver(self.actor(self.command, output="fresh", filtered_name=filtered_name))
             self.assertEqual(self.bot.observed_block_entity(self.position)["LastOutput"].value, "fresh")
 
-        with self.during_command_send(receive):
-            result = await self.bot.set_command_block(self.position, self.command, timeout=1)
+        for runtime_id, expected_mode in (
+            (_IMPULSE_BLOCK, mode.NORMAL), (_REPEATING_BLOCK, mode.REPEATING), (_CHAIN_BLOCK, mode.CHAIN),
+        ):
+            with self.subTest(mode=expected_mode.name):
+                self.transport.sent.clear()
+                await self.deliver(
+                    self.block(runtime_id), self.actor(self.command, output="cached", filtered_name=filtered_name),
+                )
 
-        self.assertIsInstance(result, BlockEntityUpdate)
-        self.assertEqual((result.dimension_id, result.position), (0, self.position))
-        self.assertEqual(result.data["Command"].value, self.command)
-        self.assertEqual(result.data["LastOutput"].value, "fresh")
-        self.assertEqual(len(self.transport.sent), 1)
-        packet, = self.sent_commands()
-        self.assertIsInstance(packet.target, self.b.CommandBlockUpdatePacket.BlockCommandData)
-        pos = packet.target.block_pos
-        self.assertEqual((pos.x, pos.y, pos.z), self.position)
-        self.assertEqual(packet.target.mode, self.b.CommandBlockMode.NORMAL)
-        self.assertFalse(packet.target.redstone_mode)
-        self.assertTrue(packet.target.is_conditional)
-        self.assertEqual(packet.command, self.command)
-        self.assertEqual(packet.name, "Keep this name")
-        self.assertEqual(packet.filtered_name, filtered_name)
-        self.assertFalse(packet.track_output)
-        self.assertEqual(packet.tick_delay, 12)
-        self.assertTrue(packet.execute_on_first_tick)
+                with self.during_command_send(receive):
+                    result = await self.bot.set_command_block(self.position, self.command, timeout=1)
+
+                self.assertIsInstance(result, BlockEntityUpdate)
+                self.assertEqual((result.dimension_id, result.position), (0, self.position))
+                self.assertEqual(result.data["Command"].value, self.command)
+                self.assertEqual(result.data["LastOutput"].value, "fresh")
+                self.assertEqual(len(self.transport.sent), 1)
+                packet, = self.sent_commands()
+                self.assertIsInstance(packet.target, self.b.CommandBlockUpdatePacket.BlockCommandData)
+                pos = packet.target.block_pos
+                self.assertEqual((pos.x, pos.y, pos.z), self.position)
+                self.assertEqual(packet.target.mode, expected_mode)
+                self.assertFalse(packet.target.redstone_mode)
+                self.assertTrue(packet.target.is_conditional)
+                self.assertEqual(packet.command, self.command)
+                self.assertEqual(packet.name, "Keep this name")
+                self.assertEqual(packet.filtered_name, filtered_name)
+                self.assertFalse(packet.track_output)
+                self.assertEqual(packet.tick_delay, 12)
+                self.assertTrue(packet.execute_on_first_tick)
 
     async def test_command_block_rejection_and_zero_timeout_do_not_send(self):
         with self.assertRaises(RuntimeError):
             await self.bot.set_command_block(self.position, self.command, timeout=1)
-        await self.deliver(self.block(22251), self.actor())  # Conditional repeating command block.
+        await self.deliver(self.block(3317), self.actor())  # minecraft:stone in the 2225 palette.
         with self.assertRaises(RuntimeError):
             await self.bot.set_command_block(self.position, self.command, timeout=1)
         await self.deliver(self.block(), self.actor())
@@ -183,19 +198,25 @@ class CommandBlockTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(self.bot.set_command_block(self.position, self.command, timeout=2), 1)
         self.assertEqual(len(self.sent_commands()), 1)
 
-    async def test_repeating_command_block_replacement_cannot_confirm_edit(self):
-        await self.deliver(self.block(), self.actor())
+    async def test_command_block_mode_replacement_cannot_confirm_edit(self):
+        for initial_id, replacement_id, replacement_name in (
+            (_IMPULSE_BLOCK, _REPEATING_BLOCK, "minecraft:repeating_command_block"),
+            (_REPEATING_BLOCK, _CHAIN_BLOCK, "minecraft:chain_command_block"),
+        ):
+            with self.subTest(replacement=replacement_name):
+                self.transport.sent.clear()
+                await self.deliver(self.block(initial_id), self.actor())
 
-        async def receive():
-            await self.deliver(self.block(22251), self.actor(self.command))
+                async def receive():
+                    await self.deliver(self.block(replacement_id), self.actor(self.command))
 
-        with self.during_command_send(receive), self.assertRaises((RuntimeError, TimeoutError)):
-            await self.bot.set_command_block(self.position, self.command, timeout=0.25)
+                with self.during_command_send(receive), self.assertRaises((RuntimeError, TimeoutError)):
+                    await self.bot.set_command_block(self.position, self.command, timeout=0.25)
 
-        state = self.bot.observed_block_state(self.position)
-        self.assertEqual(state.name, "minecraft:repeating_command_block")
-        self.assertEqual(self.bot.observed_block_entity(self.position)["Command"].value, self.command)
-        self.assertEqual(len(self.sent_commands()), 1)
+                state = self.bot.observed_block_state(self.position)
+                self.assertEqual(state.name, replacement_name)
+                self.assertEqual(self.bot.observed_block_entity(self.position)["Command"].value, self.command)
+                self.assertEqual(len(self.sent_commands()), 1)
 
     async def test_send_command_proceeds_while_command_block_waits_for_receipt(self):
         await self.deliver(self.block(), self.actor())
