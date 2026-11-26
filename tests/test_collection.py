@@ -2,20 +2,24 @@ import asyncio
 from functools import partial
 import math
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from endpilot import BlockCollectionBatch, Bot, CountedBlockCollection, DropCollection, MixedCollectionBatch, NavigationRules
+from endpilot.block_data import _catalog
 from endpilot.block_raycast import trace_blocks
 from endpilot.blocks import HASHED_AIR_RUNTIME_ID, Blocks
 from endpilot.collection import _observe_mined_block
 from endpilot.compression import PacketConnection
 from endpilot.entities import Entities
+from endpilot.harvest import HarvestToolChest
 from endpilot.inventory import Inventory
+from endpilot.item_registry import ItemRegistrySnapshot
 from endpilot.login import JoinSession
 from endpilot.movement import Movement
 from endpilot.navigation import _StandingGraph
 from endpilot.protocol import Protocol, read_batch, write_batch
 
+from test_container_take import item as stack_descriptor
 from test_scheduled_input import ManualClock
 
 
@@ -29,6 +33,7 @@ ORE = 0x54A1D0FD
 OAK_LOG_BLOCK = 4065577688
 OAK_LOG_ITEM = 17
 IRON_AXE = 446
+REFILL_CHEST = (-3, 100, 2)
 
 
 class Wire:
@@ -110,11 +115,11 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
     def item(self, item_id=0, count=0):
         return self.b.SerializedNetworkItemStackDescriptor(id=item_id, stack_size=count)
 
-    def slot(self, slot, item_id=0, count=0, *, container=None):
+    def slot(self, slot, item_id=0, count=0, *, container=None, net_id=None):
         b = self.b
         return b.InventorySlotPacket(
             inventory_id=b.ContainerID.INVENTORY if container is None else container,
-            slot=slot, item=self.item(item_id, count),
+            slot=slot, item=stack_descriptor(b, item_id, count, net_id),
         )
 
     def content(self, *slots):
@@ -705,12 +710,14 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual((action.pos.x, action.pos.y, action.pos.z), position)
                     return packet
 
-    async def finish_batch_break(self, position, *, runtime_id, total=None, item_id=DIRT, count=1, player=PLAYER):
+    async def finish_batch_break(
+        self, position, *, runtime_id, total=None, item_id=DIRT, count=1, player=PLAYER, net_id=None,
+    ):
         packets = [self.block(HASHED_AIR_RUNTIME_ID, position=position),
                    self.drop(runtime_id, position=tuple(value + 0.5 for value in position),
                              count=count, item_id=item_id)]
         if total is not None:
-            packets.extend((self.take(runtime_id, player=player), self.slot(2, item_id, total)))
+            packets.extend((self.take(runtime_id, player=player), self.slot(2, item_id, total, net_id=net_id)))
         self.wire.emit(*packets)
         self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
 
@@ -732,6 +739,190 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.drops[0].runtime_id for item in result.results], [101, 102])
         self.assertEqual(bot.observed_block(THIRD_TARGET).runtime_id, ORE)
         self.assertEqual(bot.inventory_count(DIRT), 2)
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def refill_bot(self, *, chest=REFILL_CHEST):
+        bot = await self.public_bot()
+        bot._session.item_registry = ItemRegistrySnapshot(bot._session.item_names)
+        palette, hashes = _catalog()
+        chest_id = next(runtime for runtime, index in hashes.items()
+                        if palette[index] is not None and palette[index].name == "minecraft:chest")
+        await self.emit(
+            self.block(OAK_LOG_BLOCK), self.block(ORE, position=SECOND_TARGET),
+            self.block(chest_id, position=chest),
+            self.content(stack_descriptor(self.b, 444, 1, 10), *(self.item() for _ in range(35))),
+        )
+        return bot
+
+    async def refill_batch(self, bot, *, tool_chest):
+        batch = asyncio.create_task(bot.collect_targets(
+            [TARGET, SECOND_TARGET], ticks=0, search_radius=0, timeout=1, tool_chest=tool_chest,
+        ))
+
+        async def settle_batch():
+            batch.cancel()
+            await asyncio.gather(batch, return_exceptions=True)
+
+        self.addAsyncCleanup(settle_batch)
+        await self.expect_batch_start(TARGET)
+        await self.finish_batch_break(TARGET, runtime_id=101, total=1, item_id=OAK_LOG_ITEM, net_id=15)
+        return batch
+
+    def refill_window(self, *, position=REFILL_CHEST, iron_slot=4):
+        b = self.b
+        x, y, z = position
+        open_packet = b.ContainerOpenPacket(
+            container_id=2, type=b.ContainerType.CONTAINER,
+            pos=b.BlockPos(x=x, y=y, z=z), entity_unique_id=-1,
+        )
+        stacks = {iron_slot: stack_descriptor(b, 445, 1, 14)}
+        contents = b.InventoryContentPacket(
+            inventory_id=2, slots=[stacks.get(index, self.item()) for index in range(27)],
+            full_container_name=b.FullContainerName(name=b.ContainerEnumName.LEVEL_ENTITY_CONTAINER),
+            storage_item=self.item(),
+        )
+        return open_packet, contents
+
+    async def refill_click(self, *, position=REFILL_CHEST):
+        b = self.b
+        async with asyncio.timeout(1):
+            click = await self.wire.outgoing.get()
+            while isinstance(click, b.PlayerAuthInputPacket):
+                self.assertFalse(click.player_block_actions)
+                click = await self.wire.outgoing.get()
+        self.assertIsInstance(click, b.InventoryTransactionPacket)
+        interaction = click.variant_transaction
+        self.assertEqual((interaction.pos.x, interaction.pos.y, interaction.pos.z), position)
+        return interaction
+
+    async def refill_request(self, *, position=REFILL_CHEST, expected_hit=None):
+        b = self.b
+        interaction = await self.refill_click(position=position)
+        if expected_hit is not None:
+            face, point = expected_hit
+            hit = interaction.click_pos
+            self.assertEqual(interaction.face, face)
+            self.assertLess(math.dist((hit.x, hit.y, hit.z), point), 1e-6)
+        await self.emit(*self.refill_window(position=position))
+        take = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+        self.assertIsInstance(take, b.ItemStackRequestPacket)
+        request, = take.requests
+        action, = request.actions
+        self.assertIsInstance(action, b.ItemStackRequestCereal.TakeActionData)
+        self.assertEqual((action.source.slot, action.destination.slot, action.amount), (4, 3, 1))
+        return b.ItemStackResponsePacket(responses=[b.ItemStackResponseInfo(
+            client_request_id=request.client_request_id, result=b.ItemStackNetResult.SUCCESS,
+            containers=[b.ItemStackResponseContainerInfo(
+                full_container_name=b.FullContainerName(name=b.ContainerEnumName[group]),
+                slots=[b.ItemStackResponseSlotInfo(
+                    requested_slot=slot, slot=slot, amount=count,
+                    item_stack_net_id=None if net_id is None else b.ItemStackNetId(raw_id=net_id),
+                    custom_name=b.RedactableString(unredacted_string="", redacted_string=None),
+                    durability_correction=0,
+                )],
+            ) for group, slot, count, net_id in (
+                ("LEVEL_ENTITY_CONTAINER", 4, 0, None), ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 3, 1, 20),
+            )],
+        )])
+
+    async def refill_close(self, *, confirm=True):
+        packet = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+        self.assertIsInstance(packet, self.b.ContainerClosePacket)
+        if confirm:
+            await self.emit(packet)
+        return packet
+
+    async def test_batch_without_refill_stops_after_collecting_the_prefix(self):
+        bot = await self.refill_bot()
+        result = await (await self.refill_batch(bot, tool_chest=None))
+        self.assertEqual([(row.status, row.tool_acquisition) for row in result.results],
+                         [("collected", None), ("tool_unavailable", None)])
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_batch_refills_between_confirmed_pickups_and_waits_for_owned_close(self):
+        await self.check_batch_refill(await self.refill_bot(), REFILL_CHEST)
+
+    async def test_batch_refills_from_the_top_of_a_chest_below_the_stance(self):
+        chest = (-3, 99, 2)
+        bot = await self.refill_bot(chest=chest)
+        await self.emit(*(self.block(0x80310E21, position=(x, 98, z))
+                          for x in range(-4, -1) for z in range(1, 4)))
+        await self.check_batch_refill(bot, chest, expected_hit=(1, (0.5, 0.95, 0.5)))
+
+    async def check_batch_refill(self, bot, position, *, expected_hit=None):
+        config = HarvestToolChest(position, range(4, 5), range(3, 4))
+        batch = await self.refill_batch(bot, tool_chest=config)
+        await self.emit(await self.refill_request(position=position, expected_hit=expected_hit))
+        equipped = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+        self.assertIsInstance(equipped, self.b.MobEquipmentPacket)
+        self.assertEqual((equipped.item.id, equipped.item.net_id_variant), (445, 20))
+        close = await self.refill_close(confirm=False)
+        self.assertTrue(self.wire.outgoing.empty())
+        await self.emit(close)
+        await self.expect_batch_start(SECOND_TARGET)
+        await self.finish_batch_break(SECOND_TARGET, runtime_id=102, total=1)
+        result = await batch
+        first, second = result.results
+        self.assertEqual([(row.position, row.status) for row in result.results],
+                         [(TARGET, "collected"), (SECOND_TARGET, "collected")])
+        self.assertIsNone(first.tool_acquisition)
+        self.assertEqual(second.tool, second.tool_acquisition.tool)
+        self.assertEqual(second.tool_acquisition.transfer.confirmed_count, 1)
+        self.assertIsNone(bot.open_window)
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_batch_refill_shortage_keeps_prefix_and_ignores_unauthorized_slot(self):
+        bot = await self.refill_bot()
+        batch = await self.refill_batch(bot, tool_chest=HarvestToolChest(REFILL_CHEST, range(5, 6)))
+        await self.refill_click()
+        await self.emit(*self.refill_window(iron_slot=4))
+        await self.refill_close()
+        first, second = (await batch).results
+        self.assertEqual((first.status, second.status, second.tool_acquisition.status),
+                         ("collected", "tool_unavailable", "tool_unavailable"))
+        self.assertIsNone(second.tool_acquisition.transfer)
+        self.assertIsNone(bot.open_window)
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_target_change_during_refill_keeps_confirmed_transfer_without_start(self):
+        bot = await self.refill_bot()
+        batch = await self.refill_batch(bot, tool_chest=HarvestToolChest(REFILL_CHEST, range(4, 5), range(3, 4)))
+        await self.emit(await self.refill_request(), self.block(OAK_LOG_BLOCK, position=SECOND_TARGET))
+        await self.refill_close()
+        first, second = (await batch).results
+        self.assertEqual((first.status, second.status), ("collected", "target_changed"))
+        self.assertEqual(second.tool_acquisition.transfer.confirmed_count, 1)
+        self.assertIsNone(bot.open_window)
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_cancelled_batch_refill_keeps_confirmed_transfer_in_active_progress(self):
+        bot = await self.refill_bot()
+        batch = await self.refill_batch(bot, tool_chest=HarvestToolChest(REFILL_CHEST, range(4, 5), range(3, 4)))
+        await self.emit(await self.refill_request())
+        equipped = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+        self.assertIsInstance(equipped, self.b.MobEquipmentPacket)
+        await self.refill_close(confirm=False)
+        batch.cancel("stop before chest close confirmation")
+        with self.assertRaisesRegex(asyncio.CancelledError, "stop before chest close confirmation") as caught:
+            await batch
+        progress = caught.exception.collection_progress
+        first, = progress.results
+        self.assertEqual(first.status, "collected")
+        self.assertEqual(progress.active.position, SECOND_TARGET)
+        self.assertEqual(progress.active.tool_acquisition.transfer.confirmed_count, 1)
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_batch_refill_leaves_caller_window_open_and_skips_the_detour(self):
+        bot = await self.refill_bot()
+        await self.emit(*self.refill_window())
+        caller_window = bot.open_window
+        with patch.object(bot._movement, "_navigate_goal", wraps=bot._movement._navigate_goal) as navigate:
+            batch = await self.refill_batch(bot, tool_chest=HarvestToolChest(REFILL_CHEST, range(4, 5)))
+            first, second = (await batch).results
+        self.assertEqual([call.args[1].position for call in navigate.await_args_list], [TARGET, SECOND_TARGET])
+        self.assertEqual((first.status, second.status, second.tool_acquisition.status),
+                         ("collected", "tool_refill_failed", "busy"))
+        self.assertIs(bot.open_window, caller_window)
         self.assertTrue(self.wire.outgoing.empty())
 
     async def log_bot(self, *positions):

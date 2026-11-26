@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from math import isfinite
+from math import dist, isfinite
 from typing import TYPE_CHECKING
 
 from .block_data import MiningRule
-from .blocks import Blocks
+from .blocks import BlockObservation, Blocks, _ORDINARY_MINING_REACH
 from .containers import Containers, ContainerWindow, _same_slot
 from .inventory import (
     Inventory, _InventoryMoveNotSubmitted, _MAIN_INVENTORY_SIZE, _PLAYER_CONTAINERS, _stack_snapshot,
@@ -49,6 +49,22 @@ class HarvestTool:
     slot: int | None
     item_name: str | None
     speed_multiplier: float
+
+
+@dataclass(frozen=True, slots=True)
+class HarvestToolChest:
+    """An observed ordinary chest and the slots authorized for a tool refill."""
+
+    position: tuple[int, int, int]
+    chest_slots: range
+    inventory_slots: range = range(36)
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.position, tuple) or len(self.position) != 3
+                or any(type(axis) is not int or not -(1 << 31) <= axis < (1 << 31) for axis in self.position)):
+            raise ValueError("expected three integer block coordinates within signed 32-bit bounds")
+        _check_range(self.chest_slots, _DOUBLE_CHEST_SIZE, "chest_slots")
+        _check_range(self.inventory_slots, _MAIN_INVENTORY_SIZE, "inventory_slots")
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,11 +129,12 @@ class HarvestTools:
         return self._best(position, self._inventory.slots)
 
     def _best(self, position: tuple[int, int, int], slots: dict[int, object]) -> HarvestTool | None:
-        block = self._blocks.observed_block(position)
+        rule = self._mining_rule(self._blocks.observed_block(position))
+        return None if rule is None else self._best_in_inventory(rule, slots)
+
+    def _mining_rule(self, block: BlockObservation | None) -> MiningRule | None:
         state = None if block is None else self._blocks._vanilla_state(block.runtime_id)
-        if state is None or state.mining_rule is None:
-            return None
-        return self._best_in_inventory(state.mining_rule, slots)
+        return None if state is None else state.mining_rule
 
     def _best_in_inventory(self, rule: MiningRule, slots: dict[int, object]) -> HarvestTool | None:
         return self._best_in_slots(
@@ -172,15 +189,35 @@ class HarvestTools:
             {(None, slot) for slot in indices}
         ))
 
+    def _observed_chest(self, position: tuple[int, int, int]) -> BlockObservation | None:
+        block = self._blocks.observed_block(position)
+        state = None if block is None else self._blocks._vanilla_state(block.runtime_id)
+        return block if state is not None and state.name == "minecraft:chest" else None
+
+    def _refill_chest(self, target: BlockObservation, position: tuple[int, int, int]) -> BlockObservation | None:
+        rule = self._mining_rule(target)
+        slots = self._inventory.slots
+        if (rule is not None and rule.required is not None and self._best_in_inventory(rule, slots) is None
+                and self._inventory_is_observed(slots, submitting=None)):
+            return self._observed_chest(position)
+        return None
+
+    def _window_busy(self) -> str | None:
+        containers = self._containers
+        if containers.window is not None or containers._inventory_open is not None or containers._entity_opening:
+            return "busy"
+        return "window_busy" if containers._block_open_requests else None
+
     async def _equip_from_chest(
         self, bot: Bot, position: tuple[int, int, int], *, chest: tuple[int, int, int], chest_slots: range,
-        inventory_slots: range, face: int, timeout: float,
+        inventory_slots: range, face: int, timeout: float, expected_target: BlockObservation | None = None,
+        expected_chest: BlockObservation | None = None, expected_epoch: int | None = None,
+        click_pos: tuple[float, float, float] | None = None,
     ) -> HarvestToolAcquisition:
         blocks, inventory, containers = self._blocks, self._inventory, self._containers
-        target = blocks.observed_block(position)
-        epoch = blocks._mining_epoch
-        state = None if target is None else blocks._vanilla_state(target.runtime_id)
-        rule = None if state is None else state.mining_rule
+        target = blocks.observed_block(position) if expected_target is None else expected_target
+        epoch = blocks._mining_epoch if expected_epoch is None else expected_epoch
+        rule = self._mining_rule(target)
         window: ContainerWindow | None = None
         owned_window: ContainerWindow | None = None
         transfer: RangeTransferResult | None = None
@@ -242,11 +279,10 @@ class HarvestTools:
         async def take_and_equip():
             nonlocal window, transfer
             active = containers.window
-            if active is not None and not is_target_window(active):
+            if active is not None and (expected_chest is not None or not is_target_window(active)):
                 return "busy"
-            chest_block = blocks.observed_block(chest)
-            chest_state = None if chest_block is None else blocks._vanilla_state(chest_block.runtime_id)
-            if chest_state is None or chest_state.name != "minecraft:chest":
+            chest_block = self._observed_chest(chest)
+            if chest_block is None or (expected_chest is not None and chest_block != expected_chest):
                 return "unobserved"
 
             def require_same_chest():
@@ -258,17 +294,24 @@ class HarvestTools:
                 require_shortage()
                 require_same_chest()
                 if containers.window is not None:
-                    if is_target_window(containers.window):
+                    if expected_chest is None and is_target_window(containers.window):
                         window = containers.window
                         raise _InventoryMoveNotSubmitted("borrowed_window")
                     raise _InventoryMoveNotSubmitted("busy")
                 if containers._inventory_open is not None or containers._entity_opening:
                     raise _InventoryMoveNotSubmitted("busy")
+                if click_pos is not None:
+                    point = tuple(cell + offset for cell, offset in zip(chest, click_pos, strict=True))
+                    hit = blocks.raycast_block_towards(point, _ORDINARY_MINING_REACH)
+                    if (hit.position != chest or hit.face != face or hit.click_pos is None
+                            or dist(hit.click_pos, click_pos) > 1e-6):
+                        raise _InventoryMoveNotSubmitted("unobserved")
 
             if active is None:
                 try:
                     await containers.open(chest, blocks, face=face, timeout=timeout,
-                                          _before_click=before_click, _on_observed=remember_window)
+                                          _click_pos=click_pos, _before_click=before_click,
+                                          _on_observed=remember_window)
                 except _InventoryMoveNotSubmitted as stopped:
                     if str(stopped) != "borrowed_window":
                         raise
@@ -329,6 +372,11 @@ class HarvestTools:
             slots = current_inventory()
             if slots is None:
                 return "unobserved"
+            if expected_chest is not None:
+                if (busy := self._window_busy()) is not None:
+                    return busy
+                if self._observed_chest(chest) != expected_chest:
+                    return "unobserved"
             choice = self._best_in_inventory(rule, slots)
             if choice is not None:
                 return await equip_inventory(choice, slots)
@@ -359,6 +407,8 @@ class HarvestTools:
                             closed = await containers.close_window(timeout=timeout, _expected_window=owned_window)
                             if closed is None and failure is None:
                                 status = "window_changed"
+                            elif status == "equipped" and expected_chest is not None:
+                                status = self._window_busy() or status
                         except (Exception, asyncio.CancelledError) as error:
                             if failure is None:
                                 raise

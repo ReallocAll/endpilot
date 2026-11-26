@@ -38,7 +38,7 @@ from .expression import skin_packet
 from .fishing import Fishing, FishingResult
 from .forms import Forms
 from .game_hp_estimate import _estimate_sourceless_explosion_damage
-from .harvest import HarvestTool, HarvestTools
+from .harvest import HarvestTool, HarvestToolChest, HarvestTools
 from .inventory import HeldItemSnapshot, Inventory, InventorySlotChange
 from .item_registry import ItemRegistrySnapshot
 from .item_use import ItemConsumption, ItemCooldownEvent, ItemUse
@@ -1996,18 +1996,24 @@ class Bot:
 
     async def collect_targets(
         self, positions: Iterable[tuple[int, int, int]], *, count: int | None = None,
-        ticks: int = 160, search_radius: int = 8, timeout: float = 15,
+        ticks: int = 160, search_radius: int = 8, timeout: float = 15, tool_chest: HarvestToolChest | None = None,
     ) -> BlockCollectionBatch:
         """Collect unique targets in input order, up to count.
 
         Apply the movement and wait budgets to each target. Stop at the first
         result whose status is not collected. An exception can carry known
         progress in its collection_progress attribute.
+
+        With tool_chest, a confirmed inventory shortage can trigger one trip
+        to the specified chest for that target, then a return to the target.
+        Each leg gets the same movement budget. See the target result's
+        tool_acquisition for the chest and transfer evidence.
         """
         if self._block_collector is None:
             raise RuntimeError("player has not joined")
         return await self._block_collector.collect_targets(
-            positions, count=count, ticks=ticks, search_radius=search_radius, timeout=timeout,
+            self, positions, count=count, ticks=ticks, search_radius=search_radius, timeout=timeout,
+            tool_chest=tool_chest,
         )
 
     async def collect_by_count(

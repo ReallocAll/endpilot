@@ -618,6 +618,7 @@ class Containers:
 
     async def open(
         self, position: tuple[int, int, int], blocks, *, face: int = 1, timeout: float = 15,
+        _click_pos: tuple[float, float, float] | None = None,
         _before_click: Callable[[], None] | None = None,
         _on_observed: Callable[[ContainerWindow], None] | None = None,
     ) -> ContainerWindow:
@@ -629,12 +630,12 @@ class Containers:
         self._block_open_requests += 1
         self._owned_block_opening = owns_window
         try:
-            return await self._open_block(position, blocks, face, timeout, _before_click, _on_observed)
+            return await self._open_block(position, blocks, face, timeout, _click_pos, _before_click, _on_observed)
         finally:
             self._block_open_requests -= 1
             self._owned_block_opening = False
 
-    async def _open_block(self, position, blocks, face, timeout, _before_click, _on_observed):
+    async def _open_block(self, position, blocks, face, timeout, click_pos, _before_click, _on_observed):
         b = self.packets.protocol.binding
         await self.movement.wait_for_position_sync(timeout)
         submitted = False
@@ -674,7 +675,7 @@ class Containers:
             await asyncio.sleep(0)
             # Use the origin of the latest input, including any correction
             # received while registering the window waiter.
-            await self.click_block(position, blocks, face=face, _before_send=(
+            await self.click_block(position, blocks, face=face, click_pos=click_pos, _before_send=(
                 before_click if _on_observed is not None or _before_click is not None else None
             ))
             if _on_observed is None:

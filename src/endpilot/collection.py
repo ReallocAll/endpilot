@@ -1,16 +1,24 @@
 """Collect supplied blocks and drops using their observed world and pickup evidence."""
 
 import asyncio
-from collections.abc import Callable, Coroutine, Iterable
+from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from dataclasses import dataclass, field, replace
+from functools import partial
 import math
+from typing import TYPE_CHECKING
 
 from .blocks import BlockObservation, Blocks, MiningFaceUnavailable, _ORDINARY_MINING_REACH
 from .entities import Entities, EntityState, ItemPickup
-from .harvest import HarvestTool, HarvestTools
+from .harvest import HarvestTool, HarvestToolAcquisition, HarvestToolChest, HarvestTools
 from .inventory_observation import _InventoryObservation
 from .movement import BlockApproach, Movement
 from .navigation import AllGoal, BlockFaceGoal, BlockInteractionGoal, BlockInteractionMatch, NavigationRules
+
+if TYPE_CHECKING:
+    from .bot import Bot
+
+
+_ToolRefill = Callable[[BlockObservation], Awaitable[HarvestToolAcquisition | None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +40,7 @@ class BlockCollection:
     timed_out: bool = False
     approach: BlockApproach | None = None
     tool: HarvestTool | None = None
+    tool_acquisition: HarvestToolAcquisition | None = field(default=None, kw_only=True)
     _pickup_confirmed: bool = field(default=False, kw_only=True, repr=False)
 
     @property
@@ -165,11 +174,13 @@ class _BlockCollector:
         return await self._run(self._collect(position, ticks=ticks, search_radius=search_radius, timeout=timeout))
 
     async def collect_targets(
-        self, positions: Iterable[tuple[int, int, int]], *, count: int | None = None,
-        ticks: int = 160, search_radius: int = 8, timeout: float = 15,
+        self, bot: "Bot", positions: Iterable[tuple[int, int, int]], *, count: int | None = None,
+        ticks: int = 160, search_radius: int = 8, timeout: float = 15, tool_chest: HarvestToolChest | None = None,
     ) -> BlockCollectionBatch:
         if count is not None and (not isinstance(count, int) or count < 0):
             raise ValueError("collection count must be a nonnegative integer")
+        if tool_chest is not None and not isinstance(tool_chest, HarvestToolChest):
+            raise TypeError("tool_chest must be a HarvestToolChest")
         positions = tuple(dict.fromkeys(map(_position, positions)))[:count]
         progress = _BatchProgress(self.blocks.dimension_id, positions)
         try:
@@ -178,8 +189,12 @@ class _BlockCollector:
                 return progress.snapshot()
             epoch = self.blocks._mining_epoch
             before = tuple(self.blocks.observed_block(position) for position in positions)
+            refill = None if tool_chest is None else partial(
+                self._refill_tool, bot, tool_chest, dimension=progress.dimension_id, epoch=epoch,
+                ticks=ticks, search_radius=search_radius, timeout=timeout,
+            )
             await self._run(self._collect_batch(
-                progress, before, epoch, ticks=ticks, search_radius=search_radius, timeout=timeout,
+                progress, before, epoch, ticks=ticks, search_radius=search_radius, timeout=timeout, refill=refill,
             ))
         except (Exception, asyncio.CancelledError) as error:
             error.collection_progress = progress.snapshot()
@@ -285,7 +300,7 @@ class _BlockCollector:
 
     async def _collect_batch(
         self, progress: _BatchProgress, observations: tuple[BlockObservation | None, ...], epoch: int, *,
-        ticks: int, search_radius: int, timeout: float,
+        ticks: int, search_radius: int, timeout: float, refill: _ToolRefill | None = None,
     ) -> None:
         counted = progress if isinstance(progress, _CountedProgress) else None
         async with self._lock:
@@ -294,7 +309,7 @@ class _BlockCollector:
                 self.blocks._check_mining_epoch(epoch)
                 result = await self._collect_one(
                     position, before, progress.dimension_id, ticks=ticks, search_radius=search_radius,
-                    timeout=timeout, epoch=epoch, progress=progress,
+                    timeout=timeout, epoch=epoch, progress=progress, refill=refill,
                 )
                 progress.results.append(result)
                 progress.active = None
@@ -396,10 +411,42 @@ class _BlockCollector:
         match = next((face for face in route.matches if isinstance(face, BlockInteractionMatch)), None)
         return BlockApproach(status, route.frames, route.stand_position, match.face if match else None), match
 
+    async def _refill_tool(
+        self, bot: "Bot", chest: HarvestToolChest, target: BlockObservation, *, dimension: int, epoch: int,
+        ticks: int, search_radius: int, timeout: float,
+    ) -> HarvestToolAcquisition | None:
+        chest_block = self.harvest._refill_chest(target, chest.position)
+        if chest_block is None:
+            return None
+        if (busy := self.harvest._window_busy()) is not None:
+            return HarvestToolAcquisition(busy)
+        goal = BlockInteractionGoal(chest.position, max_distance=_ORDINARY_MINING_REACH)
+        rules = NavigationRules(search_radius=int(search_radius))
+        async with asyncio.timeout(timeout):
+            route = await self.movement._navigate_goal(self.blocks, goal, rules, ticks)
+        self._check_connection()
+        if self.blocks.dimension_id != dimension:
+            return None
+        self.blocks._check_mining_epoch(epoch)
+        if self.blocks.observed_block(target.position) != target:
+            return None
+        if (busy := self.harvest._window_busy()) is not None:
+            return HarvestToolAcquisition(busy)
+        if route.status != "reached":
+            status = {"unknown": "unobserved", "budget": "budget_exhausted"}.get(route.status, route.status)
+            return HarvestToolAcquisition(f"chest_approach_{status}")
+        match, = route.matches
+        assert isinstance(match, BlockInteractionMatch) and match.position == chest.position
+        return await self.harvest._equip_from_chest(
+            bot, target.position, chest=chest.position, chest_slots=chest.chest_slots,
+            inventory_slots=chest.inventory_slots, face=match.face, click_pos=match.click_pos, timeout=timeout,
+            expected_target=target, expected_chest=chest_block, expected_epoch=epoch,
+        )
+
     async def _collect_one(
         self, position: tuple[int, int, int], before: BlockObservation | None, dimension: int, *,
         ticks: int, search_radius: int, timeout: float, epoch: int | None = None,
-        progress: _BatchProgress | _MixedProgress | None = None,
+        progress: _BatchProgress | _MixedProgress | None = None, refill: _ToolRefill | None = None,
     ) -> BlockCollection:
         if before is None or before.is_air is None:
             return BlockCollection(position, "target_unobserved", before)
@@ -410,40 +457,62 @@ class _BlockCollector:
         counted = progress if isinstance(progress, _CountedProgress) else None
         epoch = self.blocks._mining_epoch if epoch is None else epoch
         evidence = BlockCollection(position, "interrupted", before)
-        if progress is not None:
-            progress.active = evidence
-        approach, match = await self._approach(
-            position, ticks=ticks, search_radius=search_radius, timeout=timeout,
-        )
-        evidence = replace(evidence, approach=approach)
-        if progress is not None:
-            progress.active = evidence
-        self._check_connection()
-        if self.blocks.dimension_id != dimension:
-            return replace(evidence, status="dimension_changed")
-        self.blocks._check_mining_epoch(epoch)
-        # Losing the target can itself make the approach unreachable or unobserved.
-        if approach.status == "reached" or (counted is not None and approach.status in ("unreachable", "unobserved")):
-            if self.blocks.observed_block(position) != before:
-                return replace(evidence, status="target_changed")
-        if approach.status != "reached":
-            return replace(evidence, status=approach.status)
-        try:
-            tool = await self.harvest.equip(position, timeout=timeout)
-        except TimeoutError:
+
+        def remember(result: BlockCollection) -> None:
+            nonlocal evidence
+            evidence = result
+            if progress is not None:
+                progress.active = result
+
+        def check_target(*, check_observation: bool = True) -> str | None:
             self._check_connection()
-            return replace(evidence, status="tool_timeout", timed_out=True)
-        evidence = replace(evidence, tool=tool)
-        if progress is not None:
-            progress.active = evidence
-        self._check_connection()
-        if self.blocks.dimension_id != dimension:
-            return replace(evidence, status="dimension_changed")
-        self.blocks._check_mining_epoch(epoch)
-        if self.blocks.observed_block(position) != before:
-            return replace(evidence, status="target_changed")
-        if tool is None:
-            return replace(evidence, status="tool_unavailable")
+            if self.blocks.dimension_id != dimension:
+                return "dimension_changed"
+            self.blocks._check_mining_epoch(epoch)
+            if check_observation and self.blocks.observed_block(position) != before:
+                return "target_changed"
+            return None
+
+        remember(evidence)
+        while True:
+            approach, match = await self._approach(position, ticks=ticks, search_radius=search_radius, timeout=timeout)
+            remember(replace(evidence, approach=approach))
+            # A changed target can itself make a route unreachable or unobserved.
+            status = check_target(check_observation=(
+                approach.status == "reached" or evidence.tool_acquisition is not None
+                or (counted is not None and approach.status in ("unreachable", "unobserved"))
+            ))
+            if status is not None or approach.status != "reached":
+                return replace(evidence, status=status or approach.status)
+            try:
+                tool = await self.harvest.equip(position, timeout=timeout)
+            except TimeoutError:
+                self._check_connection()
+                return replace(evidence, status="tool_timeout", timed_out=True)
+            remember(replace(evidence, tool=tool))
+            if (status := check_target()) is not None:
+                return replace(evidence, status=status)
+            if tool is not None:
+                break
+            if refill is None:
+                return replace(evidence, status="tool_unavailable")
+            try:
+                acquisition = await refill(before)
+            except (Exception, asyncio.CancelledError) as error:
+                remember(replace(evidence, tool_acquisition=getattr(error, "harvest_progress", None)))
+                if not isinstance(error, TimeoutError):
+                    raise
+                self._check_connection()
+                return replace(evidence, status="tool_timeout", timed_out=True)
+            remember(replace(evidence, tool_acquisition=acquisition))
+            if (status := check_target()) is not None:
+                return replace(evidence, status=status)
+            if acquisition is None or acquisition.status == "tool_unavailable":
+                return replace(evidence, status="tool_unavailable")
+            if acquisition.status != "equipped":
+                return replace(evidence, status="tool_refill_failed")
+            refill = None
+
         assert match is not None and match.position == position
 
         def prepare_start() -> None:
@@ -455,16 +524,18 @@ class _BlockCollector:
             except MiningFaceUnavailable as error:
                 raise _BeforeStartRejected("unobserved" if error.status == "unknown" else "unreachable") from None
 
+        def with_equipment(result: BlockCollection) -> BlockCollection:
+            return replace(result, approach=approach, tool=tool, tool_acquisition=evidence.tool_acquisition)
+
         def record(result: BlockCollection) -> None:
-            progress.active = replace(result, approach=approach, tool=tool)
+            remember(with_equipment(result))
 
         result = await _observe_mined_block(
             self.blocks, self.entities, position, face=match.face, timeout=timeout, follow_ticks=120,
             epoch=epoch, prepare_start=prepare_start, record=record if progress is not None else None,
         )
-        result = replace(result, approach=approach, tool=tool)
-        if progress is not None:
-            progress.active = result
+        result = with_equipment(result)
+        remember(result)
         self._check_connection()
         return result
 
