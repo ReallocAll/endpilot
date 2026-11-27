@@ -535,6 +535,23 @@ class Inventory:
                                   after_send=None, _endpoints=None, _range_step=False,
                                   _wait_for=(), _on_unconfirmed=None, _on_slot_observed=None,
                                   _at_write=None, _automatic_unequip=False, _exact_offhand_take=False):
+        """Own pending replies for inventory, containers, trading, recipes, enchanting and creative actions.
+
+        The operation owns its slot/window checks and supplies synchronous hooks.
+        `before_send` may prepare or reject the request before encoding; `_at_write`
+        may reject it after encoding, before transport. `after_send` reports a local
+        send, not a verdict. `_on_slot_observed` runs for each matching endpoint
+        when a slot is observed while its submitted request is pending.
+        `_on_unconfirmed` runs for other pending requests with definite endpoint
+        overlap on submission or before applying a reply reporting overlapping
+        player inventory slots. These three hooks must return without raising.
+        `apply` runs inline on the reader before resolving the matching reply.
+        An ordinary exception fails the reply without rolling back applied changes.
+
+        Caller timeout or cancellation withdraws only an unsubmitted deferred or
+        write-checked request. Other requests may still send or apply a late
+        verdict. Disconnect or reader end fails pending replies and cancels sends.
+        """
         if self._request_stream_ended:
             raise ConnectionError("item-stack request stream is closed")
         request_id = int(request.client_request_id.raw_id)
