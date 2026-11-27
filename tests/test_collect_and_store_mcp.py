@@ -198,6 +198,9 @@ class CollectAndStoreStdioTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual({name: tools[name] for name in baseline}, baseline)
                 self.assertEqual(set(tools["start_collect_and_store"].input_schema["required"]),
                                  {"positions", "item", "chest"})
+                search = tools["find_observed_blocks"].input_schema
+                self.assertEqual(search["required"], ["name"])
+                self.assertIs(search["properties"]["load_nearby"]["default"], False)
                 self.assertTrue(all(tools[name].output_schema for name in names))
                 error = await session.call_tool("observe_collect_and_store", arguments={})
                 self.assertTrue(error.is_error)

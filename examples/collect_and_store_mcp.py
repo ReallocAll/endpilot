@@ -91,10 +91,60 @@ class _CollectAndStoreTools:
         except RuntimeError as error:
             raise ToolError(str(error)) from error
 
-    async def find_observed_blocks(self, name: str) -> _ObservedBlocks:
-        """Find up to 16 cached blocks by name within a 16-block radius without loading terrain."""
-        result = self._connected_bot().find_blocks(name, limit=16)
+    async def find_observed_blocks(self, name: str, *, load_nearby: bool = False) -> _ObservedBlocks:
+        """Find up to 16 blocks by name in a 16-block radius.
+
+        By default search only the cache. With load_nearby, request up to three
+        nearby announced sections at the current height and wait up to six
+        seconds. A partial search still reports complete=false.
+        """
+        bot = self._connected_bot()
+        result = bot.find_blocks(name, limit=16)
+        if load_nearby and not result.complete:
+            with self._player._connection_action():
+                if await self._read_nearby_sections(bot, result.center, result.dimension_id):
+                    result = bot.find_blocks(name, limit=16)
         return {"positions": [match.position for match in result.matches], "complete": result.complete}
+
+    @staticmethod
+    async def _read_nearby_sections(
+        bot: Bot, center: tuple[int, int, int], dimension_id: int,
+    ) -> bool:
+        x, y, z = center
+        section = y // 16
+        nearest = []
+        for cx in range((x - 16) // 16, (x + 16) // 16 + 1):
+            for cz in range((z - 16) // 16, (z + 16) // 16 + 1):
+                dx = max(cx * 16 - x, x - (cx * 16 + 15), 0)
+                dz = max(cz * 16 - z, z - (cz * 16 + 15), 0)
+                distance = dx * dx + dz * dz
+                if distance > 16 * 16:
+                    continue
+                coverage = bot.column_coverage((cx, cz))
+                if coverage.announced and section not in coverage.received_section_ys:
+                    nearest.append((distance, cx, cz))
+        selected = {(cx, cz): range(section, section + 1) for _, cx, cz in sorted(nearest)[:3]}
+        if not selected:
+            return False
+
+        deadline = asyncio.timeout(6)
+        try:
+            async with deadline:
+                for cx, cz in selected:
+                    coverage = bot.column_coverage((cx, cz))
+                    if coverage.dimension_id != dimension_id or not coverage.announced:
+                        raise ToolError("terrain changed during search; try again")
+                    if section not in coverage.received_section_ys:
+                        await bot.request_sub_chunk((cx * 16, y, cz * 16))
+                await bot.wait_for_terrain_coverage(selected)
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+        if bot.session_end is not None:
+            raise ConnectionError("player disconnected during terrain search")
+        if any(bot.column_coverage(column).dimension_id != dimension_id for column in selected):
+            raise ToolError("dimension changed during terrain search; try again")
+        return True
 
     async def start_collect_and_store(
         self, positions: list[tuple[int, int, int]], item: str | int, chest: tuple[int, int, int],
