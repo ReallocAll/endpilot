@@ -56,7 +56,7 @@ from .skin import PlayerCapeSnapshot, PlayerSkinSnapshot, Skin
 from .titles import TitleEvent, TitleKind
 from .trading import TradeManyRequest, TradeManyResult
 from .world_environment import Weather, WorldClock, WorldRule, WorldSpawn, WorldTime
-from .world_feedback import BlockEvent, ParticleEvent, SoundEvent, SoundKind
+from .world_feedback import BlockEvent, ParticleEvent, SoundEvent, SoundKind, vanilla_note_instruments
 
 __all__ = [
     "AllGoal",
@@ -218,4 +218,5 @@ __all__ = [
     "transfer_range",
     "vanilla_biomes",
     "vanilla_blocks",
+    "vanilla_note_instruments",
 ]

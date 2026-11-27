@@ -194,7 +194,8 @@ def _feedback_fields(event):
         values = {}
         names = ("vanilla_dimension_id", "actor_id", "molang_variables")
     else:
-        values = {"note_pitch": event.note_pitch, "instrument_id": event.instrument_id}
+        values = {"note_pitch": event.note_pitch, "instrument_id": event.instrument_id,
+                  "instrument_sound": event.instrument_sound}
         names = ("event_id", "b0", "b1")
         data = getattr(packet, "data", None)
         values["data"] = data if type(data) is int else None

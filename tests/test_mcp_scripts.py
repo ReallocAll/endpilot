@@ -14,6 +14,7 @@ from endpilot.blocks import MiningFaceUnavailable
 from endpilot.chat import ChatMessage
 from endpilot.collection import BlockCollection, BlockCollectionBatch
 from endpilot.entities import EntityState
+from endpilot.protocol import RawPacket, write_batch
 from endpilot.world_environment import WorldClock, WorldTime
 import test_placement
 import test_scheduled_input
@@ -444,7 +445,7 @@ def particle(event):
 
 def block(event):
     assert not hasattr(event, 'packet')
-    return [event.kind, event.position, event.note_pitch, event.instrument_id, event.data]
+    return [event.kind, event.position, event.note_pitch, event.instrument_id, event.data, event.instrument_sound]
 
 async def main(bot):
     delivered = asyncio.Event()
@@ -476,12 +477,14 @@ async def main(bot):
         spot = b.Vec3(x=1, y=100, z=2)
         self.wire.push(b.SpawnParticleEffectPacket(vanilla_dimension_id=2, actor_id=91, pos=spot,
                                                     effect_name="fixture.flame", molang_variables='{"a":1}'))
-        self.wire.push(b.LevelSoundEventPacket(pos=spot, sound_event="note", data=257))
+        # Vanilla 2225 skeleton head above a note block after its second click.
+        note = RawPacket(123, bytes.fromhex("046e6f7465000040c000005c43000088419254000000ffffffffffffffff00"))
+        self.wire.incoming.put_nowait(write_batch((note,)))
         status = await self.completed(run)
         self.assertEqual(status["state"], "succeeded", status)
         expected = [["fixture.pop", [1, 100, 2], 0.75, 1.25, 3],
                     ["fixture.flame", [1, 100, 2], 2, 91, '{"a":1}'],
-                    ["note", [1, 100, 2], 1, 1, 257]]
+                    ["note", [-3, 220, 17], 9, 21, 5385, "note.skeleton"]]
         self.assertEqual(status["result"], {"waits": expected, "notifications": expected})
 
     async def test_stop_drains_host_action_before_original_bot_is_released(self):

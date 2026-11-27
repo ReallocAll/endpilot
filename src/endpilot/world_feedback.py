@@ -1,8 +1,9 @@
 """Passive observations of sound, particles and block feedback."""
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal
 
 from bedrock_protocol import nbt
@@ -21,6 +22,41 @@ _CRACK_EVENTS = {3600: "crack_start", 3601: "crack_end", 3602: "crack_progress"}
 _PISTON_STATES = {0: "piston_retracted", 1: "piston_extending", 2: "piston_extended", 3: "piston_retracting"}
 _CHEST_ROOT_TAGS = {"id": nbt.StringTag, "x": nbt.IntTag, "y": nbt.IntTag, "z": nbt.IntTag,
                     "pairx": nbt.IntTag, "pairz": nbt.IntTag, "pairlead": nbt.ByteTag}
+_NOTE_INSTRUMENTS_2225 = MappingProxyType({
+    0: "note.harp",
+    1: "note.bd",
+    2: "note.snare",
+    3: "note.hat",
+    4: "note.bassattack",
+    5: "note.flute",
+    6: "note.bell",
+    7: "note.guitar",
+    8: "note.chime",
+    9: "note.xylophone",
+    10: "note.iron_xylophone",
+    11: "note.cow_bell",
+    12: "note.didgeridoo",
+    13: "note.bit",
+    14: "note.banjo",
+    15: "note.pling",
+    16: "note.trumpet",
+    17: "note.trumpet_exposed",
+    18: "note.trumpet_weathered",
+    19: "note.trumpet_oxidized",
+    20: "note.zombie",
+    21: "note.skeleton",
+    22: "note.creeper",
+    23: "note.enderdragon",
+    24: "note.witherskeleton",
+    25: "note.piglin",
+})
+
+
+def vanilla_note_instruments(protocol: int = 2225) -> Mapping[int, str]:
+    """Return the read-only vanilla catalog of Bedrock sound identifiers by instrument ID."""
+    if type(protocol) is not int or protocol != 2225:
+        raise ValueError(f"unsupported vanilla note instrument protocol {protocol!r}")
+    return _NOTE_INSTRUMENTS_2225
 
 
 def _xyz(pos):
@@ -90,15 +126,32 @@ class BlockEvent:
     piston_face: int | None = None
     piston_attached_blocks: tuple[_Cell, ...] | None = None
 
+    def _note_data(self) -> int | None:
+        if self.kind != "note":
+            return None
+        data = getattr(self.packet, "data", None)
+        return data if type(data) is int and data >= 0 else None
+
     @property
     def note_pitch(self) -> int | None:
-        """Return the semitone index from a note event's packed integer."""
-        return self.packet.data & 0xFF if self.kind == "note" and self.packet.data >= 0 else None
+        """Return the note sound's low-byte pitch parameter.
+
+        For mob heads, the sound pitch can differ from the block's tuning.
+        """
+        data = self._note_data()
+        return None if data is None else data & 0xFF
 
     @property
     def instrument_id(self) -> int | None:
         """Return the numeric Bedrock instrument from a note event."""
-        return self.packet.data >> 8 if self.kind == "note" and self.packet.data >= 0 else None
+        data = self._note_data()
+        return None if data is None else data >> 8
+
+    @property
+    def instrument_sound(self) -> str | None:
+        """Return the vanilla Bedrock sound identifier for a known note instrument."""
+        instrument_id = self.instrument_id
+        return None if instrument_id is None else _NOTE_INSTRUMENTS_2225.get(instrument_id)
 
 
 class WorldFeedback:
@@ -265,10 +318,10 @@ class WorldFeedback:
             if kind == "crack_end" and position == (0, 0, 0):
                 # Vanilla sent an all-zero stop position after breaking a non-origin block.
                 position = None
-        else:
-            if packet.sound_event != "note":
-                return None
+        elif self._is_2225 and packet.ID == b.LevelSoundEventPacket.ID and packet.sound_event == "note":
             kind = "note"
+        else:
+            return None
         return BlockEvent(kind, dimension, position, packet, chest_partner, piston_face, piston_attached_blocks)
 
     async def wait_for_block_event(self, position: _Position | None, kind: str | None, timeout: float) -> BlockEvent:

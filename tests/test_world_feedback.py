@@ -6,9 +6,32 @@ from unittest.mock import AsyncMock, patch
 
 from bedrock_protocol import nbt
 
-from endpilot import Bot
+from endpilot import BlockEvent, Bot, vanilla_note_instruments
 from endpilot.block_data import vanilla_block_state
 from endpilot.protocol import RawPacket, write_batch
+
+
+class NoteInstrumentCatalogTests(unittest.TestCase):
+    def test_catalog_is_read_only_and_requires_a_supported_protocol(self):
+        catalog = vanilla_note_instruments(protocol=2225)
+        self.assertIs(catalog, vanilla_note_instruments())
+        self.assertEqual(set(catalog), set(range(26)))
+        self.assertEqual((catalog[0], catalog[4], catalog[19], catalog[24]),
+                         ("note.harp", "note.bassattack", "note.trumpet_oxidized", "note.witherskeleton"))
+        self.assertIsNone(catalog.get(26))
+        with self.assertRaises(TypeError):
+            catalog[4] = "note.bass"
+        for protocol in (2193, 2226, 2225.0, "2225", True):
+            with (self.subTest(protocol=protocol),
+                  self.assertRaisesRegex(ValueError, "unsupported vanilla note instrument protocol")):
+                vanilla_note_instruments(protocol)
+
+    def test_note_without_packed_data_has_no_sound_identifier(self):
+        for packet in (object(), SimpleNamespace(data=None)):
+            event = BlockEvent("note", 0, (1, 2, 3), packet)
+            self.assertIsNone(event.instrument_sound)
+            self.assertIsNone(event.instrument_id)
+            self.assertIsNone(event.note_pitch)
 
 
 class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
@@ -269,10 +292,22 @@ class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(piston.result().instrument_id)
         self.assertEqual(played_note.result().packet.data, 257)
         self.assertEqual((played_note.result().note_pitch, played_note.result().instrument_id), (1, 1))
+        self.assertEqual(played_note.result().instrument_sound, "note.bd")
+        for event in (ambiguous, opened, piston, crack):
+            self.assertIsNone(event.result().instrument_sound)
         self.assertIsNone(crack.result().position)
         self.assertEqual(crack.result().packet, ended)
         for event in (ambiguous, opened, piston, played_note, crack):
             self.assertIsNone(event.result().piston_attached_blocks)
+
+    async def test_negative_and_unknown_note_data_keep_the_native_packet(self):
+        for data, instrument_id, pitch in ((-1, None, None), (6665, 26, 9)):
+            with self.subTest(data=data):
+                packet = self.b.LevelSoundEventPacket(sound_event="note", data=data)
+                event = await self.block_event(packet, kind="note")
+                self.assertEqual(event.packet, packet)
+                self.assertEqual((event.instrument_id, event.note_pitch), (instrument_id, pitch))
+                self.assertIsNone(event.instrument_sound)
 
     async def test_pending_observation_ends_on_close(self):
         feedback = self.bot._feedback

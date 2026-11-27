@@ -292,9 +292,19 @@ and `molang_variables`. All observations carry the bot's dimension at receipt.
 `await bot.wait_for_block_event(position, kind="chest_open")` can filter by
 position and kind. Supported feedback includes raw block events, note sounds,
 chest lid changes, piston arm states and start, progress and end of cracking.
-Note events expose `note_pitch` and `instrument_id`. A crack-end packet with
-an all-zero position has `event.position` set to `None`. Its native
-`packet.pos` remains available.
+In protocol 2225, note events expose the numeric `instrument_id` and packed
+sound `note_pitch`. The sound pitch of a mob-head note can differ from the
+block's tuning. `instrument_sound` resolves a known ID to a vanilla Bedrock
+sound identifier such as `note.bd`. It is `None` for unknown IDs, missing or
+negative note data, and other block events. The level sound packet carries
+the generic sound event `note`.
+
+Use `vanilla_note_instruments(protocol=2225)` from `endpilot` to look up these
+identifiers without a connection. The mapping is read-only and unsupported
+protocol numbers raise `ValueError`.
+
+A crack-end packet with an all-zero position has `event.position` set to
+`None`. Its native `packet.pos` remains available.
 
 Use `bot.subscribe_sound(callback, name=..., kind=...)`,
 `bot.subscribe_particle(callback, name=...)`, or
