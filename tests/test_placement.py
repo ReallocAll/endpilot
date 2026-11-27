@@ -786,7 +786,7 @@ class EntityPlacementTests(_EntityPlacementHarness):
         x, y, z = SUPPORT
         upper = (x, y + 2, z)
         await self.deliver(
-            self.registry_packet("minecraft:pig_spawn_egg"), self.boat_slot(1),
+            self.registry_packet("minecraft:sheep_spawn_egg"), self.boat_slot(1),
             self.block(SUPPORT, STONE), self.block(upper),
             *(self.block(cell, layer=1) for cell in (SUPPORT, TARGET, upper)),
         )
@@ -800,6 +800,22 @@ class EntityPlacementTests(_EntityPlacementHarness):
         actor_type = "minecraft:villager_v2"
         await self.deliver(self.spawn(-91, position=position, actor_type=actor_type))
         self.assert_entity_placement_completed(await pending, EntitySpawn(-91, 91, actor_type, position))
+
+    async def test_pig_spawn_egg_requires_a_pig_spawn_and_the_slot_debit(self):
+        x, y, z = SUPPORT
+        upper = (x, y + 2, z)
+        await self.deliver(
+            self.registry_packet("minecraft:pig_spawn_egg"), self.boat_slot(1),
+            self.block(SUPPORT, STONE), self.block(upper),
+            *(self.block(cell, layer=1) for cell in (SUPPORT, TARGET, upper)),
+        )
+        pending = await self.arm_entity(surface=STONE, click_height=1.0)
+        position = (x + 0.5, y + 1.0, z + 0.5)
+        await self.deliver(self.spawn(-92, position=position, actor_type="minecraft:cow"),
+                           self.spawn(-93, position=position, actor_type="minecraft:pig"))
+        self.assertFalse(pending.done())
+        await self.deliver(self.boat_slot(0))
+        self.assert_entity_placement_completed(await pending, EntitySpawn(-93, 93, "minecraft:pig", position))
 
     async def test_bamboo_chest_raft_matches_the_chest_boat_family_and_bamboo_variant(self):
         b = self.b

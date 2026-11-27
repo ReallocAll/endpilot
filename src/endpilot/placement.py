@@ -357,6 +357,7 @@ async def observe_entity_placement[Result: EntityPlacementResult](
                 "minecraft:armor_stand": "minecraft:armor_stand",
                 "minecraft:end_crystal": "minecraft:ender_crystal",
                 "minecraft:cow_spawn_egg": "minecraft:cow",
+                "minecraft:pig_spawn_egg": "minecraft:pig",
                 "minecraft:zombie_spawn_egg": "minecraft:zombie",
                 "minecraft:villager_spawn_egg": "minecraft:villager_v2",
             }.get(item_name)
