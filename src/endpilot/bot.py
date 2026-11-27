@@ -9,7 +9,7 @@ from typing import Any, Literal
 from uuid import UUID
 from weakref import ref
 
-from bedrock_protocol import GeneratorType, nbt
+from bedrock_protocol import GameType, GeneratorType, nbt
 from bedrock_protocol.v712 import CommandOutputPacket
 
 from ._join_address import _parse_join_address
@@ -1626,9 +1626,24 @@ class Bot:
         return self._inventory.subscribe_inventory_changes(callback, slot=slot)
 
     @property
-    def game_mode(self):
+    def game_mode(self) -> GameType | None:
         """Server-reported game mode for this player, or None before it is known."""
         return None if self._creative is None else self._creative.game_mode
+
+    def subscribe_game_mode(self, callback: Callable[[GameType | None], None]) -> Callable[[], None]:
+        """Observe future changes in this player's effective game mode in the joined session.
+
+        The synchronous callback receives the updated game_mode, including None
+        when the server reports an unresolved mode. The returned function
+        removes this registration and can be called repeatedly.
+        """
+        creative = self._require_creative_inventory()
+        state = self._get_session_end_state()
+        if state is None:
+            raise RuntimeError("player has not joined")
+        if state.result is not None:
+            raise ConnectionError("game mode subscription stream is closed")
+        return creative.subscribe_game_mode(callback)
 
     @property
     def creative_catalog(self) -> CreativeCatalog | None:

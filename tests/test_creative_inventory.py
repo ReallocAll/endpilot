@@ -152,6 +152,95 @@ class CreativeInventoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.creative_catalog.entries[0].item.name, "minecraft:replacement")
         self.assertTrue(self.transport.sent.empty())
 
+    async def test_game_mode_subscription_reports_only_effective_local_changes(self):
+        b, mode = self.b, self.mode
+        await self.join(mode.CREATIVE, b.SetPlayerGameTypePacket(player_game_type=mode.SURVIVAL))
+        self.assertEqual(self.bot.game_mode, mode.SURVIVAL)
+        modes = []
+        sent = []
+        self.addCleanup(self.bot.packets.subscribe_sent(sent.append))
+        self.bot.subscribe_game_mode(lambda value: modes.append((value, self.bot.game_mode)))
+        self.assertEqual(modes, [])
+
+        await self.deliver(
+            b.UpdatePlayerGameTypePacket(target_player=42, player_game_type=mode.CREATIVE),
+            b.SetDefaultGameTypePacket(default_game_type=mode.CREATIVE),
+            b.SetPlayerGameTypePacket(player_game_type=mode.SURVIVAL),
+            b.SetPlayerGameTypePacket(player_game_type=mode.DEFAULT),
+            b.UpdatePlayerGameTypePacket(target_player=7, player_game_type=mode.CREATIVE),
+            b.SetPlayerGameTypePacket(player_game_type=mode.DEFAULT),
+            b.SetDefaultGameTypePacket(default_game_type=mode.UNDEFINED),
+            b.SetDefaultGameTypePacket(default_game_type=mode.DEFAULT),
+            b.SetDefaultGameTypePacket(default_game_type=mode.ADVENTURE),
+            b.UpdatePlayerGameTypePacket(target_player=7, player_game_type=mode.SURVIVAL),
+        )
+        expected = [mode.CREATIVE, None, mode.ADVENTURE, mode.SURVIVAL]
+        self.assertEqual(modes, [(value, value) for value in expected])
+        self.assertEqual(sent, [])
+
+        await self.deliver(b.ChangeDimensionPacket(dimension_id=1),
+                           b.SetPlayerGameTypePacket(player_game_type=mode.SURVIVAL))
+        self.assertEqual(self.bot.game_mode, mode.SURVIVAL)
+        self.assertEqual(modes, [(value, value) for value in expected])
+
+        await self.deliver(b.SetPlayerGameTypePacket(player_game_type=mode.UNDEFINED))
+        self.assertIsNone(self.bot.game_mode)
+        self.assertEqual(modes[-1], (None, None))
+        self.assertEqual(len(modes), len(expected) + 1)
+
+    async def test_game_mode_subscriptions_are_independent_and_isolate_callback_errors(self):
+        b, mode = self.b, self.mode
+        await self.join(mode.SURVIVAL)
+        loop = asyncio.get_running_loop()
+        errors = []
+        self.addCleanup(loop.set_exception_handler, loop.get_exception_handler())
+        loop.set_exception_handler(lambda _, context: errors.append(context["exception"]))
+        failure = RuntimeError("listener failed")
+
+        def fail(_):
+            raise failure
+
+        remove_failure = self.bot.subscribe_game_mode(fail)
+        modes = []
+        callback = modes.append
+        remove_first = self.bot.subscribe_game_mode(callback)
+        remove_second = self.bot.subscribe_game_mode(callback)
+        remove_first()
+        remove_first()
+        await self.deliver(b.SetPlayerGameTypePacket(player_game_type=mode.CREATIVE))
+        self.assertEqual(errors, [failure])
+        self.assertEqual(modes, [mode.CREATIVE])
+        remove_failure()
+        remove_second()
+        await self.deliver(b.SetPlayerGameTypePacket(player_game_type=mode.SURVIVAL))
+        self.assertEqual(errors, [failure])
+        self.assertEqual(modes, [mode.CREATIVE])
+
+    async def test_game_mode_subscription_ends_with_its_session(self):
+        b, mode = self.b, self.mode
+        old_modes = []
+        with self.assertRaises(RuntimeError):
+            self.bot.subscribe_game_mode(old_modes.append)
+        await self.join(mode.SURVIVAL)
+        remove_old = self.bot.subscribe_game_mode(old_modes.append)
+        await self.deliver(b.SetPlayerGameTypePacket(player_game_type=mode.CREATIVE), b.DisconnectPacket())
+        self.assertEqual((await self.bot.wait_for_session_end()).kind, "server_disconnect")
+        self.assertEqual(old_modes, [mode.CREATIVE])
+        self.assertIsNone(self.bot.game_mode)
+        with self.assertRaises(ConnectionError):
+            self.bot.subscribe_game_mode(old_modes.append)
+        await self.bot.close()
+
+        await self.join(mode.ADVENTURE)
+        new_modes = []
+        self.bot.subscribe_game_mode(new_modes.append)
+        remove_old()
+        remove_old()
+        await self.deliver(b.SetPlayerGameTypePacket(player_game_type=mode.SURVIVAL))
+        await self.bot.close()
+        self.assertEqual(new_modes, [mode.SURVIVAL])
+        self.assertEqual(old_modes, [mode.CREATIVE])
+
     async def test_take_and_partial_destroy_apply_only_native_responses(self):
         await self.join(self.mode.CREATIVE, self.catalog(), self.registry(7, "minecraft:fixture"))
         await self.deliver(self.open(), self.observed_slot(3))

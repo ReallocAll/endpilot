@@ -1,9 +1,13 @@
 """Server-issued creative catalog and the local player's creative transactions."""
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Literal
 
+from bedrock_protocol import GameType
+
+from .compression import PacketConnection
 from .inventory import _correct_observed_item, _response_item
 from .item_user_data import read_item_user_data
 
@@ -111,6 +115,7 @@ class CreativeInventory:
         self._default_mode = None
         self._own_mode = None
         self._on_game_mode = on_game_mode
+        self._game_mode_observers: dict[object, Callable[[GameType | None], None]] = {}
         self._content = None
         self.catalog: CreativeCatalog | None = None
         self._entries: dict[int, CreativeEntry] = {}
@@ -125,13 +130,23 @@ class CreativeInventory:
         )
 
     @property
-    def game_mode(self):
+    def game_mode(self) -> GameType | None:
         mode = self._own_mode
         if mode == self._binding.GameType.DEFAULT:
             mode = self._default_mode
         if mode in (self._binding.GameType.DEFAULT, self._binding.GameType.UNDEFINED):
             return None
         return mode
+
+    def subscribe_game_mode(self, callback: Callable[[GameType | None], None]) -> Callable[[], None]:
+        observers = self._game_mode_observers
+        token = object()
+        observers[token] = callback
+
+        def unsubscribe() -> None:
+            observers.pop(token, None)
+
+        return unsubscribe
 
     def _item(self, descriptor):
         item_id = int(descriptor.id)
@@ -181,12 +196,17 @@ class CreativeInventory:
         elif raw.packet_id == b.ItemRegistryPacket.ID and self._content is not None:
             self._load(self._content)
         elif raw.packet_id in self._packet_ids:
+            previous_mode = self.game_mode
             self._apply(self._packets.protocol.decode(raw))
+            mode = self.game_mode
+            if mode != previous_mode:
+                PacketConnection._notify(self._game_mode_observers.values(), mode)
 
     def _reset(self, _cause=None):
         self._own_mode = self._default_mode = None
         self._content = self.catalog = None
         self._entries.clear()
+        self._game_mode_observers.clear()
 
     def close(self):
         self._unsubscribe()
