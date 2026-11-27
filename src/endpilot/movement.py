@@ -2355,7 +2355,7 @@ class Movement:
                 if needs_release:
                     try:
                         await release(sneak_changed=sneak_changed)
-                    except Exception:
+                    except (Exception, asyncio.CancelledError):
                         if not unwinding_error:
                             raise
 

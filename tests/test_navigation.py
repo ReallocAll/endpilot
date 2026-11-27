@@ -4556,11 +4556,11 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         self.prepare_terrain()
         goal = FootGoal((3, 100, 0))
         send = self.stream.send
-        for cancel in (True, False):
-            with self.subTest(cancel=cancel):
+        for cancel, cancel_cleanup in ((True, False), (False, False), (True, True), (False, True)):
+            with self.subTest(cancel=cancel, cancel_cleanup=cancel_cleanup):
                 self.set_position(0.5, 0.5)
                 self.stream.sent.clear()
-                first_frame = asyncio.Event()
+                first_frame, releasing = asyncio.Event(), asyncio.Event()
                 events = []
                 attempts = []
                 moving_error = BrokenPipeError("moving send failed")
@@ -4570,6 +4570,9 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                     moving = self.up in packet.input_data
                     attempts.append(moving)
                     if not moving:
+                        if cancel_cleanup:
+                            releasing.set()
+                            await asyncio.Future()
                         raise release_error
                     if first_frame.is_set():
                         raise moving_error
@@ -4581,6 +4584,10 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                     if cancel:
                         await asyncio.wait_for(first_frame.wait(), 1)
                         task.cancel("navigation cancelled")
+                    if cancel_cleanup:
+                        await asyncio.wait_for(releasing.wait(), 1)
+                        task.cancel("cleanup cancelled")
+                    if cancel:
                         with self.assertRaises(asyncio.CancelledError) as caught:
                             await asyncio.wait_for(task, 1)
                         self.assertEqual(caught.exception.args, ("navigation cancelled",))
@@ -4594,7 +4601,12 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([event.kind for event in events], ["started", "plan", "finished"])
                 self.assertEqual(events[-1].reason, "cancelled" if cancel else "error")
                 self.assertIsNone(events[-1].result)
-                self.assertEqual(await asyncio.wait_for(self.bot.walk_forward(1), 1), 1)
+                next_events = []
+                next_result = await self.bot.navigate(FootGoal((1, 100, 0)), on_event=next_events.append)
+                self.assertEqual(next_result.status, "reached")
+                self.assertEqual([event.kind for event in next_events], ["started", "plan", "finished"])
+                self.assertIs(next_events[-1].result, next_result)
+                self.assertEqual([event.kind for event in events], ["started", "plan", "finished"])
 
     async def test_timed_out_ascent_preserves_stance_and_the_next_teleport_ack(self):
         target, jumps, landings = self.ascent_route(steps=1)
