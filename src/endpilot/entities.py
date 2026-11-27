@@ -86,6 +86,9 @@ class EntityState:
     reports for these flags on this visible remote player instance. ``None``
     means the flag is unknown or does not apply.
 
+    ``firework_attached_entity_id`` is the unique ID reported in the spawn
+    metadata of a firework rocket, when the packet identifies an attachment.
+
     ``attributes`` holds the latest server report for each observed attribute of
     this actor instance. An empty tuple means no attributes have been observed.
 
@@ -112,6 +115,7 @@ class EntityState:
     status_effects: tuple[PlayerEffect, ...] = ()
     sneaking: bool | None = None
     sleeping: bool | None = None
+    firework_attached_entity_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,6 +340,7 @@ _PLAYER = "minecraft:player"
 _COW = "minecraft:cow"
 _SHEEP = "minecraft:sheep"
 _VILLAGER = "minecraft:villager_v2"
+_FIREWORK = "minecraft:fireworks_rocket"
 _ACTOR_DELTA_FEET_TYPES = frozenset((_COW, _VILLAGER))
 _ACTOR_SPAWN_FEET_TYPES = _ACTOR_DELTA_FEET_TYPES | {_SHEEP}
 _CURSOR_BODY_TYPES = frozenset((_COW, _SHEEP))
@@ -510,6 +515,7 @@ class Entities:
         self._glide_observers: list[Callable[[EntityState], None]] = []
         self._crouch_observers: list[_EntityObserver[EntityState]] = []
         self._sleep_observers: list[_EntityObserver[EntityState]] = []
+        self._attached_firework_observers: list[_EntityObserver[EntityState]] = []
         self._unidentified_equipment_since: dict[int, int] = {}
         # AddPlayer can identify an instance before its unique ID appears in EntityState.
         self._unlisted_player_runtime_by_id: dict[int, int] = {}
@@ -553,7 +559,7 @@ class Entities:
         self._clear_player_equipment(ConnectionError, "entity session is closed", _cause)
         for observers in (self._swing_observers, self._critical_effect_observers, self._health_observers,
                           self._actor_event_observers, self._attribute_observers, self._effect_observers,
-                          self._crouch_observers, self._sleep_observers):
+                          self._crouch_observers, self._sleep_observers, self._attached_firework_observers):
             self._end_entity_observers(observers, lambda _: True, ConnectionError, "entity session is closed", _cause)
         self._glide_observers.clear()
         self._actor_instances.clear()
@@ -701,6 +707,14 @@ class Entities:
     ) -> EntityState:
         self._require_remote_player_target(runtime_id)
         return await self._wait_for_entity_event(self._sleep_observers, runtime_id, timeout)
+
+    def subscribe_attached_fireworks(self, callback: Callable[[EntityState], None]) -> Callable[[], None]:
+        self._require_live()
+        return self.packets._subscribe(self._attached_firework_observers, _EntityObserver(None, callback))
+
+    async def wait_for_attached_firework(self, *, timeout: float | None = 15) -> EntityState:
+        self._require_live()
+        return await self._wait_for_entity_event(self._attached_firework_observers, None, timeout)
 
     def _require_animation_target(self, runtime_id: int | None) -> None:
         self._require_live()
@@ -1522,13 +1536,15 @@ class Entities:
             is_from_fishing=bool(getattr(packet, "is_from_fishing", False)),
         )
 
-    def _on_packet(self, raw) -> None:
+    def _on_packet(self, raw, *, startup: bool = False) -> None:
         if self._closed:
             return
         packet_id = raw.packet_id
         b = self.packets.protocol.binding
         lifecycle_observers: tuple[Callable[[EntityLifecycleEvent], None], ...] = ()
         lifecycle_events: list[EntityLifecycleEvent] | None = None
+        attached_firework = None
+        firework_observers = ()
         if self._lifecycle_observers:
             match packet_id:
                 case (b.AddActorPacket.ID | b.AddPlayerPacket.ID | b.AddItemActorPacket.ID | b.AddPaintingPacket.ID
@@ -1745,6 +1761,12 @@ class Entities:
                 owner = next((int(entry.payload.value) for entry in actor.data.data
                               if int(entry.id) == int(b.ActorDataIDs.OWNER)
                               and isinstance(entry.payload, b.DataItemInt64Payload)), None)
+            attachment = None
+            if actor.actor_type == _FIREWORK:
+                # Fireworks use this metadata for the attached actor's unique ID.
+                attachment = next((int(entry.payload.value) for entry in actor.data.data
+                                   if int(entry.id) == int(b.ActorDataIDs.CUSTOM_DISPLAY)
+                                   and isinstance(entry.payload, b.DataItemInt64Payload)), None)
             is_boat = actor.actor_type == "minecraft:boat"
             spawn_attributes = getattr(actor, "attributes", ()) if runtime_id != self._own_runtime_id else ()
             attributes: dict[str, EntityAttribute] = {}
@@ -1753,7 +1775,7 @@ class Entities:
                 attributes[name] = EntityAttribute(
                     name, float(attribute.min_value), float(attribute.current_value), float(attribute.max_value),
                 )
-            self._record(EntityState(
+            state = EntityState(
                 int(actor.entity_id), runtime_id, actor.actor_type,
                 (float(actor.pos.x), float(actor.pos.y), float(actor.pos.z)),
                 owner_entity_id=None if owner == -1 else owner,
@@ -1761,7 +1783,16 @@ class Entities:
                 boat_velocity=(float(actor.velocity.x), float(actor.velocity.y), float(actor.velocity.z))
                 if is_boat else (0.0, 0.0, 0.0),
                 attributes=tuple(attributes.values()),
-            ), lifecycle_events=lifecycle_events)
+                firework_attached_entity_id=None if attachment == -1 else attachment,
+            )
+            if (not startup and self._attached_firework_observers and self._own_entity_id
+                    and runtime_id != self._own_runtime_id and state.firework_attached_entity_id == self._own_entity_id):
+                previous = self._by_runtime.get(runtime_id)
+                if (previous is None or previous.actor_type != _FIREWORK or previous.entity_id != state.entity_id
+                        or previous.firework_attached_entity_id != state.firework_attached_entity_id):
+                    attached_firework = state
+                    firework_observers = tuple(self._attached_firework_observers)
+            self._record(state, lifecycle_events=lifecycle_events)
             if (actor.actor_type in _ACTOR_SPAWN_FEET_TYPES
                     and getattr(actor, "passenger_of_block_data", None) is not None):
                 self._actor_instances[runtime_id].feet_known = False
@@ -1824,6 +1855,8 @@ class Entities:
                                        RuntimeError, "dimension changed while waiting for an entity crouch change")
             self._end_entity_observers(self._sleep_observers, dimension_bound,
                                        RuntimeError, "dimension changed while waiting for an entity sleep change")
+            self._end_entity_observers(self._attached_firework_observers, dimension_bound,
+                                       RuntimeError, "dimension changed while waiting for an attached firework")
             if lifecycle_events is not None:
                 lifecycle_events.extend(
                     EntityLifecycleEvent("left", state, "dimension_changed") for state in self._by_runtime.values()
@@ -1935,6 +1968,9 @@ class Entities:
                 # Roster updates can project the local unique ID onto a remote runtime.
                 if event.entity.runtime_id != self._own_runtime_id:
                     self.packets._notify(lifecycle_observers, event)
+        if attached_firework is not None and not self._closed:
+            self._notify_entity_observers(firework_observers, attached_firework, attached_firework.runtime_id,
+                                          "attached firework observer failed")
 
     async def attack(self, movement, inventory, runtime_id: int, *,
                      hit_height: float = 0.5) -> None:

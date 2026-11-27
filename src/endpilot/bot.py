@@ -420,7 +420,7 @@ class Bot:
         )
         self._entities.start()
         for raw in session.entity_packets:
-            self._entities._on_packet(raw)
+            self._entities._on_packet(raw, startup=True)
         session.entity_packets.clear()
         self._fishing = Fishing(self._entities, self._item_use, session.item_names, session.player_unique_id)
         self._blocks.start(
@@ -2549,6 +2549,18 @@ class Bot:
         if self._player_state is None:
             raise RuntimeError("player has not joined")
         return await self._player_state.wait_for_glide_boost(timeout)
+
+    def subscribe_attached_fireworks(self, callback: Callable[[EntityState], None]) -> Callable[[], None]:
+        """Observe future sightings of fireworks attached to this player."""
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return self._entities.subscribe_attached_fireworks(callback)
+
+    async def wait_for_attached_firework(self, *, timeout: float | None = 15) -> EntityState:
+        """Wait for the next visible firework sighting attached to this player."""
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return await self._entities.wait_for_attached_firework(timeout=timeout)
 
     @property
     def status_effects(self) -> tuple[PlayerEffect, ...]:

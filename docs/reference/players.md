@@ -283,6 +283,31 @@ unsubscribe function is idempotent. A deadline raises `TimeoutError`.
 Use `timeout=None` to wait without a deadline. When the connection ends,
 subscriptions close and pending waits raise `ConnectionError`.
 
+## Observe attached fireworks
+
+An observed firework rocket's `EntityState.firework_attached_entity_id`
+holds the attached actor's signed unique ID when the spawn packet supplies
+it. The value is `None` when the spawn reports no attachment or the field
+is unavailable. Snapshots can report attachments to the bot or to other
+observed actors.
+
+`bot.subscribe_attached_fireworks(callback)` calls a synchronous callback
+with the committed immutable snapshot of a newly sighted rocket attached to
+the bot. `await bot.wait_for_attached_firework(timeout=15)` returns the next
+such sighting. A sighting can occur when an existing rocket enters view.
+The subscription observes future sightings, including reentries after an
+actor leaves view. It returns an idempotent unsubscribe function. Both
+methods send zero packets.
+
+A dimension change ends pending waits with `RuntimeError`. Subscriptions
+continue across dimensions until the connection ends, when pending waits
+raise `ConnectionError`. The deadline raises `TimeoutError`. Pass
+`timeout=None` to wait without a deadline.
+
+Use `await bot.wait_for_glide_boost()` to observe the server's separate
+boost effect for this player. Rocket sightings and boost reports are
+independent observations.
+
 ## Find a nearby or targeted entity
 
 `EntityState.position` keeps the latest packet's coordinate reference.
