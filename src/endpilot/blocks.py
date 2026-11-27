@@ -1409,12 +1409,12 @@ class Blocks:
             return False
         return True if all(clearance) else None
 
-    def _ascent_leaf_ceiling(self, ceiling: tuple[int, int, int]) -> bool | None:
+    def _ascent_low_roof(self, ceiling: tuple[int, int, int]) -> bool | None:
         block = self.observed_block(ceiling)
         roof = None if block is None else self._vanilla_state(block.runtime_id)
-        # Stock BDS can settle the step under this full-cell leaf shape over the landing.
-        if (roof is not None and roof.name.endswith("_leaves") and roof.unit_cube
-                and roof.outline == _UNIT_BOX and not roof.unsafe_support and not roof.unresolved_overhang):
+        if (roof is not None and roof.unit_cube and roof.outline == _UNIT_BOX
+                and not roof.unsafe_support and not roof.unresolved_overhang
+                and (roof.name.endswith("_leaves") or roof.plain_masonry)):
             return self._stance_air(self.observed_block(ceiling, layer=1))
         return False
 
@@ -1426,7 +1426,7 @@ class Blocks:
         ceiling = (lx, ly + 2, lz)
         overhead = self._stance_clearance(ceiling)
         if overhead is False:
-            overhead = self._ascent_leaf_ceiling(ceiling)
+            overhead = self._ascent_low_roof(ceiling)
         # A 1.25-block rise and 1.8-block player can enter the fourth block
         # above the lower floor while still overlapping the launch column.
         clearance = (

@@ -2654,7 +2654,7 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         for cell, layer, runtime_id, status in (
             ((0, 102, 0), 0, self.STONE, "unreachable"),
             ((0, 103, 0), 1, self.STONE, "unreachable"),
-            ((1, 103, 0), 0, self.STONE, "unreachable"),
+            ((1, 103, 0), 0, 0x6680F5C9, "unreachable"),  # magma is a full but unsafe cube
             ((1, 103, 0), 1, 0xFFFFFFFE, "unobserved"),
             ((1, 100, 0), 0, self.AIR, "unreachable"),
         ):
@@ -2665,31 +2665,44 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                                  BlockApproach(status, 0))
                 self.assertEqual(self.stream.sent, [])
 
-    async def test_ascent_plan_accepts_only_observed_dry_full_cell_leaf_ceiling(self):
+    async def test_ascent_plan_accepts_only_observed_dry_full_cell_low_roofs(self):
         source, landing = (0, 100, 0), (1, 101, 0)
         roof, launch_roof, head = (1, 103, 0), (0, 103, 0), (1, 102, 0)
         birch, oak = 0x67BDEDE8, 0x7DCEF1FD
+        cobble, sand = 0x67D16E2E, 0x8437963
+        water, unknown = 0x483B8B2A, 0xFFFFFFFE
         rules = NavigationRules(search_radius=1, vertical_radius=1)
-        for cell, layer, runtime_id, status in (
-            (roof, 0, birch, "found"),
-            (roof, 0, oak, "found"),
-            (roof, 0, self.STONE, "unreachable"),
-            (roof, 0, 0xD99F59FD, "unreachable"),  # moving block
-            (roof, 0, 0x195BFACD, "unreachable"),  # oak fence
-            (roof, 0, 0xFFFFFFFE, "unknown"),
-            (roof, 1, 0x483B8B2A, "unreachable"),  # water
-            (roof, 1, 0xFFFFFFFE, "unknown"),
-            (launch_roof, 0, birch, "unreachable"),
-            (head, 0, self.STONE, "unreachable"),
-            (head, 1, self.STONE, "unreachable"),
+        for roof_id, update, status in (
+            (birch, None, "found"),
+            (oak, None, "found"),
+            (cobble, None, "found"),
+            (self.STONE, None, "found"),
+            (sand, None, "unreachable"),
+            (0xD99F59FD, None, "unreachable"),  # moving block
+            (0x195BFACD, None, "unreachable"),  # oak fence
+            (unknown, None, "unknown"),
+            (birch, (roof, 1, water), "unreachable"),
+            (birch, (roof, 1, unknown), "unknown"),
+            (cobble, (roof, 1, water), "unreachable"),
+            (cobble, (roof, 1, unknown), "unknown"),
+            (birch, (launch_roof, 0, birch), "unreachable"),
+            (self.AIR, (head, 0, cobble), "unreachable"),
+            (birch, (head, 0, self.STONE), "unreachable"),
+            (birch, (head, 1, self.STONE), "unreachable"),
         ):
-            with self.subTest(cell=cell, layer=layer, runtime_id=hex(runtime_id)):
+            with self.subTest(roof=hex(roof_id), update=update):
                 self.prepare_ascent()
-                self.set_block(roof, birch)
-                self.set_block(cell, runtime_id, layer=layer)
-                plan = self.bot.plan_navigation(FootGoal(landing), rules=rules)
+                self.set_block(roof, roof_id)
+                if update is not None:
+                    cell, layer, runtime_id = update
+                    self.set_block(cell, runtime_id, layer=layer)
+                goal = FootGoal(landing)
+                plan = self.bot.plan_navigation(goal, rules=rules)
                 self.assertEqual((plan.status, plan.nodes),
                                  (status, (source, landing) if status == "found" else ()))
+                if status != "found":
+                    result = await self.bot.navigate(goal, rules=rules)
+                    self.assertEqual((result.status, result.frames, result.stand_position), (status, 0, None))
                 self.assertEqual(self.stream.sent, [])
 
     async def test_ascent_moves_further_only_under_a_dry_leaf_ceiling_without_confirming_landing(self):

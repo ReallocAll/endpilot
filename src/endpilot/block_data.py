@@ -58,6 +58,7 @@ class VanillaBlockState:
     unresolved_overhang: bool = False
     ladder_facing: int | None = None
     piston_face: int | None = None
+    plain_masonry: bool = False
 
 
 @cache
@@ -77,6 +78,7 @@ def _catalog() -> tuple[tuple[VanillaBlockState | None, ...], dict[int, int]]:
     terrain = data["terrain"]
     cubes = set(terrain["unit_cubes"])
     unsafe = set(terrain["unsafe_support"])
+    plain_masonry = set(terrain["plain_masonry"])
     beds = {row[0]: BedBlockState(*row[1:]) for row in data["bed_states"]}
     names = []
     for last, name in data["block_names"]:
@@ -86,6 +88,7 @@ def _catalog() -> tuple[tuple[VanillaBlockState | None, ...], dict[int, int]]:
             rules[rule_id], index == terrain["air"], index in cubes, index in unsafe,
             names[index], beds.get(index), boxes[shape_id], shape_id == unresolved_overhang_id,
             _LADDER_FACINGS.get(hash_id), _PISTON_FACINGS.get(hash_id),
+            plain_masonry=index in plain_masonry,
         )
         for index, ((hash_id, rule_id), shape_id) in
         enumerate(zip(data["palette"], outlines["shape_ids"], strict=True))

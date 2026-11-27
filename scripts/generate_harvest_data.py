@@ -52,11 +52,14 @@ def parse_properties(text):
             return properties
 
 
-def terrain_indices(blocks):
+def terrain_indices(blocks, block_types):
     unit_cubes = []
     unsafe_support = []
+    plain_masonry = []
+    stone_types = {entry["name"] for entry in block_types if "stone" in entry["tags"]}
+    full_cell = [0, 0, 0, 1, 1, 1]
     for index, block in enumerate(blocks):
-        if block["collision_shapes"] != [[0, 0, 0, 1, 1, 1]]:
+        if block["collision_shapes"] != [full_cell]:
             continue
         unit_cubes.append(index)
         name = block["name"]
@@ -64,11 +67,14 @@ def terrain_indices(blocks):
         # independently of the observed state ID.
         if name in {"minecraft:magma", "minecraft:piston", "minecraft:sticky_piston"} or name.endswith("_shulker_box"):
             unsafe_support.append(index)
+        elif name in stone_types and block["states"] == "{}" and block["outline"] == full_cell:
+            plain_masonry.append(index)
     return {
         "air": next(i for i, block in enumerate(blocks) if block["name"] == "minecraft:air"),
         "unknown": next(i for i, block in enumerate(blocks) if block["name"] == "minecraft:unknown"),
         "unit_cubes": unit_cubes,
         "unsafe_support": unsafe_support,
+        "plain_masonry": plain_masonry,
     }
 
 
@@ -144,7 +150,7 @@ def palette_metadata(blocks, block_types):
 
     states = [parse_properties(block["states"]) for block in blocks]
     return hashes, {
-        "terrain": terrain_indices(blocks),
+        "terrain": terrain_indices(blocks, block_types),
         "bed_states": bed_states(blocks, states),
         "block_names": names,
         "state_lookup": state_lookup(states, names),
