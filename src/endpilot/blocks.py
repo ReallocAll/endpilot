@@ -277,7 +277,9 @@ class Blocks:
         self._coverage: dict[tuple[int, int], _ColumnCoverage] = {}
         self._column_waiters: dict[tuple[int, int], list[_CoverageWaiter]] = {}
         self._column_observers: list[Callable[[ColumnCoverageEvent], None]] = []
-        self._block_observers: list[Callable[[BlockChange], None]] = []
+        self._block_observers: dict[
+            Callable[[BlockChange], None], tuple[int | None, Callable[[int, int], None] | None],
+        ] = {}
         self._block_entity_observers: dict[object, Callable[[], None]] = {}
         self._last_replayed_block_entity: RawPacket | None = None
         self._applied_block_entity: tuple[RawPacket, int, tuple[int, int, int], nbt.CompoundTag] | None = None
@@ -341,13 +343,21 @@ class Blocks:
         if raw.packet_id == b.ChangeDimensionPacket.ID:
             self._invalidate_mining()
             previous_dimension = self.dimension_id
-            self.dimension_id = int(self.packets.protocol.decode(raw).dimension_id)
+            new_dimension = int(self.packets.protocol.decode(raw).dimension_id)
+            self.dimension_id = new_dimension
+            leave_callbacks = []
+            if previous_dimension != new_dimension:
+                for observer, (dimension, on_leave) in tuple(self._block_observers.items()):
+                    if on_leave is not None and dimension == previous_dimension:
+                        del self._block_observers[observer]
+                        leave_callbacks.append(on_leave)
             self._published_bounds = None
             self._updates.clear()
             self._sub_chunks.clear()
             self._block_entities.clear()
             self._invalidate_columns(previous_dimension, lambda: ColumnCoverageInvalidated("dimension_changed"),
                                      lambda column: True)
+            self._notify_observers(leave_callbacks, previous_dimension, new_dimension)
         elif raw.packet_id == b.DimensionDataPacket.ID:
             if self._replayed_dimension_data and raw is self._replayed_dimension_data[0][0]:
                 _, definitions = self._replayed_dimension_data.popleft()
@@ -545,10 +555,10 @@ class Blocks:
             self._set_sub_chunk((x, y, z), section)
 
     @staticmethod
-    def _notify_observers(observers, event) -> None:
+    def _notify_observers(observers, *args) -> None:
         for callback in tuple(observers):
             try:
-                callback(event)
+                callback(*args)
             except (Exception, asyncio.CancelledError) as error:
                 asyncio.get_running_loop().call_exception_handler({
                     "message": "world observer failed", "exception": error, "callback": callback,
@@ -751,9 +761,12 @@ class Blocks:
     def subscribe_block_changes(
         self, callback: Callable[[BlockChange], None], *, dimension_id: int | None = None,
         position: tuple[int, int, int] | None = None, layer: int | None = None,
+        on_dimension_leave: Callable[[int, int], None] | None = None,
     ) -> Callable[[], None]:
         if self._closed:
             raise ConnectionError("world observation ended")
+        if on_dimension_leave is not None and dimension_id is None:
+            dimension_id = self.dimension_id
 
         def filtered(change):
             if ((dimension_id is None or dimension_id == change.dimension_id)
@@ -761,7 +774,13 @@ class Blocks:
                     and (layer is None or layer == change.after.layer)):
                 callback(change)
 
-        return PacketConnection._subscribe(self._block_observers, filtered)
+        observers = self._block_observers
+        observers[filtered] = (dimension_id, on_dimension_leave)
+
+        def unsubscribe():
+            observers.pop(filtered, None)
+
+        return unsubscribe
 
     def subscribe_block_entity_updates(
         self, callback: Callable[[BlockEntityUpdate], None], *,

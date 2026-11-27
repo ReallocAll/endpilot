@@ -1396,11 +1396,22 @@ class Bot:
     def subscribe_block_changes(
         self, callback: Callable[[BlockChange], None], *, dimension_id: int | None = None,
         position: tuple[int, int, int] | None = None, layer: int | None = None,
+        on_dimension_leave: Callable[[int, int], None] | None = None,
     ) -> Callable[[], None]:
-        """Observe immutable before/after values from sparse updates in packet order."""
+        """Observe immutable before/after values from sparse updates in packet order.
+
+        With ``on_dimension_leave``, ``position`` is required and the subscription is bound
+        to ``dimension_id`` or the current terrain dimension at registration. On leaving that
+        dimension, the subscription ends and the callback receives the old and new IDs
+        synchronously after the old terrain is cleared.
+        """
+        if on_dimension_leave is not None and position is None:
+            raise ValueError("on_dimension_leave requires a position")
         if self._blocks is None:
             raise RuntimeError("player has not joined")
-        return self._blocks.subscribe_block_changes(callback, dimension_id=dimension_id, position=position, layer=layer)
+        return self._blocks.subscribe_block_changes(
+            callback, dimension_id=dimension_id, position=position, layer=layer, on_dimension_leave=on_dimension_leave,
+        )
 
     async def request_sub_chunk(self, position: tuple[int, int, int]) -> None:
         """Ask BDS for the containing section; inspect observed_block afterwards."""

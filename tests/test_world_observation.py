@@ -953,6 +953,108 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(all_events[-1].before)
         self.assertEqual(self.transport.sent, [])
 
+    async def test_block_change_watch_ends_on_leaving_its_dimension(self):
+        await self.connect()
+        b = self.b
+        position = (1, 64, 1)
+        pos = b.BlockPos(x=1, y=64, z=1)
+        original, persistent, future_dimension, reentrant, cancelled = [], [], [], [], []
+        leaves, errors = [], []
+        loop = asyncio.get_running_loop()
+        self.addCleanup(loop.set_exception_handler, loop.get_exception_handler())
+        loop.set_exception_handler(lambda _, context: errors.append(context))
+        failure = RuntimeError("leave observer failed")
+
+        def record_leave(name):
+            def on_leave(old_id, new_id):
+                leaves.append((name, old_id, new_id, self.bot.observed_block(position)))
+            return on_leave
+
+        def on_leave(old_id, new_id):
+            leaves.append(("implicit", old_id, new_id, self.bot.observed_block(position)))
+            remove_second()
+            self.bot.subscribe_block_changes(
+                reentrant.append, position=position, on_dimension_leave=record_leave("reentrant"),
+            )
+            raise failure
+
+        remove_original = self.bot.subscribe_block_changes(
+            original.append, position=position, on_dimension_leave=on_leave,
+        )
+        remove_second = self.bot.subscribe_block_changes(
+            original.append, dimension_id=0, position=position, on_dimension_leave=record_leave("explicit"),
+        )
+        self.bot.subscribe_block_changes(persistent.append, dimension_id=0, position=position)
+        self.bot.subscribe_block_changes(
+            future_dimension.append, dimension_id=1, position=position, on_dimension_leave=record_leave("future"),
+        )
+        remove_cancelled = self.bot.subscribe_block_changes(
+            cancelled.append, position=position, on_dimension_leave=record_leave("cancelled"),
+        )
+        remove_cancelled()
+        remove_cancelled()
+
+        # Vanilla portal order is ChangeDimension, destination terrain, then the server's ACK.
+        # Sparse updates stand in for destination terrain, with no complete columns in this test.
+        ack = b.PlayerActionPacket(runtime_id=42, action=b.PlayerActionType.CHANGE_DIMENSION_ACK)
+        await self.deliver(b.UpdateBlockPacket(pos=pos, runtime_id=21))
+        await self.deliver(b.ChangeDimensionPacket(
+            dimension_id=1, pos=b.Vec3(x=-4, y=101.62001, z=-4), loading_screen_id=0,
+        ))
+        self.assertTrue(self.bot.is_changing_dimension)
+        self.assertEqual(leaves, [("implicit", 0, 1, None), ("explicit", 0, 1, None)])
+        self.assertEqual([context["exception"] for context in errors], [failure])
+        await self.deliver(b.UpdateBlockPacket(pos=pos, runtime_id=31), ack)
+        self.assertFalse(self.bot.is_changing_dimension)
+        self.assertEqual(len(leaves), 2)
+
+        await self.deliver(b.ChangeDimensionPacket(
+            dimension_id=0, pos=b.Vec3(x=-32.5, y=100.5, z=-34.5), loading_screen_id=1,
+        ))
+        self.assertEqual(leaves[2:], [("future", 1, 0, None), ("reentrant", 1, 0, None)])
+        await self.deliver(b.UpdateBlockPacket(pos=pos, runtime_id=22), ack)
+        await self.deliver(b.UpdateBlockPacket(pos=pos, runtime_id=23))
+        self.assertEqual([e.after.runtime_id for e in original], [21, 21])
+        self.assertEqual([e.after.runtime_id for e in persistent], [21, 22, 23])
+        self.assertEqual([e.after.runtime_id for e in future_dimension], [31])
+        self.assertEqual(future_dimension, reentrant)
+        self.assertEqual(cancelled, [])
+        self.assertIsNone(future_dimension[0].before)
+        self.assertIsNone(persistent[1].before)
+        self.assertEqual(persistent[2].before.runtime_id, 22)
+        self.assertEqual(len(leaves), 4)
+        remove_original()
+        remove_original()
+
+    async def test_block_change_watch_survives_same_dimension_and_column_unload(self):
+        await self.connect()
+        b = self.b
+        position = (1, 64, 1)
+        pos = b.BlockPos(x=1, y=64, z=1)
+        changes, leaves = [], []
+
+        def on_leave(old_id, new_id):
+            leaves.append((old_id, new_id))
+
+        with self.assertRaisesRegex(ValueError, "requires a position"):
+            self.bot.subscribe_block_changes(changes.append, on_dimension_leave=on_leave)
+        unsubscribe = self.bot.subscribe_block_changes(changes.append, position=position, on_dimension_leave=on_leave)
+        await self.deliver(self.published(0), b.UpdateBlockPacket(pos=pos, runtime_id=21), self.published(1024))
+        self.assertIsNone(self.bot.observed_block(position))
+        await self.deliver(self.published(0), b.UpdateBlockPacket(pos=pos, runtime_id=22))
+        await self.deliver(
+            b.RespawnPacket(state=b.PlayerRespawnState.SEARCHING_FOR_SPAWN),
+            b.RespawnPacket(state=b.PlayerRespawnState.READY_TO_SPAWN),
+            b.ChangeDimensionPacket(dimension_id=0),
+            b.PlayerActionPacket(runtime_id=42, action=b.PlayerActionType.CHANGE_DIMENSION_ACK),
+            b.UpdateBlockPacket(pos=pos, runtime_id=23),
+        )
+        self.assertEqual([e.after.runtime_id for e in changes], [21, 22, 23])
+        self.assertEqual(leaves, [])
+        await self.deliver(b.DisconnectPacket())
+        self.assertEqual(leaves, [])
+        unsubscribe()
+
     async def test_dimension_and_reader_end_invalidate_independent_waits(self):
         await self.connect()
         column = (0, 0)
