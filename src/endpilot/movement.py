@@ -2716,7 +2716,8 @@ class Movement:
             upper_y = source[1] + 1.62
             entry_tick = self._tick
             step_tick = None
-            deadline = asyncio.get_running_loop().time() + 2.0
+            # Stock BDS can report grounded more than two seconds into this edge.
+            deadline = asyncio.get_running_loop().time() + 3.0
             brake = 2 if release_input else 0
             crossed = False
             resting_frames = 0
