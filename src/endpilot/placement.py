@@ -20,6 +20,24 @@ _PlacementReason = Literal[
     "disconnected", "send_failed", "cancelled",
 ]
 
+_WATERCRAFT = {
+    f"minecraft:{hull}_{prefix}{kind}": (actor_type, variant)
+    for hull, kind, variant in (
+        ("oak", "boat", 0),
+        ("spruce", "boat", 1),
+        ("birch", "boat", 2),
+        ("jungle", "boat", 3),
+        ("acacia", "boat", 4),
+        ("dark_oak", "boat", 5),
+        ("mangrove", "boat", 6),
+        ("bamboo", "raft", 7),
+        ("cherry", "boat", 8),
+        ("pale_oak", "boat", 9),
+        ("poplar", "boat", 10),
+    )
+    for prefix, actor_type in (("", "minecraft:boat"), ("chest_", "minecraft:chest_boat"))
+}
+
 
 @dataclass(frozen=True, slots=True)
 class PlacementInventoryChange:
@@ -319,13 +337,13 @@ async def observe_entity_placement[Result: EntityPlacementResult](
     variant = None
     clearance = ()
     match item_name:
-        case "minecraft:oak_boat" | "minecraft:spruce_boat" | "minecraft:spruce_chest_boat":
+        case _ if item_name in _WATERCRAFT:
             depth = clicked.properties.get("liquid_depth")
             if clicked.name != "minecraft:water" or type(depth) is not int or depth != 0:
                 return result("precondition_failed")
-            actor_type = "minecraft:chest_boat" if item_name == "minecraft:spruce_chest_boat" else "minecraft:boat"
+            actor_type, hull_variant = _WATERCRAFT[item_name]
             if not legacy_oak_boat:
-                variant = 0 if item_name == "minecraft:oak_boat" else 1
+                variant = hull_variant
             click_pos = spawn_offset = (0.5, 0.875, 0.5)
         case "minecraft:minecart" | "minecraft:chest_minecart":
             direction = clicked.properties.get("rail_direction")
@@ -334,8 +352,19 @@ async def observe_entity_placement[Result: EntityPlacementResult](
             actor_type = item_name
             click_pos = (0.5, 0.125, 0.5)
             spawn_offset = (0.5, 0.5, 0.5)
-        case "minecraft:armor_stand":
-            if clicked.name != "minecraft:stone":
+        case _:
+            actor_type = {
+                "minecraft:armor_stand": "minecraft:armor_stand",
+                "minecraft:end_crystal": "minecraft:ender_crystal",
+                "minecraft:cow_spawn_egg": "minecraft:cow",
+                "minecraft:zombie_spawn_egg": "minecraft:zombie",
+                "minecraft:villager_spawn_egg": "minecraft:villager_v2",
+            }.get(item_name)
+            if actor_type is None:
+                return result("precondition_failed")
+            supported_blocks = (("minecraft:obsidian", "minecraft:bedrock") if item_name == "minecraft:end_crystal"
+                                else ("minecraft:stone",))
+            if clicked.name not in supported_blocks:
                 return result("precondition_failed")
             clearance = (
                 blocks.observed_block((x, y + 1, z)),
@@ -344,10 +373,7 @@ async def observe_entity_placement[Result: EntityPlacementResult](
             )
             if any(block is None or block.is_air is not True for block in clearance):
                 return result("precondition_failed")
-            actor_type = item_name
             click_pos = spawn_offset = (0.5, 1.0, 0.5)
-        case _:
-            return result("precondition_failed")
 
     if timeout == 0:
         return result("timed_out")

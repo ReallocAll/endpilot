@@ -131,7 +131,7 @@ support, then `read_block` to record that update. Call `place_against` with
 the support coordinates. The returned tick confirms input submission. Check
 the target block or server state to verify placement.
 
-## Place a boat, minecart, or armor stand
+## Place an entity
 
 In Survival on protocol 2225, select a server-observed stack of a supported
 item and move within reach of the required block. Pass that block's
@@ -141,20 +141,40 @@ sends one top-face click when the terrain and held item still match.
 
 | Held item | Observed block | Local click point | Matching `AddActorPacket` |
 | --- | --- | --- | --- |
-| `minecraft:oak_boat` | Source water | `(0.5, 0.875, 0.5)` | `minecraft:boat`, integer `VARIANT=0` |
-| `minecraft:spruce_boat` | Source water | `(0.5, 0.875, 0.5)` | `minecraft:boat`, integer `VARIANT=1` |
-| `minecraft:spruce_chest_boat` | Source water | `(0.5, 0.875, 0.5)` | `minecraft:chest_boat`, integer `VARIANT=1` |
+| Plain watercraft below | Source water | `(0.5, 0.875, 0.5)` | `minecraft:boat` with the hull's integer `VARIANT` |
+| Chest watercraft below | Source water | `(0.5, 0.875, 0.5)` | `minecraft:chest_boat` with the hull's integer `VARIANT` |
 | `minecraft:minecart` | North–south straight rail | `(0.5, 0.125, 0.5)` | `minecraft:minecart` |
 | `minecraft:chest_minecart` | North–south straight rail | `(0.5, 0.125, 0.5)` | `minecraft:chest_minecart` |
 | `minecraft:armor_stand` | Stone with clearance | `(0.5, 1.0, 0.5)` | `minecraft:armor_stand` |
+| `minecraft:end_crystal` | Obsidian or bedrock with clearance | `(0.5, 1.0, 0.5)` | `minecraft:ender_crystal` |
+| `minecraft:cow_spawn_egg` | Stone with clearance | `(0.5, 1.0, 0.5)` | `minecraft:cow` |
+| `minecraft:zombie_spawn_egg` | Stone with clearance | `(0.5, 1.0, 0.5)` | `minecraft:zombie` |
+| `minecraft:villager_spawn_egg` | Stone with clearance | `(0.5, 1.0, 0.5)` | `minecraft:villager_v2` |
 
-Source water is vanilla `minecraft:water` with `liquid_depth=0`. The rail
-is vanilla `minecraft:rail` with `rail_direction=0`. The armor stand needs
-vanilla `minecraft:stone` and observed air in the two main-layer cells above
-it. Layer 1 must also have observed air in the stone cell and both cells
-above it. Boat and armor stand spawns match the world click coordinates.
-Minecart spawns match the rail block center, offset `(0.5, 0.5, 0.5)`.
-Coordinates are compared at the wire's float32 precision.
+The 22 watercraft use the `minecraft:` namespace and the item names in this
+table.
+
+| Plain item | Chest item | `VARIANT` |
+| --- | --- | ---: |
+| `oak_boat` | `oak_chest_boat` | 0 |
+| `spruce_boat` | `spruce_chest_boat` | 1 |
+| `birch_boat` | `birch_chest_boat` | 2 |
+| `jungle_boat` | `jungle_chest_boat` | 3 |
+| `acacia_boat` | `acacia_chest_boat` | 4 |
+| `dark_oak_boat` | `dark_oak_chest_boat` | 5 |
+| `mangrove_boat` | `mangrove_chest_boat` | 6 |
+| `bamboo_raft` | `bamboo_chest_raft` | 7 |
+| `cherry_boat` | `cherry_chest_boat` | 8 |
+| `pale_oak_boat` | `pale_oak_chest_boat` | 9 |
+| `poplar_boat` | `poplar_chest_boat` | 10 |
+
+Source water is vanilla `minecraft:water` with `liquid_depth=0`. The rail is
+vanilla `minecraft:rail` with `rail_direction=0`. Land placements require
+observed air in the two main-layer cells above their support and in layer 1
+of all three cells. The initial `AddActorPacket` matches the world click
+coordinates for boats and land placements, or the rail block center, offset
+`(0.5, 0.5, 0.5)`, for minecarts. Coordinates are compared at the wire's
+float32 precision.
 
 `EntityPlacementResult` records the original dimension, clicked block,
 selected slot, and local submission state. `submitted` is `False` before

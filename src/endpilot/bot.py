@@ -2021,7 +2021,7 @@ class Bot:
     async def place_entity(
         self, position: tuple[int, int, int], *, timeout: float = 15,
     ) -> EntityPlacementResult:
-        """Click verified terrain once with the selected boat, minecart or armor stand in Survival.
+        """Place a supported held item with one click on observed terrain in Survival.
 
         Report a matching new spawn and a one-item decrease in the selected slot
         when each observation arrives after submission.

@@ -703,23 +703,23 @@ class EntityPlacementTests(_EntityPlacementHarness):
         self.assertEqual(len(self.wire.sent), 1)
         self.assert_observers_restored()
 
+    def spawn_with_variant(self, entity_id, payload, *, actor_type="minecraft:boat"):
+        b = self.b
+        packet = self.spawn(entity_id, actor_type=actor_type)
+        packet.data = b.SynchedActorData.CopyableDataList(data=[
+            b.DataItemEntry(id=int(b.ActorDataIDs.VARIANT), payload=payload),
+        ])
+        return packet
+
     async def test_spruce_boat_requires_the_integer_variant_in_its_spawn(self):
         b = self.b
-
-        def spruce_candidate(entity_id, payload):
-            packet = self.spawn(entity_id)
-            packet.data = b.SynchedActorData.CopyableDataList(data=[
-                b.DataItemEntry(id=int(b.ActorDataIDs.VARIANT), payload=payload),
-            ])
-            return packet
-
         await self.deliver(self.registry_packet("minecraft:spruce_boat"), self.boat_slot(1))
         pending = await self.arm_entity(surface=WATER, click_height=0.875)
         await self.deliver(self.boat_slot(0), self.spawn(-50),
-                           spruce_candidate(-51, b.DataItemIntPayload(value=0)),
-                           spruce_candidate(-52, b.DataItemBytePayload(value=1)))
+                           self.spawn_with_variant(-51, b.DataItemIntPayload(value=0)),
+                           self.spawn_with_variant(-52, b.DataItemBytePayload(value=1)))
         self.assertFalse(pending.done())
-        await self.deliver(spruce_candidate(-53, b.DataItemIntPayload(value=1)))
+        await self.deliver(self.spawn_with_variant(-53, b.DataItemIntPayload(value=1)))
         self.assert_entity_placement_completed(await pending, EntitySpawn(-53, 53, "minecraft:boat", BOAT_POSITION))
 
     async def test_minecart_uses_straight_rail_click_height_and_separate_spawn_height(self):
@@ -757,3 +757,63 @@ class EntityPlacementTests(_EntityPlacementHarness):
         position = (x + 0.5, y + 1.0, z + 0.5)
         await self.deliver(self.spawn(-70, position=position, actor_type=actor_type), self.boat_slot(0))
         self.assert_entity_placement_completed(await pending, EntitySpawn(-70, 70, actor_type, position))
+
+    async def test_end_crystal_requires_a_supported_surface_and_an_exact_spawn(self):
+        obsidian = 2781850042
+        x, y, z = SUPPORT
+        upper = (x, y + 2, z)
+        await self.deliver(
+            self.registry_packet("minecraft:end_crystal"), self.boat_slot(1),
+            self.block(SUPPORT, STONE), self.block(upper),
+            *(self.block(cell, layer=1) for cell in (SUPPORT, TARGET, upper)),
+        )
+        await self.assert_entity_placement_rejected()
+
+        await self.deliver(self.block(SUPPORT, obsidian))
+        pending = await self.arm_entity(surface=obsidian, click_height=1.0)
+        position = (x + 0.5, y + 1.0, z + 0.5)
+        actor_type = "minecraft:ender_crystal"
+        await self.deliver(
+            self.boat_slot(0),
+            self.spawn(-80, position=position, actor_type="minecraft:armor_stand"),
+            self.spawn(-81, position=(x + 0.5, y + 0.875, z + 0.5), actor_type=actor_type),
+        )
+        self.assertFalse(pending.done())
+        await self.deliver(self.spawn(-82, position=position, actor_type=actor_type))
+        self.assert_entity_placement_completed(await pending, EntitySpawn(-82, 82, actor_type, position))
+
+    async def test_spawn_eggs_require_an_explicit_mapping_and_the_exact_villager_actor(self):
+        x, y, z = SUPPORT
+        upper = (x, y + 2, z)
+        await self.deliver(
+            self.registry_packet("minecraft:pig_spawn_egg"), self.boat_slot(1),
+            self.block(SUPPORT, STONE), self.block(upper),
+            *(self.block(cell, layer=1) for cell in (SUPPORT, TARGET, upper)),
+        )
+        await self.assert_entity_placement_rejected()
+
+        await self.deliver(self.registry_packet("minecraft:villager_spawn_egg"))
+        pending = await self.arm_entity(surface=STONE, click_height=1.0)
+        position = (x + 0.5, y + 1.0, z + 0.5)
+        await self.deliver(self.boat_slot(0), self.spawn(-90, position=position, actor_type="minecraft:villager"))
+        self.assertFalse(pending.done())
+        actor_type = "minecraft:villager_v2"
+        await self.deliver(self.spawn(-91, position=position, actor_type=actor_type))
+        self.assert_entity_placement_completed(await pending, EntitySpawn(-91, 91, actor_type, position))
+
+    async def test_bamboo_chest_raft_matches_the_chest_boat_family_and_bamboo_variant(self):
+        b = self.b
+        await self.deliver(self.registry_packet("minecraft:chest_boat"), self.boat_slot(1))
+        await self.assert_entity_placement_rejected()
+
+        await self.deliver(self.registry_packet("minecraft:bamboo_chest_raft"))
+        pending = await self.arm_entity(surface=WATER, click_height=0.875)
+        chest_boat = "minecraft:chest_boat"
+        await self.deliver(
+            self.boat_slot(0),
+            self.spawn_with_variant(-100, b.DataItemIntPayload(value=7)),
+            self.spawn_with_variant(-101, b.DataItemIntPayload(value=1), actor_type=chest_boat),
+        )
+        self.assertFalse(pending.done())
+        await self.deliver(self.spawn_with_variant(-102, b.DataItemIntPayload(value=7), actor_type=chest_boat))
+        self.assert_entity_placement_completed(await pending, EntitySpawn(-102, 102, chest_boat, BOAT_POSITION))
