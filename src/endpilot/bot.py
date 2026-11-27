@@ -16,7 +16,7 @@ from .anvil import AnvilPreview
 from .authentication import (
     BedrockCredentialProvider, DEFAULT_LOCALE, OfflineIdentity, _OnlineIdentity, acquire_online_identity,
 )
-from .beds import BedObservation, Beds, PlayerRespawnPoint
+from .beds import BedObservation, Beds, PlayerRespawnPoint, _BedEvent
 from .block_raycast import BlockRaycastResult, MiningFaceResult
 from .blocks import (
     Blocks, BlockChange, BlockEntityUpdate, BlockMatch, BlockObservation, BlockSearchResult, BlockStateObservation,
@@ -1402,6 +1402,17 @@ class Bot:
         if self._beds is None:
             raise RuntimeError("player has not joined")
         return self._beds.respawn_point
+
+    def subscribe_bed_events(self, callback: Callable[[_BedEvent], None]) -> Callable[[], None]:
+        """Observe future local bed events synchronously in the current session.
+
+        The callback receives "sleep", "wake", or "respawn_point_invalidated"
+        after the corresponding server observation updates the local cache.
+        The returned function removes this registration.
+        """
+        if self._beds is None:
+            raise RuntimeError("player has not joined")
+        return self._beds.subscribe(callback)
 
     async def sleep(self, position: tuple[int, int, int], *, face: int = 1,
                     timeout: float = 15) -> tuple[int, int, int]:

@@ -19,7 +19,10 @@ class Transport:
         self.outgoing = asyncio.Queue()
 
     async def recv(self):
-        return await self.incoming.get()
+        frame = await self.incoming.get()
+        if isinstance(frame, Exception):
+            raise frame
+        return frame
 
     async def send(self, frame):
         self.outgoing.put_nowait(frame)
@@ -88,6 +91,95 @@ class BedTests(unittest.IsolatedAsyncioTestCase):
                 raw = next(read_batch((await self.transport.outgoing.get())[1:]))
                 if raw.packet_id == kind.ID:
                     return self.bot.protocol.decode(raw)
+
+    async def test_bed_events_follow_local_sleep_transitions_after_cache_updates(self):
+        bot, b = self.bot, self.b
+        events = []
+        bot.subscribe_bed_events(lambda event: events.append((event, bot.is_sleeping, bot.sleeping_bed)))
+        self.assertTrue(self.transport.outgoing.empty())
+        self.deliver(self.metadata(42, 4), self.metadata(43, 2, HEAD), self.metadata(42, bed=HEAD))
+        await asyncio.sleep(0)
+        self.assertEqual(events, [])
+        self.deliver(self.metadata(42, 2, HEAD), self.metadata(42, 6), self.metadata(42, bed=HEAD),
+                     self.metadata(43, 0), self.metadata(42, 4), self.metadata(42, 0))
+        await asyncio.sleep(0)
+        self.assertEqual(events, [("sleep", True, HEAD), ("wake", False, None)])
+        self.assertTrue(self.transport.outgoing.empty())
+
+        dimension = b.ChangeDimensionPacket(dimension_id=1, pos=b.Vec3(x=8.5, y=221.62, z=7.5))
+        self.deliver(self.metadata(42, 2), dimension, self.metadata(42, 0))
+        await asyncio.sleep(0)
+        self.assertEqual(events[-1:], [("sleep", True, HEAD)])
+        self.assertEqual(len(events), 3)
+        self.deliver(dimension, self.metadata(42, 2, HEAD))
+        await asyncio.sleep(0)
+        self.assertEqual(events[3:], [("sleep", True, HEAD)])
+
+    async def test_bed_invalidation_uses_native_text_even_without_known_point(self):
+        bot, b = self.bot, self.b
+        events = []
+        bot.subscribe_bed_events(lambda event: events.append((event, bot.player_respawn_point)))
+        invalid = self.message("tile.bed.notValid")
+        chat = b.TextPacket(body=b.TextPacket.AuthorAndMessage(
+            type=b.TextPacketType.CHAT, author="OtherPlayer", message=invalid.body.message,
+        ))
+        alternate = (11, 220, 10)
+        self.deliver(
+            self.spawn((8, 220, 7), HEAD), self.spawn((11, 220, 7), alternate),
+            self.spawn((11, 220, 7), alternate), self.spawn((1, 0, 2), HEAD, personal=False),
+            self.block(HEAD, 0xDBF44120), self.message("tile.bed.respawnSet"), self.message("tile.bed.noSleep"),
+            self.message("tile.bed.notValid", prefix=({"text": "Quoted: "},)),
+            self.message("tile.bed.notValid", localize=True), chat,
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(events, [])
+        self.assertEqual(bot.player_respawn_point, PlayerRespawnPoint((11, 220, 7), 0, alternate))
+        self.deliver(invalid)
+        await asyncio.sleep(0)
+        self.assertEqual(events, [("respawn_point_invalidated", None)])
+        self.deliver(invalid)
+        await asyncio.sleep(0)
+        self.assertEqual(events, [("respawn_point_invalidated", None)] * 2)
+        self.assertTrue(self.transport.outgoing.empty())
+
+    async def test_bed_subscription_removes_one_registration_and_ends_at_disconnect(self):
+        bot = self.bot
+        events = []
+        callback = events.append
+        cancel = bot.subscribe_bed_events(callback)
+        bot.subscribe_bed_events(callback)
+        cancel()
+        cancel()
+        self.deliver(self.metadata(42, 2, HEAD), self.b.DisconnectPacket(), self.metadata(42, 0),
+                     self.message("tile.bed.notValid"))
+        self.assertEqual((await bot.wait_for_session_end()).kind, "server_disconnect")
+        self.assertEqual(events, ["sleep"])
+        with self.assertRaises(ConnectionError):
+            bot.subscribe_bed_events(callback)
+
+        await bot.close()
+        with self.assertRaisesRegex(RuntimeError, "has not joined"):
+            bot.subscribe_bed_events(callback)
+        await self.join_bed_stream(bot=bot)
+        fresh = []
+        bot.subscribe_bed_events(fresh.append)
+        reader_transport = bot.packets.transport
+        reader_transport.incoming.put_nowait(write_batch([bot.protocol.encode(self.metadata(42, 2, HEAD))]))
+        await asyncio.sleep(0)
+        self.assertEqual(fresh, ["sleep"])
+        self.assertEqual(events, ["sleep"])
+
+    async def test_bed_subscription_ends_when_the_reader_ends(self):
+        events = []
+        cancel = self.bot.subscribe_bed_events(events.append)
+        self.transport.incoming.put_nowait(ConnectionError("test transport lost"))
+        self.assertEqual((await self.bot.wait_for_session_end()).kind, "reader_end")
+        with self.assertRaises(ConnectionError):
+            self.bot.subscribe_bed_events(events.append)
+        cancel()
+        self.assertEqual(events, [])
+        with self.assertRaisesRegex(ConnectionError, "test transport lost"):
+            await self.bot.close()
 
     async def test_sleep_requires_own_state_and_target_bed_and_wake_accepts_delta(self):
         b = self.b
@@ -217,10 +309,11 @@ class BedTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.bot.is_sleeping)
         self.assertIsNone(self.bot.observed_bed(FOOT))
 
-    async def join_bed_stream(self, *, before_start=(), before_spawn=(), after_spawn=()):
+    async def join_bed_stream(self, *, bot=None, before_start=(), before_spawn=(), after_spawn=()):
         b = self.b
-        bot = Bot("BedJoinTester", protocol=2225)
-        self.addAsyncCleanup(bot.close)
+        if bot is None:
+            bot = Bot("BedJoinTester", protocol=2225)
+            self.addAsyncCleanup(bot.close)
         transport = Transport()
 
         def deliver(*packets):
@@ -235,6 +328,19 @@ class BedTests(unittest.IsolatedAsyncioTestCase):
             await bot.join_nethernet("http://127.0.0.1:19132")
         await asyncio.sleep(0)
         return bot
+
+    async def test_bed_subscription_starts_after_the_join_snapshot(self):
+        bot = await self.join_bed_stream(before_spawn=(self.metadata(42, 2, HEAD),
+                                                     self.message("tile.bed.notValid")))
+        events = []
+        bot.subscribe_bed_events(events.append)
+        self.assertTrue(bot.is_sleeping)
+        self.assertEqual(bot.sleeping_bed, HEAD)
+        bot.packets.transport.incoming.put_nowait(write_batch(map(bot.protocol.encode, (
+            self.metadata(42, 2, HEAD), self.metadata(42, 0),
+        ))))
+        await asyncio.sleep(0)
+        self.assertEqual(events, ["wake"])
 
     async def test_join_replays_local_bed_packets_after_start_game_in_wire_order(self):
         early = (self.metadata(42, 2, HEAD), self.spawn((8, 220, 7), HEAD))

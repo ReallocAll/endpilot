@@ -1,10 +1,13 @@
 """Vanilla bed observations and server-confirmed player sleeping."""
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 import json
+from typing import Literal
 
 from .blocks import FACE_OFFSETS
+from .compression import PacketConnection
 
 
 _HEAD_OFFSETS = {"south": (0, 1), "west": (-1, 0), "north": (0, -1), "east": (1, 0)}
@@ -15,6 +18,7 @@ _BED_MESSAGES = {
     **{key: {"rawtext": [{"text": "§7"}, {"translate": key}]} for key in _REFUSALS},
     "tile.bed.notValid": {"rawtext": [{"translate": "tile.bed.notValid"}]},
 }
+_BedEvent = Literal["sleep", "wake", "respawn_point_invalidated"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,13 +85,35 @@ class Beds:
         self.respawn_point: PlayerRespawnPoint | None = None
         self._dimension_epoch = 0
         self._active = False
+        self._observers: dict[object, Callable[[_BedEvent], None]] = {}
+        self._unsubscribe_reader_end: Callable[[], None] | None = None
         for raw in initial_packets:
             self._on_packet(raw)
         self._unsubscribe = packets.subscribe_raw(self._on_packet)
+        self._unsubscribe_reader_end = packets.subscribe_reader_end(self._end_subscriptions)
 
     def close(self) -> None:
         self._unsubscribe()
+        self._end_subscriptions()
         self._dimension_epoch += 1
+
+    def subscribe(self, callback: Callable[[_BedEvent], None]) -> Callable[[], None]:
+        if self._unsubscribe_reader_end is None or self.packets._reader_end_result()[0]:
+            raise ConnectionError("bed subscription stream is closed")
+        observers = self._observers
+        token = object()
+        observers[token] = callback
+
+        def unsubscribe() -> None:
+            observers.pop(token, None)
+
+        return unsubscribe
+
+    def _end_subscriptions(self, _cause=None) -> None:
+        if self._unsubscribe_reader_end is not None:
+            self._unsubscribe_reader_end()
+            self._unsubscribe_reader_end = None
+        self._observers.clear()
 
     @property
     def sleeping_bed(self) -> tuple[int, int, int] | None:
@@ -131,23 +157,31 @@ class Beds:
         b = protocol.binding
         if raw.packet_id == b.SetActorDataPacket.ID:
             sleeping, bed_position = self._sleep_metadata(raw)
+            was_sleeping = self.sleeping
             if sleeping is not None:
                 self.sleeping = sleeping
             if bed_position is not None:
                 # The server sends only changed fields when the same bed is reused.
                 self._bed_position = bed_position
+            if sleeping is True and was_sleeping is not True:
+                PacketConnection._notify(self._observers.values(), "sleep")
+            elif sleeping is False and was_sleeping is True:
+                PacketConnection._notify(self._observers.values(), "wake")
         elif raw.packet_id == b.SetSpawnPositionPacket.ID:
             packet = protocol.decode(raw)
             if packet.spawn_pos_type == b.SpawnPositionType.PLAYER_RESPAWN:
                 self.respawn_point = PlayerRespawnPoint(_position(packet.pos), int(packet.dimension_type),
                                                         _position(packet.spawn_block_pos))
-        elif raw.packet_id == b.TextPacket.ID and self.respawn_point is not None:
-            if invalidates_bed_respawn(protocol, raw):
+        elif raw.packet_id == b.TextPacket.ID:
+            if (self.respawn_point is not None or self._observers) and invalidates_bed_respawn(protocol, raw):
                 self.respawn_point = None
+                PacketConnection._notify(self._observers.values(), "respawn_point_invalidated")
         elif raw.packet_id == b.ChangeDimensionPacket.ID:
             self.sleeping = None
             self._bed_position = None
             self._dimension_epoch += 1
+        elif raw.packet_id == b.DisconnectPacket.ID:
+            self._end_subscriptions()
 
     async def _click(self, position, face):
         b = self.packets.protocol.binding
