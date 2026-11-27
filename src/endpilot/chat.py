@@ -326,8 +326,14 @@ class Chat:
         return received
 
     async def wait_for_text(
-        self, *, kind: TextPacketType | None = None, author: str | None = None, timeout: float = 15,
+        self, *, kind: TextPacketType | None = None, author: str | None = None,
+        message: str | re.Pattern[str] | None = None, timeout: float = 15,
     ) -> TextEvent:
+        if message is not None and not (
+            isinstance(message, str) or isinstance(message, re.Pattern) and isinstance(message.pattern, str)
+        ):
+            raise TypeError("message must be a string, a compiled string regex, or None")
+
         received = None
 
         def matches(raw: RawPacket) -> bool:
@@ -336,6 +342,10 @@ class Chat:
             body = packet.body
             source = body.author if isinstance(body, self._text.AuthorAndMessage) else None
             if not self._matches_text(body.type, source, kind, author):
+                return False
+            if isinstance(message, str) and body.message != message:
+                return False
+            if isinstance(message, re.Pattern) and message.search(body.message) is None:
                 return False
             received = self._text_event(packet)
             return True

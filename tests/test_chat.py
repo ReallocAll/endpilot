@@ -226,6 +226,63 @@ class PublicChatPatternTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "player has not joined"):
             await self.bot.wait_for_text()
 
+    async def test_text_wait_matches_exact_wire_body_and_retains_kind_and_author_filters(self):
+        kind = TextPacketType.WHISPER
+        author = "Player\u00a7r"
+        body = " \u00a7aSignal  1 "
+        text = self.protocol.binding.TextPacket
+        sent_before = self.transport.send.await_count
+        waiting = await self.arm(self.bot.wait_for_text(kind=kind, author="Player", message=body, timeout=1))
+
+        await self.deliver(
+            text.AuthorAndMessage(type=kind, author=author, message=body.lower()),
+            text.AuthorAndMessage(type=kind, author=author, message=body + "suffix"),
+            text.AuthorAndMessage(type=kind, author=author, message=body.strip()),
+            text.AuthorAndMessage(type=kind, author="Other", message=body),
+            self.player_chat(body),
+        )
+        self.assertFalse(waiting.done())
+        await self.deliver(text.AuthorAndMessage(type=kind, author=author, message=body))
+        self.assertEqual(await waiting, TextEvent(kind, body, localize=False, author=author))
+        self.assertEqual(self.transport.send.await_count, sent_before)
+
+    async def test_text_wait_searches_the_wire_body_even_when_localized(self):
+        text = self.protocol.binding.TextPacket
+        kind = TextPacketType.TRANSLATE
+        message = "%example.signal_42"
+        waiting = await self.arm(self.bot.wait_for_text(message=re.compile(r"signal_\d+"), timeout=1))
+        packet = text(
+            body=text.MessageAndParams(type=kind, message=message, params=["argument"]), localize=True,
+        )
+        self.incoming.put_nowait(b"\xff" + write_batch([self.protocol.encode(packet)]))
+        self.assertEqual(await waiting, TextEvent(kind, message, localize=True, params=("argument",)))
+
+    async def test_text_wait_rejects_invalid_message_matchers(self):
+        for message in (1, b"body", re.compile(b"body"), ["body"]):
+            with self.subTest(message=message), self.assertRaisesRegex(TypeError, "compiled string regex"):
+                await self.bot.wait_for_text(message=message, timeout=0)
+
+    async def test_text_wait_with_message_releases_waiter_on_timeout_or_cancellation(self):
+        subscribers = self.bot._chat.packets._subscribers
+        before = tuple(subscribers)
+        with self.assertRaises(TimeoutError):
+            await self.bot.wait_for_text(message="unseen", timeout=0)
+        self.assertEqual(tuple(subscribers), before)
+
+        canceled = await self.arm(self.bot.wait_for_text(message="unseen"))
+        canceled.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await canceled
+        self.assertEqual(tuple(subscribers), before)
+
+        empty = await self.arm(self.bot.wait_for_text(message="", timeout=1))
+        text = self.protocol.binding.TextPacket
+        await self.deliver(
+            text.MessageOnly(type=TextPacketType.RAW, message="other"),
+            text.MessageOnly(type=TextPacketType.RAW, message=""),
+        )
+        self.assertEqual(await empty, TextEvent(TextPacketType.RAW, "", localize=False))
+
     async def test_message_wait_takes_the_first_matching_packet_in_a_batch(self):
         text = self.protocol.binding.TextPacket
         server = text.MessageOnly(type=TextPacketType.RAW, message="server pearl")

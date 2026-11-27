@@ -2358,12 +2358,17 @@ class Bot:
         return self._chat.subscribe_message(callback, author=author)
 
     async def wait_for_text(
-        self, *, kind: TextPacketType | None = None, author: str | None = None, timeout: float = 15,
+        self, *, kind: TextPacketType | None = None, author: str | None = None,
+        message: str | Pattern[str] | None = None, timeout: float = 15,
     ) -> TextEvent:
-        """Wait for the next matching server TextPacket dispatched after the wait starts."""
+        """Wait for the next matching server TextPacket dispatched after the wait starts.
+
+        Match the packet's original message field. Strings compare the entire
+        field and compiled regular expressions search within it.
+        """
         if self._chat is None:
             raise RuntimeError("player has not joined")
-        return await self._chat.wait_for_text(kind=kind, author=author, timeout=timeout)
+        return await self._chat.wait_for_text(kind=kind, author=author, message=message, timeout=timeout)
 
     async def wait_for_message(
         self, *matchers: str | Pattern[str] | Sequence[str | Pattern[str]], timeout: float = 15,
