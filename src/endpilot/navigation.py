@@ -649,7 +649,7 @@ class _StandingGraph:
         if source[1] - destination[1] != 1:
             return False
         required = (
-            self.blocks._flat_stance(source) if check_descent_source else True,
+            self.blocks._flat_stance(source, allow_vegetation=True) if check_descent_source else True,
             self.blocks._descent_landing(destination),
             self.blocks._descent_landing(buffer),
         )

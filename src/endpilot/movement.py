@@ -2736,7 +2736,7 @@ class Movement:
                     return abandon("unreachable", "position_changed")
                 if not on_lower:
                     target = self._navigation_goal(blocks, goal).block_exists if legacy else True
-                    status = stance_failure(blocks._flat_stance(source), target)
+                    status = stance_failure(blocks._flat_stance(source, allow_vegetation=True), target)
                     if status is not None:
                         return abandon(status, "stance_unavailable")
                     off_axis = (abs(x - source[0] - 0.5) if source[0] == landing[0]

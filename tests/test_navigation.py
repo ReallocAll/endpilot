@@ -2721,7 +2721,7 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                                  BlockApproach("unreachable", 0))
                 self.assertEqual(self.stream.sent, [])
 
-    async def test_one_block_descent_requires_air_at_the_source_landing_and_runout(self):
+    async def test_one_block_descent_allows_vegetation_only_at_the_source(self):
         self.prepare_descent()
         source, landing, runoff = (0, 100, 0), (1, 99, 0), (2, 99, 0)
         goal = FootGoal(landing)
@@ -2730,7 +2730,18 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((plan.status, plan.nodes), ("found", (source, landing)))
         self.assertEqual(self.stream.sent, [])
 
-        for cell in (source, landing, runoff):
+        self.set_block(source, self.DANDELION)
+        plan = self.bot.plan_navigation(goal, rules=rules)
+        self.assertEqual((plan.status, plan.nodes), ("found", (source, landing)))
+        result = await self.bot.navigate(goal, rules=rules, ticks=8)
+        self.assertEqual(result.status, "budget")
+        self.assertGreater(result.frames, 0)  # No grounded server correction was supplied.
+        self.assert_released()
+        self.set_block(source, self.AIR)
+        self.set_position(0.5, 0.5, y=101.62, teleport=True)
+        self.stream.sent.clear()
+
+        for cell in (landing, runoff):
             with self.subTest(cell=cell):
                 self.set_block(cell, self.DANDELION)
                 plan = self.bot.plan_navigation(goal, rules=rules)

@@ -317,7 +317,8 @@ Still-water crossings are limited to supported pool layouts and require
 On protocol 2225, ordinary same-level walking can pass through observed vanilla
 `minecraft:dandelion` and `minecraft:short_grass` in the primary feet layer.
 The extra feet layer and both head layers must contain observed air, and the
-floor must provide safe support.
+floor must provide safe support. The same vegetation is allowed at the
+launch stance of a one-block descent, but not at its landing or runout.
 Elevation changes require server landing evidence before continuing. A ladder
 descent waits for a grounded server correction at the ladder foot before
 stepping off. Use `reached` and the final match to choose a click, then observe
