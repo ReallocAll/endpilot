@@ -183,6 +183,26 @@ hopper raises `RuntimeError` and an unknown state returns `unobserved`.
 If the observed block, power, or window changes before a step is sent,
 the result is `window_changed` and keeps any earlier confirmed steps.
 
+## Use a workstation
+
+Use `transfer_range()` and `transfer_item()` for the storage layouts in this
+tutorial. Opening a workstation and reading its slots does not enable range
+transfers. Use the operations for that window instead.
+
+| Server window | Public slots and operations |
+| --- | --- |
+| Furnace, smoker, or blast furnace | Use exact-slot `put_into_container()` and `take_from_container()`: `0` is ingredient, `1` fuel, and `2` the result. Take the result rather than placing into that slot. |
+| Brewing stand | Put the ingredient in `0`, bottles in `1` through `3`, and fuel in `4` with `put_into_container()`. Use `take_from_container()` to retrieve bottles from `1` through `3`. |
+| Anvil | Use `put_into_container()` for input `1` and material `2`. These are EndPilot's logical slots; the window's content packet lists the inputs at `0` and `1`. Call `apply_anvil()` with a confirmed empty main inventory slot as the destination. |
+
+Check the matching server verdict for a slot move. For ongoing processing,
+read `bot.furnace_progress` or `bot.brewing_progress` separately. See the item
+reference for [crafting grids](../reference/items.md#craft-from-the-observed-recipe-book),
+[enchanting](../reference/items.md#observe-enchanting-choices), and
+[anvil previews](../reference/items.md#preview-anvil-costs). For villager
+exchanges, use `open_trade()` and `execute_trade()` with the current server
+quote in place of storage transfers.
+
 ## Choose ranges and interpret partial results
 
 - With `direction="take"`, the source range is in the open container and
