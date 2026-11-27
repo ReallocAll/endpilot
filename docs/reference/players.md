@@ -363,6 +363,10 @@ filters the candidates, and ties use the smaller `entity_id`. The query returns
 the cache. A `"hit"` gives the actor and hit distance, `"miss"` reports that no
 supported actor was hit, and `"unknown"` means missing or ambiguous pose,
 terrain, or actor geometry could affect the result. Both queries send no packets.
+Adult cows and sheep with observed dimensions can be selected when their upright
+feet position is known. For sheep, spawn and verified position updates establish
+the feet position. Juvenile sheep and sheep in an unverified pose can leave the
+result unknown.
 
 `attack_entity` and `interact_entity` submit input; a normal return does not
 confirm a hit, damage, or another server-side effect.

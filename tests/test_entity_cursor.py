@@ -11,7 +11,7 @@ from endpilot.blocks import Blocks
 from endpilot.entities import Entities, EntityState
 from endpilot.entity_cursor import trace_entities
 from endpilot.movement import Movement
-from endpilot.protocol import write_batch
+from endpilot.protocol import Protocol, write_batch
 
 from test_blocks import PacketStream
 from test_join import _spawn_transport
@@ -98,6 +98,29 @@ class EntityCursorGeometryTests(unittest.TestCase):
         self.assertEqual(self.trace(candidates, pose=None), ("unknown", None, None))
 
 
+class EntityCursorCompatibilityTests(unittest.TestCase):
+    def test_legacy_sheep_delta_updates_observed_position(self):
+        protocol = Protocol(1001)
+        b = protocol.binding
+        stream = PacketStream(protocol)
+        stream._reader_task = None
+        entities = Entities(stream)
+        self.addCleanup(entities.close)
+        entities.start()
+        stream.emit(protocol.encode(b.AddActorPacket(
+            runtime_id=8, entity_id=108, actor_type="minecraft:sheep", pos=b.Vec3(x=5.5, y=220, z=8.5),
+        )))
+        self.assertEqual(entities.snapshot()[0].position, (5.5, 220, 8.5))
+
+        # The protocol-1001 layout encodes which axes are present in its header.
+        move = b.MoveActorDeltaPacket()
+        move.move_data = type(move.move_data)(
+            runtime_id=8, header=7, new_position_x=5.75, new_position_y=220, new_position_z=8.5,
+        )
+        stream.emit(protocol.encode(move))
+        self.assertEqual(entities.snapshot()[0].position, (5.75, 220, 8.5))
+
+
 class EntityCursorPacketTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.bot = Bot("Cursor", protocol=2225)
@@ -176,10 +199,11 @@ class EntityCursorPacketTests(unittest.IsolatedAsyncioTestCase):
         b = self.b
         self.deliver(b.UpdateBlockPacket(pos=b.BlockPos(x=6, y=221, z=8), runtime_id=runtime_id, layer=0))
 
-    def delta(self, runtime_id=8, *, x=None, y=None, z=None):
+    def delta(self, runtime_id=8, *, x=None, y=None, z=None, force_move=False):
         b = self.b
         self.deliver(b.MoveActorDeltaPacket(move_data=b.MoveActorDeltaData(
             runtime_id=runtime_id, new_position_x=x, new_position_y=y, new_position_z=z, is_on_ground=True,
+            force_move=force_move,
         )))
 
     def query(self, **options):
@@ -379,21 +403,66 @@ class EntityCursorPacketTests(unittest.IsolatedAsyncioTestCase):
         self.delta(y=219)
         self.assertEqual(self.query(max_distance=8).entity.entity_id, 109)
 
-    async def test_measured_sheep_envelope_excludes_off_ray_actor_without_selecting_it(self):
+    async def test_adult_sheep_selects_only_the_current_box_on_the_ray(self):
         await self.view()
         self.spawn_actor()
         sheep = {"runtime_id": 9, "entity_id": 109, "actor_type": "minecraft:sheep"}
         self.spawn_actor(**sheep, x=10.5, z=13.5)
         self.assertEqual(self.query(max_distance=8).entity.entity_id, 108)
-        self.delta(runtime_id=9)  # A packet without position axes leaves the spawn anchor intact.
+        self.delta(runtime_id=9)
         self.assertEqual(self.query(max_distance=8).entity.entity_id, 108)
-        self.delta(runtime_id=9, z=13.6)
-        self.assertEqual(self.query(max_distance=8), EntityCursorResult("unknown", 0))
+        self.delta(runtime_id=9, x=6.0, z=8.5)
+        moving = self.query(max_distance=8)
+        self.assertEqual((moving.status, moving.entity.entity_id), ("hit", 109))
+        self.assertAlmostEqual(moving.distance, .95)
+        self.delta(runtime_id=9, y=220)
+        self.assertEqual(self.query(max_distance=8).entity.entity_id, 108)
+        self.delta(runtime_id=9, x=5.5, y=221, z=8.5, force_move=True)
+        moved = self.query(max_distance=8)
+        self.assertEqual(moved.entity.entity_id, 109)
+        self.assertAlmostEqual(moved.distance, .45)
 
-        self.spawn_actor(**sheep, x=6.0)
+        self.delta(runtime_id=9, x=6.0, force_move=True)
+        self.assertEqual(self.query(max_distance=8), EntityCursorResult("unknown", 0))
+        self.delta(runtime_id=9, x=6.0, y=221, z=8.5)
+        self.assertEqual(self.query(max_distance=8), EntityCursorResult("unknown", 0))
+        self.delta(runtime_id=9, x=6.0, y=221, z=8.5, force_move=True)
+        self.assertEqual(self.query(max_distance=8).entity.entity_id, 109)
+
+        self.deliver(self.b.MoveActorAbsolutePacket(move_data=self.b.MoveActorAbsoluteData(
+            runtime_id=9, pos=self.vec(6.0, 221, 8.5),
+        )))
+        self.delta(runtime_id=9, y=222)
         self.assertEqual(self.query(max_distance=8), EntityCursorResult("unknown", 0))
         self.deliver(self.b.RemoveActorPacket(entity_id=109))
         self.assertEqual(self.query(max_distance=8).entity.entity_id, 108)
+
+    async def test_sheep_requires_both_dimensions_an_adult_pose_and_a_verified_anchor(self):
+        await self.view()
+        b = self.b
+        sheep = {"x": 6.0, "actor_type": "minecraft:sheep"}
+        unknown = EntityCursorResult("unknown", 0)
+        for sizes in ({"width": None}, {"height": None}):
+            with self.subTest(sizes=sizes):
+                self.spawn_actor(**sheep, **sizes)
+                self.assertEqual(self.query(), unknown)
+        self.deliver(b.SetActorDataPacket(id=8, packed_items=self.metadata(height=1.0, low=None, high=None)))
+        self.assertAlmostEqual(self.query().distance, .95)
+
+        for flag in (b.ActorFlags.BABY, b.ActorFlags.RIDING, b.ActorFlags.SITTING, b.ActorFlags.CRAWLING):
+            with self.subTest(flag=flag):
+                self.spawn_actor(**sheep)
+                self.assertEqual(self.query().status, "hit")
+                index = int(flag)
+                low, high = (1 << index, None) if index < 64 else (None, 1 << (index - 64))
+                self.deliver(b.SetActorDataPacket(id=8, packed_items=self.metadata(low=low, high=high)))
+                self.assertEqual(self.query(), unknown)
+                self.delta(x=6.1, y=221, z=8.5, force_move=True)
+                self.deliver(b.SetActorDataPacket(id=8, packed_items=self.metadata()))
+                self.delta(x=6.2)
+                self.assertEqual(self.query(), unknown)
+        self.spawn_actor(**sheep, low=None)
+        self.assertEqual(self.query(), unknown)
 
     async def test_visible_static_block_and_gap_use_measured_entity_occlusion(self):
         for runtime_id, through, surface, pitch in (

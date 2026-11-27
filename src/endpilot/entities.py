@@ -392,8 +392,7 @@ _SHEEP = "minecraft:sheep"
 _VILLAGER = "minecraft:villager_v2"
 _FIREWORK = "minecraft:fireworks_rocket"
 _WOLF = "minecraft:wolf"
-_ACTOR_DELTA_FEET_TYPES = frozenset((_COW, _VILLAGER))
-_ACTOR_SPAWN_FEET_TYPES = _ACTOR_DELTA_FEET_TYPES | {_SHEEP}
+_ACTOR_SPAWN_FEET_TYPES = frozenset((_COW, _SHEEP, _VILLAGER))
 _CURSOR_BODY_TYPES = frozenset((_COW, _SHEEP))
 _UNBOUNDED_BOX: Box = ((-math.inf,) * 3, (math.inf,) * 3)
 
@@ -500,6 +499,15 @@ def _unsupported_view_pose(words: _PlayerFlagWords, binding) -> bool:
     flags = binding.ActorFlags
     return any(_player_flag(words, flag)
                for flag in (flags.RIDING, flags.GLIDING, flags.SWIMMING, flags.SLEEPING, flags.CRAWLING))
+
+
+def _adult_cursor_pose(body: _CursorBody, actor_type: str, binding) -> bool:
+    flags = binding.ActorFlags
+    words = body.flags
+    if None in words or _player_flag(words, flags.BABY) or _unsupported_view_pose(words, binding):
+        return False
+    return actor_type != _SHEEP or not any(_player_flag(words, flag)
+                                           for flag in (flags.SNEAKING, flags.SITTING, flags.LAYING_DOWN))
 
 
 def _actor_angle(value: int) -> float:
@@ -1318,13 +1326,8 @@ class Entities:
         if state.actor_type in _CURSOR_BODY_TYPES:
             body = self._cursor_bodies.get(runtime_id)
             feet = self._non_player_feet(state)
-            if body is not None and feet is not None:
-                adult = (None not in body.flags and not _player_flag(body.flags, binding.ActorFlags.BABY)
-                         and not _unsupported_view_pose(body.flags, binding))
-                if adult:
-                    # Vanilla sheep spawn geometry establishes an envelope.
-                    # Selecting sheep and interpreting their movement need separate evidence.
-                    return feet, state.actor_type == _COW and bool(stable_identity)
+            if body is not None and feet is not None and _adult_cursor_pose(body, state.actor_type, binding):
+                return feet, bool(stable_identity)
         return None, False
 
     def player_view_pose(self, runtime_id: int) -> tuple[tuple[float, float, float], _PlayerRotation] | None:
@@ -1838,12 +1841,14 @@ class Entities:
             body = self._cursor_bodies.get(runtime_id)
             if body is not None:
                 body = _cursor_body(metadata, b, body)
-                if (self._by_runtime[runtime_id].actor_type == "minecraft:item"
-                        and _player_flag(body.flags, b.ActorFlags.RIDING)):
+                actor_type = self._by_runtime[runtime_id].actor_type
+                if actor_type == "minecraft:item" and _player_flag(body.flags, b.ActorFlags.RIDING):
                     # Metadata can report a ride without a link; its end does not supply a new anchor.
                     self._cursor_bodies.pop(runtime_id)
                 else:
                     self._cursor_bodies[runtime_id] = body
+                    if actor_type == _SHEEP and not _adult_cursor_pose(body, actor_type, b):
+                        self._actor_instances[runtime_id].feet_known = False
             view = self._player_views.get(runtime_id)
             if view is not None:
                 words = _player_flag_words(metadata, b, view.flags)
@@ -1957,7 +1962,9 @@ class Entities:
                     and getattr(actor, "passenger_of_block_data", None) is not None):
                 self._actor_instances[runtime_id].feet_known = False
             if actor.actor_type in _CURSOR_BODY_TYPES and getattr(self.packets.protocol, "number", None) == 2225:
-                self._cursor_bodies[runtime_id] = _cursor_body(actor.data.data, b)
+                body = self._cursor_bodies[runtime_id] = _cursor_body(actor.data.data, b)
+                if actor.actor_type == _SHEEP and not _adult_cursor_pose(body, actor.actor_type, b):
+                    self._actor_instances[runtime_id].feet_known = False
             for link in actor.links:
                 self._observe_link(link)
         elif packet_id == b.SetActorLinkPacket.ID:
@@ -2100,7 +2107,8 @@ class Entities:
             state = self._by_runtime.get(runtime_id)
             if state is None:
                 return
-            item = state.actor_type == "minecraft:item" and getattr(self.packets.protocol, "number", None) == 2225
+            protocol_2225 = getattr(self.packets.protocol, "number", None) == 2225
+            item = state.actor_type == "minecraft:item" and protocol_2225
             instance = self._actor_instances.get(runtime_id) if item or state.actor_type in _ACTOR_SPAWN_FEET_TYPES else None
             if packet_id == b.MoveActorAbsolutePacket.ID:
                 position = (float(move.pos.x), float(move.pos.y), float(move.pos.z))
@@ -2117,10 +2125,19 @@ class Entities:
                 )
                 # A delta with omitted axes can only keep a previously verified feet position.
                 if instance is not None:
-                    if (item or state.actor_type in _ACTOR_DELTA_FEET_TYPES) and all(value is not None for value in axes):
+                    if state.actor_type == _SHEEP:
+                        if not protocol_2225:
+                            instance.feet_known = instance.feet_known and all(value is None for value in axes)
+                        elif move.force_completion or move.force_move_local_entity:
+                            instance.feet_known = False
+                        elif move.force_move:
+                            # Stock sheep teleports supply all three feet coordinates in one forced delta.
+                            body = self._cursor_bodies.get(runtime_id)
+                            instance.feet_known = (all(value is not None for value in axes)
+                                                   and body is not None and _adult_cursor_pose(body, _SHEEP, b)
+                                                   and state.entity_id not in self._rides)
+                    elif all(value is not None for value in axes):
                         instance.feet_known = state.entity_id not in self._rides
-                    elif state.actor_type == _SHEEP and any(value is not None for value in axes):
-                        instance.feet_known = False
             rotation = state.boat_rotation
             if rotation is not None:
                 rotation = tuple(
