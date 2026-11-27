@@ -8,7 +8,7 @@ from typing import Literal
 from bedrock_protocol import GameType
 
 from .compression import PacketConnection
-from .inventory import _correct_observed_item, _response_item
+from .inventory import _ARMOR_SLOT_NAMES, _correct_observed_item, _response_item, _stack_snapshot
 from .item_user_data import read_item_user_data
 
 
@@ -77,6 +77,27 @@ class CreativeClearResult:
 
 
 @dataclass(frozen=True, slots=True)
+class CreativeArmorClearSlot:
+    slot: Literal["head", "chest", "legs", "feet"]
+    status: Literal["pending", "unknown", "already_empty", "cleared", "rejected", "unconfirmed"]
+    staging_slot: int | None = None
+    unequip: CreativeRequestProgress | None = None
+    destroy: CreativeRequestProgress | None = None
+    staged: Literal["confirmed", "unknown"] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CreativeArmorClearResult(CreativeClearResult):
+    armor: tuple[CreativeArmorClearSlot, ...]
+
+    @property
+    def complete(self) -> bool:
+        return super(CreativeArmorClearResult, self).complete and all(
+            slot.status in ("already_empty", "cleared") for slot in self.armor
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class CreativeOperationProgress:
     """Confirmed verdicts and submission state when a composite action raises."""
 
@@ -103,6 +124,17 @@ def creative_packet_ids(binding):
 
 def _stack_key(item_id, aux_value, block_runtime_id, user_data_buffer):
     return int(item_id), int(aux_value), int(block_runtime_id) & 0xFFFFFFFF, bytes(user_data_buffer)
+
+
+def _player_slot_corrections(verdict, slot):
+    return [
+        entry
+        for container in verdict.containers or ()
+        if (container.full_container_name.name.name in _PLAYER_CONTAINERS
+            and container.full_container_name.dynamic_id is None)
+        for entry in container.slots
+        if int(entry.slot) == slot
+    ]
 
 
 class CreativeInventory:
@@ -325,13 +357,27 @@ class CreativeInventory:
             for outcome in results.values()
         ))
 
-    async def clear_inventory(self, slots, *, timeout):
+    async def clear_inventory(self, slots, *, timeout, include_armor=False):
         window = self._window()
         slots = tuple(range(36) if slots is None else slots)
         for slot in slots:
             self._check_slot(slot)
         results = {slot: CreativeClearSlot(slot, "pending") for slot in slots}
+        armor = [CreativeArmorClearSlot(slot, "pending") for slot in _ARMOR_SLOT_NAMES] if include_armor else []
         progress = _Progress()
+        main_finished = False
+
+        def result():
+            main = self._clear_result(results)
+            if not include_armor:
+                return main
+            return CreativeArmorClearResult(main.slots, tuple(
+                replace(outcome, status="unconfirmed")
+                if outcome.status in ("cleared", "already_empty") and not self._armor_empty(index)
+                else outcome
+                for index, outcome in enumerate(armor)
+            ))
+
         try:
             async with asyncio.timeout(timeout):
                 for slot in results:
@@ -344,13 +390,117 @@ class CreativeInventory:
                     else:
                         reply = await self.destroy(slot, int(observed.stack_size), timeout=None, progress=progress)
                         results[slot] = self._clear_verdict(slot, reply)
+                main_finished = True
+                for index, outcome in enumerate(armor):
+                    self._require_window(window)
+                    observed = self._inventory.armor_slots.get(index)
+                    if observed is None:
+                        armor[index] = replace(outcome, status="unknown")
+                    elif self._armor_empty(index):
+                        armor[index] = replace(outcome, status="already_empty")
+                    else:
+                        await self._clear_armor_slot(index, _stack_snapshot(observed), window, progress, armor)
+                        if armor[index].status != "cleared":
+                            break
         except (Exception, asyncio.CancelledError) as error:
-            for request in progress.requests:
-                if request.verdict is not None and results[request.slot].status == "pending":
-                    results[request.slot] = self._clear_verdict(request.slot, request.verdict)
-            progress.attach(error, self._clear_result(results))
+            if not main_finished:
+                for request in progress.requests:
+                    if request.verdict is not None and results[request.slot].status == "pending":
+                        results[request.slot] = self._clear_verdict(request.slot, request.verdict)
+            progress.attach(error, result())
             raise
-        return self._clear_result(results)
+        return result()
+
+    def _armor_empty(self, index):
+        item = self._inventory.armor_slots.get(index)
+        return item is not None and not item.id and not item.stack_size and not item.net_id_variant
+
+    @staticmethod
+    def _armor_transfer_target(source, slot, verdict):
+        # The correction identifies the resulting stack, which can get a new ID.
+        matches = _player_slot_corrections(verdict, slot)
+        if len(matches) != 1 or int(matches[0].amount) != 1:
+            return None
+        net_id = matches[0].item_stack_net_id
+        if net_id is None or not int(net_id.raw_id):
+            return None
+        return replace(source, net_id=int(net_id.raw_id))
+
+    def _staged_armor_matches(self, slot, expected):
+        return (expected is not None and slot not in self._inventory._unconfirmed_transfer_slots
+                and slot not in self._inventory._drop_key_counts
+                and _stack_snapshot(self._inventory.slots.get(slot)) == expected)
+
+    async def _clear_armor_slot(self, index, source, window, progress, results):
+        take_step = len(progress.requests)
+        expected = None
+
+        def track(slot, request_id, submitted, verdict=None):
+            nonlocal expected
+            if len(progress.requests) == take_step:
+                progress.requests.append(CreativeRequestProgress(slot, "take", request_id, submitted))
+            else:
+                previous = progress.requests[take_step]
+                progress.requests[take_step] = replace(
+                    previous, submitted=submitted, verdict=previous.verdict if verdict is None else verdict,
+                )
+            if verdict is not None and verdict.result.name == "SUCCESS":
+                expected = self._armor_transfer_target(source, slot, verdict)
+
+        def before_destroy(request_id):
+            if not self._armor_empty(index) or not self._staged_armor_matches(slot, expected):
+                raise RuntimeError("the creative armor transfer changed before destruction")
+            endpoints = ((None, slot), ("ARMOR_CONTAINER", index))
+            pending = self._inventory._pending_requests[request_id]
+            if any(other is not pending for other in self._inventory._requests_for_endpoints(endpoints)):
+                raise RuntimeError("a creative armor transfer slot has an item-stack request in flight")
+
+        try:
+            await self._inventory._unequip_armor(
+                index, timeout=None, before_write=lambda: self._require_window(window), track=track,
+            )
+            slot = progress.requests[take_step].slot
+            if self._armor_empty(index) and self._staged_armor_matches(slot, expected):
+                self._require_window(window)
+                observed = self._inventory.slots[slot]
+                b = self._binding
+                action = b.ItemStackRequestCereal.DestroyActionData(
+                    amount=1, source=self._slot_info(_INVENTORY, slot, expected.net_id),
+                )
+                await self._request(
+                    self._inventory._allocate_request_id(), window, slot, observed, observed, [action], None,
+                    timeout=None, queued=False, progress=progress, at_write=before_destroy,
+                )
+        finally:
+            steps = progress.requests[take_step:]
+            if steps:
+                unequip = steps[0]
+                destroy = steps[1] if len(steps) > 1 else None
+                results[index] = self._armor_outcome(results[index], index, expected, unequip, destroy)
+
+    def _armor_outcome(self, outcome, index, expected, unequip, destroy):
+        slot = unequip.slot
+        status, staged = "unconfirmed", None
+        if unequip.verdict is not None and unequip.verdict.result.name != "SUCCESS":
+            status = "rejected"
+        elif destroy is not None and destroy.verdict is not None and destroy.verdict.result.name == "SUCCESS":
+            observed = self._inventory.slots.get(slot)
+            empty = (observed is not None and not observed.id and not observed.stack_size and not observed.net_id_variant
+                     and slot not in self._inventory._unconfirmed_transfer_slots
+                     and slot not in self._inventory._drop_key_counts)
+            if not empty:
+                staged = "unknown"
+            elif self._armor_empty(index):
+                status = "cleared"
+        elif unequip.submitted is not False:
+            if destroy is not None and destroy.verdict is not None:
+                status = "rejected"
+            if ((destroy is None or destroy.submitted is False or destroy.verdict is not None)
+                    and self._staged_armor_matches(slot, expected)):
+                staged = "confirmed"
+            else:
+                staged = "unknown"
+        return replace(outcome, status=status, staging_slot=slot, unequip=unequip, destroy=destroy, staged=staged)
 
     async def fill(self, slot, entry, count, *, timeout):
         window = self._window()
@@ -393,7 +543,7 @@ class CreativeInventory:
         )
 
     async def _request(self, request_id, window, index, original, output, actions, entry, *,
-                       timeout, queued, progress):
+                       timeout, queued, progress, at_write=None):
         b = self._binding
         request = b.ItemStackRequestPacketData.RequestData(
             client_request_id=b.ItemStackRequestId(raw_id=request_id), actions=actions,
@@ -404,6 +554,8 @@ class CreativeInventory:
             progress.requests.append(CreativeRequestProgress(
                 index, "destroy" if entry is None else "take", request_id, False,
             ))
+        original_snapshot = _stack_snapshot(original) if at_write is not None else None
+        changed = False
 
         def update_progress(submitted, verdict=None):
             if progress is not None:
@@ -418,12 +570,28 @@ class CreativeInventory:
             self._require_window(window)
             if entry is not None:
                 self._entry(entry)
-            if self._inventory.slots.get(index) is not original:
+            if at_write is not None:
+                at_write(request_id)
+            elif self._inventory.slots.get(index) is not original:
                 raise RuntimeError("the creative action's slot changed before submission")
             update_progress(None)
 
+        def observe(_, item):
+            nonlocal changed
+            if not changed and _stack_snapshot(item) != original_snapshot:
+                changed = True
+
         def apply(response):
             update_progress(True, response)
+            if at_write is not None:
+                if changed:
+                    # An observation can return to the original stack before the reply.
+                    return
+                corrections = _player_slot_corrections(response, index)
+                current = self._inventory.slots.get(index)
+                if len(corrections) == 1 and _stack_snapshot(current) == original_snapshot:
+                    self._inventory._set_slot(index, _correct_observed_item(b, current, corrections[0]))
+                return
             for container in response.containers or ():
                 if container.full_container_name.name.name not in _PLAYER_CONTAINERS:
                     continue
@@ -443,6 +611,9 @@ class CreativeInventory:
                             self._inventory._set_slot(index, corrected)
 
         return await self._inventory._request_item_stack(
-            request, apply, timeout=timeout, queued=queued, before_send=before_send,
+            request, apply, timeout=timeout, queued=queued,
+            before_send=before_send if at_write is None else None,
+            _at_write=before_send if at_write is not None else None,
+            _on_slot_observed=observe if at_write is not None else None,
             after_send=lambda: update_progress(True),
         )

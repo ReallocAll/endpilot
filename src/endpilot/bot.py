@@ -1709,14 +1709,18 @@ class Bot:
         return await self._require_creative_inventory().clear(slot, timeout=timeout)
 
     async def clear_creative_inventory(
-        self, slots: Iterable[int] | None = None, *, timeout: float = 15,
+        self, slots: Iterable[int] | None = None, *, include_armor: bool = False, timeout: float = 15,
     ) -> CreativeClearResult:
         """Clear selected observed slots, defaulting to all main inventory slots.
 
-        The result reports each slot in selection order. If interrupted, the
-        original exception's creative_progress carries the partial result.
+        The result reports each selected slot in order. With include_armor,
+        four additional results report armor clearing after the main inventory.
+        If interrupted, the original exception's creative_progress carries the
+        partial result.
         """
-        return await self._require_creative_inventory().clear_inventory(slots, timeout=timeout)
+        return await self._require_creative_inventory().clear_inventory(
+            slots, include_armor=include_armor, timeout=timeout,
+        )
 
     @property
     def armor_slots(self) -> dict[int, object]:

@@ -180,6 +180,23 @@ its slot, status and any server verdict. The status records an observed clear,
 an already empty slot, an unknown slot, a rejection, or an unconfirmed result.
 `result.complete` requires each selected slot to be observed empty at return.
 
+Pass `include_armor=True` to clear head, chest, legs and feet after the selected
+main inventory slots. Pass `[]` to select armor only. Each equipped piece is
+moved to a confirmed empty main inventory slot, which may be outside the
+selection. The server's receipt must identify that moved stack before the SDK
+destroys it. The operation leaves the offhand untouched.
+
+With this option, `result.armor` reports the four armor outcomes in order.
+`result.slots` still reports the selected main inventory slots. Each armor
+outcome has a `staging_slot` and `unequip` and `destroy` request progress when
+those steps were prepared. `staged` is `"confirmed"` when the moved stack is
+still observed there, `"unknown"` when its presence cannot be confirmed, and
+`None` when there is no outstanding staged stack to report. An unobserved armor
+slot is `"unknown"`. A rejection or an unconfirmed change stops further armor
+requests and leaves the remaining outcomes `"pending"`. If no empty staging
+slot is confirmed for an observed piece, the operation raises `RuntimeError`.
+`result.complete` also requires all four armor slots to be observed empty.
+
 Timeout, disconnect and other interruptions of a started fill or bulk clear
 preserve the original exception. Read `error.creative_progress.requests` for
 the slot, action, request ID, submission and any confirmed verdict of each

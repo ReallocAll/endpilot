@@ -925,6 +925,10 @@ class Inventory:
         An explicit occupied destination swaps the stacks. Return the matching
         BDS ItemStackResponse and apply its armor and inventory corrections.
         """
+        return await self._unequip_armor(armor_slot, destination_slot, timeout=timeout)
+
+    async def _unequip_armor(self, armor_slot, destination_slot=None, *, timeout,
+                            before_write=None, track=None):
         if isinstance(armor_slot, str):
             if armor_slot not in _ARMOR_SLOT_NAMES:
                 raise ValueError("armor slot must be head, chest, legs or feet")
@@ -988,7 +992,12 @@ class Inventory:
             strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
         )
 
+        if track is not None:
+            track(destination_slot, request_id, False)
+
         def at_write():
+            if before_write is not None:
+                before_write()
             pending = self._pending_requests[request_id]
             if any(other is not pending for other in self._requests_for_endpoints(pending.endpoints)):
                 raise RuntimeError("an armor transfer slot has an item-stack request in flight")
@@ -998,6 +1007,8 @@ class Inventory:
                     or _stack_snapshot(armor) != original[armor_endpoint]
                     or _stack_snapshot(inventory) != original[inventory_endpoint]):
                 raise RuntimeError("an armor transfer slot changed before submission")
+            if track is not None:
+                track(destination_slot, request_id, None)
 
         def observe(endpoint, item):
             # A slot can change and return to its original descriptor before the reply.
@@ -1005,8 +1016,12 @@ class Inventory:
                 changed.add(endpoint)
 
         def apply(response):
+            if track is not None:
+                track(destination_slot, request_id, True, response)
             success = response.result.name == "SUCCESS"
             for container in response.containers or ():
+                if before_write is not None and container.full_container_name.dynamic_id is not None:
+                    continue
                 name = container.full_container_name.name.name
                 for slot in container.slots:
                     index = int(slot.slot)
@@ -1036,6 +1051,9 @@ class Inventory:
                             continue
                         if not automatic and current is not destination_observed:
                             updated = _correct_observed_item(b, current, slot)
+                        elif (before_write is not None and int(slot.amount) > 0
+                              and (slot.item_stack_net_id is None or not int(slot.item_stack_net_id.raw_id))):
+                            updated = None
                         elif int(expected.id) == 0 and int(slot.amount) > 0:
                             updated = None
                         else:
@@ -1045,6 +1063,7 @@ class Inventory:
         return await self._request_item_stack(
             request, apply, timeout=timeout, _automatic_unequip=automatic,
             _at_write=at_write if automatic else None, _on_slot_observed=observe if automatic else None,
+            after_send=None if track is None else lambda: track(destination_slot, request_id, True),
         )
 
     async def equip_offhand(self, source_slot: int, *, containers, timeout: float = 15):

@@ -3,7 +3,7 @@ from dataclasses import replace
 import unittest
 from unittest.mock import patch
 
-from endpilot import Bot
+from endpilot import Bot, CreativeArmorClearResult, CreativeClearResult
 from endpilot.protocol import read_batch
 
 from test_boss_bars import BatchTransport
@@ -111,6 +111,353 @@ class CreativeInventoryTests(unittest.IsolatedAsyncioTestCase):
                 )],
             ),
         ])
+
+    def item_slot(self, domain, slot, net_id, *, data=_NBT):
+        b = self.b
+        item = b.SerializedNetworkItemStackDescriptor(
+            id=7 if net_id else 0, stack_size=1 if net_id else 0, net_id_variant=net_id,
+            aux_value=7 if net_id else 0, block_runtime_id=0x80000001 if net_id else 0,
+            user_data_buffer=data if net_id else b"",
+        )
+        return b.InventorySlotPacket(inventory_id=b.ContainerID[domain], slot=slot, item=item)
+
+    def transfer_reply(self, request, *, slot=0, armor=0, net_id=51, amount=1,
+                       domain="COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", dynamic_id=None, source_empty=True):
+        b = self.b
+
+        def correction(name, index, count, identity, dynamic=None):
+            return b.ItemStackResponseContainerInfo(
+                full_container_name=b.FullContainerName(name=b.ContainerEnumName[name], dynamic_id=dynamic),
+                slots=[b.ItemStackResponseSlotInfo(
+                    requested_slot=index, slot=index, amount=count,
+                    item_stack_net_id=None if identity is None else b.ItemStackNetId(raw_id=identity),
+                )],
+            )
+
+        containers = [correction(domain, slot, amount, net_id, dynamic_id)]
+        if source_empty:
+            containers.append(correction("ARMOR_CONTAINER", armor, 0, None))
+        return b.ItemStackResponsePacket(responses=[b.ItemStackResponseInfo(
+            client_request_id=request.client_request_id, result=b.ItemStackNetResult.SUCCESS, containers=containers,
+        )])
+
+    async def armor_ready(self, *extra):
+        await self.join(self.mode.CREATIVE)
+        await self.deliver(
+            self.open(), self.item_slot("INVENTORY", 0, None), self.item_slot("ARMOR", 0, 25),
+            self.item_slot("ARMOR", 1, 26), self.item_slot("ARMOR", 2, None),
+            self.item_slot("ARMOR", 3, None), self.item_slot("OFFHAND", 0, 99), *extra,
+        )
+
+    def check_armor_action(self, request, kind, domain, slot, net_id, amount=1):
+        action, = request.actions
+        self.assertIsInstance(action, getattr(self.b.ItemStackRequestCereal, kind))
+        self.assertEqual((action.source.full_container_name.name.name, action.source.slot,
+                          action.source.net_id_variant, action.amount), (domain, slot, net_id, amount))
+        return action
+
+    async def test_bulk_option_keeps_default_shape_and_orders_main_then_armor(self):
+        await self.armor_ready(self.observed_slot(8, 7))
+        legacy = await self.bot.clear_creative_inventory([0, 0], include_armor=False)
+        self.assertIs(type(legacy), CreativeClearResult)
+        self.assertEqual([(row.slot, row.status) for row in legacy.slots], [(0, "already_empty")])
+        self.assertTrue(self.transport.sent.empty())
+
+        pending = asyncio.create_task(self.bot.clear_creative_inventory([8, 8], include_armor=True, timeout=1))
+        main = await self.request()
+        self.check_armor_action(main, "DestroyActionData", "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 8, 22, 3)
+        await self.deliver(self.reply(main, 0, slot=8))
+        for index, identity in enumerate((51, 52)):
+            take = await self.request()
+            action = self.check_armor_action(take, "TakeActionData", "ARMOR_CONTAINER", index, 25 + index)
+            self.assertEqual((action.destination.full_container_name.name.name, action.destination.slot,
+                              action.destination.net_id_variant), ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 0, 0))
+            await self.deliver(self.transfer_reply(take, armor=index, net_id=identity))
+            destroy = await self.request()
+            self.check_armor_action(destroy, "DestroyActionData", "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 0, identity)
+            if index == 0:
+                # An independent empty-slot observation can precede the verdict.
+                await self.deliver(self.item_slot("INVENTORY", 0, None), self.reply(destroy, 0, slot=0))
+            else:
+                await self.deliver(self.reply(destroy, 0, slot=0))
+
+        result = await pending
+        self.assertIs(type(result), CreativeArmorClearResult)
+        self.assertEqual([(row.slot, row.status) for row in result.slots], [(8, "cleared")])
+        self.assertEqual([(row.slot, row.status, row.staging_slot, row.staged) for row in result.armor], [
+            ("head", "cleared", 0, None), ("chest", "cleared", 0, None),
+            ("legs", "already_empty", None, None), ("feet", "already_empty", None, None),
+        ])
+        self.assertTrue(result.complete)
+        self.assertEqual([(row.unequip.request_id, row.destroy.request_id) for row in result.armor[:2]],
+                         [(-3, -5), (-7, -9)])
+        self.assertEqual(self.bot.offhand_item.net_id_variant, 99)
+        self.assertTrue(self.transport.sent.empty())
+
+    async def test_armor_only_distinguishes_known_empty_and_unknown(self):
+        await self.join(self.mode.CREATIVE)
+        await self.deliver(self.open(), self.item_slot("ARMOR", 1, None), self.item_slot("OFFHAND", 0, 99))
+        result = await self.bot.clear_creative_inventory([], include_armor=True)
+        self.assertEqual(result.slots, ())
+        self.assertEqual([row.status for row in result.armor], ["unknown", "already_empty", "unknown", "unknown"])
+        self.assertFalse(result.complete)
+        self.assertEqual(self.bot.offhand_item.net_id_variant, 99)
+        self.assertTrue(self.transport.sent.empty())
+
+    async def test_armor_without_empty_staging_slot_preserves_original_runtime_error(self):
+        for count, message in ((35, "no empty main inventory slot is confirmed"), (36, "the main inventory is full")):
+            with self.subTest(count=count):
+                await self.join(self.mode.CREATIVE)
+                await self.deliver(self.open(), self.item_slot("ARMOR", 0, 25),
+                                   *(self.item_slot("INVENTORY", index, 50 + index) for index in range(count)))
+                with self.assertRaisesRegex(RuntimeError, message) as caught:
+                    await self.bot.clear_creative_inventory([], include_armor=True)
+                self.assertEqual(caught.exception.creative_progress.requests, ())
+                self.assertEqual([row.status for row in caught.exception.creative_progress.clear_result.armor],
+                                 ["pending"] * 4)
+                self.assertTrue(self.transport.sent.empty())
+                await self.bot.close()
+
+    async def test_armor_rejections_stop_and_report_the_staged_piece(self):
+        for reject in ("take", "destroy"):
+            with self.subTest(reject=reject):
+                await self.armor_ready()
+                pending = asyncio.create_task(self.bot.clear_creative_inventory([], include_armor=True, timeout=1))
+                request = await self.request()
+                if reject == "destroy":
+                    await self.deliver(self.transfer_reply(request))
+                    request = await self.request()
+                await self.deliver(self.reply(request, 0, slot=0, result="ERROR"))
+                result = await pending
+                first = result.armor[0]
+                self.assertEqual([row.status for row in result.armor], ["rejected", "pending", "pending", "pending"])
+                if reject == "take":
+                    self.assertEqual((first.unequip.verdict.result.name, first.destroy, first.staged), ("ERROR", None, None))
+                    self.assertEqual(self.bot.armor_slots[0].net_id_variant, 25)
+                else:
+                    self.assertEqual((first.unequip.verdict.result.name, first.destroy.verdict.result.name, first.staged),
+                                     ("SUCCESS", "ERROR", "confirmed"))
+                    self.assertEqual(self.bot.inventory_slots[0].net_id_variant, 51)
+                self.assertTrue(self.transport.sent.empty())
+                await self.bot.close()
+
+    async def test_armor_transfer_requires_explicit_receipt_and_matching_observations(self):
+        for label, receipt, replacement in (
+            ("missing identity", {"net_id": None}, None),
+            ("zero identity with live fallback", {"net_id": 0}, (25, _NBT)),
+            ("wrong domain", {"domain": "OFFHAND_CONTAINER"}, None),
+            ("dynamic container", {"dynamic_id": 7}, None),
+            ("wrong slot", {"slot": 1}, None),
+            ("wrong amount", {"amount": 2}, None),
+            ("source not empty", {"source_empty": False}, None),
+            ("same item with a different identity", {}, (52, _NBT)),
+            ("different item data with the receipt identity", {}, (51, b"")),
+        ):
+            with self.subTest(label=label):
+                await self.armor_ready()
+                pending = asyncio.create_task(self.bot.clear_creative_inventory([], include_armor=True, timeout=1))
+                request = await self.request()
+                packets = [self.transfer_reply(request, **receipt)]
+                if replacement is not None:
+                    identity, data = replacement
+                    packets.append(self.item_slot("INVENTORY", 0, identity, data=data))
+                await self.deliver(*packets)
+                result = await pending
+                first = result.armor[0]
+                self.assertEqual([row.status for row in result.armor], ["unconfirmed", "pending", "pending", "pending"])
+                self.assertEqual((first.unequip.verdict.result.name, first.destroy), ("SUCCESS", None))
+                self.assertTrue(self.transport.sent.empty())
+                await self.bot.close()
+
+    async def test_armor_destroy_requires_an_observed_empty_slot(self):
+        for receipt in ({"slot": 1}, {"dynamic_id": 7}):
+            with self.subTest(receipt=receipt):
+                await self.armor_ready()
+                pending = asyncio.create_task(self.bot.clear_creative_inventory([], include_armor=True, timeout=1))
+                await self.deliver(self.transfer_reply(await self.request()))
+                destroy = await self.request()
+                await self.deliver(self.transfer_reply(destroy, amount=0, net_id=None, source_empty=False, **receipt))
+                result = await pending
+                first = result.armor[0]
+                self.assertEqual([row.status for row in result.armor],
+                                 ["unconfirmed", "pending", "pending", "pending"])
+                self.assertEqual((first.destroy.verdict.result.name, first.staged), ("SUCCESS", "unknown"))
+                self.assertTrue(self.transport.sent.empty())
+                await self.bot.close()
+
+    async def test_armor_checks_current_window_mode_and_stacks_at_both_writes(self):
+        b = self.b
+        for stage, change, error_type, message in (
+            ("take", "window", RuntimeError, "window changed"),
+            ("take", "mode", PermissionError, "granted creative mode"),
+            ("take", "slot", RuntimeError, "transfer slot changed"),
+            ("take", "source", RuntimeError, "transfer slot changed"),
+            ("destroy", "window", RuntimeError, "window changed"),
+            ("destroy", "mode", PermissionError, "granted creative mode"),
+            ("destroy", "slot", RuntimeError, "transfer changed before destruction"),
+            ("destroy", "source", RuntimeError, "transfer changed before destruction"),
+        ):
+            with self.subTest(stage=stage, change=change):
+                await self.armor_ready()
+                send = self.bot.packets.send
+                at_send, release = asyncio.Event(), asyncio.Event()
+                delay_type = (b.ItemStackRequestCereal.TakeActionData if stage == "take"
+                              else b.ItemStackRequestCereal.DestroyActionData)
+
+                async def delay(packet, **kwargs):
+                    if isinstance(packet, b.ItemStackRequestPacket) and isinstance(packet.requests[0].actions[0], delay_type):
+                        at_send.set()
+                        await release.wait()
+                    await send(packet, **kwargs)
+
+                with patch.object(self.bot.packets, "send", delay):
+                    pending = asyncio.create_task(self.bot.clear_creative_inventory([], include_armor=True, timeout=1))
+                    if stage == "destroy":
+                        await self.deliver(self.transfer_reply(await self.request()))
+                    await asyncio.wait_for(at_send.wait(), 1)
+                    if change == "window":
+                        await self.deliver(self.close(), self.open())
+                    elif change == "mode":
+                        await self.deliver(b.SetPlayerGameTypePacket(player_game_type=self.mode.SURVIVAL))
+                    elif change == "source":
+                        await self.deliver(self.item_slot("ARMOR", 0, 52))
+                    else:
+                        await self.deliver(self.item_slot("INVENTORY", 0, 52))
+                    release.set()
+                    with self.assertRaisesRegex(error_type, message) as caught:
+                        await pending
+                progress = caught.exception.creative_progress
+                first = progress.clear_result.armor[0]
+                self.assertEqual([row.status for row in progress.clear_result.armor],
+                                 ["unconfirmed", "pending", "pending", "pending"])
+                self.assertFalse(progress.requests[-1].submitted)
+                if stage == "destroy":
+                    self.assertEqual(first.unequip.verdict.result.name, "SUCCESS")
+                    self.assertIs(first.destroy, progress.requests[-1])
+                    self.assertEqual(first.staged, "unknown" if change == "slot" else "confirmed")
+                else:
+                    self.assertIsNone(first.destroy)
+                self.assertTrue(self.transport.sent.empty())
+                await self.bot.close()
+
+    async def test_cancel_before_second_armor_destroy_keeps_the_confirmed_prefix(self):
+        await self.armor_ready()
+        b = self.b
+        send = self.bot.packets.send
+        blocked = asyncio.Event()
+
+        async def delay(packet, **kwargs):
+            if (isinstance(packet, b.ItemStackRequestPacket)
+                    and packet.requests[0].client_request_id.raw_id == -7):
+                blocked.set()
+                await asyncio.Future()
+            await send(packet, **kwargs)
+
+        with patch.object(self.bot.packets, "send", delay):
+            pending = asyncio.create_task(self.bot.clear_creative_inventory([0], include_armor=True, timeout=1))
+            await self.deliver(self.transfer_reply(await self.request()))
+            await self.deliver(self.reply(await self.request(), 0, slot=0))
+            chest = await self.request()
+            await self.deliver(self.transfer_reply(chest, armor=1, net_id=52))
+            await asyncio.wait_for(blocked.wait(), 1)
+            pending.cancel()
+            with self.assertRaises(asyncio.CancelledError) as caught:
+                await pending
+        progress = caught.exception.creative_progress
+        self.assertEqual([(row.slot, row.status) for row in progress.clear_result.slots], [(0, "unconfirmed")])
+        self.assertEqual([(row.status, row.staged) for row in progress.clear_result.armor],
+                         [("cleared", None), ("unconfirmed", "confirmed"), ("pending", None), ("pending", None)])
+        self.assertEqual([(row.request_id, row.submitted) for row in progress.requests],
+                         [(-1, True), (-3, True), (-5, True), (-7, False)])
+        self.assertEqual(self.bot.inventory_slots[0].net_id_variant, 52)
+        self.assertTrue(self.transport.sent.empty())
+
+    async def test_armor_destroy_verdict_does_not_erase_a_replacement(self):
+        for observed_ids in ((52,), (52, 51)):
+            with self.subTest(observed_ids=observed_ids):
+                await self.armor_ready()
+                pending = asyncio.create_task(self.bot.clear_creative_inventory([], include_armor=True, timeout=1))
+                await self.deliver(self.transfer_reply(await self.request()))
+                destroy = await self.request()
+                self.check_armor_action(destroy, "DestroyActionData", "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 0, 51)
+                await self.deliver(*(self.item_slot("INVENTORY", 0, identity) for identity in observed_ids),
+                                   self.reply(destroy, 0, slot=0))
+                result = await pending
+                self.assertFalse(result.complete)
+                self.assertEqual([row.status for row in result.armor], ["unconfirmed", "pending", "pending", "pending"])
+                self.assertEqual(self.bot.inventory_slots[0].net_id_variant, observed_ids[-1])
+                verdict = result.armor[0].destroy.verdict
+                self.assertEqual(verdict.result.name, "SUCCESS")
+                self.assertEqual(verdict.client_request_id.raw_id, destroy.client_request_id.raw_id)
+                self.assertTrue(self.transport.sent.empty())
+                await self.bot.close()
+
+    async def test_armor_interruption_retains_submissions_and_already_received_verdicts(self):
+        b = self.b
+        for stage, interruption, expected_submitted, expected_verdict, error_type in (
+            ("take", "disconnect", True, None, ConnectionError),
+            ("take", "timeout", True, None, TimeoutError),
+            ("take", "cancel", True, None, asyncio.CancelledError),
+            ("take", "blocked write", None, None, asyncio.CancelledError),
+            ("take", "cancel with verdict", True, "SUCCESS", asyncio.CancelledError),
+            ("destroy", "disconnect", True, None, ConnectionError),
+            ("destroy", "timeout", True, None, TimeoutError),
+            ("destroy", "cancel", True, None, asyncio.CancelledError),
+            ("destroy", "blocked write", None, None, asyncio.CancelledError),
+            ("destroy", "cancel with verdict", True, "SUCCESS", asyncio.CancelledError),
+        ):
+            with self.subTest(stage=stage, interruption=interruption):
+                await self.armor_ready(self.observed_slot(8, 7))
+                timeout = 0.15 if interruption == "timeout" else 1
+                pending = asyncio.create_task(self.bot.clear_creative_inventory([8], include_armor=True, timeout=timeout))
+                main = await self.request()
+                if stage == "take" and interruption == "blocked write":
+                    self.transport.block_send = asyncio.Event()
+                await self.deliver(self.reply(main, 0, slot=8))
+                take = await self.request()
+                if stage == "destroy":
+                    if interruption == "blocked write":
+                        self.transport.block_send = asyncio.Event()
+                    await self.deliver(self.transfer_reply(take))
+                    request = await self.request()
+                else:
+                    request = take
+
+                if interruption == "disconnect":
+                    await self.deliver(b.DisconnectPacket())
+                elif interruption in ("cancel", "blocked write"):
+                    pending.cancel()
+                elif interruption == "cancel with verdict":
+                    unsubscribe = self.bot.packets.subscribe_raw(
+                        lambda raw: pending.cancel() if raw.packet_id == b.ItemStackResponsePacket.ID else None
+                    )
+                    try:
+                        await self.deliver(self.transfer_reply(request) if stage == "take" else self.reply(request, 0, slot=0))
+                    finally:
+                        unsubscribe()
+                with self.assertRaises(error_type) as caught:
+                    await pending
+                progress = caught.exception.creative_progress
+                result = progress.clear_result
+                self.assertEqual([(row.slot, row.status) for row in result.slots], [(8, "cleared")])
+                row = result.armor[0]
+                step = row.unequip if stage == "take" else row.destroy
+                self.assertIs(step, progress.requests[-1])
+                self.assertIs(step.submitted, expected_submitted)
+                self.assertEqual(step.verdict.result.name if step.verdict else None, expected_verdict)
+                self.assertEqual([other.status for other in result.armor[1:]], ["pending"] * 3)
+                if stage == "take":
+                    self.assertIsNone(row.destroy)
+                    self.assertEqual((row.status, row.staged),
+                                     ("unconfirmed", "confirmed" if expected_verdict else "unknown"))
+                else:
+                    self.assertEqual(row.unequip.verdict.result.name, "SUCCESS")
+                    self.assertEqual((row.status, row.staged),
+                                     ("cleared", None) if expected_verdict else ("unconfirmed", "unknown"))
+                self.assertTrue(self.transport.sent.empty())
+                if self.transport.block_send is not None:
+                    self.transport.block_send.set()
+                await self.bot.close()
 
     async def test_catalog_and_mode_preserved_across_spawn_and_reset_on_rejoin(self):
         b, mode = self.b, self.mode
