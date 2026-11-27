@@ -37,6 +37,9 @@ ORE = 0x54A1D0FD
 DEEPSLATE_ORE = 0x3057FA73
 OAK_LOG_BLOCK = 4065577688
 OAK_LOG_ITEM = 17
+MATURE_WHEAT = 1670228562
+WHEAT = 337
+WHEAT_SEEDS = 291
 IRON_AXE = 446
 IRON_SWORD = 1201
 SHEARS = 1202
@@ -731,11 +734,11 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
                     return packet
 
     async def finish_batch_break(
-        self, position, *, runtime_id, total=None, item_id=DIRT, count=1, player=PLAYER, net_id=None,
+        self, position, *, runtime_id, total=None, item_id=DIRT, count=1, player=PLAYER, net_id=None, other_drops=(),
     ):
         packets = [self.block(HASHED_AIR_RUNTIME_ID, position=position),
                    self.drop(runtime_id, position=tuple(value + 0.5 for value in position),
-                             count=count, item_id=item_id)]
+                             count=count, item_id=item_id), *other_drops]
         if total is not None:
             packets.extend((self.take(runtime_id, player=player), self.slot(2, item_id, total, net_id=net_id)))
         self.wire.emit(*packets)
@@ -865,7 +868,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def start_storage_collection(
         self, positions=(TARGET, SECOND_TARGET), *, dirt_count=64, slots=36, empty_slot=False, vein=False,
-        chest=REFILL_CHEST, terrain=(), ticks=0, search_radius=0, timeout=1,
+        chest=REFILL_CHEST, terrain=(), ticks=0, search_radius=0, timeout=1, other_drops=(),
     ):
         bot = await self.refill_bot(chest=chest)
         inventory = [stack_descriptor(self.b, OAK_LOG_ITEM, 64, 100 + index) for index in range(slots)]
@@ -893,7 +896,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
 
         self.addAsyncCleanup(settle_task)
         await self.expect_batch_start(TARGET)
-        await self.finish_batch_break(TARGET, runtime_id=101)
+        await self.finish_batch_break(TARGET, runtime_id=101, other_drops=other_drops)
         return bot, task
 
     async def assert_storage_deposit(self, amount, *, chest_count=0, chest=REFILL_CHEST, click_timeout=1):
@@ -951,8 +954,22 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_storage_does_not_open_with_a_missing_slot_observation(self):
         await self.check_storage_requires_a_known_full_inventory(slots=35)
 
+    async def test_storage_does_not_open_for_ambiguous_counted_drops(self):
+        bot, task = await self.start_storage_collection(
+            vein=True, timeout=0.2, other_drops=(self.drop(102),),
+        )
+        result = await asyncio.wait_for(task, 1)
+        attempt, = result.results
+        self.assertEqual([drop.runtime_id for drop in attempt.drops], [101, 102])
+        self.assertEqual((attempt.status, result.collected_count, attempt.storage_attempt), ("ambiguous_drop", 0, None))
+        self.assertIsNone(bot.open_window)
+        while not self.wire.outgoing.empty():
+            frame = self.wire.outgoing.get_nowait()
+            self.assertIsInstance(frame, self.b.PlayerAuthInputPacket)
+            self.assertFalse(frame.player_block_actions)
+
     async def test_storage_confirms_same_item_pickup_after_matching_close_before_counted_vein_resumes(self):
-        bot, task = await self.start_storage_collection(vein=True)
+        bot, task = await self.start_storage_collection(vein=True, other_drops=(self.drop(103, item_id=OAK_LOG_ITEM),))
         request = await self.assert_storage_deposit(64)
         await self.emit(self.storage_receipt(request, player_count=0, chest_count=64))
         close = await self.refill_close(confirm=False)
@@ -973,6 +990,9 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.collected_count, 2)
         self.assertEqual((first.status, first.inventory_delta, first.collector_id), ("collected", 1, PLAYER))
         self.assertEqual((first.drops[0].entity_id, first.drops[0].runtime_id), (1101, 101))
+        self.assertEqual([(drop.runtime_id, drop.item_network_id) for drop in first.drops],
+                         [(101, DIRT), (103, OAK_LOG_ITEM)])
+        self.assertEqual(first.pickup_drop, first.drops[0])
         self.assertEqual((first.storage_attempt.stop_reason, first.storage_attempt.transfer.confirmed_count),
                          ("complete", 64))
         self.assertEqual((second.status, second.inventory_delta, second.storage_attempt), ("collected", 1, None))
@@ -1891,16 +1911,86 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_counted_collection_stops_when_confirmed_pickup_has_a_different_item_id(self):
         bot = await self.log_bot(SECOND_TARGET, TARGET)
-        task = self.collect_logs(bot, count=1)
+        task = self.collect_logs(bot, count=1, timeout=0.5)
         await self.expect_batch_start(SECOND_TARGET)
         await self.finish_batch_break(SECOND_TARGET, runtime_id=101, total=1)
         result = await asyncio.wait_for(task, 1)
         attempt, = result.results
         self.assertEqual((attempt.status, attempt.drops[0].item_network_id), ("collected", DIRT))
+        self.assertEqual(attempt.pickup_drop, attempt.drops[0])
         self.assertEqual(result.collected_count, 0)
         self.assertEqual(bot.inventory_count(OAK_LOG_ITEM), 0)
         self.assertEqual(bot.observed_block(TARGET).runtime_id, OAK_LOG_BLOCK)
         self.assert_no_more_collection_inputs()
+
+    async def wheat_bot(self):
+        bot = await self.public_bot(item_names={WHEAT: "minecraft:wheat", WHEAT_SEEDS: "minecraft:wheat_seeds"})
+        bot._session.item_registry = ItemRegistrySnapshot(bot._session.item_names)
+        return bot
+
+    async def start_wheat_collection(self, bot, *, counted=True):
+        await self.emit(self.block(MATURE_WHEAT), self.content(*(self.item() for _ in range(36))))
+        options = {"ticks": 0, "search_radius": 0, "timeout": 1}
+        action = (bot.collect_by_count(MATURE_WHEAT, item_id=WHEAT, count=1, radius=2, **options) if counted
+                  else bot.collect_block(TARGET, **options))
+        task = asyncio.create_task(action)
+        await self.expect_batch_start(TARGET)
+        return task
+
+    async def test_counted_collection_confirms_late_wheat_among_known_seed_drops(self):
+        bot = await self.wheat_bot()
+        task = await self.start_wheat_collection(bot)
+        self.wire.emit(self.block(HASHED_AIR_RUNTIME_ID), self.drop(101, item_id=WHEAT_SEEDS))
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
+
+        await self.emit(self.drop(102, item_id=WHEAT), self.take(101), self.slot(3, WHEAT_SEEDS, 1, net_id=16))
+        self.assertEqual((bot.inventory_count(WHEAT), bot.inventory_count(WHEAT_SEEDS)), (0, 1))
+        self.assertFalse(task.done())
+
+        await self.emit(self.take(102))
+        done, _ = await asyncio.wait((task,), timeout=0.01)
+        self.assertFalse(done)
+        self.assertEqual(bot.inventory_count(WHEAT), 0)
+
+        await self.emit(self.slot(2, WHEAT, 1, net_id=15))
+        result = await asyncio.wait_for(task, 1)
+        attempt, = result.results
+        self.assertEqual((attempt.status, attempt.collector_id, attempt.inventory_delta), ("collected", PLAYER, 1))
+        self.assertTrue(attempt.pickup_confirmed)
+        self.assertEqual([(drop.runtime_id, drop.item_network_id) for drop in attempt.drops],
+                         [(101, WHEAT_SEEDS), (102, WHEAT)])
+        self.assertEqual(attempt.pickup_drop, attempt.drops[1])
+        self.assertEqual(result.collected_count, 1)
+        self.assertTrue(attempt.block_after.is_air)
+
+    async def test_mixed_wheat_drops_still_require_unambiguous_counted_pickup_evidence(self):
+        bot = await self.wheat_bot()
+        for index, case in enumerate(("two_wheat", "unknown_pickup", "outside_pickup", "uncounted")):
+            with self.subTest(case=case):
+                counted = case != "uncounted"
+                task = await self.start_wheat_collection(bot, counted=counted)
+                seed_id, wheat_id, other_id = range(110 + 3 * index, 113 + 3 * index)
+                extra = {
+                    "two_wheat": (self.drop(other_id, item_id=WHEAT),),
+                    "unknown_pickup": (self.take(other_id),),
+                    "outside_pickup": (self.drop(other_id, item_id=WHEAT, position=(-2.1, 100.5, 3.5)),
+                                       self.take(other_id)),
+                    "uncounted": (),
+                }[case]
+                self.wire.emit(self.block(HASHED_AIR_RUNTIME_ID), self.drop(seed_id, item_id=WHEAT_SEEDS),
+                               self.drop(wheat_id, item_id=WHEAT), *extra,
+                               self.take(wheat_id), self.slot(2, WHEAT, 1, net_id=15))
+                self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
+                result = await asyncio.wait_for(task, 1)
+                attempt = result
+                if counted:
+                    attempt, = result.results
+                    self.assertEqual(result.collected_count, 0)
+                self.assertEqual(attempt.status, "ambiguous_drop")
+                self.assertFalse(attempt.pickup_confirmed)
+                expected_drops = [seed_id, wheat_id, other_id] if case == "two_wheat" else [seed_id, wheat_id]
+                self.assertEqual([drop.runtime_id for drop in attempt.drops], expected_drops)
+                self.assert_no_more_collection_inputs()
 
     async def test_counted_collection_rejects_a_new_world_generation_with_the_same_id(self):
         bot = await self.log_bot(SECOND_TARGET, TARGET)

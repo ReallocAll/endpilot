@@ -96,6 +96,17 @@ confirmed in inventory.
 Read `CountedBlockCollection.collected_count` for the confirmed increase of
 `item_id` in the main inventory. A single pickup can exceed the remaining
 count. `results` contains the evidence for each attempted or skipped block.
+Each `BlockCollection.drops` keeps the new item actors observed in the
+harvested cell, including drops of other items. For example, when mature
+wheat yields wheat and seeds, a request for wheat pursues the wheat actor.
+Two actors with the requested ID, or a requested actor alongside one whose
+item ID is unknown, leave the pickup ambiguous. If no requested actor
+appears, the bot waits until the observation window ends without pursuing
+other items. The result is `drop_unobserved` unless the bot confirmed its
+pickup of the sole observed drop and its matching inventory gain. In that
+case it reports `collected` with `timed_out=True` and credits zero toward
+the requested count. `BlockCollection.pickup_drop` identifies the actor
+from `drops` whose pickup and inventory gain were confirmed.
 An interrupted call attaches its evidence to the exception as
 `collection_progress`.
 
@@ -160,7 +171,9 @@ batch = await bot.collect_targets(positions, storage=storage)
 
 The item must be an exact registered name or its transferable network ID.
 The bot considers storage after observing the break and a single new drop
-that is still present. It checks all 36 main inventory slots for a settled
+that is still present. Counted collection applies this check to its unique
+requested drop and uses the configured item for the chest transfer.
+It checks all 36 main inventory slots for a settled
 server snapshot with no available space for that drop. An empty slot or a
 same-item stack with possible spare capacity keeps collection on its usual
 pickup path. The trip uses the remaining break and pickup timeout and the

@@ -31,10 +31,13 @@ class BlockCollection:
     """Evidence received during one collection attempt.
 
     Drops are new item actors first reported inside the target block. Their
-    source may be indistinguishable on this stream. The collector and inventory
-    delta refer to a sole candidate. An unknown delta is None. Ordered refills
-    record each chest and its available acquisition evidence in tool_refill_attempts.
-    An opted-in storage trip records its transfer and stopping reason in storage_attempt.
+    source may be indistinguishable on this stream. In counted collection,
+    the collector and inventory delta normally refer to the unique requested
+    candidate. After timeout, they may describe a confirmed pickup of another
+    item instead. pickup_drop identifies the confirmed actor. An unknown delta
+    is None. Ordered refills record each chest and its available
+    acquisition evidence in tool_refill_attempts. An opted-in storage trip
+    records its transfer and stopping reason in storage_attempt.
     """
 
     position: tuple[int, int, int]
@@ -52,6 +55,7 @@ class BlockCollection:
         default=(), kw_only=True,
     )
     storage_attempt: CollectionStorageResult | None = field(default=None, kw_only=True)
+    pickup_drop: EntityState | None = field(default=None, kw_only=True)
     _pickup_confirmed: bool = field(default=False, kw_only=True, repr=False)
 
     @property
@@ -202,7 +206,11 @@ def _storage_item_id(bot: "Bot", storage: CollectionStorage | None, timeout: flo
 def _confirmed_item_count(result: BlockCollection, item_id: int, *, item_name: str | None = None) -> int:
     if not result.pickup_confirmed:
         return 0
-    drop, = result.drops
+    drop = result.pickup_drop
+    if drop is None:
+        if len(result.drops) != 1:
+            return 0
+        drop, = result.drops
     if drop.item_network_id != item_id or (item_name is not None and drop.item_id != item_name):
         return 0
     return drop.item_count or 0
@@ -623,7 +631,10 @@ class _BlockCollector:
         timeout: float, record: Callable[[BlockCollection], None] | None, *,
         dimension: int, ticks: int, search_radius: int,
     ) -> None:
-        drop, = observation.candidates.values()
+        candidates = observation.pickup_candidates()
+        if len(candidates) != 1:
+            return
+        drop, = candidates
         if observation.live_drop(drop) is None:
             return
         inventory = self.blocks.inventory
@@ -803,7 +814,7 @@ class _BlockCollector:
         result = await _observe_mined_block(
             self.blocks, self.entities, position, face=match.face, timeout=timeout, follow_ticks=120,
             epoch=epoch, prepare_start=prepare_start, record=record if progress is not None else None, store=store,
-            search_radius=search_radius,
+            search_radius=search_radius, requested_drop_id=requested_drop_id,
         )
         result = with_equipment(result)
         remember(result)
@@ -884,6 +895,7 @@ def _drop_identity(drop: EntityState) -> tuple[int | None, int | None]:
 class _CollectionObservation:
     def __init__(
         self, blocks: Blocks, entities: Entities, before: BlockObservation, epoch: int, *, bind_drops: bool = False,
+        requested_drop_id: int | None = None,
     ):
         self.blocks = blocks
         self.entities = entities
@@ -897,7 +909,8 @@ class _CollectionObservation:
         self.known_drops = {}
         self.seen_drops = {_drop_identity(drop) for drop in entities.drops()}
         self.candidates = {}
-        self.instances = {} if bind_drops else None
+        self.requested_drop_id = requested_drop_id
+        self.instances = {} if bind_drops or requested_drop_id is not None else None
         self.pickups = {}
         self.storage_item_id: int | None = None
         self.storage_attempt: CollectionStorageResult | None = None
@@ -935,7 +948,7 @@ class _CollectionObservation:
             if self.started and identity not in self.seen_drops and all(
                 corner <= value < corner + 1
                 for corner, value in zip(self.before.position, drop.position)
-            ) and drop.item_network_id != 0 and drop.item_count > 0:
+            ) and (self.requested_drop_id is not None or (drop.item_network_id != 0 and drop.item_count > 0)):
                 self.candidates[identity] = drop
                 if self.instances is not None:
                     self.instances[identity] = self.entities._actor_instance(runtime_id)
@@ -980,10 +993,19 @@ class _CollectionObservation:
         collectors, _ = self.pickups.setdefault(identity, (set(), drop))
         collectors.add(player_id)
 
+    def pickup_candidates(self) -> tuple[EntityState, ...]:
+        requested = self.requested_drop_id
+        if requested is None:
+            return tuple(self.candidates.values())
+        candidates = tuple(drop for drop in self.candidates.values() if drop.item_network_id in (requested, None, 0))
+        # Without an observed requested item, there is no candidate to pursue.
+        return candidates if any(drop.item_network_id == requested for drop in candidates) else ()
+
     def live_drop(self, drop: EntityState) -> EntityState | None:
         identity = _drop_identity(drop)
+        candidates = self.pickup_candidates()
         if (self.blocks._mining_epoch != self.epoch or not drop.entity_id
-                or len(self.candidates) != 1 or identity in self.pickups):
+                or len(candidates) != 1 or candidates[0] is not drop or identity in self.pickups):
             return None
         if self.instances is None:
             current = self.entities._get_by_unique_id(drop.entity_id)
@@ -1020,13 +1042,21 @@ class _CollectionObservation:
         drops = tuple(self.candidates.values())
         collector_id = None
         delta = None
+        pickup_drop = None
         status = "break_unconfirmed"
         if self.after is not None:
             status = "drop_unobserved"
-            if len(drops) > 1:
+            candidates = self.pickup_candidates()
+            other_item_at_timeout = (
+                timed_out and self.requested_drop_id is not None and not candidates
+                and len(drops) == 1 and bool(drops[0].item_network_id)
+            )
+            if other_item_at_timeout:
+                candidates = drops
+            if len(candidates) > 1:
                 status = "ambiguous_drop"
-            elif drops:
-                drop, = drops
+            elif candidates and (self.requested_drop_id is None or (candidates[0].item_count or 0) > 0):
+                drop, = candidates
                 identity = _drop_identity(drop)
                 collectors, _ = self.pickups.get(identity, (set(), None))
                 delta = self._pickup_delta(drop.item_network_id)
@@ -1040,15 +1070,20 @@ class _CollectionObservation:
                         status = "taken_by_other"
                     elif any(
                         other != identity and collector_id in players
-                        and (source is None or source.item_network_id == drop.item_network_id)
+                        and (source is None or source.item_network_id == drop.item_network_id
+                             or (self.requested_drop_id is not None and not source.item_network_id))
                         for other, (players, source) in self.pickups.items()
                     ):
                         status = "ambiguous_drop"
                     elif self.storage_pickup_confirmed or delta == drop.item_count:
                         status = "collected"
                         delta = drop.item_count
+                        if self.requested_drop_id is not None:
+                            pickup_drop = drop
                     else:
                         status = "inventory_unconfirmed"
+            if other_item_at_timeout and status != "collected":
+                status, collector_id, delta = "drop_unobserved", None, None
         pickup_confirmed = status == "collected"
         attempt = self.storage_attempt
         if attempt is not None and attempt.stop_reason != "complete":
@@ -1065,6 +1100,7 @@ class _CollectionObservation:
             inventory_delta=delta,
             timed_out=timed_out,
             storage_attempt=attempt,
+            pickup_drop=pickup_drop,
             _pickup_confirmed=pickup_confirmed and (dimension_changed or status != "collected"),
         )
 
@@ -1075,7 +1111,7 @@ async def _observe_mined_block(
     prepare_start: Callable[[], None] | None = None,
     record: Callable[[BlockCollection], None] | None = None,
     store: _StoreForDrop | None = None,
-    search_radius: int = 8,
+    search_radius: int = 8, requested_drop_id: int | None = None,
 ) -> BlockCollection:
     before = blocks.observed_block(position)
     if before is None or before.is_air is None:
@@ -1086,7 +1122,9 @@ async def _observe_mined_block(
     packets = blocks.packets
     b = packets.protocol.binding
     epoch = blocks._mining_epoch if epoch is None else epoch
-    observation = _CollectionObservation(blocks, entities, before, epoch, bind_drops=store is not None)
+    observation = _CollectionObservation(
+        blocks, entities, before, epoch, bind_drops=store is not None, requested_drop_id=requested_drop_id,
+    )
     deadline = asyncio.timeout(timeout)
     watched_packets = (
         b.UpdateBlockPacket.ID, b.UpdateSubChunkBlocksPacket.ID, b.AddItemActorPacket.ID,
@@ -1115,7 +1153,7 @@ async def _observe_mined_block(
             if result.status in ("collected", "ambiguous_drop", "taken_by_other"):
                 return result
             if store is not None and observation.storage_attempt is None and result.status == "pickup_unconfirmed":
-                drop, = result.drops
+                drop, = observation.pickup_candidates()
                 remaining = deadline.when() - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     return observation.result(timed_out=True)
@@ -1145,7 +1183,7 @@ async def _observe_mined_block(
                         remaining_follow_ticks = max(0, follow_ticks - (movement._tick - start_tick)) if reached else 0
                         followed = False
             if result.status == "pickup_unconfirmed" and (not followed or observation.storage_attempt is not None):
-                drop, = result.drops
+                drop, = observation.pickup_candidates()
                 current = observation.live_drop(drop)
                 if current is None and observation.storage_attempt is not None:
                     return result
