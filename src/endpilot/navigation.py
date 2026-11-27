@@ -612,6 +612,19 @@ class _StandingGraph:
             return self.blocks._dry_grass_path_stance(cell)
         return stance
 
+    def check_goal(
+        self, goal: _GoalState, cell: Cell, *, eye: Point | None = None,
+        visibility_standing: Callable[[], bool] | None = None,
+    ) -> tuple[bool | None, tuple[BlockFaceMatch, ...]]:
+        stance = True
+        if self.grass_path_walking is not None and isinstance(goal.goal, BlockInteractionGoal):
+            # A dry path can carry this route without becoming a raycast stance.
+            stance = self.blocks._flat_stance(cell, allow_vegetation=True)
+            if stance is False:
+                return False, ()
+        matches, faces = goal.check(cell, eye=eye, visibility_standing=visibility_standing)
+        return (None, ()) if stance is None and matches is not False else (matches, faces)
+
     def in_bounds(self, cell: Cell) -> bool:
         return (abs(cell[0] - self.origin[0]) <= self.rules.search_radius
                 and abs(cell[1] - self.origin[1]) <= self.rules.vertical_radius
@@ -778,8 +791,8 @@ class _StandingGraph:
                 expanded += 1
                 is_start = cell == start
                 try:
-                    matches, faces = goal.check(cell, eye=start_eye if is_start else None,
-                                                visibility_standing=start_visibility_standing if is_start else None)
+                    matches, faces = self.check_goal(goal, cell, eye=start_eye if is_start else None,
+                                                     visibility_standing=start_visibility_standing if is_start else None)
                 except _VisibilityBudgetExhausted:
                     return NavigationPlan(*args, "budget", expanded=expanded)
                 if optimistic and matches is not False:

@@ -461,6 +461,38 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(all(abs(frame.pos.y - y) < 0.001 for frame in self.stream.sent))
                 self.assert_released()
 
+    async def test_interaction_goal_crosses_dry_grass_path_without_ending_on_it(self):
+        chest = (3, 101, 0)
+        corridor = ((0, 100, 0), (1, 100, 0), (2, 100, 0))
+        walls = ((x, 100, z) for x in range(-1, 4) for z in (-1, 1))
+        self.prepare_interaction_terrain(chest, blocked=((-1, 100, 0), *walls))
+        self.set_block(chest, 3162850062)
+        self.blocks._player_game_type = "SURVIVAL"
+        self.movement._gap_jump_allowed = lambda: True
+        self.set_block((1, 99, 0), 0x73C709FB)
+        self.set_position(0.5, 0.5, on_ground=True)
+        goal = BlockInteractionGoal(chest, max_distance=1.2)
+        rules = NavigationRules(search_radius=2, vertical_radius=0)
+
+        plan = self.bot.plan_navigation(goal, rules=rules)
+        self.assertEqual((plan.status, plan.nodes), ("found", corridor))
+        self.assertEqual(self.stream.sent, [])
+        result = await self.bot.navigate(goal, rules=rules)
+        self.assertEqual((result.status, result.stand_position), ("reached", corridor[-1]))
+        hit, = result.matches
+        self.assertEqual((hit.position, hit.face), (chest, 4))
+        self.assertFalse(self.jump_input())
+        self.assert_released()
+
+        # A visible chest does not make a partial-height path an interaction stance.
+        self.set_block((2, 99, 0), 0x73C709FB)
+        self.set_position(0.5, 0.5, on_ground=True)
+        self.stream.sent.clear()
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unreachable")
+        result = await self.bot.navigate(goal, rules=rules)
+        self.assertEqual((result.status, result.frames, result.matches), ("unreachable", 0, ()))
+        self.assertEqual(self.stream.sent, [])
+
     async def test_foot_goal_rebases_grass_path_walk_from_real_ground_correction(self):
         self.prepare_vegetation_corridor(hashed=True)
         self.blocks._player_game_type = "SURVIVAL"

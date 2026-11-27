@@ -14,7 +14,7 @@ from .client_clock import ClientClock, TICK_PERIOD_NS
 from .entities import Entities, EntityState, VehicleLinkChange
 from .expression import animation
 from .navigation import (
-    AllGoal, AnyGoal, BlockFaceGoal, Cell, EntityNearGoal, EntityVisibilityGoal, FootGoal, NavigationEvent, NavigationGoal,
+    AllGoal, AnyGoal, BlockFaceGoal, BlockInteractionGoal, Cell, EntityNearGoal, EntityVisibilityGoal, FootGoal, NavigationEvent, NavigationGoal,
     NavigationPlan, NavigationResult, NavigationRules, Point,
     _GoalState, _LADDER_APPROACH, _LADDER_DECK_LENGTH, _LADDER_STRIDE, _LOWER_SLAB_STRIDE, _STANDING_HEAD_HEIGHT,
     _StandingGraph,
@@ -2380,7 +2380,7 @@ class Movement:
         return air is not None and air >= _WATER_MIN_AIR
 
     def _grass_path_walking(self, blocks, goal, rules):
-        if isinstance(goal, FootGoal) and not rules.allow_swimming:
+        if isinstance(goal, (FootGoal, BlockInteractionGoal)) and not rules.allow_swimming:
             return partial(self._standard_ground_motion, blocks)
         return None
 
@@ -3852,8 +3852,8 @@ class Movement:
                                 return abandon(status, "stance_unavailable")
                             invalidate("stance_unavailable")
                         elif current == aimed_cell and reached_cell(current, x, z) and self._teleport_pending is None:
-                            matches, faces = current_goal.check(current, eye=(x, y, z),
-                                                                visibility_standing=visibility_standing)
+                            matches, faces = graph.check_goal(current_goal, current, eye=(x, y, z),
+                                                              visibility_standing=visibility_standing)
                             if matches is True:
                                 if follow_wake is not None:
                                     parked = True
@@ -3887,7 +3887,7 @@ class Movement:
                                 invalidate("position_changed")
                             elif graph.edge(anchor, next_cell) is not True:
                                 invalidate("edge_unavailable")
-                            elif current_goal.check(route[-1])[0] is not True:
+                            elif graph.check_goal(current_goal, route[-1])[0] is not True:
                                 invalidate("goal_unmatched")
                         if route is None:
                             # An invalidation observer can synchronously request a stop.
@@ -3947,8 +3947,8 @@ class Movement:
                         if route[0][1] == current_y and (reached_cell(route[0], x, z) or ladder_top):
                             anchor = route.popleft()
                             if not route:
-                                matches, faces = current_goal.check(anchor, eye=(x, y, z),
-                                                                    visibility_standing=visibility_standing)
+                                matches, faces = graph.check_goal(current_goal, anchor, eye=(x, y, z),
+                                                                  visibility_standing=visibility_standing)
                                 if matches is not True:
                                     invalidate("goal_unmatched")
                                     continue
