@@ -315,7 +315,8 @@ descent, use `NavigationRules(vertical_radius=6)`.
 Still-water crossings are limited to supported pool layouts and require
 `NavigationRules(allow_swimming=True)`.
 On protocol 2225, ordinary same-level walking can pass through observed vanilla
-`minecraft:dandelion` and `minecraft:short_grass` in the primary feet layer.
+`minecraft:dandelion`, `minecraft:short_grass`, and `minecraft:wildflowers`
+in the primary feet layer.
 The extra feet layer and both head layers must contain observed air, and the
 floor must provide safe support. The same vegetation is allowed at the
 launch stance of a one-block descent, but not at its landing or runout.
