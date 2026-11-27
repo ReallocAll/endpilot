@@ -703,8 +703,8 @@ class Recipes:
             raise ValueError("grid crafting requires one destination slot per recipe result")
         multiple = len(destination_slots) > 1
         if multiple:
-            if window.container_type != "WORKBENCH" or times != 1:
-                raise ValueError("multiple results require one craft in an open workbench")
+            if window.container_type not in ("INVENTORY", "WORKBENCH") or times != 1:
+                raise ValueError("multiple results require one craft in an open inventory screen or workbench")
             if any(type(slot) is not int or not 0 <= slot < 36 for slot in destination_slots):
                 raise ValueError("result destinations must be main inventory slots (0..35)")
             if len(set(destination_slots)) != len(destination_slots):
@@ -820,7 +820,7 @@ class Recipes:
 
         expected_grid = {slot: _stack_snapshot(item) for slot, item in grid.items()}
         expected_destinations = {slot: _stack_snapshot(item) for slot, item in observed_destinations.items()}
-        # A second multi-result request cannot use the workbench until this request is adjudicated.
+        # A second multi-result request cannot use this grid until the first receives its verdict.
         endpoints = frozenset({(None, slot) for slot in destination_slots} | {(id(window), -1)})
         submitted_grid_versions = {}
         changed_destinations = set()

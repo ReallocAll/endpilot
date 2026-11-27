@@ -859,8 +859,9 @@ class Bot:
                                 times: int = 1, timeout: float = 15):
         """Craft from observed grid inputs and return the matching BDS verdict.
 
-        For one workbench craft with multiple results, supply a distinct observed
-        empty main inventory slot for each result, in the server's recipe order.
+        For one craft with multiple results in the personal inventory or a
+        workbench, supply a distinct confirmed empty main inventory slot for
+        each result, in the server's recipe order.
         """
         if self._recipes is None:
             raise RuntimeError("player has not joined")

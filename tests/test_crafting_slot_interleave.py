@@ -125,6 +125,71 @@ class CraftingSlotInterleaveTests(unittest.IsolatedAsyncioTestCase):
                          (2, 123, b"cake"))
         self.assertEqual(self.bot._recipes._grid_slots[32].id, 0)
 
+    async def stage_honey_recipe(self):
+        b = self.b
+        await self.deliver(
+            b.ItemRegistryPacket(items=[
+                b.ItemData(id=728, name="minecraft:honey_bottle"),
+                b.ItemData(id=419, name="minecraft:sugar"),
+                b.ItemData(id=431, name="minecraft:glass_bottle"),
+            ]),
+            b.CraftingDataPacket(shaped_recipes=[b.ShapedRecipePayload(
+                recipe_id="minecraft:honey_bottle_to_sugar", net_id=4241, tag="crafting_table",
+                width=1, height=1,
+                ingredients=[b.SerializedRecipeIngredient(descriptor={"name": "minecraft:honey_bottle"}, stack_size=1)],
+                results=[b.SerializedNetworkItemInstanceDescriptor(id=419, stack_size=3),
+                         b.SerializedNetworkItemInstanceDescriptor(id=431, stack_size=1)],
+            )]),
+            self.open_packet("INVENTORY"),
+            self.slot(28, self.item(1, 3, item_id=728), inventory_id=b.ContainerID.PLAYER_ONLY_UI),
+            self.slot(9, self.item(), inventory_id=b.ContainerID.INVENTORY),
+            self.slot(10, self.item(), inventory_id=b.ContainerID.INVENTORY),
+        )
+
+    async def test_personal_grid_craft_requires_confirmed_destinations_and_applies_both_results(self):
+        await self.stage_honey_recipe()
+        b = self.b
+        await self.deliver(self.slot(11, self.item(1, 6), inventory_id=b.ContainerID.INVENTORY))
+        sent = list(self.wire.sent)
+        for destination in (11, 12):  # Occupied and unknown.
+            with self.subTest(destination=destination), self.assertRaisesRegex(ValueError, "observed empty"):
+                await self.bot.craft_recipe_grid(4241, 9, additional_destination_slots=(destination,))
+        self.assertEqual(self.wire.sent, sent)
+
+        pending, request = await self.submit(self.bot.craft_recipe_grid(4241, 9, additional_destination_slots=(10,)))
+        _, results, consume, _, sugar, _, bottle = request.actions
+        self.assertEqual([out.item_descriptor.full_name for out in results.craft_results],
+                         ["minecraft:sugar", "minecraft:glass_bottle"])
+        self.assertEqual((consume.source.slot, consume.source.net_id_variant, consume.amount), (28, 3, 1))
+        self.assertEqual([(action.destination.slot, action.amount) for action in (sugar, bottle)], [(9, 3), (10, 1)])
+        await self.deliver(b.ItemStackResponsePacket(responses=[self.response(
+            request, ("CRAFTING_INPUT_CONTAINER", 28, 0, None),
+            ("INVENTORY_CONTAINER", 9, 3, 4), ("INVENTORY_CONTAINER", 10, 1, 5),
+        )]))
+        self.assertEqual((await pending).result.name, "SUCCESS")
+        self.assertEqual(self.carried_stacks(9, 10), ((419, 3, 4), (431, 1, 5)))
+        self.assertEqual(self.bot._recipes._grid_slots[28].id, 0)
+
+    async def test_personal_grid_craft_receipt_leaves_reopened_grid_intact(self):
+        await self.stage_honey_recipe()
+        b = self.b
+        original = self.bot.open_window
+        pending, request = await self.submit(self.bot.craft_recipe_grid(4241, 9, additional_destination_slots=(10,)))
+        await self.deliver(
+            b.ContainerClosePacket(container_id=original.container_id, container_type=b.ContainerType.INVENTORY),
+            self.open_packet("INVENTORY"),
+            self.slot(28, self.item(1, 6, item_id=728), inventory_id=b.ContainerID.PLAYER_ONLY_UI),
+        )
+        self.assertEqual(self.bot.open_window, original)
+        self.assertIsNot(self.bot.open_window, original)
+        await self.deliver(b.ItemStackResponsePacket(responses=[self.response(
+            request, ("CRAFTING_INPUT_CONTAINER", 28, 0, None),
+            ("INVENTORY_CONTAINER", 9, 3, 4), ("INVENTORY_CONTAINER", 10, 1, 5),
+        )]))
+        self.assertEqual((await pending).result.name, "SUCCESS")
+        self.assertEqual(self.carried_stacks(9, 10), ((419, 3, 4), (431, 1, 5)))
+        self.assertEqual(self.bot._recipes._grid_slots[28].net_id_variant, 6)
+
     async def test_invalid_multi_result_destinations_do_not_send(self):
         await self.stage_two_result_recipe()
         await self.deliver(self.slot(11, self.item(1, 60, item_id=17), inventory_id=self.b.ContainerID.INVENTORY))
@@ -136,7 +201,7 @@ class CraftingSlotInterleaveTests(unittest.IsolatedAsyncioTestCase):
             ((11,), 1, "observed empty"),
             ((12,), 1, "observed empty"),
             ((36,), 1, "main inventory slots"),
-            ((10,), 2, "one craft in an open workbench"),
+            ((10,), 2, "one craft in an open inventory screen or workbench"),
         ):
             with self.subTest(extra=extra, times=times):
                 with self.assertRaisesRegex(ValueError, message):

@@ -57,6 +57,26 @@ An unknown tag or an inventory that cannot supply the requested ingredients
 raises before sending an item request.
 [Recipe-book example](../../examples/craft_recipe.py)
 
+Pass `grid_size=2` to query personal-grid recipes even before opening
+the inventory screen. With one honey bottle, the announced
+`minecraft:honey_bottle_to_sugar` recipe matches
+`bot.recipes_for("glass_bottle", min_result_count=1, grid_size=2)` since
+it produces three sugar and one glass bottle. The same recipe needs two
+honey bottles to satisfy a request for two glass bottles.
+
+To craft multiple results from a manually staged personal or workbench grid,
+call `bot.craft_recipe_grid` once with one distinct confirmed empty main
+inventory slot per announced result, in recipe order. After staging the
+honey bottle in personal grid slot 28, the following call sends the
+sugar to slot 9 and the glass bottle to slot 10 if the server accepts
+the request and both slots are confirmed empty.
+
+```python
+verdict = await bot.craft_recipe_grid(
+    "minecraft:honey_bottle_to_sugar", 9, additional_destination_slots=(10,),
+)
+```
+
 To undo part of a manually staged grid without closing the screen, use
 `await bot.return_crafting_ingredient(32, 9, amount=1)`. This returns one
 item from workbench grid slot 32 to main inventory slot 9 if BDS accepts the
