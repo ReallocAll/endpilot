@@ -352,6 +352,7 @@ class _PlayerView:
     rotation: _PlayerRotation | None
     flags: _PlayerFlagWords
     ordinary_move: bool = True
+    riding_block: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1607,9 +1608,13 @@ class Entities:
             identity_matches = not entity_id or not listed_id or entity_id == listed_id
             words = _player_flag_words(metadata, b) if identity_matches else (None, None)
             gliding, sneaking = _player_posture(words, b)
+            feet = None
+            riding_block = getattr(player, "passenger_of_block_data", None) is not None
+            if not riding_block and not _unsupported_view_pose(words, b):
+                feet = position, self._unresolved_ride_epoch
             self._record(EntityState(
                 listed_id, runtime_id, _PLAYER, position, name=str(player.name), gliding=gliding, sneaking=sneaking,
-            ), player_uuid=player_uuid, player_feet=(position, self._unresolved_ride_epoch),
+            ), player_uuid=player_uuid, player_feet=feet,
                 unlisted_entity_id=entity_id if entity_id and not listed_id else None,
                 identity_matches=identity_matches, lifecycle_events=lifecycle_events)
             if getattr(self.packets.protocol, "number", None) == 2225:
@@ -1623,14 +1628,12 @@ class Entities:
                     main_hand=_equipment_stack(getattr(player, "carried_item", None)),
                 )
                 rotation = None
-                if (spawn_entity_id not in self._rides and getattr(player, "passenger_of_block_data", None) is None
-                        and not _unsupported_view_pose(words, b)):
+                if spawn_entity_id not in self._rides and feet is not None:
                     rotation = _player_rotation(player)
                 self._player_views[runtime_id] = _PlayerView(
                     spawn_entity_id, rotation, words,
-                    ordinary_move=(getattr(player, "passenger_of_block_data", None) is None
-                                   and getattr(player, "player_game_type", None) != b.GameType.SPECTATOR
-                                   and not _unsupported_view_pose(words, b)),
+                    ordinary_move=feet is not None and getattr(player, "player_game_type", None) != b.GameType.SPECTATOR,
+                    riding_block=riding_block,
                 )
         elif packet_id == b.SetActorDataPacket.ID:
             packet = self.packets.protocol.decode(raw)
@@ -1647,8 +1650,10 @@ class Entities:
             view = self._player_views.get(runtime_id)
             if view is not None:
                 words = _player_flag_words(packet.packed_items.data, b, view.flags)
-                # Once out of the measured poses, require a fresh ground sample.
+                # Pose metadata invalidates the anchor but cannot establish a new one.
                 unsupported = _unsupported_view_pose(words, b)
+                if unsupported:
+                    self._player_feet_by_runtime.pop(runtime_id, None)
                 self._player_views[runtime_id] = replace(
                     view, rotation=None if unsupported else view.rotation, flags=words,
                     ordinary_move=view.ordinary_move and not unsupported,
@@ -1726,6 +1731,18 @@ class Entities:
                 self._observe_link(link)
         elif packet_id == b.SetActorLinkPacket.ID:
             self._observe_link(self.packets.protocol.decode(raw).link)
+        elif packet_id == getattr(getattr(b, "SetPassengerOfBlockPacket", None), "ID", None):
+            packet = self.packets.protocol.decode(raw)
+            entity_id = int(packet.passenger)
+            runtime_id = self._runtime_by_id.get(entity_id)
+            if runtime_id is None:
+                runtime_id = self._unlisted_player_runtime_by_id.get(entity_id)
+            view = self._player_views.get(runtime_id)
+            if view is not None:
+                riding_block = packet.passenger_of_block_data is not None
+                self._player_views[runtime_id] = replace(view, riding_block=riding_block)
+                if riding_block:
+                    self._player_feet_by_runtime.pop(runtime_id, None)
         elif packet_id == b.AddItemActorPacket.ID:
             packet = self.packets.protocol.decode(raw)
             state = self._item_state(packet)
@@ -1797,17 +1814,17 @@ class Entities:
                 x, y, z = position = (float(move.pos.x), float(move.pos.y), float(move.pos.z))
                 state = replace(state, position=position)
                 self._by_runtime[runtime_id] = state
-                if move.riding_id or int(move.reset_position) == 3 or state.entity_id in self._rides:
+                view = self._player_views.get(runtime_id)
+                unsupported = view is not None and (view.riding_block or _unsupported_view_pose(view.flags, b))
+                if unsupported or move.riding_id or int(move.reset_position) == 3 or state.entity_id in self._rides:
                     self._player_feet_by_runtime.pop(runtime_id, None)
                 else:
                     # Ordinary MovePlayer retains its standing-height reference while sneaking.
                     self._player_feet_by_runtime[runtime_id] = ((x, y - 1.62, z), self._unresolved_ride_epoch)
-                view = self._player_views.get(runtime_id)
                 if view is not None:
                     rotation = None
                     ordinary_move = (move.on_ground and int(move.reset_position) == 0 and not move.riding_id
-                                     and view.spawn_entity_id not in self._rides
-                                     and not _unsupported_view_pose(view.flags, b))
+                                     and view.spawn_entity_id not in self._rides and not unsupported)
                     if ordinary_move:
                         rotation = _player_rotation(move)
                     self._player_views[runtime_id] = replace(

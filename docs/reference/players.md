@@ -260,17 +260,25 @@ ends subscriptions and raises `ConnectionError` in pending waits.
 
 ## Find a nearby or targeted entity
 
-`bot.nearest_entity(match=None)` searches the observed actors in the current
-dimension, excluding the local player. With a predicate, only matching actors
-are eligible. The query uses three-dimensional distance from the bot's last
-synchronized feet to each observed position and breaks ties by smaller
-`entity_id`. It returns `None` when the local feet position is unknown or no
-candidate matches.
+`EntityState.position` keeps the latest packet's coordinate reference.
+For an ordinary standing spawn, `AddPlayer` reports the feet; ordinary
+`MovePlayer` uses the standing-height offset. The snapshot does not normalize
+the value.
+
+`bot.nearest_entity(match=None)` ranks actors in the current dimension, excluding
+the local player, by three-dimensional distance from the bot's synchronized
+feet. It uses known feet for remote players and the reported position for
+other actors. Players without known feet are skipped. An optional predicate
+filters the candidates, and ties use the smaller `entity_id`. The query returns
+`None` if the local feet are unknown or no candidate matches.
 
 `bot.entity_at_cursor(max_distance=3.5)` reads the bot's current view ray from
 the cache. A `"hit"` gives the actor and hit distance, `"miss"` reports that no
 supported actor was hit, and `"unknown"` means missing or ambiguous pose,
 terrain, or actor geometry could affect the result. Both queries send no packets.
+
+`attack_entity` and `interact_entity` submit input; a normal return does not
+confirm a hit, damage, or another server-side effect.
 
 ## Observe entity swings
 

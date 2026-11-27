@@ -150,7 +150,8 @@ class EntityCursorPacketTests(unittest.IsolatedAsyncioTestCase):
             self.air(dimension)
         await self.bot.set_rotation(pitch, -90)
 
-    def player(self, runtime_id, entity_id, *, x=7.5, z=8.5, height=1.8, listed=True):
+    def player(self, runtime_id, entity_id, *, x=7.5, z=8.5, height=1.8, listed=True, low=0,
+               passenger_of_block_data=None):
         b = self.b
         uuid = UUID(int=runtime_id)
         if listed:
@@ -159,7 +160,9 @@ class EntityCursorPacketTests(unittest.IsolatedAsyncioTestCase):
             )]))
         self.deliver(b.AddPlayerPacket(
             runtime_id=runtime_id, uuid=uuid, name="Target", pos=self.vec(x, 220, z),
-            unpack=self.metadata(width=0.6, height=height), abilities_data=b.SerializedAbilitiesData(target_player=entity_id),
+            unpack=self.metadata(width=0.6, height=height, low=low),
+            abilities_data=b.SerializedAbilitiesData(target_player=entity_id),
+            passenger_of_block_data=passenger_of_block_data,
         ))
 
     def spawn_actor(self, runtime_id=8, entity_id=108, *, x=7.5, y=221, z=8.5,
@@ -204,6 +207,72 @@ class EntityCursorPacketTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((after.status, after.entity.entity_id), ("hit", 108))
         self.assertAlmostEqual(after.distance, 2.4, places=5)
         self.assertAlmostEqual(before.distance, 2.6)
+
+    async def test_remote_feet_require_a_fresh_move_after_an_unverified_pose(self):
+        await self.view()
+        b = self.b
+        self.player(8, 108)
+        self.assertEqual(self.entities._navigation_target(108)[1], (7.5, 220, 8.5))
+        walking = b.MovePlayerPacket(player_id=8, pos=self.vec(7.5, 221.62001, 8.5), on_ground=True)
+        self.deliver(walking)
+        self.assertAlmostEqual(self.entities._navigation_target(108)[1][1], 220, places=4)
+        self.assertEqual(self.bot.nearest_player().position[1], walking.pos.y)
+
+        for flag in (b.ActorFlags.RIDING, b.ActorFlags.CRAWLING):
+            with self.subTest(flag=flag):
+                index = int(flag)
+                low, high = (1 << index, None) if index < 64 else (None, 1 << (index - 64))
+                self.deliver(b.SetActorDataPacket(id=8, packed_items=self.metadata(low=low, high=high)))
+                self.assertIsNone(self.bot.nearest_player())
+                self.assertIsNone(self.entities._navigation_target(108)[1])
+                self.deliver(b.MovePlayerPacket(player_id=8, pos=self.vec(7.5, 219, 8.5)))
+                self.assertEqual(self.bot.observed_entities[0].position, (7.5, 219, 8.5))
+                self.assertIsNone(self.bot.nearest_player())
+                self.assertEqual(self.query().status, "unknown")
+
+                self.deliver(b.SetActorDataPacket(id=8, packed_items=self.metadata()))
+                self.assertIsNone(self.bot.nearest_player())
+                self.deliver(walking)
+                self.assertEqual(self.bot.nearest_player().entity_id, 108)
+                self.assertEqual(self.query().status, "hit")
+
+        self.player(8, 108, low=1 << int(b.ActorFlags.SWIMMING))
+        self.assertIsNone(self.bot.nearest_player())
+        self.assertIsNone(self.entities._navigation_target(108)[1])
+        self.assertEqual(self.bot.observed_entities[0].position, (7.5, 220, 8.5))
+
+    async def test_remote_block_riding_keeps_feet_unknown_until_a_fresh_move_after_stop(self):
+        await self.view()
+        b = self.b
+        riding = b.PassengerOfBlockArguments(block_pos=b.BlockPos(x=7, y=219, z=8))
+        riding_move = b.MovePlayerPacket(player_id=8, pos=self.vec(7.75, 219, 8.5), on_ground=True)
+        walking = b.MovePlayerPacket(player_id=8, pos=self.vec(7.5, 221.62001, 8.5), on_ground=True)
+
+        def assert_unknown():
+            self.assertIsNone(self.bot.nearest_player())
+            self.assertIsNone(self.entities._navigation_target(108)[1])
+            self.assertEqual(self.query().status, "unknown")
+
+        for riding_at_spawn in (False, True):
+            with self.subTest(riding_at_spawn=riding_at_spawn):
+                self.player(8, 108, passenger_of_block_data=riding if riding_at_spawn else None)
+                if not riding_at_spawn:
+                    self.assertEqual(self.bot.nearest_player().entity_id, 108)
+                    self.assertEqual(self.entities._navigation_target(108)[1], (7.5, 220, 8.5))
+                    self.deliver(b.SetPassengerOfBlockPacket(passenger=108, passenger_of_block_data=riding))
+                assert_unknown()
+
+                self.deliver(riding_move)
+                self.assertEqual(self.bot.observed_entities[0].position, (7.75, 219, 8.5))
+                assert_unknown()
+
+                self.deliver(b.SetPassengerOfBlockPacket(passenger=108))
+                assert_unknown()
+
+                self.deliver(walking)
+                self.assertEqual(self.bot.nearest_player().position[1], walking.pos.y)
+                self.assertAlmostEqual(self.entities._navigation_target(108)[1][1], 220, places=4)
+                self.assertEqual(self.query().status, "hit")
 
     async def test_cow_sparse_axes_and_measurements_expire_on_reappearance(self):
         await self.view()
