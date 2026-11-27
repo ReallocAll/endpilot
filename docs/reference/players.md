@@ -258,6 +258,31 @@ subscription returns an idempotent unsubscribe function. A deadline raises
 `TimeoutError`. Use `timeout=None` to wait without a deadline. Disconnection
 ends subscriptions and raises `ConnectionError` in pending waits.
 
+## Observe remote player sleep changes
+
+`EntityState.sleeping` in `bot.observed_entities` holds the last valid server
+report of the sleeping bit in the `PLAYER_FLAGS` byte for a visible remote
+player. The field is `None` until the first valid report and remains `None`
+for other actors. A later packet that omits the byte or supplies a different
+payload type leaves the last valid value in place.
+
+`bot.subscribe_entity_sleep_changes(callback, runtime_id=...)` calls a
+synchronous callback with the committed immutable `EntityState` for each
+change between `False` and `True`. The spawn packet or the first valid
+update establishes the initial value silently. Use
+`await bot.wait_for_entity_sleep_change(runtime_id=..., timeout=15)` for
+the next matching change. Both methods send zero packets.
+
+Omit `runtime_id` to observe any visible remote player. A runtime filter
+binds to the current instance. An untracked runtime ID or local player
+raises `LookupError`, as does a filtered wait whose target leaves view,
+is replaced, or has a conflicting roster identity. A dimension change
+ends filtered subscriptions and raises `RuntimeError` in pending waits.
+Unfiltered subscriptions continue across dimensions. The returned
+unsubscribe function is idempotent. A deadline raises `TimeoutError`.
+Use `timeout=None` to wait without a deadline. When the connection ends,
+subscriptions close and pending waits raise `ConnectionError`.
+
 ## Find a nearby or targeted entity
 
 `EntityState.position` keeps the latest packet's coordinate reference.

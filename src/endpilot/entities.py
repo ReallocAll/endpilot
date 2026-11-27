@@ -82,9 +82,9 @@ class EntityState:
     arrives. A stack with item ID and count zero represents an observed empty hand.
     The server can omit updates, so the observed stack can be stale.
 
-    ``gliding`` and ``sneaking`` are the latest valid server reports for these
-    flags on this visible remote player instance. ``None`` means the flag is
-    unknown or does not apply.
+    ``gliding``, ``sneaking``, and ``sleeping`` are the latest valid server
+    reports for these flags on this visible remote player instance. ``None``
+    means the flag is unknown or does not apply.
 
     ``attributes`` holds the latest server report for each observed attribute of
     this actor instance. An empty tuple means no attributes have been observed.
@@ -111,6 +111,7 @@ class EntityState:
     attributes: tuple[EntityAttribute, ...] = ()
     status_effects: tuple[PlayerEffect, ...] = ()
     sneaking: bool | None = None
+    sleeping: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,6 +410,14 @@ def _player_posture(words: _PlayerFlagWords, binding) -> tuple[bool | None, bool
     return _player_flag(words, flags.GLIDING), _player_flag(words, flags.SNEAKING)
 
 
+def _player_sleeping(metadata, binding) -> bool | None:
+    sleeping = None
+    for item in metadata:
+        if item.id == binding.ActorDataIDs.PLAYER_FLAGS and isinstance(item.payload, binding.DataItemBytePayload):
+            sleeping = bool(item.payload.value & 0x02)
+    return sleeping
+
+
 def _unsupported_view_pose(words: _PlayerFlagWords, binding) -> bool:
     flags = binding.ActorFlags
     return any(_player_flag(words, flag)
@@ -500,6 +509,7 @@ class Entities:
         self._effect_observers: list[_EntityObserver[EntityEffectUpdate]] = []
         self._glide_observers: list[Callable[[EntityState], None]] = []
         self._crouch_observers: list[_EntityObserver[EntityState]] = []
+        self._sleep_observers: list[_EntityObserver[EntityState]] = []
         self._unidentified_equipment_since: dict[int, int] = {}
         # AddPlayer can identify an instance before its unique ID appears in EntityState.
         self._unlisted_player_runtime_by_id: dict[int, int] = {}
@@ -543,7 +553,7 @@ class Entities:
         self._clear_player_equipment(ConnectionError, "entity session is closed", _cause)
         for observers in (self._swing_observers, self._critical_effect_observers, self._health_observers,
                           self._actor_event_observers, self._attribute_observers, self._effect_observers,
-                          self._crouch_observers):
+                          self._crouch_observers, self._sleep_observers):
             self._end_entity_observers(observers, lambda _: True, ConnectionError, "entity session is closed", _cause)
         self._glide_observers.clear()
         self._actor_instances.clear()
@@ -663,7 +673,7 @@ class Entities:
 
         return self.packets._subscribe(self._glide_observers, observe)
 
-    def _require_crouch_target(self, runtime_id: int | None) -> None:
+    def _require_remote_player_target(self, runtime_id: int | None) -> None:
         self._require_live()
         if runtime_id is not None and runtime_id not in self._player_views:
             raise LookupError("remote player is not currently observed")
@@ -671,14 +681,26 @@ class Entities:
     def subscribe_entity_crouch_changes(
         self, callback: Callable[[EntityState], None], *, runtime_id: int | None = None,
     ) -> Callable[[], None]:
-        self._require_crouch_target(runtime_id)
+        self._require_remote_player_target(runtime_id)
         return self.packets._subscribe(self._crouch_observers, _EntityObserver(runtime_id, callback))
 
     async def wait_for_entity_crouch_change(
         self, *, runtime_id: int | None = None, timeout: float | None = 15,
     ) -> EntityState:
-        self._require_crouch_target(runtime_id)
+        self._require_remote_player_target(runtime_id)
         return await self._wait_for_entity_event(self._crouch_observers, runtime_id, timeout)
+
+    def subscribe_entity_sleep_changes(
+        self, callback: Callable[[EntityState], None], *, runtime_id: int | None = None,
+    ) -> Callable[[], None]:
+        self._require_remote_player_target(runtime_id)
+        return self.packets._subscribe(self._sleep_observers, _EntityObserver(runtime_id, callback))
+
+    async def wait_for_entity_sleep_change(
+        self, *, runtime_id: int | None = None, timeout: float | None = 15,
+    ) -> EntityState:
+        self._require_remote_player_target(runtime_id)
+        return await self._wait_for_entity_event(self._sleep_observers, runtime_id, timeout)
 
     def _require_animation_target(self, runtime_id: int | None) -> None:
         self._require_live()
@@ -1435,6 +1457,7 @@ class Entities:
             self._forget_entity_observers(self._attribute_observers, runtime_id)
             self._forget_entity_observers(self._effect_observers, runtime_id)
             self._forget_entity_observers(self._crouch_observers, runtime_id)
+            self._forget_entity_observers(self._sleep_observers, runtime_id)
             if not new_instance and (state.attributes or state.status_effects):
                 # A conflicting roster identity must not inherit the previous actor's reports.
                 state = replace(state, attributes=(), status_effects=())
@@ -1473,6 +1496,7 @@ class Entities:
         self._forget_entity_observers(self._attribute_observers, runtime_id)
         self._forget_entity_observers(self._effect_observers, runtime_id)
         self._forget_entity_observers(self._crouch_observers, runtime_id)
+        self._forget_entity_observers(self._sleep_observers, runtime_id)
         self._forget_player_equipment(runtime_id)
         state = self._by_runtime.pop(runtime_id, None)
         if lifecycle_events is not None and state is not None:
@@ -1570,9 +1594,9 @@ class Entities:
                                 self._player_views.pop(runtime_id, None)
                                 state = self._by_runtime[runtime_id]
                                 if (state.last_observed_offhand is not None or state.gliding is not None
-                                        or state.sneaking is not None):
+                                        or state.sneaking is not None or state.sleeping is not None):
                                     self._by_runtime[runtime_id] = replace(
-                                        state, last_observed_offhand=None, gliding=None, sneaking=None,
+                                        state, last_observed_offhand=None, gliding=None, sneaking=None, sleeping=None,
                                     )
                 else:
                     removed = self._players_by_uuid.pop(change.uuid, None)
@@ -1608,12 +1632,14 @@ class Entities:
             identity_matches = not entity_id or not listed_id or entity_id == listed_id
             words = _player_flag_words(metadata, b) if identity_matches else (None, None)
             gliding, sneaking = _player_posture(words, b)
+            sleeping = _player_sleeping(metadata, b) if identity_matches else None
             feet = None
             riding_block = getattr(player, "passenger_of_block_data", None) is not None
             if not riding_block and not _unsupported_view_pose(words, b):
                 feet = position, self._unresolved_ride_epoch
             self._record(EntityState(
                 listed_id, runtime_id, _PLAYER, position, name=str(player.name), gliding=gliding, sneaking=sneaking,
+                sleeping=sleeping,
             ), player_uuid=player_uuid, player_feet=feet,
                 unlisted_entity_id=entity_id if entity_id and not listed_id else None,
                 identity_matches=identity_matches, lifecycle_events=lifecycle_events)
@@ -1649,7 +1675,8 @@ class Entities:
                     self._cursor_bodies[runtime_id] = body
             view = self._player_views.get(runtime_id)
             if view is not None:
-                words = _player_flag_words(packet.packed_items.data, b, view.flags)
+                metadata = packet.packed_items.data
+                words = _player_flag_words(metadata, b, view.flags)
                 # Pose metadata invalidates the anchor but cannot establish a new one.
                 unsupported = _unsupported_view_pose(words, b)
                 if unsupported:
@@ -1659,20 +1686,33 @@ class Entities:
                     ordinary_move=view.ordinary_move and not unsupported,
                 )
                 gliding, sneaking = _player_posture(words, b)
+                sleeping = _player_sleeping(metadata, b)
                 previous = self._by_runtime[runtime_id]
-                if gliding is not None and (gliding != previous.gliding or sneaking != previous.sneaking):
-                    state = replace(previous, gliding=gliding, sneaking=sneaking)
+                if gliding is None:
+                    gliding, sneaking = previous.gliding, previous.sneaking
+                if sleeping is None:
+                    sleeping = previous.sleeping
+                if gliding != previous.gliding or sneaking != previous.sneaking or sleeping != previous.sleeping:
+                    state = replace(previous, gliding=gliding, sneaking=sneaking, sleeping=sleeping)
                     self._by_runtime[runtime_id] = state
-                    # Bind this packet's crouch recipients before a glide callback can change them.
+                    # Bind both observer lists before another callback can change them.
                     crouch_observers = (
                         tuple(self._crouch_observers)
                         if previous.sneaking is not None and sneaking != previous.sneaking else ()
+                    )
+                    sleep_observers = (
+                        tuple(self._sleep_observers)
+                        if previous.sleeping is not None and sleeping != previous.sleeping else ()
                     )
                     if previous.gliding is False and gliding:
                         self.packets._notify(self._glide_observers, state)
                     if crouch_observers:
                         self._notify_entity_observers(
                             crouch_observers, state, runtime_id, "entity crouch observer failed",
+                        )
+                    if sleep_observers:
+                        self._notify_entity_observers(
+                            sleep_observers, state, runtime_id, "entity sleep observer failed",
                         )
         elif packet_id == b.MobEquipmentPacket.ID:
             packet = self.packets.protocol.decode(raw)
@@ -1782,6 +1822,8 @@ class Entities:
                                        RuntimeError, "dimension changed while waiting for an entity effect update")
             self._end_entity_observers(self._crouch_observers, dimension_bound,
                                        RuntimeError, "dimension changed while waiting for an entity crouch change")
+            self._end_entity_observers(self._sleep_observers, dimension_bound,
+                                       RuntimeError, "dimension changed while waiting for an entity sleep change")
             if lifecycle_events is not None:
                 lifecycle_events.extend(
                     EntityLifecycleEvent("left", state, "dimension_changed") for state in self._by_runtime.values()
