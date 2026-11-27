@@ -3024,6 +3024,42 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.moving_input()), 1)
         self.assert_released()
 
+    async def test_short_descent_handoff_rechecks_a_newer_pose(self):
+        for x, grounded, status in ((1.25, True, "unreachable"), (1.40, False, "budget"),
+                                    (1.40, True, "reached")):
+            with self.subTest(x=x, grounded=grounded):
+                self.prepare_descent()
+                self.blocks._player_game_type = "SURVIVAL"
+                self.movement._gap_jump_allowed = lambda: True
+                for floor in ((0, 99, 0), (1, 98, 0), (2, 98, 0)):
+                    self.set_block(floor, 3727763636)  # grass block
+                self.set_block((2, 101, 0), 1740500456)  # birch leaves
+                self.set_position(0.5, 0.5, on_ground=True)
+                self.stream.sent.clear()
+                events = []
+                advancing = updated = False
+                neutral = 0
+
+                def update_pose():
+                    nonlocal advancing, updated, neutral
+                    packet = self.stream.sent[-1]
+                    if self.up in packet.input_data:
+                        advancing = True
+                    elif advancing and not updated:
+                        neutral += 1
+                        if neutral < 2:
+                            return
+                        updated = True
+                        self.correct_position(1.36, 100.62, 0.5, on_ground=True, tick=packet.client_tick)
+                        self.set_position(x, 0.5, y=100.62, on_ground=grounded)
+
+                self.stream.on_send = update_pose
+                result = await self.bot.navigate(FootGoal((1, 99, 0)), rules=NavigationRules(2, 1),
+                                                 on_event=events.append)
+                self.assertTrue(updated)
+                self.assertEqual(result.status, status)
+                self.assertEqual(any(e.kind == "transition_completed" for e in events), status == "reached")
+
     async def test_neutral_descent_frames_share_the_budget_and_stale_ground_is_ignored(self):
         target = self.prepare_descent()
         corrected = False

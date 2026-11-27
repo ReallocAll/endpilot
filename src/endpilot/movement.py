@@ -2866,7 +2866,9 @@ class Movement:
                     if not self._standard_ground_motion(blocks):
                         return abandon("unknown", "edge_unavailable")
                     progress, lateral = offsets(self._input_position)
-                    if abs(lateral) >= side_safe or progress >= last_safe:
+                    # A newer pose can supersede the earlier landing correction.
+                    if (abs(lateral) >= side_safe or progress >= last_safe
+                            or (crossed and progress <= lip + margin)):
                         return abandon("unreachable", "position_changed")
                     if step_tick is None:
                         if not at_center(source, x, z) or self._observed_ground is False:
@@ -2884,7 +2886,7 @@ class Movement:
                 if short:
                     witness = self._server_grounding
                     grounded = False
-                    if settle_tick is not None and witness is not None:
+                    if settle_tick is not None and witness is not None and self._observed_ground is True:
                         tick, on_ground, received, _ = witness
                         along, across = offsets(received)
                         grounded = (settle_tick <= tick < self._tick and on_ground
