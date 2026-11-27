@@ -36,7 +36,7 @@ class FakePackets:
                  "UpdateSubChunkBlocksPacket", "SubChunkPacket", "LevelChunkPacket", "DimensionDataPacket",
                  "BlockActorDataPacket")
         binding = SimpleNamespace(**{name: SimpleNamespace(ID=i) for i, name in enumerate(names)})
-        self.protocol = SimpleNamespace(binding=binding, decode=lambda raw: raw.payload)
+        self.protocol = SimpleNamespace(number=2225, binding=binding, decode=lambda raw: raw.payload)
         self.observer = None
 
     def subscribe_raw(self, observer):

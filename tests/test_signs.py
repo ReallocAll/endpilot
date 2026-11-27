@@ -826,7 +826,6 @@ class SignTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(caught.exception.args, ("caller cancelled",))
                     self.assertTrue(any("stop refused" in note for note in caught.exception.__notes__))
 
-    @unittest.skipUnless(hasattr(nbt, "decode_network_compound"), "native chunk NBT cursor unavailable")
     async def test_sub_chunk_observes_two_consecutive_sign_roots_then_replaces_them(self):
         chunk = self.b.SubChunkPacket
         prefix = bytes((9, 1, 1, 1, 2))

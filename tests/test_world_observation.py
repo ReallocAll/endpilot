@@ -445,11 +445,11 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.bot.observed_block_entity(position))
         self.assertEqual(self.bot.observed_block(position).runtime_id, 1)
 
-    @unittest.skipUnless(hasattr(nbt, "decode_network_compound"), "native chunk NBT cursor unavailable")
     async def test_block_entity_section_replaces_only_after_all_roots_are_decoded(self):
         await self.connect()
         one, two = (8, 20, 9), (9, 20, 9)
         neighbor = (24, 20, 9)
+        long_name = "two" * 200
         await self.deliver(self.entity(24, "neighbor"))
         seen = []
         updates = []
@@ -463,11 +463,11 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
         try:
             await self.deliver(self.entity_section(
                 self.entity(8, "one"), self.entity(24, "outside replacement"),
-                self.entity(9, "two"), self.entity(25, "outside addition"),
+                self.entity(9, long_name), self.entity(25, "outside addition"),
             ))
         finally:
             unsubscribe()
-        self.assertEqual(seen, [("one", "two")])
+        self.assertEqual(seen, [("one", long_name)])
         self.assertEqual(updates, [])
         self.assertEqual(self.bot.observed_block_entity(neighbor)["CustomName"].value, "neighbor")
         self.assertIsNone(self.bot.observed_block_entity((25, 20, 9)))
@@ -477,6 +477,8 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
         await self.deliver(self.entity_section(self.entity(8, "incomplete"), tail=b"\x0a\x00"))
         self.assertIsNone(self.bot.observed_block_entity(one))
         self.assertEqual(self.bot.observed_block_entity(neighbor)["CustomName"].value, "neighbor")
+        await self.deliver(self.entity_section(self.entity(8, "first"), self.entity(8, "duplicate")))
+        self.assertIsNone(self.bot.observed_block_entity(one))
         await self.deliver(self.entity(9, "put back"), self.air(1))
         self.assertIsNone(self.bot.observed_block_entity(two))
 

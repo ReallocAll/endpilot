@@ -9,7 +9,7 @@ from math import atan2, degrees, dist, floor, hypot, isqrt, prod
 from types import MappingProxyType
 from typing import Literal
 
-from bedrock_protocol import nbt
+from bedrock_protocol import DecodeError, nbt
 
 from .block_data import VanillaBlockState, _catalog, _vanilla_state_properties, vanilla_block_state
 from .block_raycast import (
@@ -268,6 +268,8 @@ class Blocks:
         self._sub_chunks: dict[tuple[int, int, int], SubChunk | None] = {}
         self._block_entities: dict[tuple[int, int, int], dict[tuple[int, int, int], nbt.CompoundTag]] = {}
         self._decode_block_entity = getattr(nbt, "decode_network_compound", None)
+        if self._decode_block_entity is None and packets.protocol.number == 2225:
+            self._decode_block_entity = self._decode_block_entity_packet
         self._observe_block_entity = None
         self._unsubscribe = None
         self._unsubscribe_end = None
@@ -618,6 +620,27 @@ class Blocks:
         if self._observe_block_entity is not None:
             for position in previous.keys() | roots.keys():
                 self._observe_block_entity(position, previous.get(position), roots.get(position))
+
+    def _decode_block_entity_packet(self, data: bytes, offset: int) -> tuple[nbt.CompoundTag, int]:
+        binding = self.packets.protocol.binding
+        decode, packet = binding.decode, binding.BlockActorDataPacket
+        # Protocol 2225's BlockActorData body is three coordinates followed by the same network NBT root.
+        prefix = b"\x00\x00\x00"
+        # Probe a bounded window instead of copying the entire remaining suffix for every small root.
+        view = memoryview(data)
+        end = min(offset + 512, len(data))
+        while True:
+            try:
+                return decode(packet, b"".join((prefix, view[offset:end]))).data, end
+            except DecodeError as error:
+                if error.reason == "trailing bytes" and error.path == ():
+                    root_end = offset + error.offset - len(prefix)
+                    if not offset < root_end < end:
+                        raise
+                    return decode(packet, b"".join((prefix, view[offset:root_end]))).data, root_end
+                if error.reason != "truncated" or end == len(data):
+                    raise
+            end = min(offset + 2 * (end - offset), len(data))
 
     def _read_section_block_entities(self, key, data, offset):
         decode = self._decode_block_entity

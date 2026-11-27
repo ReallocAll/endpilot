@@ -330,9 +330,9 @@ Read block updates to confirm where the blocks finish.
 
 `bot.observed_sign(position)` returns the observed front text, back text,
 dimension ID, and wax status of a standing or hanging sign. It returns `None`
-when the sign data is unknown. With the published codec wheel, sign data comes
-from standalone `BlockActorDataPacket` updates. Sign data delivered solely in
-a sub-chunk payload remains unknown.
+when the sign data is unknown. Sign data comes from standalone
+`BlockActorDataPacket` updates and, on protocol 2225, from received
+sub-chunk payloads. Reading the observation does not request world data.
 
 Stand close to a sign the bot has observed. `await bot.edit_sign(position, text,
 face=2)` clicks the specified block face and edits the side the server opens.
