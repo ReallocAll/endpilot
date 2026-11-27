@@ -149,8 +149,8 @@ class Inventory:
         self._damage_descriptors = {}
         self._next_request_id = -1
         self._selected_slot = 0
-        # Item ID and count from the last accepted equipment announcement for this slot.
-        self._selected_equipment: tuple[int, int] | None = None
+        # The last accepted equipment announcement for this slot.
+        self._selected_equipment: HeldItemStack | None = None
         self._selection_source: Literal["default", "local", "server"] = "default"
         self._selection_revision = 0
         self._selection_order = count(1)
@@ -308,8 +308,7 @@ class Inventory:
                 if 0 <= selected < 9:
                     item = packet.item if int(packet.slot) == selected else None
                     self._record_damage_descriptor((None, selected), item, received=True)
-                    equipment = None if item is None else (int(item.id), int(item.stack_size))
-                    self._observe_selection(selected, equipment=equipment)
+                    self._observe_selection(selected, equipment=_stack_snapshot(item))
         elif raw.packet_id == b.PlayerHotbarPacket.ID:
             packet = self.packets.protocol.decode(raw)
             if packet.should_select_slot and int(packet.container_id) == int(b.ContainerID.INVENTORY):
@@ -665,7 +664,7 @@ class Inventory:
         return self._selection_revision
 
     def _apply_selection(
-        self, slot: int, order: int, source: Literal["local", "server"], *, equipment: tuple[int, int] | None = None,
+        self, slot: int, order: int, source: Literal["local", "server"], *, equipment: HeldItemStack | None = None,
     ) -> None:
         if order <= self._applied_selection_order:
             return
@@ -680,11 +679,11 @@ class Inventory:
             self._selection_source = source
         self._notify_held_item()
 
-    def _observe_selection(self, slot: int, *, equipment: tuple[int, int] | None = None) -> None:
+    def _observe_selection(self, slot: int, *, equipment: HeldItemStack | None = None) -> None:
         if 0 <= slot < 9:
             self._apply_selection(slot, next(self._selection_order), "server", equipment=equipment)
 
-    async def _send_selection(self, packet, slot: int, *, equipment: tuple[int, int] | None = None) -> None:
+    async def _send_selection(self, packet, slot: int, *, equipment: HeldItemStack | None = None) -> None:
         # Reserve order before handing the packet to the transport. Only
         # successful sends and received corrections can advance the selection.
         order = next(self._selection_order)
@@ -749,7 +748,7 @@ class Inventory:
             slot=slot,
             selected_slot=slot,
             container_id=b.ContainerID.INVENTORY,
-        ), slot, equipment=(int(item.id), int(item.stack_size)))
+        ), slot, equipment=_stack_snapshot(item))
 
 
 

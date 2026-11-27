@@ -31,6 +31,33 @@ _WEB_DROP_TOOLS = {
     }),
     "minecraft:web": frozenset({"minecraft:shears"}),
 }
+_DIAMOND_ORES = frozenset({"minecraft:diamond_ore", "minecraft:deepslate_diamond_ore"})
+
+
+@dataclass(frozen=True, slots=True)
+class _SilkTouchRule(MiningRule):
+    silk_touch: bool
+
+
+def _silk_touch(user_data: bytes, enchant_type) -> bool | None:
+    # Even the no-NBT form has a marker and two list counts in a complete descriptor.
+    if len(user_data) < 10:
+        return None
+    try:
+        entries = read_item_user_data(user_data, _strict_enchantments=True).get("ench", [])
+    except ValueError:
+        return None
+    levels = {}
+    for entry in entries:
+        enchantment, level = entry["id"], entry["lvl"]
+        if enchantment in levels or level <= 0:
+            return None
+        levels[enchantment] = level
+    silk_level = levels.get(int(enchant_type.SILK_TOUCH))
+    if silk_level is None:
+        return False
+    # The pinned vanilla enchantment catalog makes Silk Touch and Fortune incompatible.
+    return True if silk_level == 1 and int(enchant_type.FORTUNE) not in levels else None
 
 
 def _efficiency_bonus(user_data: bytes, efficiency_id: int) -> int:
@@ -147,36 +174,45 @@ class HarvestTools:
         self, block: BlockObservation | None, *, requested_drop_id: int | None = None,
     ) -> MiningRule | None:
         state = None if block is None else self._blocks._vanilla_state(block.runtime_id)
-        rule = None if state is None else state.mining_rule
-        required = self._requested_drop_tools(state, requested_drop_id)
-        return rule if required is None else replace(rule, required=required)
+        return None if state is None else self._requested_drop_rule(state, requested_drop_id) or state.mining_rule
 
-    def _requested_drop_tools(
+    def _requested_drop_rule(
         self, state: VanillaBlockState | None, requested_drop_id: int | None,
-    ) -> frozenset[str] | None:
-        if state is None or state.mining_rule is None or state.name != "minecraft:web" or requested_drop_id is None:
+    ) -> MiningRule | None:
+        if requested_drop_id is None or state is None or state.mining_rule is None:
             return None
-        required = _WEB_DROP_TOOLS.get(self._item_names.get(requested_drop_id))
-        eligible = state.mining_rule.required
-        return required if required is None or eligible is None else eligible & required
+        rule = state.mining_rule
+        requested = self._item_names.get(requested_drop_id)
+        if state.name == "minecraft:web" and (required := _WEB_DROP_TOOLS.get(requested)) is not None:
+            return replace(rule, required=required if rule.required is None else rule.required & required)
+        if state.name in _DIAMOND_ORES and requested in ("minecraft:diamond", state.name):
+            return _SilkTouchRule(rule.required, rule.speeds, silk_touch=requested == state.name)
+        return None
+
+    def _matches_drop_enchantment(self, rule: MiningRule, user_data: bytes) -> bool:
+        if not isinstance(rule, _SilkTouchRule):
+            return True
+        enchant_type = self._inventory.packets.protocol.binding.Enchant.Type
+        return _silk_touch(bytes(user_data), enchant_type) is rule.silk_touch
 
     def _has_equipped_drop_tool(self, block: BlockObservation, tool: HarvestTool, requested_drop_id: int) -> bool:
-        required = self._requested_drop_tools(self._blocks._vanilla_state(block.runtime_id), requested_drop_id)
-        if required is None:
+        rule = self._requested_drop_rule(self._blocks._vanilla_state(block.runtime_id), requested_drop_id)
+        if rule is None:
             return True
         slot = self._inventory.selected_slot
         if slot != tool.slot:
             return False
         held = self._inventory.item_or_empty(slot)
         held_name = self._item_names.get(int(held.id))
-        if held.id == 0 or held.stack_size <= 0 or held_name != tool.item_name or held_name not in required:
+        if (held.id == 0 or held.stack_size <= 0 or held_name != tool.item_name or held_name not in rule.required
+                or not self._matches_drop_enchantment(rule, held.user_data_buffer)):
             return False
         equipment = self._inventory._selected_equipment
         # BDS can correct the held item without updating that slot's inventory stack.
         if equipment is None:
             return True
-        item_id, count = equipment
-        return item_id == int(held.id) and count > 0
+        return (equipment.item_id == int(held.id) and equipment.count > 0
+                and self._matches_drop_enchantment(rule, equipment.user_data_buffer))
 
     def _best_in_inventory(self, rule: MiningRule, slots: dict[int, object]) -> HarvestTool | None:
         return self._best_in_slots(
@@ -197,6 +233,8 @@ class HarvestTools:
                 continue
             name = self._item_names.get(int(item.id))
             if name is None or (rule.required is not None and name not in rule.required):
+                continue
+            if isinstance(rule, _SilkTouchRule) and not self._matches_drop_enchantment(rule, item.user_data_buffer):
                 continue
             base_speed = rule.speeds.get(name, 1.0)
             speed = base_speed

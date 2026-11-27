@@ -86,6 +86,13 @@ shears. The same requirement applies to authorized refill chests. The bot
 checks the equipped tool again before starting to mine. A confirmed shortage
 ends the attempt with `tool_unavailable` before mining.
 
+For diamond ore and deepslate diamond ore, request `minecraft:diamond` to
+use an eligible pickaxe without Silk Touch. Request the matching ore item
+to use an eligible pickaxe with Silk Touch I. Both counted methods apply
+this rule to inventory tools and authorized refill chests. The pickaxe's
+enchantments must be readable. Fortune pickups count by the actual quantity
+confirmed in inventory.
+
 Read `CountedBlockCollection.collected_count` for the confirmed increase of
 `item_id` in the main inventory. A single pickup can exceed the remaining
 count. `results` contains the evidence for each attempted or skipped block.

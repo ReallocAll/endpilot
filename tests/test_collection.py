@@ -34,6 +34,7 @@ RAISED_TARGET = (0, 101, 3)
 PLAYER = 7
 DIRT = 13
 ORE = 0x54A1D0FD
+DEEPSLATE_ORE = 0x3057FA73
 OAK_LOG_BLOCK = 4065577688
 OAK_LOG_ITEM = 17
 IRON_AXE = 446
@@ -41,6 +42,16 @@ IRON_SWORD = 1201
 SHEARS = 1202
 STRING_ITEM = 1203
 WEB_ITEM = 1204
+DIAMOND = 306
+DIAMOND_ORE_ITEM = 56
+DEEPSLATE_ORE_ITEM = -405
+DIAMOND_PICKAXE = 320
+# Stock item user data includes the NBT compound and both restriction counts.
+PLAIN_PICK_DATA = bytes.fromhex("ffff010a000003060044616d61676500000000000000000000000000")
+SILK_PICK_DATA = bytes.fromhex(
+    "ffff010a000003060044616d61676500000000090400656e63680a02000000"
+    "020200696410000203006c766c01000002020069640f000203006c766c020000000000000000000000"
+)
 REFILL_CHEST = (-3, 100, 2)
 ALTERNATE_REFILL_CHEST = (-4, 100, 3)
 
@@ -1542,15 +1553,18 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def check_counted_cobweb_tool_change_at_mining_start(self, correction):
         bot = await self.web_bot(sword=True)
+        await self.check_counted_equipment_correction(bot, correction, "web", STRING_ITEM, IRON_SWORD, WEB)
+
+    async def check_counted_equipment_correction(self, bot, correction, block, item_id, equipped_id, block_runtime):
         mining_lock = bot._blocks._mining_lock
         movement_lock = bot._movement._action_lock
         async with mining_lock:
             task = asyncio.create_task(bot.collect_by_count(
-                "web", item_id=STRING_ITEM, count=1, radius=2, ticks=0, search_radius=0, timeout=1,
+                block, item_id=item_id, count=1, radius=2, ticks=0, search_radius=0, timeout=1,
             ))
             equipped = await asyncio.wait_for(self.wire.outgoing.get(), 1)
             self.assertIsInstance(equipped, self.b.MobEquipmentPacket)
-            self.assertEqual(equipped.item.id, IRON_SWORD)
+            self.assertEqual(equipped.item.id, equipped_id)
             await movement_lock.acquire()
         try:
             async with asyncio.timeout(0.5):
@@ -1560,7 +1574,8 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             await self.emit(correction)
             self.assertEqual((bot.held_item.slot, bot.held_item.selection_source),
                              (correction.selected_slot, "server"))
-            self.assertEqual(bot.inventory_slots[1].id, IRON_SWORD)
+            cached = bot.inventory_slots[1]
+            self.assertEqual((cached.id, cached.user_data_buffer), (equipped_id, equipped.item.user_data_buffer))
             self.assertTrue(self.wire.outgoing.empty())
         finally:
             movement_lock.release()
@@ -1568,7 +1583,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         attempt, = result.results
         self.assertEqual((attempt.status, result.collected_count), ("tool_unavailable", 0))
         self.assertIsNone(bot.mining_target)
-        self.assertEqual(bot.observed_block(TARGET).runtime_id, WEB)
+        self.assertEqual(bot.observed_block(TARGET).runtime_id, block_runtime)
         self.assertTrue(self.wire.outgoing.empty())
 
     async def test_counted_cobweb_vein_refills_for_string_despite_carried_shears(self):
@@ -1584,6 +1599,111 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         await self.refill_close()
         await self.expect_batch_start(TARGET)
         await self.finish_batch_break(TARGET, runtime_id=101, total=1, item_id=STRING_ITEM)
+        result = await task
+        attempt, = result.results
+        self.assertEqual((attempt.status, result.collected_count), ("collected", 1))
+        self.assertEqual(attempt.tool_acquisition.transfer.confirmed_count, 1)
+        self.assertTrue(self.wire.outgoing.empty())
+
+    def diamond_pick(self, net_id, data):
+        pick = stack_descriptor(self.b, DIAMOND_PICKAXE, 1, net_id)
+        pick.user_data_buffer = data
+        return pick
+
+    async def diamond_tool_bot(self, *tools):
+        bot = await self.refill_bot(item_names={
+            DIAMOND_PICKAXE: "minecraft:diamond_pickaxe", DIAMOND: "minecraft:diamond",
+            DIAMOND_ORE_ITEM: "minecraft:diamond_ore", DEEPSLATE_ORE_ITEM: "minecraft:deepslate_diamond_ore",
+        })
+        inventory = [self.item() for _ in range(36)]
+        for slot, tool in tools:
+            inventory[slot] = tool
+        await self.emit(self.block(ORE), self.block(HASHED_AIR_RUNTIME_ID, position=SECOND_TARGET),
+                        self.content(*inventory))
+        return bot
+
+    async def test_counted_diamond_ore_chooses_same_item_pick_by_silk_touch(self):
+        bot = await self.diamond_tool_bot((1, self.diamond_pick(12, PLAIN_PICK_DATA)),
+                                          (5, self.diamond_pick(13, SILK_PICK_DATA)))
+        options = {"count": 1, "ticks": 0, "search_radius": 0, "timeout": 1}
+        for collect, target, block, requested, silk_drop, slot in (
+            (partial(bot.collect_by_count, radius=2), "diamond_ore", ORE, DIAMOND, DIAMOND_ORE_ITEM, 1),
+            (bot.collect_vein_by_count, TARGET, DEEPSLATE_ORE, DEEPSLATE_ORE_ITEM, DEEPSLATE_ORE_ITEM, 5),
+        ):
+            with self.subTest(requested=requested):
+                await self.emit(self.block(block), self.slot(2))
+                task = asyncio.create_task(collect(target, item_id=requested, **options))
+                equipped = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+                self.assertIsInstance(equipped, self.b.MobEquipmentPacket)
+                await self.expect_batch_start(TARGET)
+                item_id = silk_drop if equipped.item.user_data_buffer == SILK_PICK_DATA else DIAMOND
+                await self.finish_batch_break(TARGET, runtime_id=100 + slot, total=1, item_id=item_id)
+                result = await task
+                attempt, = result.results
+                self.assertEqual((equipped.item.id, equipped.selected_slot, attempt.status, result.collected_count),
+                                 (DIAMOND_PICKAXE, slot, "collected", 1))
+                self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_counted_diamond_ore_rechecks_same_pick_enchantment_at_mining_start(self):
+        bot = await self.diamond_tool_bot((1, self.diamond_pick(12, PLAIN_PICK_DATA)))
+        correction = self.b.MobEquipmentPacket(
+            runtime_id=PLAYER, item=self.diamond_pick(12, SILK_PICK_DATA),
+            slot=1, selected_slot=1, container_id=self.b.ContainerID.INVENTORY,
+        )
+        await self.check_counted_equipment_correction(bot, correction, "diamond_ore", DIAMOND, DIAMOND_PICKAXE, ORE)
+
+    async def test_counted_diamond_ore_refuses_malformed_enchantment_metadata(self):
+        bot = await self.diamond_tool_bot()
+        # Insert each additional root field before the compound end and restriction counts.
+        for description, data in (
+            ("int array", PLAIN_PICK_DATA[:-9] + bytes.fromhex("0b0400656e636800000000") + PLAIN_PICK_DATA[-9:]),
+            ("duplicate", SILK_PICK_DATA[:-9] + bytes.fromhex("090400656e63680a00000000") + SILK_PICK_DATA[-9:]),
+        ):
+            with self.subTest(ench=description):
+                update = self.slot(1)
+                update.item = self.diamond_pick(12, data)
+                await self.emit(update)
+                result = await bot.collect_by_count(
+                    "diamond_ore", item_id=DIAMOND, count=1, radius=2, ticks=0, search_radius=0, timeout=0.2,
+                )
+                attempt, = result.results
+                actions = []
+                while not self.wire.outgoing.empty():
+                    frame = self.wire.outgoing.get_nowait()
+                    if isinstance(frame, self.b.PlayerAuthInputPacket):
+                        actions.extend(action.player_action_type.name for action in frame.player_block_actions or ())
+                self.assertEqual((attempt.status, result.collected_count, actions), ("tool_unavailable", 0, []))
+                self.assertEqual(bot.observed_block(TARGET).runtime_id, ORE)
+
+    async def test_counted_diamond_ore_refill_skips_silk_and_unobserved_pick_enchantments(self):
+        bot = await self.diamond_tool_bot((1, self.diamond_pick(12, SILK_PICK_DATA)),
+                                          (5, self.diamond_pick(13, b"")))
+        chest = HarvestToolChest(REFILL_CHEST, range(4, 6), range(3, 4))
+        task = asyncio.create_task(bot.collect_by_count(
+            "diamond_ore", item_id=DIAMOND, count=1, radius=2, ticks=0, search_radius=0, timeout=1, tool_chest=chest,
+        ))
+        await self.refill_click()
+        opened, contents = self.refill_window(count=0)
+        slots = contents.slots
+        slots[4] = self.diamond_pick(14, SILK_PICK_DATA)
+        slots[5] = self.diamond_pick(15, PLAIN_PICK_DATA)
+        contents.slots = slots
+        await self.emit(opened, contents)
+        take = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+        self.assertIsInstance(take, self.b.ItemStackRequestPacket)
+        request, = take.requests
+        action, = request.actions
+        self.assertIsInstance(action, self.b.ItemStackRequestCereal.TakeActionData)
+        self.assertEqual((action.source.slot, action.destination.slot, action.amount), (5, 3, 1))
+        await self.emit(self.stack_response(request, (
+            ("LEVEL_ENTITY_CONTAINER", 5, 0, None), ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 3, 1, 20),
+        )))
+        equipped = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+        self.assertIsInstance(equipped, self.b.MobEquipmentPacket)
+        self.assertEqual((equipped.item.id, equipped.item.user_data_buffer), (DIAMOND_PICKAXE, PLAIN_PICK_DATA))
+        await self.refill_close()
+        await self.expect_batch_start(TARGET)
+        await self.finish_batch_break(TARGET, runtime_id=101, total=1, item_id=DIAMOND)
         result = await task
         attempt, = result.results
         self.assertEqual((attempt.status, result.collected_count), ("collected", 1))
