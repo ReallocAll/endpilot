@@ -89,6 +89,71 @@ async def main(bot, expected_host_pid, label):
         self.assertTrue(any(isinstance(packet, self.bot.protocol.binding.TextPacket)
                             and packet.body.message == "fixture chat" for packet in self.wire.sent))
 
+    async def test_command_output_preserves_ordered_packet_fields_and_zero_success(self):
+        b = self.bot.protocol.binding
+        data = ' \n{"键":"猫 🌱","accent":"e\u0301"} '
+        cases = [
+            ("/list", b.CommandOutputType.ALL_OUTPUT, 1, None, "",
+             [("commands.players.list", True, ["1", "7"]),
+              ("commands.players.list.names", True, ["ScriptFixture"])]),
+            ("/packstack bogus verbose", b.CommandOutputType.DATA_SET, 0, data, "応答",
+             [("commands.generic.syntax", False, ["", "猫", "e\u0301", "🌱", " verbose"]),
+              ("commands.generic.unknown", False, [])]),
+            ("/help", b.CommandOutputType.NONE, 0, None, "", []),
+        ]
+        requests = []
+        send = self.wire.send
+
+        async def respond(batch):
+            await send(batch)
+            request = self.wire.sent[-1]
+            if not isinstance(request, b.CommandRequestPacket):
+                return
+            command, kind, success_count, opaque_data, request_id, messages = cases[len(requests)]
+            self.assertEqual(request.command, command)
+            requests.append(request)
+            self.wire.push(b.CommandOutputPacket(
+                origin_data=b.CommandOriginData(type=b.CommandOriginType.PLAYER, uuid=request.origin.uuid,
+                                                request_id=request_id, player_id=0),
+                output=b.CommandOutput(type=kind, success_count=success_count, data=opaque_data, messages=[
+                    b.CommandOutputMessage(message_id=message_id, successful=successful, params=params)
+                    for message_id, successful, params in messages
+                ]),
+            ))
+
+        script = """
+async def main(bot):
+    try:
+        await bot.execute_command_output("expired", timeout=0)
+    except TimeoutError:
+        pass
+    else:
+        raise AssertionError("nonpositive timeout should fail")
+    replies = []
+    for command in ("list", "/packstack bogus verbose", "help"):
+        reply = await bot.execute_command_output(command, timeout=3)
+        assert isinstance(reply.origin_data.uuid, str)
+        assert not hasattr(reply, "ID")
+        assert all(not hasattr(message, "raw_message") for message in reply.output.messages)
+        replies.append(reply)
+    return replies
+"""
+        with patch.object(self.wire, "send", side_effect=respond):
+            observed = await self.completed(await self.start(script))
+
+        self.assertEqual(observed["state"], "succeeded", observed)
+        self.assertEqual([request.command for request in requests], [case[0] for case in cases])
+        self.assertEqual(len({request.origin.uuid for request in requests}), len(cases))
+        expected = [
+            {"origin_data": {"type": "PLAYER", "uuid": str(request.origin.uuid), "request_id": request_id,
+                             "player_id": 0},
+             "output": {"type": kind.name, "success_count": success_count, "data": opaque_data,
+                        "messages": [{"message_id": message_id, "successful": successful, "params": params}
+                                     for message_id, successful, params in messages]}}
+            for request, (_, kind, success_count, opaque_data, request_id, messages) in zip(requests, cases, strict=True)
+        ]
+        self.assertEqual(observed["result"], expected)
+
     async def test_form_reply_encoding_failure_leaves_the_script_usable(self):
         b = self.bot.protocol.binding
         scheduled = test_scheduled_input.ScheduledInputTests()

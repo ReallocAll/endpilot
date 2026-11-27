@@ -83,6 +83,7 @@ _MEMBERS = {
             use_item_on place_block place_against start_mining continue_mining stop_mining finish_mining
             mine_block collect_block collect_targets collect_by_count collect_vein_by_count equip_harvest_tool
             answer_form close_form send_chat send_whisper wait_for_chat wait_for_message send_command
+            execute_command_output
             wait_for_health_update wait_for_vitals_update wait_for_abilities wait_for_status_effects_update
             wait_for_hunger_update respawn wait_for_death wait_for_respawn submit_respawn attack_entity
             swing animate missed_swing emote interact_entity mount dismount set_boat_input collect_drop
@@ -241,6 +242,17 @@ def _snapshot(name, value):
     elif name in _ITEM_VERDICTS:
         return _record({"result": _record({"name": value.result.name}),
                         "client_request_id": _record({"raw_id": int(value.client_request_id.raw_id)})})
+    elif name == "execute_command_output":
+        origin, output = value.origin_data, value.output
+        return _record({
+            "origin_data": _record({"type": _project(origin.type), "uuid": str(origin.uuid),
+                                    "request_id": origin.request_id, "player_id": origin.player_id}),
+            "output": _record({
+                "type": _project(output.type), "success_count": output.success_count, "data": output.data,
+                "messages": [_record({"message_id": message.message_id, "successful": message.successful,
+                                      "params": _project(message.params)}) for message in output.messages],
+            }),
+        })
     return _project(value)
 
 
