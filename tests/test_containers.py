@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 from bedrock_protocol import nbt
 
-from endpilot import Bot, transfer_range
+from endpilot import Bot, transfer_item, transfer_range
 from endpilot.block_data import _catalog
 from endpilot.blocks import BlockObservation
 from endpilot.containers import Containers, ContainerWindow
@@ -155,21 +155,27 @@ class ContainerTests(unittest.IsolatedAsyncioTestCase):
             binding=b, encode=codec.encode,
             decode=lambda packet: response if packet.body == b"close" else other,
         )
+        sent = asyncio.Event()
 
         async def wait(packet_id, *, timeout, match):
-            self.assertEqual(packet_id, b.ContainerClosePacket.ID)
+            self.assertIn(b.ContainerClosePacket.ID, packet_id)
             self.assertEqual(timeout, 3)
-            self.assertFalse(match(different_raw))
-            self.assertTrue(match(close_raw))
+            await sent.wait()
             callbacks[0](different_raw)
+            self.assertFalse(match(different_raw))
             self.assertEqual(containers.window, opened)
             callbacks[0](close_raw)
+            self.assertTrue(match(close_raw))
             return close_raw
+
+        async def send(packet, *, _before_send):
+            _before_send()
+            sent.set()
 
         stream = SimpleNamespace(
             protocol=protocol,
             subscribe_raw=lambda cb: callbacks.append(cb) or (lambda: callbacks.remove(cb)),
-            send=AsyncMock(), wait_for_packet=wait,
+            send=AsyncMock(side_effect=send), wait_for_packet=wait,
         )
         containers = Containers(stream, None, None)
         opened = ContainerWindow(5, "CONTAINER", (1, 100, 0), -1)
@@ -340,13 +346,13 @@ class ContainerTests(unittest.IsolatedAsyncioTestCase):
         matching = RawPacket(b.ContainerClosePacket.ID, b"server")
 
         async def wait(packet_id, *, timeout, match):
-            self.assertEqual(packet_id, b.ContainerClosePacket.ID)
+            self.assertIn(b.ContainerClosePacket.ID, packet_id)
             self.assertEqual(timeout, 4)
-            self.assertFalse(match(unrelated))
             callbacks[0](unrelated)
+            self.assertFalse(match(unrelated))
             self.assertIs(containers.window, opened)
-            self.assertTrue(match(matching))
             callbacks[0](matching)
+            self.assertTrue(match(matching))
             return matching
 
         stream = SimpleNamespace(
@@ -701,6 +707,247 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
         b = self.b
         return b.AddActorPacket(runtime_id=34, entity_id=unique, actor_type="minecraft:chest_boat",
                                 pos=b.Vec3(x=1.5, y=100, z=0.5))
+
+    def horse(self, unique=-205):
+        b = self.b
+        return b.AddActorPacket(runtime_id=35, entity_id=unique, actor_type="minecraft:horse",
+                                pos=b.Vec3(x=1.5, y=100, z=0.5))
+
+    def horse_equipment(self, unique=-205, *, window_id=2):
+        b = self.b
+        return b.UpdateEquipPacket(
+            container_id=window_id, type=b.ContainerType.HORSE, size=0, entity_unique_id=unique,
+            data=nbt.CompoundTag({"slots": nbt.ListTag([nbt.CompoundTag({
+                "slotNumber": nbt.IntTag(1),
+                "item": nbt.CompoundTag({"Name": nbt.StringTag("minecraft:horsearmoriron")}),
+            })])}),
+        )
+
+    async def prepare_horse(self, *, confirmed=True):
+        await self.deliver(self.horse(), self.position(), self.main_slot(), self.sneak_pose(False))
+        await self.bot.set_sneaking(True)
+        if confirmed:
+            await self.deliver(self.sneak_pose(True))
+
+    def horse_closed(self, window_id=2):
+        b = self.b
+        return b.ContainerClosePacket(container_id=window_id, container_type=b.ContainerType.NONE,
+                                      server_initiated_close=False)
+
+    async def start_close(self, *, timeout=2):
+        b = self.b
+        sent = asyncio.Event()
+        unsubscribe = self.bot.packets.subscribe_sent(
+            lambda packet_id: sent.set() if packet_id == b.ContainerClosePacket.ID else None,
+        )
+        try:
+            closing = self.start(self.bot.close_container(timeout=timeout))
+            await asyncio.wait_for(sent.wait(), 1)
+            return closing
+        finally:
+            unsubscribe()
+
+    async def test_horse_window_reads_matching_inventory_and_closes_by_server_receipt(self):
+        b = self.b
+        await self.prepare_horse()
+        opening = await self.start_open(35)
+        click, = self.clicks()
+        self.assertEqual((int(click.slot), int(click.item.id), click.item.stack_size), (0, 0, 0))
+        contents = b.InventoryContentPacket(inventory_id=2, slots=[
+            b.SerializedNetworkItemStackDescriptor(id=374, stack_size=1),
+            b.SerializedNetworkItemStackDescriptor(),
+        ])
+        await self.deliver(contents)
+        self.assertIsNone(self.bot.open_window)
+        self.assertFalse(opening.done())
+        await self.deliver(self.horse_equipment())
+        window = await opening
+        self.assertEqual(window, ContainerWindow(2, "HORSE", None, -205))
+        self.assertIs(self.bot.open_window, window)
+        self.assertIsNone(self.bot.container_slots)
+
+        changes = []
+        self.bot.subscribe_container_slot_changes(changes.append)
+        waiting = self.start(self.bot.wait_for_container_slots())
+        await self.deliver(b.InventoryContentPacket(inventory_id=3, slots=contents.slots))
+        self.assertFalse(waiting.done())
+        await self.deliver(contents)
+        self.assertEqual([(i, item.id, item.stack_size) for i, item in (await waiting).items()],
+                         [(0, 374, 1), (1, 0, 0)])
+        self.assertEqual([change.slot for change in changes], [0, 1])
+        armor = b.SerializedNetworkItemStackDescriptor(id=386, stack_size=1)
+        await self.deliver(b.InventorySlotPacket(inventory_id=3, slot=1, item=armor))
+        self.assertEqual(self.bot.container_slots[1].id, 0)
+        await self.deliver(b.InventorySlotPacket(inventory_id=2, slot=1, item=armor))
+        self.assertEqual(self.bot.container_slots[1].id, 386)
+        self.assertEqual(changes[-1].after.item_id, 386)
+
+        requests_before = list(self.wire.sent)
+        for operation in (self.bot.take_from_container(0, 0), self.bot.put_into_container(0, 0)):
+            with self.assertRaisesRegex(RuntimeError, "read-only"):
+                await operation
+        for operation in (
+            transfer_range(self.bot, direction="take", item="minecraft:saddle", count=1,
+                           source_slots=range(1), destination_slots=range(1)),
+            transfer_item(self.bot, direction="put", item="minecraft:saddle", count=1),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "supported storage container"):
+                await operation
+        self.assertEqual(self.wire.sent, requests_before)
+
+        closing = await self.start_close()
+        request = self.wire.sent[-1]
+        self.assertEqual((int(request.container_id), request.container_type, request.server_initiated_close),
+                         (2, b.ContainerType.HORSE, False))
+        await self.deliver(self.horse_closed(3), self.closed())
+        self.assertIs(self.bot.open_window, window)
+        self.assertFalse(closing.done())
+        await self.deliver(self.horse_closed())
+        self.assertIs(await closing, window)
+        self.assertIsNone(self.bot.open_window)
+        self.assertIsNone(self.bot.container_slots)
+        await self.deliver(contents)
+        self.assertIsNone(self.bot.container_slots)
+
+    async def test_horse_open_rejects_wrong_window_and_tracks_actual_replacement(self):
+        await self.prepare_horse()
+        opening = await self.start_open(35)
+        await self.deliver(self.horse_equipment(-206))
+        with self.assertRaisesRegex(RuntimeError, "different container"):
+            await opening
+        self.assertEqual(self.bot.open_window, ContainerWindow(2, "HORSE", None, -206))
+        await self.deliver(self.contents(), self.horse_equipment(window_id=4))
+        self.assertEqual(self.bot.open_window, ContainerWindow(4, "HORSE", None, -205))
+        self.assertIsNone(self.bot.container_slots)
+
+        await self.deliver(self.horse_closed(4))
+        opening = await self.start_open(35)
+        await self.deliver(self.opened(-205, "HORSE"))
+        with self.assertRaisesRegex(RuntimeError, "different container"):
+            await opening
+
+    async def test_horse_open_cannot_use_stale_announcement_or_replaced_actor(self):
+        b = self.b
+        await self.prepare_horse(confirmed=False)
+        with self.assertRaises(TimeoutError):
+            await self.bot.open_entity_container(35, timeout=.03)
+        self.assertEqual(self.clicks(), [])
+
+        waiting = asyncio.Event()
+        wait_for_packet = self.bot.packets.wait_for_packet
+
+        async def observe_wait(packet_ids, **kwargs):
+            if packet_ids == b.SetActorDataPacket.ID:
+                waiting.set()
+            return await wait_for_packet(packet_ids, **kwargs)
+
+        with patch.object(self.bot.packets, "wait_for_packet", side_effect=observe_wait):
+            opening = self.start(self.bot.open_entity_container(35))
+            await asyncio.wait_for(waiting.wait(), 1)
+            await self.deliver(self.horse_equipment(), self.sneak_pose(True))
+            with self.assertRaisesRegex(RuntimeError, "opened before the interaction"):
+                await opening
+        self.assertEqual(self.clicks(), [])
+
+        await self.deliver(self.horse_closed())
+        opening = await self.start_open(35)
+        await self.deliver(b.RemoveActorPacket(entity_id=-205), self.horse(), self.horse_equipment())
+        with self.assertRaisesRegex(RuntimeError, "horse is no longer observed"):
+            await opening
+
+    async def test_horse_open_does_not_return_a_window_already_closed_or_replaced(self):
+        await self.prepare_horse()
+        for end in (self.horse_closed(), self.horse_equipment(window_id=4)):
+            with self.subTest(packet=type(end).__name__):
+                opening = await self.start_open(35)
+                await self.deliver(self.horse_equipment(), end)
+                with self.assertRaisesRegex(RuntimeError, "closed or changed during open"):
+                    await opening
+                if self.bot.open_window is not None:
+                    await self.deliver(self.horse_closed(4))
+
+    async def test_horse_close_cannot_return_a_receipt_from_a_reused_window_id(self):
+        await self.prepare_horse()
+        await self.deliver(self.horse_equipment())
+        closing = await self.start_close()
+        await self.deliver(self.horse_equipment(-206), self.horse_closed())
+        with self.assertRaisesRegex(RuntimeError, "window changed before its close"):
+            await closing
+
+    async def test_cart_close_cannot_return_a_horse_receipt_with_the_same_window_id(self):
+        await self.deliver(self.opened(-201))
+        closing = await self.start_close()
+        await self.deliver(self.horse_equipment(), self.horse_closed())
+        with self.assertRaisesRegex(RuntimeError, "window changed before its close"):
+            await closing
+        self.assertIsNone(self.bot.open_window)
+
+    async def test_disconnect_ends_close_waits_while_reader_is_still_open(self):
+        await self.deliver(self.horse_equipment(window_id=3))
+        reader = self.bot.packets._reader_task
+        observing = self.start(self.bot.wait_for_container_close(timeout=.3))
+        closing = await self.start_close(timeout=.3)
+        await self.deliver(self.b.DisconnectPacket())
+        self.assertIsNone(self.bot.open_window)
+        self.assertFalse(reader.done())
+        for waiter in (observing, closing):
+            with self.assertRaises(ConnectionError):
+                await waiter
+
+    async def test_passive_close_wait_rejects_replacement_by_any_window_announcement(self):
+        b = self.b
+        for replacement in (self.opened(-202), self.horse_equipment(),
+                            b.UpdateTradePacket(container_id=2, entity_unique_id=-203),
+                            b.ChangeDimensionPacket(dimension_id=1)):
+            with self.subTest(packet=type(replacement).__name__):
+                await self.deliver(self.opened(-201))
+                before = sum(isinstance(packet, b.ContainerClosePacket) for packet in self.wire.sent)
+                observing = self.start(self.bot.wait_for_container_close(timeout=.3))
+                await asyncio.sleep(0)
+                await self.deliver(replacement, self.horse_closed())
+                with self.assertRaisesRegex(RuntimeError, "window changed before its close"):
+                    await observing
+                self.assertEqual(sum(isinstance(packet, b.ContainerClosePacket) for packet in self.wire.sent), before)
+
+    async def test_trade_refresh_keeps_passive_close_bound_for_matching_none_receipt(self):
+        b = self.b
+        quote = b.UpdateTradePacket(container_id=2, entity_unique_id=-203)
+        await self.deliver(self.opened(-203, "TRADE"))
+        window = self.bot.open_window
+        self.wire.sent.clear()
+        observing = self.start(self.bot.wait_for_container_close(timeout=1))
+        await asyncio.sleep(0)
+        await self.deliver(quote, b.UpdateEquipPacket(container_id=2, type=b.ContainerType.CONTAINER))
+        self.assertIs(self.bot.open_window, window)
+        self.assertFalse(observing.done())
+        await self.deliver(self.horse_closed())
+        reply = await observing
+        self.assertEqual((int(reply.container_id), reply.container_type), (2, b.ContainerType.NONE))
+        self.assertIsNone(self.bot.open_window)
+        self.assertFalse(any(isinstance(packet, b.ContainerClosePacket) for packet in self.wire.sent))
+
+    async def test_close_rechecks_starting_window_at_packet_write(self):
+        b = self.b
+        await self.deliver(self.opened(-201))
+        blocked, release = asyncio.Event(), asyncio.Event()
+        send = self.bot.packets.send
+
+        async def paused_send(packet, **kwargs):
+            if isinstance(packet, b.ContainerClosePacket):
+                blocked.set()
+                await release.wait()
+            return await send(packet, **kwargs)
+
+        with patch.object(self.bot.packets, "send", side_effect=paused_send):
+            closing = self.start(self.bot.close_container(timeout=.3))
+            await asyncio.wait_for(blocked.wait(), 1)
+            await self.deliver(self.horse_equipment())
+            replacement = self.bot.open_window
+            release.set()
+            with self.assertRaisesRegex(RuntimeError, "window changed before its close"):
+                await closing
+        self.assertEqual([packet for packet in self.wire.sent if isinstance(packet, b.ContainerClosePacket)], [])
+        self.assertIs(self.bot.open_window, replacement)
 
     def sneak_pose(self, sneaking, *, runtime_id=7):
         b = self.b

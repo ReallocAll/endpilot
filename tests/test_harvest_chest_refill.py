@@ -717,7 +717,7 @@ class HarvestChestRefillTests(unittest.IsolatedAsyncioTestCase):
 
         async def wait_for_packet(packet_ids, **kwargs):
             nonlocal replacement
-            if packet_ids == b.ContainerClosePacket.ID:
+            if b.ContainerClosePacket.ID in (packet_ids if isinstance(packet_ids, tuple) else (packet_ids,)):
                 replacement = self.open_storage(stacks={4: self.stack(IRON, 15)})
             return await original_wait(packet_ids, **kwargs)
 

@@ -25,7 +25,7 @@ from .inventory import (
 class ContainerWindow:
     container_id: int
     container_type: str
-    position: tuple[int, int, int] | None  # Absent in UpdateTradePacket.
+    position: tuple[int, int, int] | None  # Absent in UpdateTradePacket and UpdateEquipPacket.
     entity_unique_id: int
 
 
@@ -71,7 +71,12 @@ class _InventoryOpen:
     completion: asyncio.Future[ContainerWindow | None]
 
 
+class _WindowChangedBeforeClose(RuntimeError):
+    pass
+
+
 _CHEST_BOAT = "minecraft:chest_boat"
+_HORSE = "minecraft:horse"
 _ENTITY_CONTAINER_LAYOUTS = {
     "minecraft:chest_minecart": ("CONTAINER", 27),
     "minecraft:hopper_minecart": ("HOPPER", 5),
@@ -195,6 +200,15 @@ class Containers:
             (int(packet.pos.x), int(packet.pos.y), int(packet.pos.z)),
             int(packet.entity_unique_id),
         )
+
+    def _matches_close(self, window: ContainerWindow, packet) -> bool:
+        if int(packet.container_id) != window.container_id:
+            return False
+        if window.container_type != "HORSE":
+            return True
+        types = self.packets.protocol.binding.ContainerType
+        # BDS can reply with NONE even when the request names the horse window type.
+        return packet.container_type in (types.HORSE, types.NONE)
 
     def _set_window(self, window: ContainerWindow | None) -> None:
         for stop in tuple(self._transfer_block_watches):
@@ -501,7 +515,8 @@ class Containers:
                 entity = _observed_entity_container(self._entities, actor)
                 if entity is not None and (
                     entity.actor_type == _CHEST_BOAT or entity.slot_count(window) is not None
-                    or (window.container_type == "CONTAINER" and entity.actor_type != "minecraft:hopper_minecart")
+                    or (window.container_type == "CONTAINER"
+                        and entity.actor_type not in ("minecraft:hopper_minecart", _HORSE))
                 ):
                     self._entity_container = entity
         elif raw.packet_id == b.UpdateTradePacket.ID:
@@ -517,6 +532,12 @@ class Containers:
                     or current.container_type != "TRADE"
                     or current.entity_unique_id != window.entity_unique_id):
                 self._set_window(window)
+        elif raw.packet_id == b.UpdateEquipPacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            if packet.type == b.ContainerType.HORSE:
+                self._set_window(ContainerWindow(
+                    int(packet.container_id), "HORSE", None, int(packet.entity_unique_id),
+                ))
         elif raw.packet_id == b.InventoryContentPacket.ID:
             packet = self.packets.protocol.decode(raw)
             window = self.window
@@ -563,8 +584,10 @@ class Containers:
             self._observe_window_slot(packet.inventory_id, packet.slot, packet.item, before)
             self._notify_slot_changes(window, before)
         elif raw.packet_id == b.InventoryTransactionPacket.ID:
-            packet = self.packets.protocol.decode(raw)
             window = self.window
+            if window is not None and window.container_type == "HORSE":
+                return
+            packet = self.packets.protocol.decode(raw)
             before = {} if self._slot_observers else None
             transaction = getattr(packet.variant_transaction, "transaction", None)
             for action in getattr(transaction, "actions", ()):
@@ -574,7 +597,7 @@ class Containers:
             self._notify_slot_changes(window, before)
         elif raw.packet_id == b.ContainerClosePacket.ID:
             packet = self.packets.protocol.decode(raw)
-            if self.window is not None and int(packet.container_id) == self.window.container_id:
+            if self.window is not None and self._matches_close(self.window, packet):
                 self._set_window(None)
                 if packet.server_initiated_close:
                     # A server-originated close is acknowledged with the same
@@ -870,31 +893,34 @@ class Containers:
                 pending.exception()
 
     async def open_entity(self, runtime_id: int, entities: Entities, *, timeout: float = 15) -> ContainerWindow:
-        """Open an observed storage entity and return its active server window."""
+        """Open an observed storage entity or horse and return its active server window."""
         if self._unsubscribe is None:
             raise ConnectionError("container session is closed")
         if self.window is not None or self._entity_opening:
             raise RuntimeError("a container window is open or opening")
         actor = entities.get(runtime_id)
         target = _observed_entity_container(entities, actor)
-        if target is None or target.actor_type not in _ENTITY_CONTAINER_LAYOUTS:
-            raise ValueError("an observed chest minecart, hopper minecart, or chest boat with a known identity is required")
+        if target is None or (target.actor_type not in _ENTITY_CONTAINER_LAYOUTS and target.actor_type != _HORSE):
+            raise ValueError("an observed chest minecart, hopper minecart, chest boat, or horse with a known identity is required")
         b = self.packets.protocol.binding
-        boat = target.actor_type == _CHEST_BOAT
+        horse = target.actor_type == _HORSE
+        sneak_target = "horse" if horse else "chest boat" if target.actor_type == _CHEST_BOAT else None
         move = self.movement
-        generation = move._pose_generation if boat else None
+        generation = move._pose_generation if sneak_target else None
         layout = self._layout_token
         submitted = False
         opened = None
 
         def require_target():
             target.require_visible()
-            if boat and move._pose_generation != generation:
-                raise RuntimeError("player pose changed generation while opening the chest boat")
+            if sneak_target and move._pose_generation != generation:
+                raise RuntimeError(f"player pose changed generation while opening the {sneak_target}")
 
-        def require_boat_input():
+        def require_sneak_input():
             if not move._sneaking:
-                raise RuntimeError("hold sneak to open a chest boat")
+                raise RuntimeError(f"hold sneak to open a {sneak_target}")
+            if horse and entities.vehicle() is not None:
+                raise RuntimeError("opening a horse equipment window requires leaving the vehicle")
             held = self.inventory.held_item
             item = held.observed_item
             # A server equipment correction can precede the matching inventory update.
@@ -903,27 +929,27 @@ class Containers:
                     or (equipment is not None and (equipment.id != 0 or equipment.stack_size != 0))
                     or held.slot in self.inventory._unconfirmed_transfer_slots
                     or self.inventory._requests_for_endpoints(((None, held.slot),))):
-                raise RuntimeError("opening a chest boat requires an observed empty main hand")
+                raise RuntimeError(f"opening a {sneak_target} requires an observed empty main hand")
 
         def confirmed_sneaking(_raw=None):
             require_target()
-            require_boat_input()
+            require_sneak_input()
             return move._actor_flag(b.ActorFlags.SNEAKING) is True
 
         def before_send(slot, item):
             nonlocal submitted
             require_target()
-            if self.window is not None or (boat and self._layout_token is not layout):
+            if self.window is not None or (sneak_target and self._layout_token is not layout):
                 raise RuntimeError("a container window opened before the interaction")
-            if boat:
+            if sneak_target:
                 if not confirmed_sneaking():
-                    raise RuntimeError("the server no longer confirms the player's chest boat sneak pose")
+                    raise RuntimeError(f"the server no longer confirms the player's {sneak_target} sneak pose")
                 if slot != self.inventory.selected_slot or item.id or item.stack_size:
-                    raise RuntimeError("the selected main hand changed before the chest boat interaction")
+                    raise RuntimeError(f"the selected main hand changed before the {sneak_target} interaction")
             submitted = True
 
         async def interact():
-            if boat and not confirmed_sneaking():
+            if sneak_target and not confirmed_sneaking():
                 await self.packets.wait_for_packet(b.SetActorDataPacket.ID, timeout=None, match=confirmed_sneaking)
             await entities.interact(move, self.inventory, runtime_id, _before_send=before_send)
 
@@ -934,29 +960,41 @@ class Containers:
             if raw.packet_id == b.ChangeDimensionPacket.ID:
                 raise RuntimeError("dimension changed while opening the entity container")
             require_target()
-            if raw.packet_id != b.ContainerOpenPacket.ID:
+            packet_id = raw.packet_id
+            if packet_id == b.UpdateEquipPacket.ID:
+                if self.packets.protocol.decode(raw).type != b.ContainerType.HORSE:
+                    return False
+            elif packet_id != b.ContainerOpenPacket.ID and not (horse and packet_id == b.UpdateTradePacket.ID):
                 return False
             if not submitted:
-                if boat:
+                if sneak_target:
                     raise RuntimeError("a container window opened before the interaction")
                 return False
             window = self.window
-            if window is None or target.slot_count(window) is None:
+            if horse:
+                matching = (packet_id == b.UpdateEquipPacket.ID and window is not None
+                            and window.container_type == "HORSE" and window.entity_unique_id == target.entity_id)
+            else:
+                matching = target.slot_count(window) is not None
+            if not matching:
                 raise RuntimeError("the server opened a different container")
             opened = window
-            self._entity_container = target
+            if not horse:
+                self._entity_container = target
             return True
 
-        if boat:
-            require_boat_input()
+        if sneak_target:
+            require_sneak_input()
+        packet_ids = (b.ContainerOpenPacket.ID, b.ChangeDimensionPacket.ID, b.DisconnectPacket.ID,
+                      b.RemoveActorPacket.ID, b.AddActorPacket.ID, b.RespawnPacket.ID)
+        if horse:
+            packet_ids += (b.UpdateEquipPacket.ID, b.UpdateTradePacket.ID)
         self._entity_opening = True
         tasks = []
         try:
             async with asyncio.timeout(timeout):
                 pending = asyncio.create_task(self.packets.wait_for_packet(
-                    (b.ContainerOpenPacket.ID, b.ChangeDimensionPacket.ID, b.DisconnectPacket.ID,
-                     b.RemoveActorPacket.ID, b.AddActorPacket.ID, b.RespawnPacket.ID),
-                    timeout=None, match=matches,
+                    packet_ids, timeout=None, match=matches,
                 ))
                 tasks.append(pending)
                 await asyncio.sleep(0)
@@ -1052,22 +1090,35 @@ class Containers:
                 self._inventory_open = None
                 request.completion.set_result(confirmed)
 
-    async def wait_for_close(self, *, timeout: float = 15):
+    async def wait_for_close(self, *, timeout: float = 15, _expected_window: ContainerWindow | None = None):
         """Await the active window's server close packet, without requesting a close.
 
         Register the waiter before the server action. Returns a typed
         ContainerClosePacket, including its server_initiated_close flag.
         """
-        window = self.window
+        window = self.window if _expected_window is None else _expected_window
         if window is None:
             raise RuntimeError("no container window is open")
+        if self._unsubscribe is None:
+            raise ConnectionError("container session ended before its close was observed")
+        if self.window is not window:
+            raise _WindowChangedBeforeClose("container window changed before its close was observed")
         b = self.packets.protocol.binding
+        packet_ids = (b.ContainerClosePacket.ID, b.ContainerOpenPacket.ID, b.UpdateEquipPacket.ID,
+                      b.UpdateTradePacket.ID, b.ChangeDimensionPacket.ID, b.DisconnectPacket.ID)
 
         def matches(raw):
-            return int(self.packets.protocol.decode(raw).container_id) == window.container_id
+            if raw.packet_id == b.DisconnectPacket.ID or self._unsubscribe is None:
+                raise ConnectionError("container session ended before its close was observed")
+            if raw.packet_id == b.ContainerClosePacket.ID:
+                return self._matches_close(window, self.packets.protocol.decode(raw))
+            # The window observer has applied each announcement before this waiter.
+            if self.window is not window:
+                raise _WindowChangedBeforeClose("container window changed before its close was observed")
+            return False
 
         raw = await self.packets.wait_for_packet(
-            b.ContainerClosePacket.ID, timeout=timeout, match=matches,
+            packet_ids, timeout=timeout, match=matches,
         )
         return self.packets.protocol.decode(raw)
 
@@ -1080,11 +1131,21 @@ class Containers:
             return None
         b = self.packets.protocol.binding
 
-        pending = asyncio.create_task(self.wait_for_close(timeout=timeout))
+        def before_send():
+            if self._unsubscribe is None:
+                raise ConnectionError("container session ended before its close was requested")
+            if self.window is not window:
+                raise _WindowChangedBeforeClose("container window changed before its close was requested")
+
+        pending = asyncio.create_task(self.wait_for_close(
+            timeout=timeout, _expected_window=window,
+        ))
         try:
             # Register the observer before sending; BDS may reply immediately.
             await asyncio.sleep(0)
-            if _expected_window is not None and self.window is not _expected_window:
+            if self._unsubscribe is None:
+                raise ConnectionError("container session ended before its close was requested")
+            if self.window is not window:
                 return None
             container_type = (
                 int(window.container_type) if window.container_type.lstrip("-").isdigit()
@@ -1094,13 +1155,19 @@ class Containers:
                 container_id=window.container_id,
                 container_type=container_type,
                 server_initiated_close=False,
-            ))
+            ), _before_send=before_send)
             await pending
             return window
+        except _WindowChangedBeforeClose:
+            if _expected_window is not None:
+                return None
+            raise
         finally:
             if not pending.done():
                 pending.cancel()
                 await asyncio.gather(pending, return_exceptions=True)
+            elif not pending.cancelled():
+                pending.exception()
 
     async def take_from_container(
         self, source_slot: int, destination_slot: int, amount: int = 1, *, timeout: float = 15
@@ -1271,6 +1338,8 @@ class Containers:
         _before_range_write: Callable[[int], None] | None = None,
     ):
         window = self.window
+        if window is not None and window.container_type == "HORSE":
+            raise RuntimeError("horse equipment windows are read-only")
         if window is None or self._slots is None:
             raise RuntimeError("container window or its server-reported slots are unavailable")
         layout = self._layout_token
