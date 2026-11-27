@@ -1452,7 +1452,7 @@ class Bot:
         return await self._signs.edit(position, text, face=face, timeout=timeout)
 
     def inventory_count(self, item_id: int) -> int:
-        """Current server-described count of a numeric inventory item ID."""
+        """Count items in the latest applied inventory snapshot, which may be stale."""
         if self._inventory is None:
             raise RuntimeError("player has not joined")
         return self._inventory.count_item(item_id)
@@ -1460,6 +1460,11 @@ class Bot:
     async def wait_for_inventory_item_count(
         self, item_id: int, minimum: int, *, timeout: float = 15
     ) -> int:
+        """Wait for a server-observed item count to reach the minimum.
+
+        Raise RuntimeError if a main inventory slot update failed and fresh
+        server observations have not yet restored the missing slots.
+        """
         if self._inventory is None:
             raise RuntimeError("player has not joined")
         return await self._inventory.wait_for_item_count(

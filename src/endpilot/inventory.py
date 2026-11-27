@@ -155,6 +155,7 @@ class Inventory:
         self._applied_selection_order = 0
         self._events = {}
         self._changed = asyncio.Event()
+        self._count_observation_gaps: set[int] = set()
         self._pending_requests = {}
         self._unconfirmed_transfer_slots: set[int] = set()
         self._qa_requests = {}
@@ -206,6 +207,8 @@ class Inventory:
             self._slots[slot] = item
         if 0 <= slot < 9:
             self._record_damage_descriptor((None, slot), item, received=received)
+        if received:
+            self._count_observation_gaps.discard(slot)
         event = self._events.get(slot)
         if event is not None:
             event.set()
@@ -268,6 +271,7 @@ class Inventory:
             self._observe_transfer_content(None, previous, self._slots)
             self._drop_origins.clear()
             self._drop_key_counts.clear()
+            self._count_observation_gaps.clear()
             for event in self._events.values():
                 event.set()
             self._changed.set()
@@ -279,7 +283,12 @@ class Inventory:
                 slot = int(packet.slot)
                 before = {slot: self._slots.get(slot)} if self._observes_inventory_slot(slot) else None
                 self._unconfirmed_transfer_slots.discard(slot)
-                self._set_slot(slot, packet.item, received=True)
+                try:
+                    self._set_slot(slot, packet.item, received=True)
+                except Exception:
+                    self._count_observation_gaps.add(slot)
+                    self._changed.set()
+                    raise
                 self._observe_transfer_slot((None, slot), packet.item)
                 if slot == self._selected_slot:
                     self._notify_held_item()
@@ -631,6 +640,8 @@ class Inventory:
         """Wait for an observed inventory count; unrelated slot changes are allowed."""
         async with asyncio.timeout(timeout):
             while True:
+                if self._count_observation_gaps:
+                    raise RuntimeError("inventory count is not current after a failed slot update")
                 count = self.count_item(item_id)
                 if count >= minimum:
                     return count

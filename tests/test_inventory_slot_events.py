@@ -189,6 +189,63 @@ class InventorySlotEventsTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ConnectionError, "inventory observation ended"):
             self.bot.subscribe_inventory_changes(observed.append)
 
+    async def test_count_wait_rejects_a_lost_slot_update_until_that_slot_is_known(self):
+        b = self.b
+        await self.deliver(self.content(self.item(3, 20), self.item()))
+        self.assertEqual(await self.bot.wait_for_inventory_item_count(17, 1), 3)
+        removed = self.slot(0, self.item())
+        extension = b.ClientboundControlSchemeSetPacket()
+        protocol = self.bot.protocol
+        raw_removed, raw_extension = map(protocol.encode, (removed, extension))
+        decoded = protocol.decode(raw_removed)
+        self.assertEqual((decoded.slot, decoded.item.id), (0, 0))
+
+        errors, observed = [], []
+        loop = asyncio.get_running_loop()
+        self.addCleanup(loop.set_exception_handler, loop.get_exception_handler())
+        loop.set_exception_handler(lambda _, context: errors.append(context["exception"]))
+        reducer_error = RuntimeError("main inventory slot update failed")
+        observer_error = RuntimeError("external raw observer failed")
+
+        def bad_observer(raw):
+            if raw == raw_extension:
+                raise observer_error
+
+        self.bot.packets.subscribe_raw(bad_observer)
+        self.bot.packets.subscribe_raw(observed.append)
+        waiting = asyncio.create_task(self.bot.wait_for_inventory_item_count(17, 4, timeout=1))
+        self.addAsyncCleanup(self.cancel, waiting)
+        await asyncio.sleep(0)
+        inventory = self.bot._inventory
+        with patch.object(inventory, "_set_slot", side_effect=reducer_error):
+            await self.deliver(removed, extension)
+        self.assertEqual(errors, [reducer_error, observer_error])
+        self.assertIn(raw_removed, observed)
+        self.assertIn(raw_extension, observed)
+        self.assertEqual(self.read_counts(0), (3,))
+
+        with self.assertRaisesRegex(RuntimeError, "inventory count is not current"):
+            await self.bot.wait_for_inventory_item_count(17, 1, timeout=.1)
+        with self.assertRaisesRegex(RuntimeError, "inventory count is not current"):
+            await waiting
+        await self.deliver(self.slot(1, self.item(2, 21)),
+                           self.content(self.item(), container="ARMOR"),
+                           self.slot(0, self.item(), container="OFFHAND"))
+        with self.assertRaisesRegex(RuntimeError, "inventory count is not current"):
+            await self.bot.wait_for_inventory_item_count(17, 1, timeout=.1)
+
+        await self.deliver(removed, extension)
+        self.assertEqual(await self.bot.wait_for_inventory_item_count(17, 1, timeout=.1), 2)
+        self.assertEqual(self.read_counts(0, 1), (0, 2))
+        self.assertEqual(errors, [reducer_error, observer_error, observer_error])
+
+        with patch.object(inventory, "_set_slot", side_effect=reducer_error):
+            await self.deliver(self.slot(1, self.item()))
+        with self.assertRaisesRegex(RuntimeError, "inventory count is not current"):
+            await self.bot.wait_for_inventory_item_count(17, 1, timeout=.1)
+        await self.deliver(self.content(self.item(4, 22), self.item()))
+        self.assertEqual(await self.bot.wait_for_inventory_item_count(17, 1, timeout=.1), 4)
+
     async def test_observer_failure_is_reported_and_the_next_observer_receives_the_change(self):
         loop = asyncio.get_running_loop()
         errors, observed = [], []
