@@ -90,6 +90,9 @@ class EntityState:
     owner or the ID reported at a fishing hook's spawn. The owner can be outside
     the observed actors or player list. ``None`` means absent or unknown.
 
+    ``sitting`` holds the latest valid sitting flag for this visible wolf
+    instance. ``None`` means the flag is unknown or does not apply.
+
     ``firework_attached_entity_id`` is the unique ID reported in the spawn
     metadata of a firework rocket, when the packet identifies an attachment.
 
@@ -125,6 +128,7 @@ class EntityState:
     sleeping: bool | None = None
     firework_attached_entity_id: int | None = None
     visible_effects_value: int | None = None
+    sitting: bool | None = None
 
     @property
     def visible_effect_ids(self) -> tuple[int, ...] | None:
@@ -482,6 +486,14 @@ def _owner_entity_id(metadata, binding, previous: int | None = None) -> int | No
             owner = int(entry.payload.value)
             return None if owner == -1 else owner
     return previous
+
+
+def _wolf_sitting(metadata, binding, previous: bool | None = None) -> bool | None:
+    flag = binding.ActorFlags.SITTING
+    words = _player_flag_words(metadata, binding)
+    if words[int(flag) // 64] is None:
+        return previous
+    return _player_flag(words, flag)
 
 
 def _unsupported_view_pose(words: _PlayerFlagWords, binding) -> bool:
@@ -1811,8 +1823,9 @@ class Entities:
             state = self._by_runtime.get(runtime_id)
             if state is not None and state.actor_type == _WOLF:
                 owner = _owner_entity_id(metadata, b, state.owner_entity_id)
-                if owner != state.owner_entity_id:
-                    state = replace(state, owner_entity_id=owner)
+                sitting = _wolf_sitting(metadata, b, state.sitting)
+                if owner != state.owner_entity_id or sitting != state.sitting:
+                    state = replace(state, owner_entity_id=owner, sitting=sitting)
                     self._by_runtime[runtime_id] = state
             visible_observers = ()
             if state is not None and self._visible_effect_target(runtime_id):
@@ -1930,6 +1943,7 @@ class Entities:
                 firework_attached_entity_id=None if attachment == -1 else attachment,
                 visible_effects_value=_visible_effects_value(getattr(getattr(actor, "data", None), "data", ()), b)
                 if runtime_id != self._own_runtime_id else None,
+                sitting=_wolf_sitting(actor.data.data, b) if actor.actor_type == _WOLF else None,
             )
             if (not startup and self._attached_firework_observers and self._own_entity_id
                     and runtime_id != self._own_runtime_id and state.firework_attached_entity_id == self._own_entity_id):

@@ -70,9 +70,11 @@ class EntityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         return b.AddItemActorPacket(id=109, runtime_id=9, pos=b.Vec3(x=2, y=3, z=4),
                                     item=b.SerializedNetworkItemStackDescriptor(id=5, stack_size=2))
 
-    def owner_metadata(self, owner, *, tamed=True, owner_type=None):
+    def owner_metadata(self, owner, *, tamed=True, owner_type=None, sitting=False):
         b = self.b
         flags = (1 << int(b.ActorFlags.TAMED)) if tamed else 0
+        if sitting:
+            flags |= 1 << int(b.ActorFlags.SITTING)
         fields = [b.DataItemEntry(id=int(b.ActorDataIDs.RESERVED_0),
                                   payload=b.DataItemInt64Payload(value=flags))]
         if owner is not None:
@@ -119,6 +121,60 @@ class EntityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         current, = self.bot.observed_entities
         self.assertEqual((current.entity_id, current.owner_entity_id), (replacement.entity_id, None))
         self.assertEqual(initial.owner_entity_id, owner_id)
+
+    async def test_wolf_sitting_tracks_valid_flags_across_sparse_updates(self):
+        b = self.b
+        owner_id = -4294967295
+        wolf = self.actor(actor_type="minecraft:wolf")
+        wolf.data = self.owner_metadata(owner_id)
+        control = self.actor(entity_id=109, runtime_id=9, actor_type="minecraft:wolf")
+        control.data = self.owner_metadata(-1, tamed=False)
+        await self.join()
+        await self.deliver(wolf, control)
+
+        def observed(runtime_id):
+            return next(actor for actor in self.bot.observed_entities if actor.runtime_id == runtime_id)
+
+        initial = observed(wolf.runtime_id)
+        self.assertIs(initial.sitting, False)
+        await self.deliver(b.SetActorDataPacket(id=wolf.runtime_id, packed_items=self.owner_metadata(None, sitting=True)))
+        sitting = observed(wolf.runtime_id)
+        self.assertIs(sitting.sitting, True)
+        self.assertIs(initial.sitting, False)
+        self.assertEqual(sitting.owner_entity_id, owner_id)
+
+        owner_only = b.DataItemEntry(id=int(b.ActorDataIDs.OWNER), payload=b.DataItemInt64Payload(value=owner_id))
+        wrong_flags = b.DataItemEntry(id=int(b.ActorDataIDs.RESERVED_0), payload=b.DataItemIntPayload(value=0))
+        for entry in (owner_only, wrong_flags):
+            metadata = b.SynchedActorData.CopyableDataList(data=[entry])
+            await self.deliver(b.SetActorDataPacket(id=wolf.runtime_id, packed_items=metadata))
+            self.assertIs(observed(wolf.runtime_id).sitting, True)
+
+        await self.deliver(b.SetActorDataPacket(id=wolf.runtime_id, packed_items=self.owner_metadata(None)))
+        self.assertIs(observed(wolf.runtime_id).sitting, False)
+        self.assertIs(sitting.sitting, True)
+        self.assertIs(observed(control.runtime_id).sitting, False)
+
+    async def test_wolf_sitting_is_scoped_to_the_visible_actor_instance(self):
+        b = self.b
+        wolf = self.actor(actor_type="minecraft:wolf")
+        wolf.data = self.owner_metadata(-4294967295, sitting=True)
+        other = self.actor(entity_id=109, runtime_id=9, actor_type="minecraft:zombie")
+        other.data = wolf.data
+        await self.join(wolf, other)
+        initial, observed_other = self.bot.observed_entities
+        self.assertIs(initial.sitting, True)
+        self.assertIsNone(observed_other.sitting)
+
+        replacement = self.actor(entity_id=110, actor_type="minecraft:wolf")
+        wrong_flags = b.DataItemEntry(id=int(b.ActorDataIDs.RESERVED_0), payload=b.DataItemIntPayload(value=0))
+        await self.deliver(b.RemoveActorPacket(entity_id=wolf.entity_id), replacement,
+                           b.SetActorDataPacket(id=replacement.runtime_id,
+                                                packed_items=b.SynchedActorData.CopyableDataList(data=[wrong_flags])))
+        current = next(actor for actor in self.bot.observed_entities if actor.runtime_id == replacement.runtime_id)
+        self.assertEqual(current.entity_id, replacement.entity_id)
+        self.assertIsNone(current.sitting)
+        self.assertIs(initial.sitting, True)
 
     async def test_all_add_families_publish_immutable_physical_snapshots(self):
         await self.join()
