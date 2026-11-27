@@ -294,6 +294,32 @@ async def main(bot):
         self.assertEqual(failed["error"], {"error_type": "SleepRejected", "message": "tile.bed.notSafe",
                                           "attributes": {"translation_key": "tile.bed.notSafe"}})
 
+    async def test_script_can_stop_another_mining_call_and_catch_mining_aborted(self):
+        await self.update_block((1, 100, 0), 42)
+        run = await self.start("""
+import asyncio
+from endpilot import MiningAborted
+
+async def main(bot):
+    mining = asyncio.create_task(bot.mine_block((1, 100, 0), face=4, timeout=4))
+    async with asyncio.timeout(2):
+        while bot.mining_target is None:
+            await asyncio.sleep(0.01)
+    released = await bot.stop_mining()
+    try:
+        await mining
+    except MiningAborted as error:
+        return [type(error).__name__, released]
+""")
+        report = await self.completed(run)
+        actions = [(packet.client_tick, [action.player_action_type.name for action in packet.player_block_actions])
+                   for packet in self.wire.sent if getattr(packet, "player_block_actions", None)]
+        start, release = actions
+        self.assertEqual(start[1], ["START_DESTROY_BLOCK"])
+        self.assertEqual(release[1], ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
+        self.assertEqual(report["state"], "succeeded", report)
+        self.assertEqual(report["result"], ["MiningAborted", release[0]])
+
     async def test_world_time_and_entity_properties_are_projected_as_snapshots(self):
         clocks = (WorldClock(1, "minecraft:overworld", 120_001, False),)
         world_time = WorldTime(daylight_ticks=48_123, clocks=clocks)

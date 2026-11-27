@@ -2229,7 +2229,7 @@ class Bot:
         return await self._blocks.continue_mining(position, face=face)
 
     async def stop_mining(self) -> int | None:
-        """Release the held target; return the submission tick if input was needed."""
+        """Stop the active break or release held input, returning the release tick if sent."""
         if self._blocks is None:
             raise RuntimeError("player has not joined")
         return await self._blocks.stop_mining()
@@ -2247,6 +2247,7 @@ class Bot:
 
         Face None selects and aims at a visible mining face without moving.
         Raise MiningFaceUnavailable if automatic selection cannot submit START.
+        Raise MiningAborted if stop_mining stops the break before its matching update.
         """
         if self._blocks is None:
             raise RuntimeError("player has not joined")

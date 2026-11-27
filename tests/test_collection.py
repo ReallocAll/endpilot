@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 from endpilot import (
     BlockCollectionBatch, Bot, CollectionStorage, CountedBlockCollection, DropCollection,
-    MixedCollectionBatch, NavigationRules,
+    MiningAborted, MixedCollectionBatch, NavigationRules,
 )
 from endpilot.block_data import _catalog
 from endpilot.block_raycast import trace_blocks
@@ -449,6 +449,156 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.assertTrue(self.wire.outgoing.empty())
         self.assertIsNone(bot.mining_target)
+
+    def observe_mining_release_wait(self, lock):
+        attempted = asyncio.Event()
+        acquire = lock.acquire
+
+        async def observe():
+            attempted.set()
+            return await acquire()
+
+        return attempted, patch.object(lock, "acquire", observe)
+
+    async def check_stop_releases_when_mining_caller_is_cancelled(self, *, send_fails):
+        bot = await self.public_bot()
+        mining = asyncio.create_task(bot.mine_block(TARGET, face=4))
+        self.assertEqual(await self.next_actions(), ["START_DESTROY_BLOCK"])
+        lock = bot._movement._action_lock
+        send = self.wire.send
+
+        async def release_send(data):
+            await send(data)
+            if send_fails:
+                raise OSError("release send failed")
+
+        attempted, observe = self.observe_mining_release_wait(lock)
+        with patch.object(self.wire, "send", release_send):
+            async with lock:
+                with observe:
+                    stopped = asyncio.create_task(bot.stop_mining())
+                    await asyncio.wait_for(attempted.wait(), 1)
+                    mining.cancel()
+                    await asyncio.sleep(0)
+                    self.assertTrue(self.wire.outgoing.empty())
+            done, _ = await asyncio.wait((mining, stopped), timeout=1)
+            self.assertEqual(done, {mining, stopped})
+            with self.assertRaises(asyncio.CancelledError):
+                await mining
+            if send_fails:
+                with self.assertRaisesRegex(OSError, "release send failed"):
+                    await stopped
+            else:
+                tick = await stopped
+                self.assertIsInstance(tick, int)
+
+        self.assertFalse(self.wire.outgoing.empty())
+        release = self.wire.outgoing.get_nowait()
+        self.assertEqual([action.player_action_type.name for action in release.player_block_actions],
+                         ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
+        if not send_fails:
+            self.assertEqual(tick, release.client_tick)
+        self.assertTrue(self.wire.outgoing.empty())
+        self.assertIsNone(bot.mining_target)
+
+    async def test_stop_releases_mining_even_if_the_mining_caller_is_cancelled(self):
+        await self.check_stop_releases_when_mining_caller_is_cancelled(send_fails=False)
+
+    async def test_stop_reports_release_failure_after_the_mining_caller_is_cancelled(self):
+        await self.check_stop_releases_when_mining_caller_is_cancelled(send_fails=True)
+
+    async def check_stop_waiting_for_input_on_invalidation(self, packet, expected, message):
+        bot = await self.public_bot()
+        mining = asyncio.create_task(bot.mine_block(TARGET, face=4))
+        self.assertEqual(await self.next_actions(), ["START_DESTROY_BLOCK"])
+        lock = bot._movement._action_lock
+        attempted, observe = self.observe_mining_release_wait(lock)
+        async with lock:
+            with observe:
+                stopped = asyncio.create_task(bot.stop_mining())
+                await asyncio.wait_for(attempted.wait(), 1)
+                queued = asyncio.create_task(bot.mine_block(TARGET, face=4))
+                await asyncio.sleep(0)
+                self.assertFalse(queued.done())
+                await self.emit(packet)
+                done, _ = await asyncio.wait((mining, stopped, queued), timeout=1)
+        try:
+            self.assertEqual(done, {mining, stopped, queued})
+            with self.assertRaises(MiningAborted):
+                await mining
+            for action in (stopped, queued):
+                with self.assertRaisesRegex(expected, message):
+                    await action
+            self.assertIsNone(bot.mining_target)
+            self.assertTrue(self.wire.outgoing.empty())
+        finally:
+            for task in (mining, stopped, queued):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(mining, stopped, queued, return_exceptions=True)
+        return bot
+
+    async def test_dimension_change_discards_pending_mining_release_before_new_position(self):
+        bot = await self.check_stop_waiting_for_input_on_invalidation(
+            self.b.ChangeDimensionPacket(dimension_id=1), RuntimeError, "world changed",
+        )
+        self.assertIsNone(bot.position)
+        await self.emit(self.pose(), self.block(ORE))
+        mining = asyncio.create_task(bot.mine_block(TARGET, face=4, timeout=1))
+        self.assertEqual(await self.next_actions(), ["START_DESTROY_BLOCK"])
+        await self.emit(self.block(HASHED_AIR_RUNTIME_ID))
+        self.assertEqual((await mining).runtime_id, HASHED_AIR_RUNTIME_ID)
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_disconnect_discards_pending_mining_release_without_input_lock(self):
+        await self.check_stop_waiting_for_input_on_invalidation(
+            self.b.DisconnectPacket(), ConnectionError, "server disconnected",
+        )
+
+    async def check_submitted_mining_release_during_dimension_change(self, send_error=None):
+        bot = await self.public_bot()
+        mining = asyncio.create_task(bot.mine_block(TARGET, face=4))
+        self.assertEqual(await self.next_actions(), ["START_DESTROY_BLOCK"])
+        send = self.wire.send
+        finish_release = asyncio.Event()
+
+        async def send_release(data):
+            await send(data)
+            await finish_release.wait()
+            if send_error is not None:
+                raise send_error
+
+        with patch.object(self.wire, "send", send_release):
+            stopped = asyncio.create_task(bot.stop_mining())
+            try:
+                release = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+                self.assertEqual([action.player_action_type.name for action in release.player_block_actions],
+                                 ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
+                await self.emit(self.b.ChangeDimensionPacket(dimension_id=1))
+                self.assertIsNone(bot.position)
+                self.assertFalse(stopped.done())
+                finish_release.set()
+                async with asyncio.timeout(1):
+                    with self.assertRaises(MiningAborted):
+                        await mining
+                    if send_error is None:
+                        self.assertEqual(await stopped, release.client_tick)
+                    else:
+                        with self.assertRaises(OSError) as failure:
+                            await stopped
+                        self.assertIs(failure.exception, send_error)
+            finally:
+                finish_release.set()
+                await asyncio.gather(mining, stopped, return_exceptions=True)
+        self.assertTrue(self.wire.outgoing.empty())
+        self.assertIsNone(bot.mining_target)
+
+    async def test_stop_returns_submitted_release_tick_after_dimension_change(self):
+        await self.check_submitted_mining_release_during_dimension_change()
+
+    async def test_stop_reports_submitted_release_failure_after_dimension_change(self):
+        await self.check_submitted_mining_release_during_dimension_change(OSError("release send failed"))
 
     async def test_other_players_respawn_preserves_phased_and_whole_mining(self):
         clock = ManualClock()
@@ -2766,6 +2916,31 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
                          (TARGET, "break_unconfirmed", None))
         self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_batch_stopped_during_second_break_keeps_completed_and_active_evidence(self):
+        bot = await self.batch_bot()
+        positions = TARGET, SECOND_TARGET, THIRD_TARGET
+        async with asyncio.timeout(2):
+            task = asyncio.create_task(bot.collect_targets(positions, timeout=2))
+            await self.expect_batch_start(TARGET)
+            await self.finish_batch_break(TARGET, runtime_id=101, total=1)
+            await self.expect_batch_start(SECOND_TARGET)
+            tick = await bot.stop_mining()
+            with self.assertRaises(MiningAborted) as interruption:
+                await task
+
+        progress = interruption.exception.collection_progress
+        self.assertEqual(progress.positions, positions)
+        first, = progress.results
+        self.assertEqual((first.position, first.status, first.inventory_delta), (TARGET, "collected", 1))
+        self.assertEqual((progress.active.position, progress.active.status, progress.active.block_after),
+                         (SECOND_TARGET, "break_unconfirmed", None))
+        release = self.wire.outgoing.get_nowait()
+        self.assertEqual(release.client_tick, tick)
+        self.assertEqual([action.player_action_type.name for action in release.player_block_actions],
+                         ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
+        self.assertTrue(self.wire.outgoing.empty())
+        self.assertEqual(bot.observed_block(THIRD_TARGET).runtime_id, ORE)
 
     def ready_to_spawn(self, runtime_id):
         b = self.b

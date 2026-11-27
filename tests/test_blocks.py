@@ -2,6 +2,7 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
+from endpilot import MiningAborted
 from endpilot.blocks import HASHED_AIR_RUNTIME_ID, Blocks, BlockObservation, BlockUpdate, MiningTarget
 from endpilot.inventory import Inventory
 from endpilot.movement import Movement
@@ -129,6 +130,217 @@ class BlocksTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([a.player_action_type.name for a in stream.sent[-1].player_block_actions],
                          ["START_DESTROY_BLOCK"])
         self.assertEqual(blocks.mining_target, MiningTarget(b, 4))
+
+    async def test_stop_interrupts_blocked_start_and_never_stops_the_queued_break(self):
+        async with asyncio.timeout(2):
+            for next_position in ((2, 100, 0), (1, 100, 0)):
+                _, stream, blocks, observe = self.mining_fixture()
+                first = (1, 100, 0)
+                observe(first)
+                observe(next_position)
+                on_wire = asyncio.Event()
+                releasing = asyncio.Event()
+                finish_release = asyncio.Event()
+                original_send = stream.send
+
+                async def send(packet):
+                    await original_send(packet)
+                    match len(stream.sent):
+                        case 1:
+                            on_wire.set()
+                            await asyncio.Future()
+                        case 2:
+                            releasing.set()
+                            await finish_release.wait()
+                        case 3:
+                            observe(next_position, HASHED_AIR_RUNTIME_ID)
+
+                stream.send = send
+                mining = asyncio.create_task(blocks.mine_block(first, face=4))
+                await on_wire.wait()
+                queued = asyncio.create_task(blocks.mine_block(next_position, face=4))
+                action = asyncio.create_task(blocks.stop_mining())
+                await releasing.wait()
+                action.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await action
+                second_stop = asyncio.create_task(blocks.stop_mining())
+                await asyncio.sleep(0)
+                self.assertFalse(second_stop.done())
+                self.assertEqual(len(stream.sent), 2)
+                finish_release.set()
+                self.assertEqual(await second_stop, stream.sent[1].client_tick)
+                with self.assertRaises(MiningAborted):
+                    await mining
+                self.assertEqual(await queued, BlockUpdate(next_position, HASHED_AIR_RUNTIME_ID, 0))
+                self.assertEqual([[action.player_action_type.name for action in packet.player_block_actions]
+                                  for packet in stream.sent], [
+                    ["START_DESTROY_BLOCK"], ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"],
+                    ["START_DESTROY_BLOCK"], ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"],
+                ])
+
+    async def test_update_and_stop_are_ordered_at_packet_match(self):
+        async with asyncio.timeout(2):
+            for update_first in (False, True):
+                with self.subTest(update_first=update_first):
+                    _, stream, blocks, observe = self.mining_fixture()
+                    target = (1, 100, 0)
+                    observe(target)
+                    on_wire = asyncio.Event()
+                    finish_start = asyncio.Event()
+                    original_send = stream.send
+
+                    async def send(packet):
+                        await original_send(packet)
+                        if len(stream.sent) == 1:
+                            on_wire.set()
+                            await finish_start.wait()
+
+                    stream.send = send
+                    mining = asyncio.create_task(blocks.mine_block(target, face=4))
+                    await on_wire.wait()
+                    if update_first:
+                        observe(target, HASHED_AIR_RUNTIME_ID)
+                    stopped = asyncio.create_task(blocks.stop_mining())
+                    await asyncio.sleep(0)
+                    if not update_first:
+                        observe(target, HASHED_AIR_RUNTIME_ID)
+                    else:
+                        finish_start.set()
+                    self.assertEqual(await stopped, stream.sent[1].client_tick)
+                    if update_first:
+                        self.assertEqual(await mining, BlockUpdate(target, HASHED_AIR_RUNTIME_ID, 0))
+                    else:
+                        with self.assertRaises(MiningAborted):
+                            await mining
+                    self.assertEqual(len(stream.sent), 2)
+                    self.assertEqual([action.player_action_type.name for action in stream.sent[-1].player_block_actions],
+                                     ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
+
+    async def test_stop_before_start_sends_no_input_or_releases_the_previous_segment(self):
+        async with asyncio.timeout(2):
+            for hold in (False, True):
+                with self.subTest(hold=hold):
+                    _, stream, blocks, observe = self.mining_fixture()
+                    previous, target = (1, 100, 0), (2, 100, 0)
+                    observe(previous)
+                    observe(target)
+                    if hold:
+                        await blocks.start_mining(previous, face=4)
+                    async with blocks.movement._action_lock:
+                        mining = asyncio.create_task(blocks.mine_block(target, face=4))
+                        await asyncio.sleep(0)
+                        stopped = asyncio.create_task(blocks.stop_mining())
+                        await asyncio.sleep(0)
+                        self.assertEqual(len(stream.sent), int(hold))
+                    tick = await stopped
+                    with self.assertRaises(MiningAborted):
+                        await mining
+                    if hold:
+                        release = stream.sent[1]
+                        self.assertEqual(tick, release.client_tick)
+                        self.assertEqual(len(stream.sent), 2)
+                        abort, stop = release.player_block_actions
+                        self.assertEqual(abort.player_action_type.name, "ABORT_DESTROY_BLOCK")
+                        self.assertEqual((abort.pos.x, abort.pos.y, abort.pos.z), previous)
+                        self.assertEqual(stop.player_action_type.name, "STOP_DESTROY_BLOCK")
+                    else:
+                        self.assertIsNone(tick)
+                        self.assertEqual(stream.sent, [])
+
+    async def test_session_invalidation_ends_blocked_start_without_releasing_into_the_next_world(self):
+        async with asyncio.timeout(2):
+            for event in ("dimension", "respawn", "disconnect", "close"):
+                with self.subTest(event=event):
+                    protocol, stream, blocks, observe = self.mining_fixture()
+                    b = protocol.binding
+                    target = (1, 100, 0)
+                    observe(target)
+                    on_wire = asyncio.Event()
+                    original_send = stream.send
+
+                    async def send(packet):
+                        await original_send(packet)
+                        if len(stream.sent) == 1:
+                            on_wire.set()
+                            await asyncio.Future()
+
+                    stream.send = send
+                    mining = asyncio.create_task(blocks.mine_block(target, face=4))
+                    await on_wire.wait()
+                    observe(target, HASHED_AIR_RUNTIME_ID)
+                    if event == "close":
+                        blocks.close()
+                    else:
+                        packet = {
+                            "dimension": b.ChangeDimensionPacket(dimension_id=1),
+                            "respawn": b.RespawnPacket(runtime_id=7, state=b.PlayerRespawnState.READY_TO_SPAWN),
+                            "disconnect": b.DisconnectPacket(),
+                        }[event]
+                        stream.emit(protocol.encode(packet))
+                    expected = ConnectionError if event in ("disconnect", "close") else RuntimeError
+                    with self.assertRaises(expected) as caught:
+                        await mining
+                    self.assertIs(type(caught.exception), expected)
+                    self.assertEqual(len(stream.sent), 1)
+                    self.assertIsNone(blocks.mining_target)
+
+    async def test_stop_reports_release_send_failure_without_repeating_release(self):
+        async with asyncio.timeout(2):
+            _, stream, blocks, observe = self.mining_fixture()
+            target = (1, 100, 0)
+            observe(target)
+            on_wire = asyncio.Event()
+            original_send = stream.send
+
+            async def send(packet):
+                await original_send(packet)
+                if len(stream.sent) == 1:
+                    on_wire.set()
+                else:
+                    raise OSError("release send failed")
+
+            stream.send = send
+            mining = asyncio.create_task(blocks.mine_block(target, face=4))
+            await on_wire.wait()
+            with self.assertRaisesRegex(OSError, "release send failed"):
+                await blocks.stop_mining()
+            with self.assertRaises(MiningAborted) as caught:
+                await mining
+            self.assertIn("release send failed", caught.exception.__notes__[0])
+            self.assertIsNone(await blocks.stop_mining())
+            self.assertEqual(len(stream.sent), 2)
+
+    async def test_caller_can_cancel_while_successful_break_is_releasing(self):
+        _, stream, blocks, observe = self.mining_fixture()
+        target = (1, 100, 0)
+        observe(target)
+        releasing = asyncio.Event()
+        finish_release = asyncio.Event()
+        original_send = stream.send
+
+        async def send(packet):
+            await original_send(packet)
+            if len(stream.sent) == 1:
+                observe(target, HASHED_AIR_RUNTIME_ID)
+            else:
+                releasing.set()
+                await finish_release.wait()
+
+        stream.send = send
+        mining = asyncio.create_task(blocks.mine_block(target, face=4))
+        try:
+            await asyncio.wait_for(releasing.wait(), 1)
+            mining.cancel()
+            done, _ = await asyncio.wait((mining,), timeout=1)
+            self.assertIn(mining, done)
+            with self.assertRaises(asyncio.CancelledError):
+                await mining
+        finally:
+            finish_release.set()
+            await asyncio.gather(mining, return_exceptions=True)
+        self.assertIsNone(await blocks.stop_mining())
+        self.assertEqual(len(stream.sent), 2)
 
     async def test_dimension_change_rejects_a_start_waiting_for_the_movement_lock(self):
         protocol, stream, blocks, observe = self.mining_fixture()

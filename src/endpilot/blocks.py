@@ -167,6 +167,20 @@ class MiningFaceUnavailable(RuntimeError):
         super().__init__(f"automatic mining face unavailable: {status}")
 
 
+class MiningAborted(RuntimeError):
+    """A concurrent stop_mining call stopped this break."""
+
+
+@dataclass(slots=True)
+class _MiningOperation:
+    epoch: int
+    interrupted: asyncio.Future[None]
+    released: asyncio.Future[tuple[bool, int | None, Exception | None]]
+    accepts_stop: bool = True
+    stop_requested: bool = False
+    pending_release: asyncio.Task | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class BlockMatch:
     """An observed block in a search snapshot, with its name when known."""
@@ -263,7 +277,8 @@ class Blocks:
         self._mining_completed = False
         self._mining_generation = 0
         self._mining_epoch = 0
-        self._mining_closed = False
+        self._mining_close: tuple[str, BaseException | None] | None = None
+        self._mining_operation: _MiningOperation | None = None
         self._published_bounds: tuple[int, int, int, int] | None = None
         self._dimension_definitions: dict[int, DimensionBounds] = {}
         self._replayed_dimension_data: deque[tuple[RawPacket, tuple[DimensionBounds, ...]]] = deque()
@@ -301,8 +316,6 @@ class Blocks:
         self._unsubscribe_end = self.packets.subscribe_reader_end(self._end_observation)
 
     def close(self) -> None:
-        self._mining_closed = True
-        self._invalidate_mining()
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None
@@ -312,10 +325,18 @@ class Blocks:
         self._observe_block_entity = None
         self._end_observation()
 
-    def _end_observation(self, cause: BaseException | None = None) -> None:
+    def _end_observation(self, cause: BaseException | None = None, *, disconnected: bool = False) -> None:
         if self._closed:
             return
         self._closed = True
+        if disconnected:
+            message = "server disconnected while mining"
+        elif cause is not None:
+            message = "packet stream lost while waiting"
+        else:
+            message = "mining session is closed"
+        self._mining_close = (message, cause)
+        self._invalidate_mining()
         self._dimension_definitions.clear()
         self._replayed_dimension_data.clear()
         self._updates.clear()
@@ -446,9 +467,7 @@ class Blocks:
                 self._invalidate_columns(self.dimension_id, lambda: ColumnCoverageInvalidated("unloaded"),
                                          lambda column: not self._column_is_published(*column))
         elif raw.packet_id == b.DisconnectPacket.ID:
-            self._mining_closed = True
-            self._invalidate_mining()
-            self._end_observation()
+            self._end_observation(disconnected=True)
         elif raw.packet_id == b.RespawnPacket.ID:
             if self._own_ready_respawn(raw):
                 self._invalidate_mining()
@@ -475,6 +494,12 @@ class Blocks:
         self._mining_epoch += 1
         self._mining_target = None
         self._mining_completed = False
+        operation = self._mining_operation
+        if operation is not None:
+            if not operation.interrupted.done():
+                operation.interrupted.set_result(None)
+            if operation.pending_release is not None:
+                operation.pending_release.cancel()
 
     @property
     def published_bounds(self) -> tuple[int, int, int, int] | None:
@@ -1712,8 +1737,9 @@ class Blocks:
         return None if self._mining_completed else self._mining_target
 
     def _check_mining_epoch(self, epoch: int) -> None:
-        if self._mining_closed:
-            raise ConnectionError("mining session is closed")
+        if self._mining_close is not None:
+            message, cause = self._mining_close
+            raise ConnectionError(message) from cause
         if self._mining_epoch != epoch:
             raise RuntimeError("world changed before submitting mining input")
 
@@ -1843,6 +1869,19 @@ class Blocks:
             )
 
     async def stop_mining(self) -> int | None:
+        operation = self._mining_operation
+        if operation is not None:
+            self._check_mining_epoch(operation.epoch)
+            if operation.accepts_stop and not operation.interrupted.done():
+                operation.stop_requested = True
+                operation.interrupted.set_result(None)
+            submitted, tick, failure = await asyncio.shield(operation.released)
+            if not submitted:
+                self._check_mining_epoch(operation.epoch)
+            if failure is not None:
+                raise failure
+            return tick
+
         epoch = self._mining_epoch
         async with self._mining_lock:
             self._check_mining_epoch(epoch)
@@ -1902,6 +1941,7 @@ class Blocks:
         return the first matching update; callers must interpret its runtime ID.
         One deadline covers acquiring ownership, starting, and observing the break.
         A timed-out or cancelled break that already started is aborted.
+        An explicit stop raises MiningAborted.
         """
         epoch = self._mining_epoch
         prepare_start = _prepare_start
@@ -1934,18 +1974,26 @@ class Blocks:
             await self._mining_lock.acquire()
         try:
             self._check_mining_epoch(epoch)
-            return await self._mine_observed(position, face, budget.when(), before_start, epoch, prepare_start)
+            loop = asyncio.get_running_loop()
+            operation = _MiningOperation(epoch, loop.create_future(), loop.create_future())
+            self._mining_operation = operation
+            return await self._mine_observed(position, face, budget.when(), before_start, operation, prepare_start)
         finally:
+            self._mining_operation = None
             self._mining_lock.release()
 
-    async def _mine_observed(self, position, face, deadline, before_start, epoch, prepare_start) -> BlockUpdate:
+    async def _mine_observed(self, position, face, deadline, before_start, operation, prepare_start) -> BlockUpdate:
         b = self.packets.protocol.binding
         target = MiningTarget(position, face)
         loop = asyncio.get_running_loop()
+        epoch = operation.epoch
+        owner = asyncio.current_task()
+        initial_cancellations = owner.cancelling()
         started = False
 
         def start():
             nonlocal started
+            check_interruption()
             if deadline is not None and loop.time() >= deadline:
                 raise TimeoutError("mining timed out before submitting START")
             if before_start is not None:
@@ -1957,44 +2005,131 @@ class Blocks:
                 return self._own_ready_respawn(raw)
             if raw.packet_id != b.UpdateBlockPacket.ID:
                 return True
-            if not started:
+            if not started or operation.interrupted.done():
                 return False
             packet = self.packets.protocol.decode(raw)
-            return (
+            accepted = (
                 (int(packet.pos.x), int(packet.pos.y), int(packet.pos.z)) == position
                 and int(packet.layer) == 0
                 and (not self.hashed_runtime_ids
                      or int(packet.runtime_id) == HASHED_AIR_RUNTIME_ID)
             )
+            if accepted:
+                # Settle the race in the packet observer, before a waiting task wakes.
+                operation.accepts_stop = False
+            return accepted
+
+        def check_interruption():
+            # The private START task can acquire the input lock before the
+            # cancelled lock owner gets a chance to cancel it.
+            if owner.cancelling() > initial_cancellations:
+                raise asyncio.CancelledError
+            self._check_mining_epoch(epoch)
+            if operation.stop_requested:
+                raise MiningAborted("mining stopped by stop_mining")
+
+        def prepare():
+            check_interruption()
+            if prepare_start is not None:
+                prepare_start()
 
         waiter = asyncio.create_task(self.packets.wait_for_packet(
             (b.UpdateBlockPacket.ID, b.ChangeDimensionPacket.ID, b.DisconnectPacket.ID, b.RespawnPacket.ID),
             timeout=None, match=matches,
         ))
+        submission = None
+        update = None
+        error = None
         try:
             async with asyncio.timeout_at(deadline):
                 # The observer must be active before START enters the wire.
                 await asyncio.sleep(0)
+                check_interruption()
                 actions = self._release_mining_actions()
                 actions.append(("START_DESTROY_BLOCK", position, face))
-                await self._submit_mining(actions, target, epoch, validate=start, build_item_use=prepare_start)
-                raw = await waiter
+                submission = asyncio.create_task(self._submit_mining(
+                    actions, target, epoch, validate=start, build_item_use=prepare,
+                ))
+                await asyncio.wait((submission, operation.interrupted), return_when=asyncio.FIRST_COMPLETED)
+                if submission.done():
+                    submission.result()
+                check_interruption()
+                await asyncio.wait((waiter, operation.interrupted), return_when=asyncio.FIRST_COMPLETED)
+                check_interruption()
+                raw = waiter.result()
             if raw.packet_id == b.DisconnectPacket.ID:
                 raise ConnectionError("server disconnected while mining")
             self._check_mining_epoch(epoch)
             if raw.packet_id != b.UpdateBlockPacket.ID:
                 raise RuntimeError("world changed while mining")
-        except BaseException as error:
-            waiter.cancel()
-            if started and self._mining_target is target:
-                try:
-                    await self._submit_mining(self._release_mining_actions(), None, epoch)
-                except Exception as cleanup_error:
-                    # A lost transport may also reject ABORT. Keep the cause.
-                    error.add_note(f"mining abort failed: {cleanup_error!r}")
-            await asyncio.gather(waiter, return_exceptions=True)
+            packet = self.packets.protocol.decode(raw)
+            update = BlockUpdate(position, int(packet.runtime_id), int(packet.layer))
+        except BaseException as failure:
+            error = failure
             raise
-        # Seeing air ends the observation, not the server's held break input.
-        await self._submit_mining(self._release_mining_actions(target), None, epoch)
-        packet = self.packets.protocol.decode(raw)
-        return BlockUpdate(position, int(packet.runtime_id), int(packet.layer))
+        finally:
+            operation.accepts_stop = False
+            pending = (waiter,) if submission is None else (waiter, submission)
+            for task in pending:
+                task.cancel()
+            await self._settle_mining(operation, pending, target if started else None, update is not None, error)
+        return update
+
+    async def _settle_mining(
+        self, operation: _MiningOperation, pending: tuple[asyncio.Task, ...],
+        target: MiningTarget | None, succeeded: bool, error: BaseException | None,
+    ) -> None:
+        submitted = False
+
+        def commit_release():
+            nonlocal submitted
+            submitted = True
+            operation.pending_release = None
+
+        async def release_input():
+            await asyncio.gather(*pending, return_exceptions=True)
+            held = self._mining_target
+            if (self._mining_epoch != operation.epoch or held is None
+                    or (target is not held and not (target is None and operation.stop_requested))):
+                return None
+            # The observed break can end before the server's held input is released.
+            release = held if succeeded or operation.stop_requested else None
+            operation.pending_release = asyncio.current_task()
+            try:
+                return await self._submit_mining(
+                    self._release_mining_actions(release), None, operation.epoch, validate=commit_release,
+                )
+            except asyncio.CancelledError:
+                self._check_mining_epoch(operation.epoch)
+                raise
+            finally:
+                operation.pending_release = None
+
+        # Keep the mining lock until the release settles, even when the caller
+        # cancels after an independent stop has already been accepted.
+        cleanup = asyncio.create_task(release_input())
+        cancelled = None
+        tick = failure = None
+        try:
+            while not cleanup.done():
+                try:
+                    await asyncio.wait((cleanup,))
+                except asyncio.CancelledError as cancellation:
+                    cancelled = cancellation
+                    if not operation.stop_requested:
+                        cleanup.cancel()
+            if cancelled is None or not cleanup.cancelled():
+                tick = cleanup.result()
+        except Exception as cleanup_error:
+            failure = cleanup_error
+            primary = cancelled if cancelled is not None else error
+            if primary is None:
+                raise
+            # A lost transport may also reject ABORT. Keep the cause.
+            primary.add_note(f"mining abort failed: {cleanup_error!r}")
+        finally:
+            operation.released.set_result((submitted, tick, failure))
+        if cancelled is not None:
+            raise cancelled
+        if error is None:
+            self._check_mining_epoch(operation.epoch)

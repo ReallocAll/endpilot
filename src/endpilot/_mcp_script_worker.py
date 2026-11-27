@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from ._mcp_scripts import (
     _ERROR_FIELDS, _ERROR_PROGRESS, _INPUT_RECORDS, _MAX_FRAME, _MAX_OUTGOING_FRAMES, _SLOT_MAPS, _read,
 )
+from .blocks import MiningAborted
 from .bot import Bot
 
 
@@ -28,7 +29,7 @@ class _RemoteError(RuntimeError):
 
 _REMOTE_ERRORS = {error.__name__: error for error in (
     asyncio.CancelledError, AttributeError, ConnectionError, IndexError, KeyError, NotImplementedError,
-    OSError, PermissionError, RuntimeError, TimeoutError, TypeError, ValueError,
+    MiningAborted, OSError, PermissionError, RuntimeError, TimeoutError, TypeError, ValueError,
 )}
 _SDK_ERRORS = {cls.__name__: (cls, name) for cls, name in _ERROR_FIELDS.items()}
 
