@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import unittest
+from contextlib import asynccontextmanager
 from importlib.util import find_spec
 from unittest.mock import patch
 
@@ -18,6 +19,112 @@ class NetherNetTests(unittest.IsolatedAsyncioTestCase):
 
         # NetherNet falls back to aiortc's default STUN server for an empty list.
         self.enterContext(patch.object(RTCIceGatherer, "getDefaultIceServers", return_value=[]))
+
+    @asynccontextmanager
+    async def _connected_peer(self):
+        from nethernet import serve_http
+
+        from endpilot.transport.nethernet import connect
+
+        accepted = asyncio.Queue(maxsize=1)
+        finished = asyncio.Event()
+
+        async def peer(connection):
+            accepted.put_nowait(connection)
+            await finished.wait()
+
+        with patch("aioice.ice.get_host_addresses", return_value=["127.0.0.1"]):
+            async with asyncio.timeout(30), serve_http(peer, host="127.0.0.1") as server:
+                async with await connect(f"http://127.0.0.1:{server.bound_port}") as client:
+                    try:
+                        yield client, await accepted.get()
+                    finally:
+                        finished.set()
+
+    async def test_reliable_channel_end_drains_received_messages(self):
+        from nethernet import ConnectionClosed, SessionError, SessionState
+
+        async with self._connected_peer() as (client, peer):
+            read = asyncio.create_task(client.recv())
+            await asyncio.sleep(0)
+            read.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await read
+
+            messages = (b"first complete message", b"second complete message")
+            queued = asyncio.Event()
+
+            # Wait until the native receive handlers have enqueued both complete messages.
+            @client._session._pc._reliable.on("message")
+            def on_message(_fragment):
+                if client._recv_queue.qsize() == len(messages):
+                    queued.set()
+
+            for message in messages:
+                await peer.send(message)
+            await queued.wait()
+
+            peer._session._pc._reliable.close()
+            async with asyncio.timeout(10):
+                self.assertIs(await client.wait_closed(), SessionError.DATA_CHANNEL_CLOSED)
+                self.assertIs(peer.state, SessionState.CONNECTED)
+                for message in messages:
+                    self.assertEqual(await client.recv(), message)
+                with self.assertRaises(ConnectionClosed) as closed:
+                    await client.recv()
+                self.assertEqual(closed.exception.error, 32)
+
+                await client.close(SessionError.GENERIC_FAILURE)
+                with self.assertRaises(ConnectionClosed) as closed_again:
+                    await client.recv()
+                self.assertIs(closed_again.exception.error, SessionError.DATA_CHANNEL_CLOSED)
+
+    async def test_reliable_channel_end_releases_pending_inventory_request(self):
+        from nethernet import ConnectionClosed, SessionError
+
+        from endpilot.compression import PacketConnection
+        from endpilot.inventory import Inventory
+
+        protocol = Protocol(2225)
+        binding = protocol.binding
+        settings = binding.NetworkSettingsPacket(compression_algorithm=65535, compression_threshold=0)
+        async with self._connected_peer() as (client, peer):
+            packets = PacketConnection(client, protocol, settings)
+            peer_packets = PacketConnection(peer, protocol, settings)
+            inventory = Inventory(packets, 7)
+            reader = packets.start_receiving()
+            try:
+                await peer_packets.send(binding.InventorySlotPacket(
+                    inventory_id=binding.ContainerID.INVENTORY, slot=9,
+                    item=binding.SerializedNetworkItemStackDescriptor(id=389, stack_size=2, net_id_variant=77),
+                ))
+                self.assertEqual((await inventory.wait_for_item(9)).stack_size, 2)
+                move = asyncio.create_task(inventory.move_item(9, 18, timeout=60))
+                try:
+                    packet = await peer_packets.recv()
+                    self.assertIsInstance(packet, binding.ItemStackRequestPacket)
+                    request, = packet.requests
+                    self.assertEqual(set(inventory._pending_requests), {int(request.client_request_id.raw_id)})
+                    self.assertFalse(move.done())
+
+                    peer._session._pc._reliable.close()
+                    async with asyncio.timeout(10):
+                        with self.assertRaisesRegex(ConnectionError, "connection ended before an item-stack verdict") as lost:
+                            await asyncio.shield(move)
+                        with self.assertRaises(ConnectionClosed) as closed:
+                            await asyncio.shield(reader)
+                    self.assertIs(lost.exception.__cause__, closed.exception)
+                    self.assertIs(closed.exception.error, SessionError.DATA_CHANNEL_CLOSED)
+                    self.assertFalse(inventory._pending_requests)
+                    self.assertEqual(inventory.slots[9].stack_size, 2)
+                    self.assertNotIn(18, inventory.slots)
+                finally:
+                    move.cancel()
+                    await asyncio.gather(move, return_exceptions=True)
+            finally:
+                inventory.close()
+                reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
 
     async def test_reads_protocol_from_http_advertisement(self):
         from aiohttp import web

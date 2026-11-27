@@ -165,7 +165,11 @@ class JoinAddressTests(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def _mock_connection():
-        session = SimpleNamespace(offer=AsyncMock(return_value="v=0"), accept_answer=AsyncMock(), aclose=AsyncMock())
+        reliable = SimpleNamespace(on=Mock(return_value=lambda callback: callback))
+        session = SimpleNamespace(
+            _pc=SimpleNamespace(_reliable=reliable),
+            offer=AsyncMock(return_value="v=0"), accept_answer=AsyncMock(), aclose=AsyncMock(),
+        )
         return SimpleNamespace(_session=session, _await_connected=AsyncMock())
 
     async def test_untrusted_certificate_stops_before_offer_or_other_transport(self):

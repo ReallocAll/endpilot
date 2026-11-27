@@ -120,6 +120,11 @@ async def connect_http(url: str, *, identity_signer, on_server_identity, capabil
     )
     session = conn._session
     try:
+        # b51ab0f creates this dialer's reliable channel without a session close handler.
+        @session._pc._reliable.on("close")
+        def _on_reliable_close() -> None:
+            session.close(SessionError.DATA_CHANNEL_CLOSED)
+
         offer = identity_signer.sign(await session.offer())
         answer = await _request_answer(url, local, offer, capability_check=capability_check)
         if on_server_identity is not None:
