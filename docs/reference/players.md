@@ -140,6 +140,44 @@ same server from a second client with a different name after
 `player_list_watcher_ready` appears.
 [Player list example](../../examples/observe_player_list.py)
 
+## Observe entities entering and leaving view
+
+`bot.subscribe_entity_lifecycle(callback)` delivers an immutable
+`EntityLifecycleEvent` for each observed remote actor instance that enters
+or leaves the entity cache. The event has a `kind` (`"entered"` or `"left"`),
+the actor's `entity` snapshot at that transition, and a `reason`. A departure
+describes the bot's visibility. An actor can leave view while it remains in
+the world and later enter again with the same IDs.
+
+- `"spawn_packet"` is an entry from `AddActor`, `AddPlayer`, `AddItemActor`,
+  or `AddPainting`.
+- `"remove_actor"` is a departure when `RemoveActor` removes a tracked actor.
+- `"pickup"` is a departure when `TakeItemActor` removes a tracked drop. A
+  matching `RemoveActor` after the pickup produces no second departure.
+- `"replaced"` is a departure when a new spawn takes over a tracked instance's
+  runtime ID or identity. The departure comes before the new entry, including
+  when a spawn reuses the same IDs.
+- `"roster_removed"` is a departure when removing a player-list entry also
+  removes its visible actor.
+- `"identity_invalidated"` is a departure when roster reconciliation evicts
+  an actor. Roster details added or corrected in place produce no event.
+- `"dimension_changed"` is a departure for each actor cleared from the old
+  dimension, in cache insertion order.
+
+Callbacks run synchronously on the packet reader after the whole packet has
+updated the cache. Each callback can read the resulting `bot.observed_entities`
+while retaining the event's snapshot. Changes to subscriptions during a
+callback take effect for future packets. Registration begins with future
+packets. Read `bot.observed_entities` for actors already visible when you
+subscribe. Local actors and session teardown produce no events.
+
+The subscription sends no packets, survives dimension changes, and returns an
+idempotent unsubscribe function. Callback failures go to the event loop's
+exception handler. The subscription ends when the server disconnects, the
+packet reader stops, or the bot closes. Registration raises `RuntimeError`
+before joining or after closing the bot, and `ConnectionError` after the
+joined connection ends.
+
 ## Observe remote player equipment
 
 `bot.observed_player_equipment(runtime_id)` reads the latest immutable

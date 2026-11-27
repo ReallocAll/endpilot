@@ -113,6 +113,21 @@ class EntityState:
     sneaking: bool | None = None
 
 
+_EntityLifecycleReason = Literal[
+    "spawn_packet", "remove_actor", "pickup", "replaced", "roster_removed", "identity_invalidated",
+    "dimension_changed",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class EntityLifecycleEvent:
+    """One visible actor instance entering or leaving, with its snapshot at the transition."""
+
+    kind: Literal["entered", "left"]
+    entity: EntityState
+    reason: _EntityLifecycleReason
+
+
 _MovementWaiters = dict[asyncio.Future[EntityState | BaseException], Callable[[EntityState], bool]]
 
 
@@ -452,6 +467,7 @@ class Entities:
         self._player_views: dict[int, _PlayerView] = {}
         self._item_names = dict(item_names or {})
         self._by_runtime: dict[int, EntityState] = {}
+        self._lifecycle_observers: dict[object, Callable[[EntityLifecycleEvent], None]] = {}
         self._actor_instances: dict[int, _ActorInstance] = {}
         self._movement_waiters: dict[int, _MovementWaiters] = {}
         self._cursor_bodies: dict[int, _CursorBody] = {}
@@ -503,6 +519,7 @@ class Entities:
         self._last_skin_update = None
         self._player_list_observers.clear()
         self._player_skin_observers.clear()
+        self._lifecycle_observers.clear()
         self._end_movement_waiters(ConnectionError, "entity session is closed", _cause)
         self._clear_player_equipment(ConnectionError, "entity session is closed", _cause)
         for observers in (self._swing_observers, self._critical_effect_observers, self._health_observers,
@@ -602,6 +619,17 @@ class Entities:
 
     def get(self, runtime_id: int) -> EntityState | None:
         return self._by_runtime.get(runtime_id)
+
+    def subscribe_entity_lifecycle(self, callback: Callable[[EntityLifecycleEvent], None]) -> Callable[[], None]:
+        self._require_live()
+        observers = self._lifecycle_observers
+        token = object()
+        observers[token] = callback
+
+        def unsubscribe() -> None:
+            observers.pop(token, None)
+
+        return unsubscribe
 
     def subscribe_entity_glides(self, callback: Callable[[EntityState], None]) -> Callable[[], None]:
         self._require_live()
@@ -1342,7 +1370,8 @@ class Entities:
 
     def _record(self, state: EntityState, *, player_uuid: UUID | None = None,
                 player_feet: _PlayerFeet | None = None, new_instance: bool = True,
-                unlisted_entity_id: int | None = None, identity_matches: bool = True) -> None:
+                unlisted_entity_id: int | None = None, identity_matches: bool = True,
+                lifecycle_events: list[EntityLifecycleEvent] | None = None) -> None:
         runtime_id = state.runtime_id
         previous = self._by_runtime.get(runtime_id)
         known_id = self._animation_entity_id(runtime_id)
@@ -1358,18 +1387,20 @@ class Entities:
             self._runtime_by_id.pop(previous.entity_id, None)
         old_uuid = self._player_uuid_by_runtime.get(runtime_id)
         if old_uuid is not None and old_uuid != player_uuid:
-            self._forget_runtime(runtime_id)
+            self._forget_runtime(runtime_id, lifecycle_events=lifecycle_events if new_instance else None,
+                                 reason="replaced")
+        collision_reason: _EntityLifecycleReason = "replaced" if new_instance else "identity_invalidated"
         if player_uuid is not None:
             old_runtime = self._player_runtime_by_uuid.get(player_uuid)
             if old_runtime is not None and old_runtime != runtime_id:
-                self._forget_runtime(old_runtime)
+                self._forget_runtime(old_runtime, lifecycle_events=lifecycle_events, reason=collision_reason)
         if entity_id is not None:
             previous_runtime = self._runtime_by_id.get(entity_id)
             if previous_runtime is not None and previous_runtime != runtime_id:
-                self._forget_runtime(previous_runtime)
+                self._forget_runtime(previous_runtime, lifecycle_events=lifecycle_events, reason=collision_reason)
             previous_unlisted = self._unlisted_player_runtime_by_id.pop(entity_id, None)
             if previous_unlisted is not None and previous_unlisted != runtime_id:
-                self._forget_runtime(previous_unlisted)
+                self._forget_runtime(previous_unlisted, lifecycle_events=lifecycle_events, reason=collision_reason)
             if state.entity_id:
                 self._runtime_by_id[entity_id] = runtime_id
         if replaced:
@@ -1383,6 +1414,11 @@ class Entities:
             if not new_instance and (state.attributes or state.status_effects):
                 # A conflicting roster identity must not inherit the previous actor's reports.
                 state = replace(state, attributes=(), status_effects=())
+        if lifecycle_events is not None and new_instance:
+            outgoing = self._by_runtime.get(runtime_id)
+            if outgoing is not None:
+                lifecycle_events.append(EntityLifecycleEvent("left", outgoing, "replaced"))
+            lifecycle_events.append(EntityLifecycleEvent("entered", state, "spawn_packet"))
         self._by_runtime[runtime_id] = state
         if new_instance:
             self._forget_player_equipment(runtime_id)
@@ -1401,7 +1437,10 @@ class Entities:
         else:
             self._player_feet_by_runtime[runtime_id] = player_feet
 
-    def _forget_runtime(self, runtime_id: int) -> None:
+    def _forget_runtime(
+        self, runtime_id: int, *, lifecycle_events: list[EntityLifecycleEvent] | None = None,
+        reason: _EntityLifecycleReason = "identity_invalidated",
+    ) -> None:
         self._end_movement_waiters(LookupError, "entity is no longer observed", runtime_id=runtime_id)
         self._forget_entity_observers(self._swing_observers, runtime_id)
         self._forget_entity_observers(self._critical_effect_observers, runtime_id)
@@ -1412,6 +1451,8 @@ class Entities:
         self._forget_entity_observers(self._crouch_observers, runtime_id)
         self._forget_player_equipment(runtime_id)
         state = self._by_runtime.pop(runtime_id, None)
+        if lifecycle_events is not None and state is not None:
+            lifecycle_events.append(EntityLifecycleEvent("left", state, reason))
         self._actor_instances.pop(runtime_id, None)
         self._cursor_bodies.pop(runtime_id, None)
         self._player_feet_by_runtime.pop(runtime_id, None)
@@ -1436,21 +1477,31 @@ class Entities:
     def _on_packet(self, raw) -> None:
         if self._closed:
             return
+        packet_id = raw.packet_id
         b = self.packets.protocol.binding
-        if raw.packet_id == b.DisconnectPacket.ID:
+        lifecycle_observers: tuple[Callable[[EntityLifecycleEvent], None], ...] = ()
+        lifecycle_events: list[EntityLifecycleEvent] | None = None
+        if self._lifecycle_observers:
+            match packet_id:
+                case (b.AddActorPacket.ID | b.AddPlayerPacket.ID | b.AddItemActorPacket.ID | b.AddPaintingPacket.ID
+                      | b.RemoveActorPacket.ID | b.TakeItemActorPacket.ID | b.PlayerListPacket.ID
+                      | b.ChangeDimensionPacket.ID):
+                    lifecycle_observers = tuple(self._lifecycle_observers.values())
+                    lifecycle_events = []
+        if packet_id == b.DisconnectPacket.ID:
             self._end_session()
-        elif raw.packet_id == b.AnimatePacket.ID:
+        elif packet_id == b.AnimatePacket.ID:
             self._observe_animation(raw)
-        elif raw.packet_id == b.ActorEventPacket.ID:
+        elif packet_id == b.ActorEventPacket.ID:
             self._observe_actor_event(raw)
-        elif raw.packet_id == b.UpdateAttributesPacket.ID:
+        elif packet_id == b.UpdateAttributesPacket.ID:
             self._observe_attribute_update(raw)
-        elif raw.packet_id == b.MobEffectPacket.ID:
+        elif packet_id == b.MobEffectPacket.ID:
             self._observe_effect_update(raw)
-        elif raw.packet_id == b.ItemRegistryPacket.ID:
+        elif packet_id == b.ItemRegistryPacket.ID:
             packet = self.packets.protocol.decode(raw)
             self._item_names = {int(item.id): str(item.name) for item in packet.items}
-        elif raw.packet_id == b.PlayerListPacket.ID:
+        elif packet_id == b.PlayerListPacket.ID:
             packet = self.packets.protocol.decode(raw)
             observers = tuple(self._player_list_observers)
             observed_changes = [] if observers else None
@@ -1469,7 +1520,7 @@ class Entities:
                             continue
                         since = self._unidentified_equipment_since.pop(runtime_id, None)
                         if since is not None and self._equipment_removal_may_match(since, entity_id):
-                            self._forget_runtime(runtime_id)
+                            self._forget_runtime(runtime_id, lifecycle_events=lifecycle_events)
                             continue
                         feet = self._player_feet_by_runtime.get(runtime_id)
                         changes = self._unresolved_ride_changes
@@ -1485,7 +1536,7 @@ class Entities:
                                             and self._animation_entity_id(runtime_id) in (None, entity_id))
                         state = replace(state, entity_id=entity_id)
                         self._record(state, player_uuid=change.uuid, player_feet=feet, new_instance=False,
-                                     identity_matches=identity_matches)
+                                     identity_matches=identity_matches, lifecycle_events=lifecycle_events)
                         equipment = self._player_equipment.get(runtime_id)
                         if equipment is not None:
                             if equipment.entity_id is None:
@@ -1505,10 +1556,10 @@ class Entities:
                                                 or self._runtime_by_id.get(removed.entity_id) == runtime_id):
                         self._forget_links(removed.entity_id)
                     if runtime_id is not None:
-                        self._forget_runtime(runtime_id)
+                        self._forget_runtime(runtime_id, lifecycle_events=lifecycle_events, reason="roster_removed")
             if observed_changes:
                 self.packets._notify(observers, tuple(observed_changes))
-        elif raw.packet_id == b.PlayerSkinPacket.ID:
+        elif packet_id == b.PlayerSkinPacket.ID:
             packet = self.packets.protocol.decode(raw)
             listed = self._players_by_uuid.get(packet.uuid)
             if listed is not None:
@@ -1517,7 +1568,7 @@ class Entities:
                 self._players_by_uuid[packet.uuid] = updated
                 self._last_skin_update = raw, packet.uuid
                 self.packets._notify(self._player_skin_observers, updated)
-        elif raw.packet_id == b.AddPlayerPacket.ID:
+        elif packet_id == b.AddPlayerPacket.ID:
             player = self.packets.protocol.decode(raw)
             for link in player.links:
                 self._observe_link(link)
@@ -1537,7 +1588,7 @@ class Entities:
                 listed_id, runtime_id, _PLAYER, position, name=str(player.name), gliding=gliding, sneaking=sneaking,
             ), player_uuid=player_uuid, player_feet=(position, self._unresolved_ride_epoch),
                 unlisted_entity_id=entity_id if entity_id and not listed_id else None,
-                identity_matches=identity_matches)
+                identity_matches=identity_matches, lifecycle_events=lifecycle_events)
             if getattr(self.packets.protocol, "number", None) == 2225:
                 self._cursor_bodies[runtime_id] = _cursor_body(metadata, b)
             if identity_matches:
@@ -1558,7 +1609,7 @@ class Entities:
                                    and getattr(player, "player_game_type", None) != b.GameType.SPECTATOR
                                    and not _unsupported_view_pose(words, b)),
                 )
-        elif raw.packet_id == b.SetActorDataPacket.ID:
+        elif packet_id == b.SetActorDataPacket.ID:
             packet = self.packets.protocol.decode(raw)
             runtime_id = int(packet.id)
             body = self._cursor_bodies.get(runtime_id)
@@ -1595,7 +1646,7 @@ class Entities:
                         self._notify_entity_observers(
                             crouch_observers, state, runtime_id, "entity crouch observer failed",
                         )
-        elif raw.packet_id == b.MobEquipmentPacket.ID:
+        elif packet_id == b.MobEquipmentPacket.ID:
             packet = self.packets.protocol.decode(raw)
             runtime_id = int(packet.runtime_id)
             current = self._player_equipment.get(runtime_id)
@@ -1610,7 +1661,7 @@ class Entities:
                 offhand = _equipment_stack(packet.item)
                 if offhand != state.last_observed_offhand:
                     self._by_runtime[runtime_id] = replace(state, last_observed_offhand=offhand)
-        elif raw.packet_id == b.MobArmorEquipmentPacket.ID:
+        elif packet_id == b.MobArmorEquipmentPacket.ID:
             packet = self.packets.protocol.decode(raw)
             current = self._player_equipment.get(int(packet.runtime_id))
             if current is not None:
@@ -1618,7 +1669,7 @@ class Entities:
                     current, head=_equipment_stack(packet.head), chest=_equipment_stack(packet.torso),
                     legs=_equipment_stack(packet.legs), feet=_equipment_stack(packet.feet),
                 ))
-        elif raw.packet_id == b.AddActorPacket.ID:
+        elif packet_id == b.AddActorPacket.ID:
             actor = self.packets.protocol.decode(raw)
             runtime_id = int(actor.runtime_id)
             owner = None
@@ -1642,7 +1693,7 @@ class Entities:
                 boat_velocity=(float(actor.velocity.x), float(actor.velocity.y), float(actor.velocity.z))
                 if is_boat else (0.0, 0.0, 0.0),
                 attributes=tuple(attributes.values()),
-            ))
+            ), lifecycle_events=lifecycle_events)
             if (actor.actor_type in _ACTOR_SPAWN_FEET_TYPES
                     and getattr(actor, "passenger_of_block_data", None) is not None):
                 self._actor_instances[runtime_id].feet_known = False
@@ -1650,22 +1701,22 @@ class Entities:
                 self._cursor_bodies[runtime_id] = _cursor_body(actor.data.data, b)
             for link in actor.links:
                 self._observe_link(link)
-        elif raw.packet_id == b.SetActorLinkPacket.ID:
+        elif packet_id == b.SetActorLinkPacket.ID:
             self._observe_link(self.packets.protocol.decode(raw).link)
-        elif raw.packet_id == b.AddItemActorPacket.ID:
+        elif packet_id == b.AddItemActorPacket.ID:
             packet = self.packets.protocol.decode(raw)
             state = self._item_state(packet)
-            self._record(state)
+            self._record(state, lifecycle_events=lifecycle_events)
             if getattr(self.packets.protocol, "number", None) == 2225:
                 body = _cursor_body(packet.data.data, b)
                 if not _player_flag(body.flags, b.ActorFlags.RIDING):
                     self._cursor_bodies[state.runtime_id] = body
-        elif raw.packet_id == b.AddPaintingPacket.ID:
+        elif packet_id == b.AddPaintingPacket.ID:
             painting = _painting_snapshot(self.packets.protocol.decode(raw))
             self._record(EntityState(
                 painting.entity_id, painting.runtime_id, _PAINTING, painting.position, painting=painting,
-            ))
-        elif raw.packet_id == b.ChangeDimensionPacket.ID:
+            ), lifecycle_events=lifecycle_events)
+        elif packet_id == b.ChangeDimensionPacket.ID:
             # Actors from the previous dimension are no longer observable.
             self._dimension_epoch += 1
             self._last_pickup = None
@@ -1690,6 +1741,10 @@ class Entities:
                                        RuntimeError, "dimension changed while waiting for an entity effect update")
             self._end_entity_observers(self._crouch_observers, dimension_bound,
                                        RuntimeError, "dimension changed while waiting for an entity crouch change")
+            if lifecycle_events is not None:
+                lifecycle_events.extend(
+                    EntityLifecycleEvent("left", state, "dimension_changed") for state in self._by_runtime.values()
+                )
             self._by_runtime.clear()
             self._actor_instances.clear()
             self._cursor_bodies.clear()
@@ -1700,17 +1755,17 @@ class Entities:
             self._player_feet_by_runtime.clear()
             self._player_views.clear()
             self._unresolved_ride_changes.clear()
-        elif raw.packet_id == b.RemoveActorPacket.ID:
+        elif packet_id == b.RemoveActorPacket.ID:
             entity_id = int(self.packets.protocol.decode(raw).entity_id)
             self._forget_links(entity_id)
             runtime_id = self._runtime_by_id.get(entity_id)
             if runtime_id is None:
                 runtime_id = self._unlisted_player_runtime_by_id.get(entity_id)
             if runtime_id is not None:
-                self._forget_runtime(runtime_id)
+                self._forget_runtime(runtime_id, lifecycle_events=lifecycle_events, reason="remove_actor")
             elif entity_id and self._unidentified_equipment_since:
                 self._equipment_removals.append((self._equipment_removal_cursor() + 1, entity_id))
-        elif raw.packet_id == b.MovePlayerPacket.ID:
+        elif packet_id == b.MovePlayerPacket.ID:
             move = self.packets.protocol.decode(raw)
             runtime_id = int(move.player_id)
             state = self._by_runtime.get(runtime_id)
@@ -1735,7 +1790,7 @@ class Entities:
                         view, rotation=rotation, ordinary_move=ordinary_move,
                     )
                 self._match_movement_waiters(state)
-        elif raw.packet_id == b.TakeItemActorPacket.ID:
+        elif packet_id == b.TakeItemActorPacket.ID:
             packet = self.packets.protocol.decode(raw)
             runtime_id, collector = int(packet.item_id), int(packet.actor_id)
             state = self._by_runtime.get(runtime_id)
@@ -1744,8 +1799,8 @@ class Entities:
                 runtime_id, collector, self._actor_entity_id(runtime_id), self._actor_entity_id(collector),
                 state if state is not None and state.actor_type == "minecraft:item" else None,
             ), self._actor_instances.get(runtime_id))
-            self._forget_runtime(runtime_id)
-        elif raw.packet_id == b.SetActorMotionPacket.ID:
+            self._forget_runtime(runtime_id, lifecycle_events=lifecycle_events, reason="pickup")
+        elif packet_id == b.SetActorMotionPacket.ID:
             motion = self.packets.protocol.decode(raw)
             runtime_id = int(motion.runtime_id)
             state = self._by_runtime.get(runtime_id)
@@ -1753,14 +1808,14 @@ class Entities:
                 self._by_runtime[runtime_id] = replace(
                     state, boat_velocity=(float(motion.motion.x), float(motion.motion.y), float(motion.motion.z)),
                 )
-        elif raw.packet_id in (b.MoveActorAbsolutePacket.ID, b.MoveActorDeltaPacket.ID):
+        elif packet_id in (b.MoveActorAbsolutePacket.ID, b.MoveActorDeltaPacket.ID):
             move = self.packets.protocol.decode(raw).move_data
             runtime_id = int(move.runtime_id)
             state = self._by_runtime.get(runtime_id)
             if state is None:
                 return
             instance = self._actor_instances.get(runtime_id) if state.actor_type in _ACTOR_SPAWN_FEET_TYPES else None
-            if raw.packet_id == b.MoveActorAbsolutePacket.ID:
+            if packet_id == b.MoveActorAbsolutePacket.ID:
                 position = (float(move.pos.x), float(move.pos.y), float(move.pos.z))
                 if instance is not None:
                     instance.feet_known = False
@@ -1790,6 +1845,13 @@ class Entities:
             self._by_runtime[runtime_id] = state
             self._player_feet_by_runtime.pop(runtime_id, None)
             self._match_movement_waiters(state)
+
+        # Other packet observers may already have changed the subscriptions.
+        if lifecycle_events and not self._closed:
+            for event in lifecycle_events:
+                # Roster updates can project the local unique ID onto a remote runtime.
+                if event.entity.runtime_id != self._own_runtime_id:
+                    self.packets._notify(lifecycle_observers, event)
 
     async def attack(self, movement, inventory, runtime_id: int, *,
                      hit_height: float = 0.5) -> None:

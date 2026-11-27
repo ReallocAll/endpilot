@@ -35,9 +35,9 @@ from .dimension_transition import DimensionTransition
 from .enchanting import Enchanting, EnchantOption
 from .entities import (
     Entities, EntityActorEvent, EntityAttributeUpdate, EntityCriticalEffect, EntityCriticalEffectKind,
-    EntityCursorResult, EntityEffectUpdate, EntityHealthEvent, EntityHealthEventKind, EntityMovement, EntitySpawn,
-    EntityState, EntitySwing, ItemPickup, PlayerEquipmentSnapshot, PlayerListChange, PlayerListEntry, VehicleLink,
-    VehicleLinkChange,
+    EntityCursorResult, EntityEffectUpdate, EntityHealthEvent, EntityHealthEventKind, EntityLifecycleEvent,
+    EntityMovement, EntitySpawn, EntityState, EntitySwing, ItemPickup, PlayerEquipmentSnapshot, PlayerListChange,
+    PlayerListEntry, VehicleLink, VehicleLinkChange,
 )
 from .expression import skin_packet
 from .fishing import Fishing, FishingResult
@@ -2665,6 +2665,17 @@ class Bot:
         if self._entities is None:
             raise RuntimeError("player has not joined")
         return self._entities.snapshot()
+
+    def subscribe_entity_lifecycle(self, callback: Callable[[EntityLifecycleEvent], None]) -> Callable[[], None]:
+        """Observe future entries and departures of visible remote actors in this session.
+
+        The callback runs synchronously after the packet updates the cache and
+        receives an immutable snapshot. The returned unsubscribe function is
+        idempotent. The subscription continues across dimension changes.
+        """
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return self._entities.subscribe_entity_lifecycle(callback)
 
     def subscribe_entity_glides(self, callback: Callable[[EntityState], None]) -> Callable[[], None]:
         """Observe glide starts by visible remote players during this session.
