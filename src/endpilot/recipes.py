@@ -9,7 +9,7 @@ import json
 from operator import index
 from typing import Literal
 
-from .inventory import _correct_observed_item, _response_item, _stack_snapshot
+from .inventory import _PLAYER_CONTAINERS, _correct_observed_item, _response_item, _stack_snapshot
 
 
 _RECIPE_KINDS = (
@@ -76,6 +76,9 @@ class Recipes:
         self._tag_members = _vanilla_recipe_tags() if vanilla_recipe_tags else {}
         self._unlocked: set[str] = set()
         self._grid_slots = {}  # Server-described player UI slots (124), plus confirmed request slots.
+        # A semantic change still supersedes a receipt if the slot later returns to its original value.
+        self._grid_versions: dict[int, int] = {}
+        self._unconfirmed_grid_slots: set[int] = set()
         self._grid_window = None if containers is None else containers.window
         self._by_id: dict[str, Recipe] = {}
         self._by_net_id: dict[int, Recipe] = {}
@@ -93,14 +96,20 @@ class Recipes:
         window = None if self.containers is None else self.containers.window
         if self._grid_window is not window:
             self._grid_slots.clear()
+            self._grid_versions.clear()
+            self._unconfirmed_grid_slots.clear()
             self._grid_window = window
         return window
 
     def _set_grid_slot(self, slot, item):
+        previous = self._grid_slots.get(slot)
+        if previous is not item and _stack_snapshot(previous) != _stack_snapshot(item):
+            self._grid_versions[slot] = self._grid_versions.get(slot, 0) + 1
         if item is None:
             self._grid_slots.pop(slot, None)
         else:
             self._grid_slots[slot] = item
+            self._unconfirmed_grid_slots.discard(slot)
 
     def _on_packet(self, raw) -> None:
         b = self.packets.protocol.binding
@@ -114,15 +123,17 @@ class Recipes:
             packet = self.packets.protocol.decode(raw)
             if int(packet.inventory_id) == 124:  # Player-only UI container.
                 self._sync_grid_window()
-                self._grid_slots = {
+                slots = {
                     slot: item for slot, item in enumerate(packet.slots)
                     if 28 <= slot <= 40
                 }
+                for slot in self._grid_slots.keys() | slots.keys():
+                    self._set_grid_slot(slot, slots.get(slot))
         elif raw.packet_id == b.InventorySlotPacket.ID:
             packet = self.packets.protocol.decode(raw)
             if int(packet.inventory_id) == 124 and 28 <= int(packet.slot) <= 40:
                 self._sync_grid_window()
-                self._grid_slots[int(packet.slot)] = packet.item
+                self._set_grid_slot(int(packet.slot), packet.item)
         elif raw.packet_id == b.InventoryTransactionPacket.ID:
             packet = self.packets.protocol.decode(raw)
             transaction = getattr(packet.variant_transaction, "transaction", None)
@@ -132,7 +143,7 @@ class Recipes:
                         and source.container_id is not None
                         and int(source.container_id) == 124 and 28 <= int(action.slot) <= 40):
                     self._sync_grid_window()
-                    self._grid_slots[int(action.slot)] = action.to_item_descriptor
+                    self._set_grid_slot(int(action.slot), action.to_item_descriptor)
         elif raw.packet_id in (b.ContainerOpenPacket.ID, b.ContainerClosePacket.ID,
                                b.ChangeDimensionPacket.ID, b.DisconnectPacket.ID):
             self._sync_grid_window()
@@ -670,35 +681,60 @@ class Recipes:
         )
 
     async def craft_grid(self, recipe_id: str | int, destination_slot: int, *,
+                         additional_destination_slots: tuple[int, ...] = (),
                          times: int = 1, timeout: float = 15, _queued: bool = False):
         """Craft from the observed 2x2 or workbench 3x3 grid; return BDS's response.
 
-        Send the CraftRecipe/CraftResults/Consume/Place sequence.
         The server decides whether the staged layout matches the chosen recipe.
         """
         recipe = self.get(recipe_id)
         if recipe is None:
             raise KeyError(f"the server sent no recipe {recipe_id!r}")
         window = self._sync_grid_window()
-        if self.inventory is None or window is None:
+        inventory = self.inventory
+        if inventory is None or window is None:
             raise RuntimeError("open the inventory screen before grid crafting")
         if not 0 <= destination_slot <= 255:
             raise ValueError("destination slot must fit in a byte")
         if not 1 <= times <= 255:
             raise ValueError("craft count must be between 1 and 255")
-        if len(recipe.results) != 1:
-            raise ValueError("grid crafting currently requires one output stack")
-        output = recipe.results[0]
-        if not 1 <= output.count * times <= 255:
+        destination_slots = (destination_slot, *additional_destination_slots)
+        if len(recipe.results) != len(destination_slots):
+            raise ValueError("grid crafting requires one destination slot per recipe result")
+        multiple = len(destination_slots) > 1
+        if multiple:
+            if window.container_type != "WORKBENCH" or times != 1:
+                raise ValueError("multiple results require one craft in an open workbench")
+            if any(type(slot) is not int or not 0 <= slot < 36 for slot in destination_slots):
+                raise ValueError("result destinations must be main inventory slots (0..35)")
+            if len(set(destination_slots)) != len(destination_slots):
+                raise ValueError("result destinations must be distinct")
+            if any(not result.item_id or not result.name for result in recipe.results):
+                raise ValueError("all recipe results must have observed item identities")
+        if any(not 1 <= output.count * times <= 255 for output in recipe.results):
             raise ValueError("result stack count must fit in a byte")
         grid_slots = (range(32, 41) if window.container_type == "WORKBENCH"
                       else range(28, 32))
-        grid = {
-            slot: item for slot, item in self._grid_slots.items()
-            if slot in grid_slots and int(item.id) != 0
-        }
+        if not self._unconfirmed_grid_slots.isdisjoint(grid_slots):
+            raise RuntimeError("unconfirmed crafting inputs require a new observation")
+
+        def observed_grid():
+            return {slot: item for slot, item in self._grid_slots.items()
+                    if slot in grid_slots and int(item.id) != 0}
+
+        grid = observed_grid()
         if not grid:
             raise ValueError("no observed crafting ingredients in the active grid")
+        carried = inventory.slots
+        observed_destinations = {slot: carried.get(slot) for slot in destination_slots}
+        if multiple:
+            if any(item is None or item.id or item.stack_size or item.net_id_variant
+                   for item in observed_destinations.values()):
+                raise ValueError("result destinations must be observed empty")
+            if any(not item.net_id_variant or item.net_id_variant < 0 for item in grid.values()):
+                raise ValueError("crafting inputs must have observed stack IDs")
+        destinations = (observed_destinations if multiple else
+                        {destination_slot: inventory.item_or_empty(destination_slot)})
         b = self.packets.protocol.binding
         cereal = b.ItemStackRequestCereal
 
@@ -709,15 +745,16 @@ class Recipes:
                 ), slot=slot, net_id_variant=net_id,
             )
 
-        request_id = self.inventory._allocate_request_id()
-        destination_observed = self.inventory.slots.get(destination_slot)
-        destination = self.inventory.item_or_empty(destination_slot)
-        output_descriptor = b.SerializedNetworkItemStackDescriptor(
-            id=output.item_id, stack_size=output.count * times,
-            aux_value=output.aux_value, net_id_variant=None,
-            block_runtime_id=output.block_runtime_id & 0xFFFFFFFF,
-            user_data_buffer=output.user_data_buffer,
-        )
+        request_id = inventory._allocate_request_id()
+        output_descriptors = {
+            slot: b.SerializedNetworkItemStackDescriptor(
+                id=output.item_id, stack_size=output.count * times,
+                aux_value=output.aux_value, net_id_variant=None,
+                block_runtime_id=output.block_runtime_id & 0xFFFFFFFF,
+                user_data_buffer=output.user_data_buffer,
+            )
+            for slot, output in zip(destination_slots, recipe.results)
+        }
         actions = [
             cereal.CraftRecipeActionData(recipe_net_id=recipe.net_id, num_crafts=times),
             cereal.CraftResultsActionData(
@@ -728,7 +765,7 @@ class Recipes:
                     stack_size=output.count,
                     block_runtime_id=output.block_runtime_id & 0xFFFFFFFF,
                     user_data_buffer=output.user_data_buffer,
-                )], num_crafts=times,
+                ) for output in recipe.results], num_crafts=times,
             ),
             *[
                 cereal.ConsumeActionData(
@@ -738,13 +775,17 @@ class Recipes:
                 )
                 for slot, item in sorted(grid.items())
             ],
-            cereal.PlaceActionData(
-                amount=output.count * times,
-                source=slot_info("CREATED_OUTPUT_CONTAINER", 50, request_id),
-                destination=slot_info("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER",
-                                      destination_slot, int(destination.net_id_variant or 0)),
-            ),
         ]
+        for result_index, (slot, output) in enumerate(output_descriptors.items()):
+            container = "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER"
+            if multiple:
+                actions.append(cereal.CreateActionData(results_index=result_index))
+                container = "HOTBAR_CONTAINER" if slot < 9 else "INVENTORY_CONTAINER"
+            actions.append(cereal.PlaceActionData(
+                amount=int(output.stack_size),
+                source=slot_info("CREATED_OUTPUT_CONTAINER", 50, request_id),
+                destination=slot_info(container, slot, int(destinations[slot].net_id_variant or 0)),
+            ))
         request = b.ItemStackRequestPacketData.RequestData(
             client_request_id=b.ItemStackRequestId(raw_id=request_id),
             actions=actions, strings_to_filter=[],
@@ -763,18 +804,99 @@ class Recipes:
                         updated = (_response_item(b, source, source, slot) if current is source
                                    else _correct_observed_item(b, current, slot))
                         self._set_grid_slot(index, updated)
-                    elif (name in ("HOTBAR_CONTAINER", "INVENTORY_CONTAINER",
-                                   "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER")
-                          and index == destination_slot):
-                        current = self.inventory.slots.get(index)
-                        if current is not destination_observed:
+                    elif name in _PLAYER_CONTAINERS and index in output_descriptors:
+                        current = inventory.slots.get(index)
+                        destination = destinations[index]
+                        output = output_descriptors[index]
+                        if current is not observed_destinations[index]:
                             updated = _correct_observed_item(b, current, slot)
                         else:
-                            fallback = output_descriptor if reply.result.name == "SUCCESS" else destination
+                            fallback = output if reply.result.name == "SUCCESS" else destination
                             updated = _response_item(b, destination, fallback, slot)
-                        self.inventory._set_slot(index, updated)
+                        inventory._set_slot(index, updated)
 
-        return await self.inventory._request_item_stack(request, apply, timeout=timeout, queued=_queued)
+        if not multiple:
+            return await inventory._request_item_stack(request, apply, timeout=timeout, queued=_queued)
+
+        expected_grid = {slot: _stack_snapshot(item) for slot, item in grid.items()}
+        expected_destinations = {slot: _stack_snapshot(item) for slot, item in observed_destinations.items()}
+        # A second multi-result request cannot use the workbench until this request is adjudicated.
+        endpoints = frozenset({(None, slot) for slot in destination_slots} | {(id(window), -1)})
+        submitted_grid_versions = {}
+        changed_destinations = set()
+
+        def observe_destination(change):
+            if change.slot in expected_destinations:
+                changed_destinations.add(change.slot)
+
+        def at_write():
+            if self._sync_grid_window() is not window:
+                raise RuntimeError("the crafting window changed before submission")
+            if self.get(recipe_id) != recipe:
+                raise RuntimeError("the crafting recipe changed before submission")
+            if (not self._unconfirmed_grid_slots.isdisjoint(grid_slots)
+                    or {slot: _stack_snapshot(item) for slot, item in observed_grid().items()} != expected_grid):
+                raise RuntimeError("crafting inputs changed before submission")
+            carried = inventory.slots
+            current_destinations = {slot: carried.get(slot) for slot in destination_slots}
+            if ({slot: _stack_snapshot(item) for slot, item in current_destinations.items()} != expected_destinations
+                    or any(slot in inventory._unconfirmed_transfer_slots or slot in inventory._count_observation_gaps
+                           for slot in destination_slots)):
+                raise RuntimeError("crafting destinations are no longer confirmed empty")
+            owner = inventory._pending_requests[request_id]
+            if any(pending is not owner for pending in inventory._requests_for_endpoints(endpoints)):
+                raise RuntimeError("the crafting window or a result destination has a pending item-stack request")
+            submitted_grid_versions.update((slot, self._grid_versions.get(slot, 0)) for slot in grid)
+            unsubscribe = inventory.subscribe_inventory_changes(observe_destination)
+            # A submitted request can still receive its verdict after the caller stops waiting.
+            owner.reply.add_done_callback(lambda _: unsubscribe())
+
+        def unique_receipt(rows):
+            if rows and rows[0].slot == rows[0].requested_slot and all(row == rows[0] for row in rows[1:]):
+                return rows[0]
+            return None
+
+        def apply_multiple(reply):
+            if reply.result.name != "SUCCESS":
+                return
+            inputs, outputs = defaultdict(list), defaultdict(list)
+            for group in reply.containers or ():
+                name = group.full_container_name.name.name
+                if name == "CRAFTING_INPUT_CONTAINER":
+                    receipts = inputs
+                elif name in _PLAYER_CONTAINERS:
+                    receipts = outputs
+                else:
+                    continue
+                for slot in group.slots:
+                    receipts[int(slot.slot)].append(slot)
+                    if slot.requested_slot != slot.slot:
+                        receipts[int(slot.requested_slot)].append(slot)
+
+            if self.containers.window is window:
+                for index, version in submitted_grid_versions.items():
+                    if self._grid_versions.get(index, 0) != version:
+                        continue
+                    row = unique_receipt(inputs.get(index))
+                    current = self._grid_slots.get(index)
+                    item = None if row is None else _correct_observed_item(b, current, row)
+                    self._set_grid_slot(index, item)
+                    if item is None:
+                        self._unconfirmed_grid_slots.add(index)
+
+            for index, output in output_descriptors.items():
+                if index in changed_destinations:
+                    continue
+                row = unique_receipt(outputs.get(index))
+                net_id = None if row is None else row.item_stack_net_id
+                if row is not None and row.amount == output.stack_size and net_id is not None and net_id.raw_id > 0:
+                    inventory._set_slot(index, _response_item(b, destinations[index], output, row))
+                else:
+                    inventory._count_observation_gaps.add(index)
+                    inventory._set_slot(index, None)
+
+        return await inventory._request_item_stack(request, apply_multiple, timeout=timeout, queued=_queued,
+                                                   _endpoints=endpoints, _at_write=at_write)
 
     def close(self) -> None:
         self._unsubscribe()

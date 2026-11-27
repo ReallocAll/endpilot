@@ -746,11 +746,17 @@ class Bot:
         return await self._recipes.return_grid(grid_slot, destination_slot, amount, timeout=timeout)
 
     async def craft_recipe_grid(self, recipe_id: str | int, destination_slot: int, *,
+                                additional_destination_slots: tuple[int, ...] = (),
                                 times: int = 1, timeout: float = 15):
-        """Craft from server-observed grid inputs; return BDS's item-stack verdict."""
+        """Craft from observed grid inputs and return the matching BDS verdict.
+
+        For one workbench craft with multiple results, supply a distinct observed
+        empty main inventory slot for each result, in the server's recipe order.
+        """
         if self._recipes is None:
             raise RuntimeError("player has not joined")
         return await self._recipes.craft_grid(recipe_id, destination_slot,
+                                              additional_destination_slots=additional_destination_slots,
                                               times=times, timeout=timeout)
 
     @property
