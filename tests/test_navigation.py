@@ -2692,6 +2692,26 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                                  (status, (source, landing) if status == "found" else ()))
                 self.assertEqual(self.stream.sent, [])
 
+    async def test_ascent_moves_further_only_under_a_dry_leaf_ceiling_without_confirming_landing(self):
+        goal = FootGoal((1, 101, 0))
+        rules = NavigationRules(search_radius=1, vertical_radius=1)
+        for roof, count, stop_x in ((self.AIR, 8, 1.22), (0x67BDEDE8, 9, 1.31)):
+            with self.subTest(roof=hex(roof)):
+                self.prepare_ascent()
+                self.set_block((1, 103, 0), roof)
+                self.set_position(0.5, 0.5, teleport=True, on_ground=True)
+                self.stream.sent.clear()
+                events = []
+                result = await self.bot.navigate(goal, rules=rules, ticks=16, on_event=events.append)
+                self.assertEqual((result.status, result.stand_position), ("budget", None))
+                self.assertNotIn("transition_completed", [event.kind for event in events])
+                launch, = self.jump_input()
+                forward = self.moving_input()
+                self.assertEqual([frame.client_tick - launch.client_tick for frame in forward],
+                                 list(range(3, 3 + count)))
+                self.assertAlmostEqual(forward[-1].pos.x, stop_x, places=4)
+                self.assert_released()
+
     async def test_ascent_lands_with_foot_overlap_before_the_center_reaches_the_upper_cell(self):
         target = self.prepare_ascent()
         corrected = False

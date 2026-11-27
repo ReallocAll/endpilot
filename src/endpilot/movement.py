@@ -2915,7 +2915,10 @@ class Movement:
                     if not at_center(source, x, z):
                         return "position_changed"
                     await self.look_at((lx + 0.5, y, lz + 0.5))
-                braking_at_edge = (braking_at_edge or progress >= 0.7
+                # Under a qualified low canopy, brake once the whole body clears the lip.
+                brake_progress = (0.5 + _PLAYER_HALF_WIDTH
+                                  if blocks._ascent_leaf_ceiling((lx, ly + 2, lz)) is True else 0.7)
+                braking_at_edge = (braking_at_edge or progress >= brake_progress
                                    or (advancing and y < upper_eye - 0.0001))
                 # From rest, gain the ledge's height before applying forward input.
                 forward = (jump_tick is not None and not jump and not braking_at_edge
