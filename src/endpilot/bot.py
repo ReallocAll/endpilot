@@ -118,6 +118,7 @@ class Bot:
         self._creative: CreativeInventory | None = None
         self._enchanting: Enchanting | None = None
         self._blocks: Blocks | None = None
+        self._placement_completion_observers: dict[object, Callable[[PlacementResult], None]] = {}
         self._terrain: _TerrainObserver | None = None
         self._beds: Beds | None = None
         self._block_collector: _BlockCollector | None = None
@@ -2144,11 +2145,53 @@ class Bot:
         containers, blocks, creative = self._containers, self._blocks, self._creative
         if containers is None or blocks is None or creative is None:
             raise RuntimeError("player has not joined")
-        return await observe_placement(
+        result = await observe_placement(
             containers, blocks, creative, against,
             face=face, expected_runtime_id=expected_runtime_id, expected_block_name=expected_block_name,
             replace=replace, click_pos=click_pos, timeout=timeout,
         )
+        observers = self._placement_completion_observers
+        if result.reason != "observations_complete" or self._blocks is not blocks or not observers:
+            return result
+        # The reader can finish before its done callback clears the observers.
+        state = self._get_session_end_state()
+        if state is None or state.result is not None:
+            return result
+        for key, callback in tuple(observers.items()):
+            if key not in observers:
+                continue
+            try:
+                callback(result)
+            except (Exception, asyncio.CancelledError) as error:
+                asyncio.get_running_loop().call_exception_handler({
+                    "message": "placement completion observer failed", "exception": error, "callback": callback,
+                })
+        return result
+
+    def subscribe_placement_completions(self, callback: Callable[[PlacementResult], None]) -> Callable[[], None]:
+        """Observe future complete results from this Bot's ``place_block`` in the joined session.
+
+        The synchronous callback receives the same immutable result just before
+        the action returns, once the target change and the selected stack's
+        one-item decrease have both been observed. Those observations establish
+        no server attribution. The returned function unsubscribes and can be
+        called repeatedly. Registrations end with the session.
+        """
+        state = self._get_session_end_state()
+        if self._session is None or state is None:
+            raise RuntimeError("player has not joined")
+        if state.result is not None:
+            raise ConnectionError("placement completion subscription stream is closed")
+        key = object()
+        self._placement_completion_observers[key] = callback
+        owner_ref = ref(self)
+
+        def unsubscribe() -> None:
+            owner = owner_ref()
+            if owner is not None:
+                owner._placement_completion_observers.pop(key, None)
+
+        return unsubscribe
 
     async def fill_water_bucket(
         self, position: tuple[int, int, int], *, timeout: float = 15,
@@ -3488,6 +3531,7 @@ class Bot:
         return unsubscribe
 
     def _publish_session_end(self, result: SessionEnd) -> None:
+        self._placement_completion_observers.clear()
         for callback in tuple(self._session_end_observers.values()):
             try:
                 callback(result)

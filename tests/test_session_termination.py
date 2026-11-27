@@ -464,8 +464,125 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(placing.done())
         return placing
 
+    async def test_placement_completion_is_shared_once_and_isolates_callback_errors(self):
+        wire = await self.join_for_placement()
+        delivered, removed, reports = [], [], []
+        loop = asyncio.get_running_loop()
+        self.addCleanup(loop.set_exception_handler, loop.get_exception_handler())
+        loop.set_exception_handler(lambda _, context: reports.append(context))
+
+        def failing(result):
+            unsubscribe_removed()
+            raise ValueError("observer failed")
+
+        def cancelled(result):
+            raise asyncio.CancelledError("observer cancelled")
+
+        self.bot.subscribe_placement_completions(failing)
+        unsubscribe_removed = self.bot.subscribe_placement_completions(removed.append)
+        self.bot.subscribe_placement_completions(cancelled)
+        self.bot.subscribe_placement_completions(delivered.append)
+        unsubscribe = self.bot.subscribe_placement_completions(removed.append)
+        unsubscribe()
+        unsubscribe()
+        self.assertEqual(self.placement_transactions(wire), [])
+
+        placing = await self.start_placement(wire, timeout=1)
+        target_update = asyncio.create_task(self.bot.wait_for_block_update(TARGET, timeout=1))
+        await asyncio.sleep(0)
+        wire.push(self.placement_block(TARGET, STONE))
+        self.assertEqual((await target_update).runtime_id, STONE)
+        self.assertEqual(delivered, [])
+        self.assertFalse(placing.done())
+        wire.push(self.placement_slot(3))
+        result = await asyncio.wait_for(placing, 1)
+        self.assertEqual(result.reason, "observations_complete")
+        self.assertEqual(len(delivered), 1)
+        self.assertIs(delivered[0], result)
+        self.assertEqual(removed, [])
+        self.assertEqual([type(report["exception"]) for report in reports], [ValueError, asyncio.CancelledError])
+        self.assertEqual([report["callback"] for report in reports], [failing, cancelled])
+
+    async def test_placement_completion_ignores_sparse_world_updates_and_partial_timeout(self):
+        wire = await self.join_for_placement()
+        delivered = []
+        self.bot.subscribe_placement_completions(delivered.append)
+
+        async def update_target(runtime_id):
+            observed = asyncio.create_task(self.bot.wait_for_block_update(TARGET, timeout=1))
+            await asyncio.sleep(0)
+            wire.push(self.placement_block(TARGET, runtime_id))
+            self.assertEqual((await observed).runtime_id, runtime_id)
+
+        await update_target(STONE)
+        self.assertEqual(delivered, [])
+        rejected = await self.bot.place_block(SUPPORT, face=1, expected_runtime_id=STONE)
+        self.assertEqual(rejected.reason, "precondition_failed")
+        self.assertEqual(self.placement_transactions(wire), [])
+        await update_target(HASHED_AIR_RUNTIME_ID)
+        placing = await self.start_placement(wire, timeout=0.3)
+        await update_target(STONE)
+        result = await asyncio.wait_for(placing, 1)
+        self.assertEqual((result.submitted, result.reason), (True, "timed_out"))
+        self.assertEqual(result.world_change.after.runtime_id, STONE)
+        self.assertIsNone(result.inventory_change)
+        self.assertEqual(delivered, [])
+
+    async def test_placement_completion_ignores_cancelled_action_and_ends_on_local_close(self):
+        wire = await self.join_for_placement()
+        delivered = []
+        unsubscribe = self.bot.subscribe_placement_completions(delivered.append)
+        placing = await self.start_placement(wire, timeout=1)
+        placing.cancel("caller stopped")
+        with self.assertRaisesRegex(asyncio.CancelledError, "caller stopped") as raised:
+            await placing
+        self.assertEqual(raised.exception.placement_progress.reason, "cancelled")
+        await self.bot.close()
+        with self.assertRaisesRegex(RuntimeError, "player has not joined"):
+            self.bot.subscribe_placement_completions(delivered.append)
+
+        replacement = await self.join_for_placement(player_id=42)
+        current = []
+        self.bot.subscribe_placement_completions(current.append)
+        placing = await self.start_placement(replacement, timeout=1)
+        replacement.push(self.placement_slot(3))
+        replacement.push(self.placement_block(TARGET, STONE))
+        result = await asyncio.wait_for(placing, 1)
+        self.assertEqual(result.reason, "observations_complete")
+        self.assertEqual(current, [result])
+        self.assertEqual(delivered, [])
+        unsubscribe()
+        unsubscribe()
+
+    async def test_placement_completion_after_reader_stops_returns_without_notifying(self):
+        wire = await self.join_for_placement()
+        packets = self.bot.packets
+        reader = packets.start_receiving()
+        delivered, session_ends, reader_ends = [], [], []
+        self.bot.subscribe_placement_completions(delivered.append)
+        self.bot.subscribe_session_end(session_ends.append)
+        packets.subscribe_reader_end(reader_ends.append)
+        placing = await self.start_placement(wire, timeout=1)
+
+        wire.push(self.placement_block(TARGET, STONE))
+        wire.push(self.placement_slot(3, net_id=22))
+        # The next receive unwinds the reader before the queued placement task resumes.
+        wire.incoming.put_nowait(asyncio.CancelledError())
+
+        result = await asyncio.wait_for(placing, 1)
+        self.assertEqual((result.submitted, result.reason), (True, "observations_complete"))
+        self.assertEqual(result.world_change.after.runtime_id, STONE)
+        self.assertEqual((result.inventory_change.before.count, result.inventory_change.after.count), (4, 3))
+        self.assertEqual(delivered, [])
+        await self.bot.close()
+        self.assertTrue(reader.cancelled())
+        self.assertEqual(reader_ends, [None])
+        self.assertEqual(session_ends, [SessionEnd("reader_end")])
+
     async def test_placement_ends_on_peer_eof_and_same_bot_can_rejoin_after_close(self):
         wire = await self.join_for_placement()
+        delivered = []
+        self.bot.subscribe_placement_completions(delivered.append)
         packets = self.bot.packets
         reader = packets._reader_task
         ticker = self.bot._movement._ticker
@@ -484,6 +601,8 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
                          PlacementResult(0, TARGET, 0, True, "disconnected", None, None))
         ended = await self.bot.wait_for_session_end(timeout=1)
         self.assertEqual(ended, SessionEnd("reader_end", error_type="EOFError"))
+        with self.assertRaisesRegex(ConnectionError, "placement completion subscription stream is closed"):
+            self.bot.subscribe_placement_completions(delivered.append)
         _, pending = await asyncio.wait((reader, ticker, clock), timeout=1)
         self.assertFalse(pending)
         self.assertIs(reader.exception(), eof)
@@ -515,6 +634,7 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.world_change.after.runtime_id, STONE)
         self.assertEqual((result.inventory_change.before.count, result.inventory_change.after.count), (3, 2))
         self.assertEqual(result.inventory_change.after.net_id, 22)
+        self.assertEqual(delivered, [])
         self.assertEqual(len(self.placement_transactions(wire)), 1)
         self.assertEqual(len(self.placement_transactions(replacement)), 1)
 
