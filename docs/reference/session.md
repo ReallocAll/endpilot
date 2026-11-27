@@ -71,6 +71,14 @@ still running at the deadline. Pass `timeout=None` to wait without a deadline.
 immutable snapshot stays available through `close()` and is cleared on the
 next join attempt. Confirm a server crash from BDS process status or logs.
 
+When the packet reader ends or `bot.close()` completes, the old session cannot
+apply another transfer verdict. An unresolved request may already have moved
+items; reconnect and observe the affected slots before deciding whether to
+retry. In an active session, a matching late verdict settles its pending
+request; fresh slot observations can make a slot usable after incomplete
+corrections, but they neither settle an outstanding request nor change an earlier
+[`transfer_progress` snapshot](../tutorials/containers.md#choose-ranges-and-interpret-partial-results).
+
 If you need the native `DisconnectPacket`, call
 `await bot.wait_for_server_disconnect(timeout=10)` on an active bot. It raises
 `ConnectionError` if the stream ends first and `TimeoutError` if it receives
