@@ -881,13 +881,11 @@ class EntityPlacementTests(_EntityPlacementHarness):
         self.assert_entity_placement_completed(await pending, EntitySpawn(-53, 53, "minecraft:boat", BOAT_POSITION))
 
     async def test_minecart_uses_straight_rail_click_height_and_separate_spawn_height(self):
-        straight_rail, ascending_rail = 2560510590, 2683460236
+        straight_rail = 2560510590
         x, y, z = SUPPORT
         actor_type = "minecraft:minecart"
         await self.deliver(self.registry_packet(actor_type), self.boat_slot(1),
-                           self.block((x, y - 1, z), STONE), self.block(SUPPORT, ascending_rail))
-        self.assertEqual(self.bot.observed_block_state(SUPPORT).properties["rail_direction"], 2)
-        await self.assert_entity_placement_rejected()
+                           self.block((x, y - 1, z), STONE))
 
         await self.deliver(self.block(SUPPORT, straight_rail))
         pending = await self.arm_entity(surface=straight_rail, click_height=0.125)
@@ -897,6 +895,42 @@ class EntityPlacementTests(_EntityPlacementHarness):
         position = (x + 0.5, y + 0.5, z + 0.5)
         await self.deliver(self.spawn(-61, position=position, actor_type=actor_type))
         self.assert_entity_placement_completed(await pending, EntitySpawn(-61, 61, actor_type, position))
+
+    async def test_minecart_rejects_slopes_curves_other_rails_and_unknown_states(self):
+        await self.deliver(self.registry_packet("minecraft:minecart"), self.boat_slot(1))
+        for runtime_id, name, direction in (
+            (2683460236, "rail", 2), (2929359528, "rail", 6), (791742332, "golden_rail", 0),
+            (2297846613, "detector_rail", 0), (2602891109, "activator_rail", 0), (123456789, None, None),
+        ):
+            with self.subTest(runtime_id=runtime_id):
+                await self.deliver(self.block(SUPPORT, runtime_id))
+                observed = self.bot.observed_block_state(SUPPORT)
+                if name is None:
+                    self.assertIsNone(observed)
+                else:
+                    self.assertEqual((observed.name, observed.properties["rail_direction"]),
+                                     (f"minecraft:{name}", direction))
+                await self.assert_entity_placement_rejected()
+
+    async def test_hopper_minecart_on_east_west_rail_requires_a_new_matching_center_spawn(self):
+        east_west_rail = 2499035767
+        x, y, z = SUPPORT
+        center = (x + 0.5, y + 0.5, z + 0.5)
+        actor_type = "minecraft:hopper_minecart"
+        existing = self.spawn(-62, position=center, actor_type=actor_type)
+        await self.deliver(self.registry_packet(actor_type), self.boat_slot(1),
+                           self.block(SUPPORT, east_west_rail), existing)
+        pending = await self.arm_entity(surface=east_west_rail, click_height=0.125)
+        await self.deliver(
+            self.boat_slot(0), existing,
+            self.spawn(-63, position=center, actor_type="minecraft:chest_minecart"),
+            self.spawn(-64, position=(x + 0.5, y + 0.125, z + 0.5), actor_type=actor_type),
+            self.spawn(-65, position=(x + 0.5, y + 0.5, z + 0.5 + 1 / 128), actor_type=actor_type),
+        )
+        self.assertFalse(pending.done())
+        position = (x + 0.5 + 1 / 2048, y + 0.5, z + 0.5)
+        await self.deliver(self.spawn(-66, position=position, actor_type=actor_type))
+        self.assert_entity_placement_completed(await pending, EntitySpawn(-66, 66, actor_type, position))
 
     async def test_armor_stand_requires_both_clear_cells_above_the_support(self):
         x, y, z = SUPPORT
@@ -913,6 +947,7 @@ class EntityPlacementTests(_EntityPlacementHarness):
         await self.deliver(self.block(upper, layer=1))
         pending = await self.arm_entity(surface=STONE, click_height=1.0)
         position = (x + 0.5, y + 1.0, z + 0.5)
+        await self.deliver(self.spawn(-69, position=(x + 0.5 + 1 / 2048, y + 1.0, z + 0.5), actor_type=actor_type))
         await self.deliver(self.spawn(-70, position=position, actor_type=actor_type), self.boat_slot(0))
         self.assert_entity_placement_completed(await pending, EntitySpawn(-70, 70, actor_type, position))
 

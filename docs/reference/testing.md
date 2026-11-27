@@ -159,8 +159,9 @@ sends one top-face click when the terrain and held item still match.
 | --- | --- | --- | --- |
 | Plain watercraft below | Source water | `(0.5, 0.875, 0.5)` | `minecraft:boat` with the hull's integer `VARIANT` |
 | Chest watercraft below | Source water | `(0.5, 0.875, 0.5)` | `minecraft:chest_boat` with the hull's integer `VARIANT` |
-| `minecraft:minecart` | North–south straight rail | `(0.5, 0.125, 0.5)` | `minecraft:minecart` |
-| `minecraft:chest_minecart` | North–south straight rail | `(0.5, 0.125, 0.5)` | `minecraft:chest_minecart` |
+| `minecraft:minecart` | Flat north–south or east–west rail | `(0.5, 0.125, 0.5)` | `minecraft:minecart` |
+| `minecraft:chest_minecart` | Flat north–south or east–west rail | `(0.5, 0.125, 0.5)` | `minecraft:chest_minecart` |
+| `minecraft:hopper_minecart` | Flat north–south or east–west rail | `(0.5, 0.125, 0.5)` | `minecraft:hopper_minecart` |
 | `minecraft:armor_stand` | Stone with clearance | `(0.5, 1.0, 0.5)` | `minecraft:armor_stand` |
 | `minecraft:end_crystal` | Obsidian or bedrock with clearance | `(0.5, 1.0, 0.5)` | `minecraft:ender_crystal` |
 | `minecraft:cow_spawn_egg` | Stone with clearance | `(0.5, 1.0, 0.5)` | `minecraft:cow` |
@@ -185,12 +186,13 @@ table.
 | `poplar_boat` | `poplar_chest_boat` | 10 |
 
 Source water is vanilla `minecraft:water` with `liquid_depth=0`. The rail is
-vanilla `minecraft:rail` with `rail_direction=0`. Land placements require
+vanilla `minecraft:rail` with `rail_direction=0` (north–south) or `1`
+(east–west). Land placements require
 observed air in the two main-layer cells above their support and in layer 1
 of all three cells. The initial `AddActorPacket` matches the world click
 coordinates for boats and land placements, or the rail block center, offset
 `(0.5, 0.5, 0.5)`, for minecarts. Coordinates are compared at the wire's
-float32 precision.
+float32 precision, with a tolerance of `0.001` block per axis for minecarts.
 
 `EntityPlacementResult` records the original dimension, clicked block,
 selected slot, and local submission state. `submitted` is `False` before

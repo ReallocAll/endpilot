@@ -3,7 +3,7 @@
 import asyncio
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
-from math import isfinite
+from math import isclose, isfinite
 from typing import Literal
 
 from .blocks import FACE_OFFSETS, BlockChange, BlockStateObservation, Blocks
@@ -523,6 +523,7 @@ async def observe_entity_placement[Result: EntityPlacementResult](
 
     variant = None
     clearance = ()
+    spawn_tolerance = 0.0
     match item_name:
         case _ if item_name in _WATERCRAFT:
             if not _is_water_source(clicked):
@@ -531,13 +532,14 @@ async def observe_entity_placement[Result: EntityPlacementResult](
             if not legacy_oak_boat:
                 variant = hull_variant
             click_pos = spawn_offset = (0.5, 0.875, 0.5)
-        case "minecraft:minecart" | "minecraft:chest_minecart":
+        case "minecraft:minecart" | "minecraft:chest_minecart" | "minecraft:hopper_minecart":
             direction = clicked.properties.get("rail_direction")
-            if clicked.name != "minecraft:rail" or type(direction) is not int or direction != 0:
+            if clicked.name != "minecraft:rail" or type(direction) is not int or direction not in (0, 1):
                 return result("precondition_failed")
             actor_type = item_name
             click_pos = (0.5, 0.125, 0.5)
             spawn_offset = (0.5, 0.5, 0.5)
+            spawn_tolerance = 0.001
         case _:
             actor_type = {
                 "minecraft:armor_stand": "minecraft:armor_stand",
@@ -609,7 +611,9 @@ async def observe_entity_placement[Result: EntityPlacementResult](
             seen_ids.add(entity_id)
             if submitted is True and actor.actor_type == actor_type:
                 location = (float(actor.pos.x), float(actor.pos.y), float(actor.pos.z))
-                if location == world_spawn and matches_variant(actor):
+                matches_position = all(isclose(actual, expected, rel_tol=0, abs_tol=spawn_tolerance)
+                                       for actual, expected in zip(location, world_spawn))
+                if matches_position and matches_variant(actor):
                     spawn = EntitySpawn(entity_id, int(actor.runtime_id), actor.actor_type, location)
                     if inventory_change is not None:
                         finish("observations_complete")

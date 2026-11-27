@@ -2294,6 +2294,7 @@ class Bot:
     ) -> EntityPlacementResult:
         """Place a supported held item with one click on observed terrain in Survival.
 
+        Plain, chest, and hopper minecarts use a flat north–south or east–west rail.
         Report a matching new spawn and a one-item decrease in the selected slot
         when each observation arrives after submission.
         """
