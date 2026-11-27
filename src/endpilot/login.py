@@ -179,6 +179,7 @@ class JoinSession:
         self.player_unique_id = None
         self.player_game_type: str | None = None
         self._enchantment_seed_at_join: int | None = None
+        self.reported_server_version: str | None = None
         self.dimension_id = 0
         self.chunk_radius = None
         self.requested_chunk_radius: int | None = None
@@ -572,6 +573,7 @@ class JoinSession:
                 self.player_id = int(game.runtime_id)
                 self.player_unique_id = int(game.entity_id)
                 self._enchantment_seed_at_join = getattr(game, "enchantment_seed", None)
+                self.reported_server_version = getattr(game, "server_version", "") or None
                 if self.commands_enabled is None:
                     self.commands_enabled = getattr(game.settings, "commands_enabled", None)
                 mode = getattr(game, "entity_game_type", None)
@@ -582,7 +584,7 @@ class JoinSession:
                 self.dimension_id = int(game.settings.spawn_settings.dimension)
                 self.block_network_ids_are_hashes = bool(game.block_network_ids_are_hashes)
                 self.vanilla_recipe_tags = (
-                    protocol.number == 2225 and game.server_version == "1.26.66"
+                    protocol.number == 2225 and self.reported_server_version == "1.26.66"
                     and packs.plain_pack_info and stack_allows_vanilla_recipe_tags
                     and _experiments_allow_vanilla_recipe_tags(game.settings.experiments)
                 )

@@ -217,6 +217,18 @@ class Bot:
         )
 
     @property
+    def reported_server_version(self) -> str | None:
+        """Return the server version string from StartGame in the active joined session.
+
+        An empty string or the absence of an active joined session yields None.
+        """
+        session = self._session
+        state = self._get_session_end_state()
+        if session is None or state is None or state.result is not None:
+            return None
+        return session.reported_server_version
+
+    @property
     def resource_pack_index(self) -> ResourcePackIndex | None:
         """Return the resource-pack index of the joined session, or None while offline."""
         session = self._session

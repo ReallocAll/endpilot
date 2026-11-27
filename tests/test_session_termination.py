@@ -864,13 +864,48 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
 
         refused = Wire(self.bot.protocol)
         refused.push(self.b.NetworkSettingsPacket(compression_algorithm=self.b.PacketCompressionAlgorithm.NONE))
+        refused.push(self.b.StartGamePacket(runtime_id=41, entity_id=41, server_version="Refused"))
         refused.push(self.disconnect("refused before spawn"))
         with self.assertRaises(LoginRefused):
             await self.connect(refused)
         self.assertTrue(refused.closed)
         self.assertIsNone(self.bot.session_end)
+        self.assertIsNone(self.bot.reported_server_version)
         self.assertEqual(observed, [saved])
         self.assertIs(observed[0], saved)
+
+    async def test_reported_server_version_tracks_only_the_active_joined_session(self):
+        self.assertIsNone(self.bot.reported_server_version)
+        b = self.b
+        cases = (
+            ("1.26.66", "server_disconnect"),
+            (" Proxy Δ / 1.26.66 ", "reader_end"),
+            ("", "local_close"),
+            (" ", "local_close"),
+        )
+        for version, end in cases:
+            with self.subTest(version=version, end=end):
+                wire = self.wire(server_version=version)
+                await self.connect(wire)
+                sent_count = len(wire.sent)
+                self.assertEqual(self.bot.reported_server_version, version or None)
+                self.assertEqual(len(wire.sent), sent_count)
+                with self.assertRaises(AttributeError):
+                    self.bot.reported_server_version = "overwritten"
+
+                if end == "server_disconnect":
+                    wire.push(self.disconnect())
+                elif end == "reader_end":
+                    wire.incoming.put_nowait(EOFError("peer closed"))
+                else:
+                    await self.bot.close()
+                self.assertEqual((await self.bot.wait_for_session_end(timeout=1)).kind, end)
+                self.assertIsNone(self.bot.reported_server_version)
+                if end == "reader_end":
+                    with self.assertRaises(EOFError):
+                        await self.bot.close()
+                else:
+                    await self.bot.close()
 
     async def test_cancelled_authorization_and_failed_assembly_never_publish_a_session(self):
         observed = []
@@ -917,11 +952,12 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancelled_online_join_after_assembly_keeps_the_end_private(self):
         observed = []
         self.bot.subscribe_session_end(observed.append)
-        wire = self.wire(self.disconnect("queued just after spawn"))
+        wire = self.wire(self.disconnect("queued just after spawn"), server_version="Cancelled")
         start = self.bot._start_session
 
         def cancel_after_assembly(session, **options):
             start(session, **options)
+            self.assertIsNone(self.bot.reported_server_version)
             joining.cancel()
 
         with (
@@ -936,6 +972,7 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
                 await joining
         self.assertTrue(wire.closed)
         self.assertIsNone(self.bot.session_end)
+        self.assertIsNone(self.bot.reported_server_version)
         with self.assertRaisesRegex(RuntimeError, "player has not joined"):
             await self.bot.wait_for_session_end(timeout=0)
         self.assertEqual(observed, [])
