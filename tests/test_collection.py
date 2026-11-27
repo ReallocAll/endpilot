@@ -23,6 +23,7 @@ from endpilot.navigation import _StandingGraph
 from endpilot.protocol import Protocol, read_batch, write_batch
 
 from test_container_take import item as stack_descriptor
+from test_harvest import WEB, enchantment_data
 from test_scheduled_input import ManualClock
 
 
@@ -36,6 +37,10 @@ ORE = 0x54A1D0FD
 OAK_LOG_BLOCK = 4065577688
 OAK_LOG_ITEM = 17
 IRON_AXE = 446
+IRON_SWORD = 1201
+SHEARS = 1202
+STRING_ITEM = 1203
+WEB_ITEM = 1204
 REFILL_CHEST = (-3, 100, 2)
 ALTERNATE_REFILL_CHEST = (-4, 100, 3)
 
@@ -301,7 +306,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(forward not in frame.input_data for frame in release_frames))
         self.assert_released()
 
-    async def public_bot(self, *, tool_slot=1, clock=None):
+    async def public_bot(self, *, tool_slot=1, clock=None, item_names=None):
         self.enterContext((clock or ManualClock()).patch_scheduler())
         bot = Bot("CollectionTest")
         session = JoinSession(self.packets, bot.identity, "127.0.0.1")
@@ -309,7 +314,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         session.block_network_ids_are_hashes = True
         session.item_names = {DIRT: "minecraft:dirt", 444: "minecraft:golden_pickaxe",
                               445: "minecraft:iron_pickaxe", IRON_AXE: "minecraft:iron_axe",
-                              OAK_LOG_ITEM: "minecraft:oak_log"}
+                              OAK_LOG_ITEM: "minecraft:oak_log", **(item_names or {})}
         bot._start_session(session)
         self.addAsyncCleanup(bot.close)
         await self.emit(
@@ -745,8 +750,8 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.inventory_count(DIRT), 2)
         self.assertTrue(self.wire.outgoing.empty())
 
-    async def refill_bot(self, *, chest=REFILL_CHEST, additional_chests=()):
-        bot = await self.public_bot()
+    async def refill_bot(self, *, chest=REFILL_CHEST, additional_chests=(), item_names=None):
+        bot = await self.public_bot(item_names=item_names)
         bot._session.item_registry = ItemRegistrySnapshot(bot._session.item_names)
         palette, hashes = _catalog()
         chest_id = next(runtime for runtime, index in hashes.items()
@@ -799,7 +804,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((interaction.pos.x, interaction.pos.y, interaction.pos.z), position)
         return interaction
 
-    async def refill_request(self, *, position=REFILL_CHEST, expected_hit=None):
+    async def refill_request(self, *, position=REFILL_CHEST, expected_hit=None, item_id=445):
         b = self.b
         interaction = await self.refill_click(position=position)
         if expected_hit is not None:
@@ -807,7 +812,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             hit = interaction.click_pos
             self.assertEqual(interaction.face, face)
             self.assertLess(math.dist((hit.x, hit.y, hit.z), point), 1e-6)
-        await self.emit(*self.refill_window(position=position))
+        await self.emit(*self.refill_window(position=position, item_id=item_id))
         take = await asyncio.wait_for(self.wire.outgoing.get(), 1)
         self.assertIsInstance(take, b.ItemStackRequestPacket)
         request, = take.requests
@@ -1478,6 +1483,112 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             "oak_log", item_id=OAK_LOG_ITEM, count=count, radius=radius, ticks=ticks,
             search_radius=search_radius, timeout=timeout,
         ))
+
+    async def web_bot(self, *, sword):
+        bot = await self.refill_bot(item_names={
+            IRON_SWORD: "minecraft:iron_sword", SHEARS: "minecraft:shears",
+            STRING_ITEM: "minecraft:string", WEB_ITEM: "minecraft:web",
+        })
+        inventory = [self.item() for _ in range(36)]
+        if sword:
+            inventory[1] = stack_descriptor(self.b, IRON_SWORD, 1, 12)
+        inventory[5] = stack_descriptor(self.b, SHEARS, 1, 13)
+        inventory[5].user_data_buffer = enchantment_data(self.b, 2)
+        await self.emit(self.block(WEB), self.content(*inventory))
+        return bot
+
+    async def test_counted_cobweb_chooses_tool_for_the_requested_drop(self):
+        bot = await self.web_bot(sword=True)
+        cases = ((STRING_ITEM, IRON_SWORD), (WEB_ITEM, SHEARS))
+        for index, (item_id, tool_id) in enumerate(cases, 101):
+            with self.subTest(item_id=item_id):
+                await self.emit(self.block(WEB), self.slot(2))
+                task = asyncio.create_task(bot.collect_by_count(
+                    "web", item_id=item_id, count=1, radius=2, ticks=0, search_radius=0, timeout=1,
+                ))
+                equipped = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+                self.assertIsInstance(equipped, self.b.MobEquipmentPacket)
+                await self.expect_batch_start(TARGET)
+                dropped_item = STRING_ITEM if equipped.item.id == IRON_SWORD else WEB_ITEM
+                await self.finish_batch_break(TARGET, runtime_id=index, total=1, item_id=dropped_item)
+                result = await task
+                attempt, = result.results
+                self.assertEqual((equipped.item.id, attempt.status, result.collected_count),
+                                 (tool_id, "collected", 1))
+                self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_counted_cobweb_for_string_does_not_mine_with_only_shears(self):
+        bot = await self.web_bot(sword=False)
+        result = await bot.collect_by_count(
+            "web", item_id=STRING_ITEM, count=1, radius=2, ticks=0, search_radius=0, timeout=0.2,
+        )
+        attempt, = result.results
+        self.assertEqual((attempt.status, result.collected_count), ("tool_unavailable", 0))
+        self.assertEqual(bot.observed_block(TARGET).runtime_id, WEB)
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_counted_cobweb_for_string_rechecks_tool_at_mining_start(self):
+        await self.check_counted_cobweb_tool_change_at_mining_start(self.b.PlayerHotbarPacket(
+            selected_slot=5, container_id=self.b.ContainerID.INVENTORY, should_select_slot=True,
+        ))
+
+    async def test_counted_cobweb_for_string_rechecks_same_slot_equipment_at_mining_start(self):
+        shears = stack_descriptor(self.b, SHEARS, 1, 13)
+        shears.user_data_buffer = enchantment_data(self.b, 2)
+        await self.check_counted_cobweb_tool_change_at_mining_start(self.b.MobEquipmentPacket(
+            runtime_id=PLAYER, item=shears,
+            slot=1, selected_slot=1, container_id=self.b.ContainerID.INVENTORY,
+        ))
+
+    async def check_counted_cobweb_tool_change_at_mining_start(self, correction):
+        bot = await self.web_bot(sword=True)
+        mining_lock = bot._blocks._mining_lock
+        movement_lock = bot._movement._action_lock
+        async with mining_lock:
+            task = asyncio.create_task(bot.collect_by_count(
+                "web", item_id=STRING_ITEM, count=1, radius=2, ticks=0, search_radius=0, timeout=1,
+            ))
+            equipped = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+            self.assertIsInstance(equipped, self.b.MobEquipmentPacket)
+            self.assertEqual(equipped.item.id, IRON_SWORD)
+            await movement_lock.acquire()
+        try:
+            async with asyncio.timeout(0.5):
+                while not mining_lock.locked():
+                    await asyncio.sleep(0)
+            self.assertEqual(bot.held_item.slot, 1)
+            await self.emit(correction)
+            self.assertEqual((bot.held_item.slot, bot.held_item.selection_source),
+                             (correction.selected_slot, "server"))
+            self.assertEqual(bot.inventory_slots[1].id, IRON_SWORD)
+            self.assertTrue(self.wire.outgoing.empty())
+        finally:
+            movement_lock.release()
+        result = await task
+        attempt, = result.results
+        self.assertEqual((attempt.status, result.collected_count), ("tool_unavailable", 0))
+        self.assertIsNone(bot.mining_target)
+        self.assertEqual(bot.observed_block(TARGET).runtime_id, WEB)
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_counted_cobweb_vein_refills_for_string_despite_carried_shears(self):
+        bot = await self.web_bot(sword=False)
+        chest = HarvestToolChest(REFILL_CHEST, range(4, 5), range(3, 4))
+        task = asyncio.create_task(bot.collect_vein_by_count(
+            TARGET, item_id=STRING_ITEM, count=1, ticks=0, search_radius=0, timeout=1, tool_chest=chest,
+        ))
+        await self.emit(await self.refill_request(item_id=IRON_SWORD))
+        equipped = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+        self.assertIsInstance(equipped, self.b.MobEquipmentPacket)
+        self.assertEqual((equipped.item.id, equipped.item.net_id_variant), (IRON_SWORD, 20))
+        await self.refill_close()
+        await self.expect_batch_start(TARGET)
+        await self.finish_batch_break(TARGET, runtime_id=101, total=1, item_id=STRING_ITEM)
+        result = await task
+        attempt, = result.results
+        self.assertEqual((attempt.status, result.collected_count), ("collected", 1))
+        self.assertEqual(attempt.tool_acquisition.transfer.confirmed_count, 1)
+        self.assertTrue(self.wire.outgoing.empty())
 
     async def count_log_after_losing_a_slot_update(self, *, before_start=False, refresh=None):
         bot = await self.log_bot(TARGET)

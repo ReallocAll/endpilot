@@ -149,6 +149,8 @@ class Inventory:
         self._damage_descriptors = {}
         self._next_request_id = -1
         self._selected_slot = 0
+        # Item ID and count from the last accepted equipment announcement for this slot.
+        self._selected_equipment: tuple[int, int] | None = None
         self._selection_source: Literal["default", "local", "server"] = "default"
         self._selection_revision = 0
         self._selection_order = count(1)
@@ -306,7 +308,8 @@ class Inventory:
                 if 0 <= selected < 9:
                     item = packet.item if int(packet.slot) == selected else None
                     self._record_damage_descriptor((None, selected), item, received=True)
-                self._observe_selection(selected)
+                    equipment = None if item is None else (int(item.id), int(item.stack_size))
+                    self._observe_selection(selected, equipment=equipment)
         elif raw.packet_id == b.PlayerHotbarPacket.ID:
             packet = self.packets.protocol.decode(raw)
             if packet.should_select_slot and int(packet.container_id) == int(b.ContainerID.INVENTORY):
@@ -661,10 +664,14 @@ class Inventory:
         """Advance whenever the local selection changes, including a round trip."""
         return self._selection_revision
 
-    def _apply_selection(self, slot: int, order: int, source: Literal["local", "server"]) -> None:
+    def _apply_selection(
+        self, slot: int, order: int, source: Literal["local", "server"], *, equipment: tuple[int, int] | None = None,
+    ) -> None:
         if order <= self._applied_selection_order:
             return
         self._applied_selection_order = order
+        if equipment is not None or slot != self._selected_slot:
+            self._selected_equipment = equipment
         if slot != self._selected_slot:
             self._selected_slot = slot
             self._selection_revision += 1
@@ -673,16 +680,16 @@ class Inventory:
             self._selection_source = source
         self._notify_held_item()
 
-    def _observe_selection(self, slot: int) -> None:
+    def _observe_selection(self, slot: int, *, equipment: tuple[int, int] | None = None) -> None:
         if 0 <= slot < 9:
-            self._apply_selection(slot, next(self._selection_order), "server")
+            self._apply_selection(slot, next(self._selection_order), "server", equipment=equipment)
 
-    async def _send_selection(self, packet, slot: int) -> None:
+    async def _send_selection(self, packet, slot: int, *, equipment: tuple[int, int] | None = None) -> None:
         # Reserve order before handing the packet to the transport. Only
         # successful sends and received corrections can advance the selection.
         order = next(self._selection_order)
         await self.packets.send(packet)
-        self._apply_selection(slot, order, "local")
+        self._apply_selection(slot, order, "local", equipment=equipment)
 
     def item_or_empty(self, slot: int):
         """Return the client's item for input, using the last known stack identity.
@@ -742,7 +749,7 @@ class Inventory:
             slot=slot,
             selected_slot=slot,
             container_id=b.ContainerID.INVENTORY,
-        ), slot)
+        ), slot, equipment=(int(item.id), int(item.stack_size)))
 
 
 

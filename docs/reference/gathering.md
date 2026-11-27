@@ -79,6 +79,13 @@ the same world generation. It stops at the requested count, when it runs out
 of candidates, or at any other failure. `ticks`, `search_radius`, and `timeout`
 apply to each attempt as in `collect_block`.
 
+For `minecraft:web` targets, both counted methods use the requested item to
+choose the tool. Request `minecraft:string` to use a wooden, stone, golden,
+copper, iron, diamond, or netherite sword. Request `minecraft:web` to use
+shears. The same requirement applies to authorized refill chests. The bot
+checks the equipped tool again before starting to mine. A confirmed shortage
+ends the attempt with `tool_unavailable` before mining.
+
 Read `CountedBlockCollection.collected_count` for the confirmed increase of
 `item_id` in the main inventory. A single pickup can exceed the remaining
 count. `results` contains the evidence for each attempted or skipped block.

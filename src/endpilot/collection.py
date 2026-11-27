@@ -399,6 +399,7 @@ class _BlockCollector:
         refill = None if not chests else partial(
             self._refill_tool, bot, dimension=progress.dimension_id, epoch=epoch,
             ticks=ticks, search_radius=search_radius, timeout=timeout, ordered=ordered_refill,
+            requested_drop_id=counted.item_id if counted is not None else None,
         )
         store = None if storage is None else partial(
             self._store_for_drop, bot, storage, storage_item_id,
@@ -536,9 +537,9 @@ class _BlockCollector:
 
     async def _refill_tool(
         self, bot: "Bot", chest: HarvestToolChest, target: BlockObservation, *, dimension: int, epoch: int,
-        ticks: int, search_radius: int, timeout: float, ordered: bool,
+        ticks: int, search_radius: int, timeout: float, ordered: bool, requested_drop_id: int | None = None,
     ) -> HarvestToolAcquisition | None:
-        chest_block = self.harvest._refill_chest(target, chest.position)
+        chest_block = self.harvest._refill_chest(target, chest.position, requested_drop_id=requested_drop_id)
         if chest_block is None:
             return None
         if (busy := self.harvest._window_busy()) is not None:
@@ -557,7 +558,9 @@ class _BlockCollector:
             return HarvestToolAcquisition(busy)
         if route.status != "reached":
             if (ordered and route.status == "unreachable"
-                    and self.harvest._refill_chest(target, chest.position) != chest_block):
+                    and self.harvest._refill_chest(
+                        target, chest.position, requested_drop_id=requested_drop_id,
+                    ) != chest_block):
                 return None
             status = {"unknown": "unobserved", "budget": "budget_exhausted"}.get(route.status, route.status)
             return HarvestToolAcquisition(f"chest_approach_{status}")
@@ -591,6 +594,7 @@ class _BlockCollector:
                 inventory_slots=chest.inventory_slots, face=match.face, click_pos=match.click_pos, timeout=timeout,
                 expected_target=target, expected_chest=chest_block, expected_epoch=epoch,
                 on_owned_window=track_owned_window if ordered else None,
+                requested_drop_id=requested_drop_id,
             )
         finally:
             if unsubscribe is not None:
@@ -694,6 +698,7 @@ class _BlockCollector:
         if progress is not None and self.blocks.observed_block(position) != before:
             return BlockCollection(position, "target_changed", before)
         counted = progress if isinstance(progress, _CountedProgress) else None
+        requested_drop_id = counted.item_id if counted is not None else None
         epoch = self.blocks._mining_epoch if epoch is None else epoch
         evidence = BlockCollection(position, "interrupted", before)
 
@@ -734,7 +739,9 @@ class _BlockCollector:
             if status is not None or approach.status != "reached":
                 return replace(evidence, status=status or approach.status)
             try:
-                tool = await self.harvest.equip(position, timeout=timeout)
+                tool = await self.harvest.equip(
+                    position, timeout=timeout, requested_drop_id=requested_drop_id,
+                )
             except TimeoutError:
                 self._check_connection()
                 return replace(evidence, status="tool_timeout", timed_out=True)
@@ -779,6 +786,8 @@ class _BlockCollector:
             self.blocks._check_mining_epoch(epoch)
             if self.blocks.observed_block(position) != before:
                 raise _BeforeStartRejected("target_changed")
+            if requested_drop_id is not None and not self.harvest._has_equipped_drop_tool(before, tool, requested_drop_id):
+                raise _BeforeStartRejected("tool_unavailable")
             try:
                 self.blocks._aim_mining_face(position, match.face, match.click_pos)
             except MiningFaceUnavailable as error:

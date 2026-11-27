@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from math import dist, isfinite
 from typing import TYPE_CHECKING
 
-from .block_data import MiningRule
+from .block_data import MiningRule, VanillaBlockState
 from .blocks import BlockObservation, Blocks, _ORDINARY_MINING_REACH
 from .containers import Containers, ContainerWindow, _same_slot
 from .inventory import (
@@ -22,6 +22,15 @@ from .range_transfer import (
 
 if TYPE_CHECKING:
     from .bot import Bot
+
+
+_WEB_DROP_TOOLS = {
+    "minecraft:string": frozenset({
+        "minecraft:wooden_sword", "minecraft:stone_sword", "minecraft:golden_sword", "minecraft:copper_sword",
+        "minecraft:iron_sword", "minecraft:diamond_sword", "minecraft:netherite_sword",
+    }),
+    "minecraft:web": frozenset({"minecraft:shears"}),
+}
 
 
 def _efficiency_bonus(user_data: bytes, efficiency_id: int) -> int:
@@ -128,13 +137,46 @@ class HarvestTools:
     def best(self, position: tuple[int, int, int]) -> HarvestTool | None:
         return self._best(position, self._inventory.slots)
 
-    def _best(self, position: tuple[int, int, int], slots: dict[int, object]) -> HarvestTool | None:
-        rule = self._mining_rule(self._blocks.observed_block(position))
+    def _best(
+        self, position: tuple[int, int, int], slots: dict[int, object], *, requested_drop_id: int | None = None,
+    ) -> HarvestTool | None:
+        rule = self._mining_rule(self._blocks.observed_block(position), requested_drop_id=requested_drop_id)
         return None if rule is None else self._best_in_inventory(rule, slots)
 
-    def _mining_rule(self, block: BlockObservation | None) -> MiningRule | None:
+    def _mining_rule(
+        self, block: BlockObservation | None, *, requested_drop_id: int | None = None,
+    ) -> MiningRule | None:
         state = None if block is None else self._blocks._vanilla_state(block.runtime_id)
-        return None if state is None else state.mining_rule
+        rule = None if state is None else state.mining_rule
+        required = self._requested_drop_tools(state, requested_drop_id)
+        return rule if required is None else replace(rule, required=required)
+
+    def _requested_drop_tools(
+        self, state: VanillaBlockState | None, requested_drop_id: int | None,
+    ) -> frozenset[str] | None:
+        if state is None or state.mining_rule is None or state.name != "minecraft:web" or requested_drop_id is None:
+            return None
+        required = _WEB_DROP_TOOLS.get(self._item_names.get(requested_drop_id))
+        eligible = state.mining_rule.required
+        return required if required is None or eligible is None else eligible & required
+
+    def _has_equipped_drop_tool(self, block: BlockObservation, tool: HarvestTool, requested_drop_id: int) -> bool:
+        required = self._requested_drop_tools(self._blocks._vanilla_state(block.runtime_id), requested_drop_id)
+        if required is None:
+            return True
+        slot = self._inventory.selected_slot
+        if slot != tool.slot:
+            return False
+        held = self._inventory.item_or_empty(slot)
+        held_name = self._item_names.get(int(held.id))
+        if held.id == 0 or held.stack_size <= 0 or held_name != tool.item_name or held_name not in required:
+            return False
+        equipment = self._inventory._selected_equipment
+        # BDS can correct the held item without updating that slot's inventory stack.
+        if equipment is None:
+            return True
+        item_id, count = equipment
+        return item_id == int(held.id) and count > 0
 
     def _best_in_inventory(self, rule: MiningRule, slots: dict[int, object]) -> HarvestTool | None:
         return self._best_in_slots(
@@ -195,8 +237,10 @@ class HarvestTools:
         state = None if block is None else self._blocks._vanilla_state(block.runtime_id)
         return block if state is not None and state.name == "minecraft:chest" else None
 
-    def _refill_chest(self, target: BlockObservation, position: tuple[int, int, int]) -> BlockObservation | None:
-        rule = self._mining_rule(target)
+    def _refill_chest(
+        self, target: BlockObservation, position: tuple[int, int, int], *, requested_drop_id: int | None = None,
+    ) -> BlockObservation | None:
+        rule = self._mining_rule(target, requested_drop_id=requested_drop_id)
         slots = self._inventory.slots
         if (rule is not None and rule.required is not None and self._best_in_inventory(rule, slots) is None
                 and self._inventory_is_observed(slots, submitting=None)):
@@ -215,11 +259,12 @@ class HarvestTools:
         expected_chest: BlockObservation | None = None, expected_epoch: int | None = None,
         click_pos: tuple[float, float, float] | None = None,
         on_owned_window: Callable[[ContainerWindow], None] | None = None,
+        requested_drop_id: int | None = None,
     ) -> HarvestToolAcquisition:
         blocks, inventory, containers = self._blocks, self._inventory, self._containers
         target = blocks.observed_block(position) if expected_target is None else expected_target
         epoch = blocks._mining_epoch if expected_epoch is None else expected_epoch
-        rule = self._mining_rule(target)
+        rule = self._mining_rule(target, requested_drop_id=requested_drop_id)
         window: ContainerWindow | None = None
         owned_window: ContainerWindow | None = None
         transfer: RangeTransferResult | None = None
@@ -422,13 +467,17 @@ class HarvestTools:
             raise
         return HarvestToolAcquisition(status, window, transfer, tool)
 
-    async def equip(self, position: tuple[int, int, int], *, timeout: float) -> HarvestTool | None:
+    async def equip(
+        self, position: tuple[int, int, int], *, timeout: float, requested_drop_id: int | None = None,
+    ) -> HarvestTool | None:
         async with self._equip_lock:
-            return await self._equip(position, timeout=timeout)
+            return await self._equip(position, timeout=timeout, requested_drop_id=requested_drop_id)
 
-    async def _equip(self, position: tuple[int, int, int], *, timeout: float) -> HarvestTool | None:
+    async def _equip(
+        self, position: tuple[int, int, int], *, timeout: float, requested_drop_id: int | None = None,
+    ) -> HarvestTool | None:
         slots = self._inventory.slots
-        tool = self._best(position, slots)
+        tool = self._best(position, slots, requested_drop_id=requested_drop_id)
         if tool is None:
             return None
         return await self._equip_tool(tool, slots, timeout=timeout)
