@@ -4,7 +4,7 @@ import asyncio
 import math
 from collections import deque
 from collections.abc import Callable
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from time import perf_counter_ns
@@ -283,6 +283,7 @@ class Movement:
         self._stop_requested = False
         self._active_done: asyncio.Event | None = None
         self._navigation_pose: asyncio.Task | None = None
+        self._navigation_wake: asyncio.Event | None = None
         self._follow_target_id: int | None = None
         self._ticker: asyncio.Task | None = None
         self._closing = False
@@ -1738,6 +1739,8 @@ class Movement:
             self._stop_requested = True
             if self._navigation_pose is not None:
                 self._navigation_pose.cancel()
+            if self._navigation_wake is not None:
+                self._navigation_wake.set()
             await done.wait()
         elif self._manual_vector is not None:
             async with self._action_lock:
@@ -2329,20 +2332,26 @@ class Movement:
             bind(goal)
         return instances
 
+    def _navigation_entity_feet(self, entity_id: int, instances: dict[int, object] | None) -> Point | None:
+        target = None if self._entities is None else self._entities._navigation_target(entity_id)
+        if target is None:
+            return None
+        instance, feet = target
+        if instances is not None and instances.setdefault(entity_id, instance) is not instance:
+            return None
+        return feet
+
     def _navigation_goal(
         self, blocks, goal: NavigationGoal, instances: dict[int, object] | None = None, *,
         visibility_budget: _VisibilityScanBudget | None = None,
     ):
-        def entity_feet(entity_id):
-            target = None if self._entities is None else self._entities._navigation_target(entity_id)
-            if target is None:
-                return None
-            instance, feet = target
-            if instances is not None and instances.setdefault(entity_id, instance) is not instance:
-                return None
-            return feet
+        return _resolve_goal(goal, blocks, lambda entity_id: self._navigation_entity_feet(entity_id, instances),
+                             visibility_budget)
 
-        return _resolve_goal(goal, blocks, entity_feet, visibility_budget)
+    def _require_follow_reader(self, failure: Exception | None = None) -> None:
+        ended, cause = self.packets._reader_end_result()
+        if ended and (failure is None or failure is cause):
+            raise ConnectionError("packet stream closed during movement") from cause
 
     def _standard_motion(self, blocks, *, owns_sprint: bool = False, owns_sneak: bool = False) -> bool:
         # Stock reports a 0.13 movement attribute while this action sprints.
@@ -2383,18 +2392,23 @@ class Movement:
                           start_visibility_standing=self._navigation_visibility_standing)
 
     async def navigate(self, blocks, goal: NavigationGoal, rules: NavigationRules, *,
-                       ticks: int, timeout: float,
+                       ticks: int, timeout: float, follow: bool = False,
                        on_plan: Callable[[NavigationPlan], None] | None = None,
                        on_event: Callable[[NavigationEvent], None] | None = None) -> NavigationResult:
         _require_goal(goal)
         if not isinstance(rules, NavigationRules):
             raise TypeError("expected NavigationRules")
+        if not isinstance(follow, bool):
+            raise TypeError("follow must be a bool")
+        if follow and not isinstance(goal, EntityNearGoal):
+            raise TypeError("follow=True requires an EntityNearGoal")
         if not isinstance(ticks, int) or ticks < 0 or not 0 <= timeout < math.inf:
             raise ValueError("ticks must be a nonnegative integer and timeout finite and nonnegative")
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         if on_event is None:
-            return await self._navigate_goal(blocks, goal, rules, ticks, deadline=deadline, on_plan=on_plan)
+            return await self._navigate_goal(blocks, goal, rules, ticks, deadline=deadline, follow=follow,
+                                             on_plan=on_plan)
 
         def emit(event: NavigationEvent) -> None:
             try:
@@ -2407,7 +2421,7 @@ class Movement:
         emit(NavigationEvent("started", goal))
         try:
             result = await self._navigate_goal(
-                blocks, goal, rules, ticks, deadline=deadline, on_plan=on_plan, emit_event=emit,
+                blocks, goal, rules, ticks, deadline=deadline, follow=follow, on_plan=on_plan, emit_event=emit,
             )
         except asyncio.CancelledError:
             emit(NavigationEvent("finished", goal, reason="cancelled"))
@@ -2430,6 +2444,7 @@ class Movement:
         return BlockApproach(status, result.frames, result.stand_position, face)
 
     async def _navigate_goal(self, blocks, goal, rules, ticks, *, deadline=None, legacy=False, preferred_goal=None,
+                             follow: bool = False,
                              on_plan: Callable[[NavigationPlan], None] | None = None,
                              emit_event: Callable[[NavigationEvent], None] | None = None,
                              near_anchor: Callable[[], Point | None] | None = None,
@@ -2451,11 +2466,15 @@ class Movement:
         try:
             if self._closing:
                 raise ConnectionError("movement is closed")
+            if follow:
+                self._require_follow_reader()
             self._require_ground_input()
             if self._changing_dimension:
                 return NavigationResult("unknown", 0)
             if deadline is not None and loop.time() >= deadline:
                 return NavigationResult("budget", 0)
+            if follow and goal.entity_id not in instances:
+                return NavigationResult("unknown", 0)
             dimension, epoch = blocks.dimension_id, self._dimension_epoch
             self._stop_requested = False
             done = self._active_done = asyncio.Event()
@@ -2470,7 +2489,9 @@ class Movement:
                         if pose.cancelled() and self._stop_requested:
                             return NavigationResult("stopped", 0)
                         pose.result()
-                    except TimeoutError:
+                    except TimeoutError as error:
+                        if follow:
+                            self._require_follow_reader(error)
                         if legacy:
                             raise
                         return NavigationResult("budget", 0)
@@ -2488,21 +2509,36 @@ class Movement:
                 if not self._navigation_start_is_standing(blocks, start):
                     return NavigationResult("unreachable", 0)
                 self._pending_landing = None
-                return await self._navigate_from(
-                    blocks, goal, rules, ticks, start, dimension, epoch, deadline, legacy,
-                    instances=instances, preferred_goal=preferred_goal, on_plan=on_plan, emit_event=emit_event,
-                    near_anchor=near_anchor, near_clearance=near_clearance,
-                )
+                with ExitStack() as subscriptions:
+                    wake = None
+                    if follow:
+                        wake = self._navigation_wake = asyncio.Event()
+
+                        def wake_navigation(_):
+                            wake.set()
+
+                        subscriptions.callback(self.packets.subscribe_raw(wake_navigation))
+                        subscriptions.callback(self.packets.subscribe_reader_end(wake_navigation))
+                    return await self._navigate_from(
+                        blocks, goal, rules, ticks, start, dimension, epoch, deadline, legacy,
+                        instances=instances, preferred_goal=preferred_goal, on_plan=on_plan, emit_event=emit_event,
+                        near_anchor=near_anchor, near_clearance=near_clearance, follow_wake=wake,
+                    )
             finally:
+                self._navigation_wake = None
                 self._active_done = None
                 done.set()
+        except Exception as error:
+            if follow and not isinstance(error, ConnectionError):
+                self._require_follow_reader(error)
+            raise
         finally:
             self._action_lock.release()
 
     async def _navigate_from(self, blocks, goal, rules, ticks, start, dimension, epoch, deadline, legacy, *,
                              instances, preferred_goal=None, on_plan: Callable[[NavigationPlan], None] | None = None,
                              emit_event: Callable[[NavigationEvent], None] | None = None,
-                             near_anchor=None, near_clearance=None):
+                             near_anchor=None, near_clearance=None, follow_wake: asyncio.Event | None = None):
         calibrated = not legacy and self._standard_ground_motion(blocks)
         graph = _StandingGraph(blocks, start, rules, allow_vertical=not (self._sprint_key or self._sneaking),
                                allow_gap=calibrated, allow_drop_two=calibrated, allow_ladder=calibrated,
@@ -2522,6 +2558,7 @@ class Movement:
         use_ground_velocity = not legacy and self._observed_ground is not False
         used_ascents = set()
         aimed_cell = None
+        parked = False
         route = None
         original_goal = goal
         active_plan = None
@@ -2544,10 +2581,11 @@ class Movement:
         def at_center(cell, x, z):
             return math.hypot(cell[0] + 0.5 - x, cell[2] + 0.5 - z) <= 0.12
 
+        def horizontal_speed():
+            return max(abs(self._velocity[0]), abs(self._velocity[2]))
+
         def reached_cell(cell, x, z):
-            return (at_center(cell, x, z) and
-                    (not use_ground_velocity
-                     or max(abs(self._velocity[0]), abs(self._velocity[2])) < _REST_SPEED))
+            return at_center(cell, x, z) and (not use_ground_velocity or horizontal_speed() < _REST_SPEED)
 
         def stance_failure(clear: bool | None, target: bool | None = True):
             if target is False or clear is False:
@@ -2565,19 +2603,50 @@ class Movement:
         visibility_budget = _VisibilityScanBudget(rules.max_expansions, expired)
         visibility_standing = self._navigation_visibility_standing
 
-        def interrupted():
+        def interrupted(*, check_deadline=True):
             if self._server_disconnected:
                 raise ConnectionError("server disconnected during movement")
+            if follow_wake is not None:
+                self._require_follow_reader()
+                if self._closing:
+                    return outcome("stopped")
             if not dimension_is_current():
                 return abandon("unknown", "dimension_changed")
             if self._stop_requested:
                 return outcome("stopped")
             if near_anchor is not None and near_anchor() is None:
                 return abandon("unknown", "goal_unmatched")
+            if follow_wake is not None and self._navigation_entity_feet(goal.entity_id, instances) is None:
+                return abandon("unknown", "goal_unmatched")
             self._require_ground_input()
-            if expired():
+            if check_deadline and expired():
                 return outcome("budget")
             return None
+
+        def parked_status():
+            result = interrupted(check_deadline=False)
+            if result is not None:
+                return result
+            position = self._input_position
+            if position is None or not self._ray_pose_current or not all(map(math.isfinite, position)):
+                return abandon("unknown", "position_changed")
+            cell = self._foot_cell(position)
+            if (not graph.in_bounds(cell) or not self._at_standing_height(cell[1])
+                    or not at_center(cell, position[0], position[2])
+                    or horizontal_speed() >= _REST_SPEED
+                    or self._teleport_pending is not None):
+                reason = "position_changed"
+            elif (stance := blocks._flat_stance(cell, allow_vegetation=True)) is None:
+                return abandon("unknown", "stance_unavailable")
+            elif not stance:
+                reason = "stance_unavailable"
+            elif self._navigation_goal(blocks, goal, instances).check(cell)[0] is not True:
+                reason = "goal_unmatched"
+            else:
+                reason = None
+            if expired():
+                return outcome("reached", cell) if reason is None else outcome("budget")
+            return reason
 
         def check_near_anchor():
             if near_anchor() is None:
@@ -2607,6 +2676,16 @@ class Movement:
                 if frame == 0:
                     await asyncio.sleep(0.05)
             return True
+
+        async def release_at_arrival(cell):
+            nonlocal release_input, aimed_cell, route
+            moving = horizontal_speed() >= _REST_SPEED
+            if release_input or moving or self._teleport_pending is not None or legacy:
+                release_input |= moving or legacy
+                await release()
+                release_input = False
+            aimed_cell = cell
+            route = None
 
         @asynccontextmanager
         async def release_on_exit(*, sneak_changed=False, budgeted=False, guard=None):
@@ -3705,6 +3784,20 @@ class Movement:
             try:
                 async with timeout, release_on_exit():
                     while True:
+                        resuming = parked
+                        if parked:
+                            # Recheck the latest state before sleeping, including updates during input release.
+                            follow_wake.clear()
+                            status = parked_status()
+                            if status is None:
+                                await follow_wake.wait()
+                                continue
+                            if isinstance(status, NavigationResult):
+                                return status
+                            parked = False
+                            aimed_cell = None
+                            invalidate(status)
+
                         result = interrupted()
                         if result is not None:
                             return result
@@ -3714,7 +3807,7 @@ class Movement:
                         # Position-only updates cannot turn an airborne correction into a stance.
                         if not self._at_standing_height(current_y) or not graph.in_bounds(current):
                             return abandon("unreachable", "position_changed")
-                        if self._teleport_pending is not None:
+                        if self._teleport_pending is not None or resuming:
                             accepted_level = current_y
                             use_ground_velocity |= current_y > start[1]
                         elif current_y != accepted_level:
@@ -3737,6 +3830,9 @@ class Movement:
                             matches, faces = current_goal.check(current, eye=(x, y, z),
                                                                 visibility_standing=visibility_standing)
                             if matches is True:
+                                if follow_wake is not None:
+                                    parked = True
+                                    continue
                                 point = _aim_point(faces)
                                 if point is not None:
                                     await self.look_at(point)
@@ -3746,6 +3842,15 @@ class Movement:
                         elif route is None and active_plan is not None:
                             # The pose changed after the tentative arrival and input release.
                             invalidate("position_changed")
+
+                        if (follow_wake is not None and route is not None
+                                and self._ground_correction_tick == self._tick - 1
+                                and self._input_position is self.position and self._teleport_pending is None
+                                and at_center(current, x, z) and horizontal_speed() < _REST_SPEED
+                                and current_goal.check(current)[0] is True):
+                            # The latest sent frame was corrected to an in-range stance on this leg.
+                            await release_at_arrival(current)
+                            continue
 
                         if route is not None:
                             next_cell = route[0]
@@ -3823,17 +3928,11 @@ class Movement:
                                 point = _aim_point(faces)
                                 if point is not None:
                                     await self.look_at(point)
-                                moving = max(abs(self._velocity[0]), abs(self._velocity[2])) >= _REST_SPEED
-                                if release_input or moving or self._teleport_pending is not None or legacy:
-                                    if legacy and aimed_cell is not None:
-                                        if remaining <= 0:
-                                            return outcome("budget")
-                                        remaining -= 1
-                                    release_input |= moving or legacy
-                                    await release()
-                                    release_input = False
-                                aimed_cell = anchor
-                                route = None
+                                if legacy and aimed_cell is not None:
+                                    if remaining <= 0:
+                                        return outcome("budget")
+                                    remaining -= 1
+                                await release_at_arrival(anchor)
                                 continue
                             if graph.edge(anchor, route[0]) is not True:
                                 invalidate("edge_unavailable")
@@ -3907,6 +4006,8 @@ class Movement:
                     raise
                 if pending_error is not None:
                     raise pending_error from error
+                if follow_wake is not None:
+                    return parked_status() if parked else interrupted()
                 return outcome("budget")
 
     async def send_item_use(self, transaction) -> int:
@@ -3953,6 +4054,8 @@ class Movement:
         self._clock.stop()
         self._clear_swimming()
         self._stop_requested = True
+        if self._navigation_wake is not None:
+            self._navigation_wake.set()
         self._clear_manual_input()
         self._finish_jump()
         self._pending_landing = None

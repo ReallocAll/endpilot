@@ -1109,7 +1109,7 @@ class Bot:
         return self._movement.plan_navigation(self._blocks, goal, rules)
 
     async def navigate(self, goal: NavigationGoal, *, rules: NavigationRules = NavigationRules(),
-                       ticks: int = 160, timeout: float = 15,
+                       ticks: int = 160, timeout: float = 15, follow: bool = False,
                        on_plan: Callable[[NavigationPlan], None] | None = None,
                        on_event: Callable[[NavigationEvent], None] | None = None) -> NavigationResult:
         """Plan from the actual start, then move while rechecking terrain and the goal.
@@ -1117,6 +1117,12 @@ class Bot:
         The starting search bounds, expansion limit, frame budget and timeout
         apply throughout the action. Reached means the latest stance satisfies
         the goal. A later interaction has its own server response.
+
+        With a top-level EntityNearGoal, follow=True keeps the action active after arrival.
+        It holds the movement lock and sends no inputs while the route remains
+        settled in range. It can replan for the same observed actor within the
+        original limits. At the deadline, reached requires a confirmed arrival
+        and a current stance that still matches the goal.
 
         If supplied, on_plan runs synchronously each time this call adopts a
         route, before sending movement for it. Callback exceptions propagate
@@ -1130,7 +1136,7 @@ class Bot:
         if self._movement is None or self._blocks is None:
             raise RuntimeError("player has not joined")
         return await self._movement.navigate(
-            self._blocks, goal, rules, ticks=ticks, timeout=timeout, on_plan=on_plan, on_event=on_event,
+            self._blocks, goal, rules, ticks=ticks, timeout=timeout, follow=follow, on_plan=on_plan, on_event=on_event,
         )
 
     async def approach_block(self, position: tuple[int, int, int], *,

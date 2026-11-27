@@ -52,16 +52,20 @@ class BlocksSnapshot:
 class Sink:
     _subscribe = staticmethod(PacketConnection._subscribe)
     _notify = staticmethod(PacketConnection._notify)
+    subscribe_raw = PacketConnection.subscribe_raw
+    subscribe_reader_end = PacketConnection.subscribe_reader_end
+    _reader_end_result = PacketConnection._reader_end_result
 
     def __init__(self, protocol=2193):
         self.protocol = Protocol(protocol)
         self.sent = []
-        self.observer = None
         self.on_send = None
+        self._subscribers = []
+        self._reader_task = None
+        self._reader_end_subscribers = []
 
-    def subscribe_raw(self, callback):
-        self.observer = callback
-        return lambda: None
+    def observe(self, raw):
+        self._notify(self._subscribers, raw)
 
     def start_receiving(self):
         pass
@@ -281,7 +285,7 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
             BlocksSnapshot(), (7, 100, 0), ticks=180
         ))
         await asyncio.wait_for(moving.wait(), 2)
-        stream.observer(RawPacket(stream.protocol.binding.DisconnectPacket.ID, b""))
+        stream.observe(RawPacket(stream.protocol.binding.DisconnectPacket.ID, b""))
         with self.assertRaisesRegex(ConnectionError, "server disconnected"):
             await asyncio.wait_for(task, 2)
         self.assertIsNone(movement._active_done)
@@ -3594,7 +3598,9 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         return unique_id, runtime_id, roster
 
     def observe_entity(self, packet):
-        self.bot._entities._on_packet(self.stream.protocol.encode(packet))
+        raw = self.stream.protocol.encode(packet)
+        self.bot._entities._on_packet(raw)
+        self.stream.observe(raw)
 
     def move_peer(self, runtime_id, *, x, z):
         b = self.binding
@@ -4083,6 +4089,185 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(result.expanded, initial.expanded)
         self.assertTrue(all(not (1 <= p.pos.x < 2 and 0 <= p.pos.z < 1) for p in self.moving_input()))
         self.assert_released()
+
+    def record_follow_arrivals(self, *positions):
+        destinations = iter(positions)
+        destination = next(destinations)
+        arrivals = asyncio.Queue()
+
+        def observe_release():
+            nonlocal destination
+            if destination is None or len(self.stream.sent) < 2:
+                return
+            if all(not list(frame.input_data) and
+                   math.hypot(frame.pos.x - destination[0], frame.pos.z - destination[1]) <= 0.25
+                   for frame in self.stream.sent[-2:]):
+                arrivals.put_nowait(len(self.stream.sent))
+                destination = next(destinations, None)
+
+        self.stream.on_send = observe_release
+        return arrivals
+
+    async def test_navigation_follow_parks_in_range_and_resumes_around_the_wall(self):
+        wall = (2, 100, 0)
+        self.prepare_terrain(blocked={wall, (2, 101, 0)})
+        unique_id, runtime_id = self.spawn_navigation_actor(x=1.5)
+        goal = EntityNearGoal(unique_id, 0.25)
+        rules = NavigationRules(search_radius=4, vertical_radius=0)
+        arrivals = self.record_follow_arrivals((1.5, 0.5), (3.5, 0.5))
+        plans, events = [], []
+        loop = asyncio.get_running_loop()
+        time, sleep = loop.time, asyncio.sleep
+        offset = 0
+
+        async def yield_frame(delay):
+            await sleep(0 if delay == 0.05 else delay)
+
+        with (patch.object(loop, "time", lambda: time() + offset),
+              patch.object(loop, "slow_callback_duration", 20),
+              patch("endpilot.movement.asyncio.sleep", yield_frame)):
+            async with asyncio.TaskGroup() as tasks:
+                follow = tasks.create_task(self.bot.navigate(goal, follow=True, rules=rules, timeout=10,
+                                                              on_plan=plans.append, on_event=events.append))
+                first = await asyncio.wait_for(arrivals.get(), 2)
+                queued = tasks.create_task(self.bot.navigate(goal, ticks=0, timeout=60))
+                for z in (0.52, 0.48, 0.55):
+                    self.move_villager(runtime_id, z=z)
+                    offset += 1
+                    await asyncio.sleep(0)
+                self.assertFalse(follow.done())
+                self.assertFalse(queued.done())
+                self.assertEqual(len(self.stream.sent), first)
+                self.assertEqual([plan.endpoint for plan in plans], [(1, 100, 0)])
+
+                self.move_villager(runtime_id, x=3.5, z=0.5)
+                second = await asyncio.wait_for(arrivals.get(), 2)
+                self.assertFalse(follow.done())
+                self.assertFalse(queued.done())
+                offset = 11
+                result = await asyncio.wait_for(follow, 1)
+                one_shot = await asyncio.wait_for(queued, 1)
+
+        self.assertEqual((one_shot.status, one_shot.stand_position), ("reached", (3, 100, 0)))
+        self.assertEqual(len(self.stream.sent), second)
+        self.assertEqual([plan.endpoint for plan in plans], [(1, 100, 0), (3, 100, 0)])
+        self.assertNotIn(wall, plans[1].nodes)
+        crossing = [frame for frame in self.stream.sent[first:second] if 2 <= frame.pos.x < 3]
+        self.assertTrue(crossing)
+        self.assertTrue(all(not 0 <= frame.pos.z < 1 for frame in crossing))
+        self.assertEqual([frame.client_tick for frame in self.stream.sent], list(range(1, second + 1)))
+        self.assertEqual(result, NavigationResult("reached", len(self.moving_input()),
+                                                 sum(plan.expanded for plan in plans), (3, 100, 0)))
+        self.assertEqual([event.kind for event in events if event.kind in ("started", "finished")],
+                         ["started", "finished"])
+
+    async def test_navigation_follow_releases_when_a_correction_puts_it_in_range_on_the_old_route(self):
+        self.prepare_terrain()
+        self.set_position(0.5, 0.5, on_ground=True)
+        unique_id, runtime_id = self.spawn_navigation_actor(x=3.5)
+        goal = EntityNearGoal(unique_id, 2.1)
+        rules = NavigationRules(vertical_radius=0)
+        frames_ready = asyncio.Event()
+        plans = []
+        loop = asyncio.get_running_loop()
+        time = loop.time
+        offset = 0
+
+        def observe_send():
+            frame = self.stream.sent[-1]
+            if frame.client_tick == 1:
+                # Both native updates arrive before the next movement decision.
+                self.correct_position(0.5, 101.62, 0.5, on_ground=True, tick=frame.client_tick)
+                self.move_villager(runtime_id, x=2.5)
+            elif frame.client_tick == 3:
+                frames_ready.set()
+
+        self.stream.on_send = observe_send
+        with (patch.object(loop, "time", lambda: time() + offset),
+              patch.object(loop, "slow_callback_duration", 20)):
+            async with asyncio.TaskGroup() as tasks:
+                follow = tasks.create_task(self.bot.navigate(goal, follow=True, rules=rules, timeout=10,
+                                                              on_plan=plans.append))
+                await asyncio.wait_for(frames_ready.wait(), 2)
+                self.assertEqual([list(frame.input_data) for frame in self.stream.sent], [[self.up], [], []])
+                self.assertEqual([(frame.pos.x, frame.pos.z) for frame in self.stream.sent[1:]], [(0.5, 0.5)] * 2)
+                self.assertFalse(follow.done())
+                offset = 11
+                result = await asyncio.wait_for(follow, 1)
+
+        start = (0, 100, 0)
+        self.assertEqual(plans[0].nodes, (start, (1, 100, 0)))
+        if len(plans) > 1:
+            self.assertEqual([plan.nodes for plan in plans[1:]], [(start,)])
+        self.assertEqual(result, NavigationResult("reached", 1, sum(plan.expanded for plan in plans), start))
+        self.assertEqual([frame.client_tick for frame in self.stream.sent], [1, 2, 3])
+
+    async def test_navigation_follow_carries_frame_and_search_budgets_through_arrival(self):
+        self.prepare_terrain()
+        unique_id, runtime_id = self.spawn_navigation_actor(x=1.5)
+        goal = EntityNearGoal(unique_id, 0.25)
+        initial = self.bot.plan_navigation(goal, rules=NavigationRules(vertical_radius=0))
+        for resource in ("frames", "expansions"):
+            with self.subTest(resource=resource):
+                self.set_position(0.5, 0.5)
+                self.move_villager(runtime_id, x=1.5)
+                self.stream.sent.clear()
+                arrivals = self.record_follow_arrivals((1.5, 0.5))
+                limit = initial.expanded + 1 if resource == "expansions" else 16384
+                rules = NavigationRules(vertical_radius=0, max_expansions=limit)
+                ticks = 20 if resource == "frames" else 160
+                async with asyncio.TaskGroup() as tasks:
+                    follow = tasks.create_task(self.bot.navigate(goal, follow=True, rules=rules, ticks=ticks))
+                    first = await asyncio.wait_for(arrivals.get(), 2)
+                    approached = len(self.moving_input())
+                    self.assertGreater(approached, 0)
+                    self.assertEqual(first - approached, 2)
+                    self.assertFalse(follow.done())
+                    self.move_villager(runtime_id, x=3.5)
+                    result = await asyncio.wait_for(follow, 1)
+                self.assertEqual((result.status, result.stand_position), ("budget", None))
+                if resource == "frames":
+                    self.assertEqual(result.frames - approached, ticks - first)
+                else:
+                    self.assertEqual((result.frames, result.expanded, len(self.stream.sent)),
+                                     (approached, limit, first))
+                self.assertEqual(result.frames, len(self.moving_input()))
+
+    async def test_navigation_follow_finishes_from_park_on_stop_close_or_latest_target_state(self):
+        self.prepare_terrain()
+        loop = asyncio.get_running_loop()
+        time = loop.time
+        for trigger, status in (("stop", "stopped"), ("replacement", "unknown"), ("late move", "budget"),
+                                ("late replacement", "unknown"), ("close", "stopped")):
+            with self.subTest(trigger=trigger):
+                unique_id, runtime_id = self.spawn_navigation_actor(x=0.5)
+                goal = EntityNearGoal(unique_id, 0.25)
+                planned = asyncio.Event()
+                offset = 0
+                with (patch.object(loop, "time", lambda: time() + offset),
+                      patch.object(loop, "slow_callback_duration", 20)):
+                    async with asyncio.TaskGroup() as tasks:
+                        follow = tasks.create_task(self.bot.navigate(goal, follow=True, ticks=0, timeout=10,
+                                                                      on_plan=lambda _plan: planned.set()))
+                        await asyncio.wait_for(planned.wait(), 1)
+                        self.assertFalse(follow.done())
+                        self.assertEqual(self.stream.sent, [])
+                        if trigger.startswith("late"):
+                            offset = 11
+                        if trigger == "stop":
+                            await asyncio.wait_for(self.bot.stop_moving(), 1)
+                        elif trigger == "close":
+                            await asyncio.wait_for(self.bot.close(), 1)
+                        elif trigger == "late move":
+                            self.move_villager(runtime_id, x=1.5)
+                        else:
+                            self.observe_entity(self.binding.RemoveActorPacket(entity_id=unique_id))
+                            self.spawn_navigation_actor(entity_id=unique_id, runtime_id=runtime_id, x=0.5)
+                        result = await asyncio.wait_for(follow, 1)
+                self.assertEqual(result, NavigationResult(status, 0, 1))
+                self.assertEqual(self.stream.sent, [])
+                if trigger != "close":
+                    self.observe_entity(self.binding.RemoveActorPacket(entity_id=unique_id))
 
     async def test_open_trade_after_navigation_uses_the_last_committed_input_origin(self):
         self.prepare_terrain()

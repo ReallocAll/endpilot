@@ -250,6 +250,34 @@ The [chest approach example](../../examples/approach_chest.py) uses the
 `approach_block()` shortcut and opens the chest from the selected face. For
 window lifecycle and item transfers, see [Work with containers](containers.md).
 
+## Follow an entity around obstacles
+
+Pass `follow=True` with a top-level `EntityNearGoal` to keep a route active after
+arrival. The action follows the same observed entity instance for its entire
+lifetime.
+
+```python
+from endpilot import EntityNearGoal
+
+goal = EntityNearGoal(entity.entity_id, radius=1.5)
+result = await bot.navigate(goal, follow=True, ticks=200, timeout=25)
+print(result.status, result.stand_position, result.frames)
+```
+
+After the bot releases its movement input and confirms arrival, it keeps
+exclusive control of movement while it waits for observations. The hold
+sends no input frames and spends no search expansions. If the entity moves
+out of range, the bot replans from its latest stance within the original
+search bounds, using the remaining tick and expansion budgets. Release
+frames count toward the remaining tick budget when following resumes.
+`result.frames` counts moving frames across all legs.
+
+At the deadline, the result is `reached` if the latest settled stance still
+matches the same entity after a confirmed arrival. The result is `budget`
+if time expires while pursuing the target. Removal, replacement, unresolved
+target feet, or a dimension change can yield `unknown`. Use
+`await bot.stop_moving()` to end the action with `stopped`.
+
 ## Read the result
 
 `plan_navigation()` sends no packets. It returns an immutable snapshot of
