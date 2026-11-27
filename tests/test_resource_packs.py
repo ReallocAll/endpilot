@@ -1,8 +1,10 @@
 import asyncio
+from collections import Counter
 from dataclasses import replace
 import hashlib
 from io import BytesIO
 import json
+import re
 from struct import pack_into
 import unittest
 from unittest.mock import patch
@@ -306,6 +308,92 @@ class ResourcePackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.resolve_text(locale="fr_FR", resource_pack_index=index), "Racine: left et right")
         self.assertIsNone(event.resolve_text(locale="de_DE", resource_pack_index=index))
         self.assertIsNone(lower.resolve_text(locale="en_US", resource_pack_index=index))
+
+    async def test_display_matching_reuses_resolution_per_event_and_locale(self):
+        pending = asyncio.create_task(self.join(lambda offer: ResourcePackDecision.ACCEPT))
+        self.transport.deliver(self.info((_FIRST,)))
+        await self.outgoing()
+        await self.deliver_complete_archive(_FIRST, archive_bytes(_FIRST, b"fixture.message=[%s]  %s", files={
+            "texts/fr_FR.lang": "fixture.message=%s reçoit %s".encode(),
+        }))
+        await self.outgoing()
+        self.transport.deliver(self.stack(_FIRST))
+        await self.outgoing()
+        self.start_game()
+        await pending
+
+        display = r"^report\|(.*)\|end$"
+        pattern = (r"^<Player> begin$", display)
+        french = self.bot.add_display_pattern("report", pattern, locale="fr_FR", repeat=False)
+        english = self.bot.add_display_pattern("report", pattern, locale="en_US")
+        self.bot.add_display_pattern("report", pattern, locale="de_DE")
+        self.bot.add_display_pattern("report", pattern)
+        events, sent = [], []
+        self.bot.subscribe_text(events.append)
+        self.bot.packets.subscribe_sent(sent.append)
+        text = self.b.TextPacket
+
+        def report(key):
+            message = json.dumps({"rawtext": [
+                {"text": "report|"}, {"translate": key, "with": ["Alice", "snow"]}, {"text": "|end"},
+            ]})
+            return text(localize=False, body=text.MessageOnly(type=TextPacketType.TEXT_OBJECT_WHISPER, message=message))
+
+        async with asyncio.TaskGroup() as group:
+            by_name = group.create_task(self.bot.wait_for_display_match("report", timeout=1))
+            by_id = group.create_task(self.bot.wait_for_display_match(english, timeout=1))
+            content_en = group.create_task(self.bot.wait_for_message(re.compile(display), locale="en_US", timeout=1))
+            content_fr = group.create_task(self.bot.wait_for_message(re.compile(display), locale="fr_FR", timeout=1))
+            default = group.create_task(self.bot.wait_for_message(re.compile(display), "barrier", timeout=1))
+            literal = group.create_task(self.bot.wait_for_message(
+                re.compile(display), "barrier", include_text_objects=True, timeout=1,
+            ))
+            cancelled = group.create_task(self.bot.wait_for_message(re.compile(display), locale="es_ES", timeout=1))
+            await asyncio.sleep(0)
+            cancelled.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await cancelled
+            read = resource_packs.ResourcePackIndex.read
+            with patch.object(resource_packs.ResourcePackIndex, "read", autospec=True, side_effect=read) as reads:
+                self.transport.deliver(
+                    text(localize=False, body=text.AuthorAndMessage(
+                        type=TextPacketType.CHAT, author="Player\u00a7r", message="begin",
+                    )),
+                    report("chat.type.announcement"), report("fixture.message"), report("fixture.message"),
+                    text(localize=False, body=text.MessageOnly(type=TextPacketType.RAW, message="barrier")),
+                )
+                self.assertEqual(await default, "barrier")
+                self.assertEqual(await literal, "barrier")
+                self.assertEqual(Counter(call.args[1] for call in reads.call_args_list), {
+                    "texts/fr_FR.lang": 2, "texts/en_US.lang": 3, "texts/de_DE.lang": 3,
+                })
+        self.assertEqual((await by_name).pattern_id, french)
+        self.assertEqual((await by_id).matches[1][1], "[Alice]  snow")
+        self.assertEqual((await by_name).matches[1][1], "Alice reçoit snow")
+        self.assertEqual((await by_name).events, (events[0], events[2]))
+        self.assertEqual((await by_id).events, (events[0], events[2]))
+        self.assertEqual(events[0].author, "Player\u00a7r")
+        self.assertEqual(await content_en, "report|[Alice]  snow|end")
+        self.assertEqual(await content_fr, "report|Alice reçoit snow|end")
+        self.assertEqual(len(events), 5)
+        self.assertFalse(sent)
+
+        await self.bot.close()
+        self.transport = PackTransport(self.bot.protocol)
+        self.transport.deliver(self.b.NetworkSettingsPacket(
+            compression_algorithm=self.b.PacketCompressionAlgorithm.ZLIB, compression_threshold=0,
+        ), compressed_connection=False)
+        self.start_game()
+        await self.join()
+        self.assertEqual(self.bot.remove_display_pattern("report"), 0)
+        async with asyncio.TaskGroup() as group:
+            fresh = group.create_task(self.bot.wait_for_message(re.compile(display), "barrier", locale="en_US", timeout=1))
+            await asyncio.sleep(0)
+            self.transport.deliver(
+                report("fixture.message"),
+                text(localize=False, body=text.MessageOnly(type=TextPacketType.RAW, message="barrier")),
+            )
+        self.assertEqual(await fresh, "barrier")
 
     async def assert_invalid_stack(self, pack_id, subpack, message):
         pending = asyncio.create_task(self.join(lambda offer: ResourcePackDecision.ACCEPT))

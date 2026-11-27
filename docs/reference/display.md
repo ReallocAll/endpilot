@@ -21,12 +21,11 @@ wait before the final message arrives. Registrations repeat by default. Use
 remove all registrations with that name. For chat observations by author, use
 `wait_for_chat(author=...)` as in the [two-player example](../../examples/chat.py).
 
-## Match literal display text
+## Match display text
 
 Use `add_display_pattern()` to match incoming player chat formatted as
 `<author> message`, literal raw text, system messages, tips, and supported
-text objects made entirely of literal text. It skips localized text and
-text objects containing dynamic values such as selectors or translations.
+text objects made entirely of literal text by default.
 Start the wait before the message arrives. Its `events` are the original
 `TextEvent` values, and `matches` contains the regex captures.
 
@@ -42,6 +41,14 @@ while the bot named `Knight` is waiting.
 ```text
 tellraw Knight {"rawtext":[{"text":"Checkpoint 3 saved"}]}
 ```
+
+Pass an exact Bedrock locale such as `locale="fr_FR"` to
+`add_display_pattern()` or `wait_for_message()` to include text objects whose
+translations resolve in full using the resource packs loaded by this connection.
+If a locale or translation key is unavailable, matching skips the whole object.
+Each wait or registration can select its own locale. For literal objects only,
+use `wait_for_message(..., include_text_objects=True)` or the default display
+pattern behavior.
 
 ## Observe server text and send private chat
 

@@ -157,10 +157,23 @@ class DisplayTextPatternTests(unittest.IsolatedAsyncioTestCase):
         await self.deliver(self.rawtext({"text": "first"}), self.rawtext({"text": "last 4"}))
         self.assertEqual((await late).matches[1][1], "4")
 
+    async def test_invalid_locale_does_not_subscribe_or_allocate_a_pattern_id(self):
+        first = self.bot.add_display_pattern("first", "ready")
+        for invalid in ("", "fr-FR", "fr_fr", "../fr_FR", False):
+            with self.subTest(locale=invalid):
+                with self.assertRaisesRegex(ValueError, "Bedrock language code"):
+                    self.bot.add_display_pattern("invalid", "ready", locale=invalid)
+                with self.assertRaisesRegex(ValueError, "Bedrock language code"):
+                    await self.bot.wait_for_message("ready", locale=invalid, timeout=0)
+        self.assertEqual(self.bot.remove_display_pattern("invalid"), 0)
+        self.assertEqual(self.bot.add_display_pattern("next", "ready", locale="fr_FR"), first + 1)
+        self.assertFalse(self.bot._chat._text_observers)
+        self.assertFalse(self.bot._chat._content_waits)
+
     async def test_disconnect_prevents_a_matching_text_object_in_the_same_batch(self):
-        pattern = self.bot.add_display_pattern("late", "late")
+        pattern = self.bot.add_display_pattern("late", "late", locale="fr_FR")
         waiting = await self.arm(self.bot.wait_for_display_match(pattern, timeout=1))
-        content = await self.arm(self.bot.wait_for_message("late", include_text_objects=True, timeout=1))
+        content = await self.arm(self.bot.wait_for_message("late", locale="fr_FR", timeout=1))
         await self.deliver(self.b.DisconnectPacket(), self.rawtext({"text": "late"}))
         for task in (waiting, content):
             with self.assertRaises(ConnectionError):

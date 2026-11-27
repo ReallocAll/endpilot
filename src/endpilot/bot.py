@@ -462,7 +462,7 @@ class Bot:
             self._blocks, self._inventory, self._containers, session.item_names,
         )
         self._signs = Signs(session.packets, self._blocks, self._movement, self._inventory, session.player_id)
-        self._chat = Chat(session.packets, identity.name, _xuid=xuid)
+        self._chat = Chat(session.packets, identity.name, resource_pack_index=session.resource_pack_index, _xuid=xuid)
         self._titles = Titles(session.packets, session._end_state, _publish_error=publish_error)
         self._commands = Commands(
             session.packets, session.identity.uuid, session.player_unique_id,
@@ -2623,17 +2623,21 @@ class Bot:
 
     async def wait_for_message(
         self, *matchers: str | Pattern[str] | Sequence[str | Pattern[str]], timeout: float = 15,
-        include_text_objects: bool = False,
+        include_text_objects: bool = False, locale: str | None = None,
     ) -> str:
         """Wait for the first matching incoming text with a supported format.
 
         Strings match the entire text. Compiled regular expressions search within it.
         A sequence supplies alternative matchers.
         Set include_text_objects to include fully literal rawtext objects.
+        An explicit Bedrock locale also includes rawtext resolved in full from
+        this connection's resource packs.
         """
         if self._chat is None:
             raise RuntimeError("player has not joined")
-        return await self._chat.wait_for_content(*matchers, timeout=timeout, include_text_objects=include_text_objects)
+        return await self._chat.wait_for_content(
+            *matchers, timeout=timeout, include_text_objects=include_text_objects, locale=locale,
+        )
 
     def subscribe_text(
         self, callback: Callable[[TextEvent], None], *, kind: TextPacketType | None = None,
@@ -2672,15 +2676,18 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._chat.wait_for_match(name_or_id, timeout=timeout)
 
-    def add_display_pattern(self, name: str, pattern: ChatPatterns, *, repeat: bool = True) -> int:
-        """Register an ordered pattern over literal incoming display text.
+    def add_display_pattern(
+        self, name: str, pattern: ChatPatterns, *, repeat: bool = True, locale: str | None = None,
+    ) -> int:
+        """Register an ordered pattern over incoming display text.
 
         Chat uses the same <author> message format as wait_for_message.
-        Text objects participate only when they are entirely literal.
+        By default, text objects must be entirely literal. An explicit Bedrock
+        locale also includes rawtext resolved in full from this connection's packs.
         """
         if self._chat is None:
             raise RuntimeError("player has not joined")
-        return self._chat.add_display_pattern(name, pattern, repeat=repeat)
+        return self._chat.add_display_pattern(name, pattern, repeat=repeat, locale=locale)
 
     def remove_display_pattern(self, name_or_id: str | int) -> int:
         """Remove display patterns by name or ID and return the number removed."""

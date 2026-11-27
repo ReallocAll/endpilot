@@ -245,19 +245,42 @@ class DisplayMatch:
 
 
 @dataclass(slots=True)
+class _IncomingText:
+    """Share one packet's content across display patterns and content waits."""
+
+    event: TextEvent
+    resource_pack_index: ResourcePackIndex | None
+    _contents: dict[str | None, str | None] = field(default_factory=dict)
+
+    def content(self, locale: str | None, *, include_text_objects: bool = True) -> str | None:
+        if locale is None and not include_text_objects:
+            return _text_content(self.event)
+        if locale not in self._contents:
+            self._contents[locale] = (
+                _text_content(self.event, include_text_objects=True) if locale is None
+                else self.event.resolve_text(locale=locale, resource_pack_index=self.resource_pack_index)
+            )
+        return self._contents[locale]
+
+
+@dataclass(slots=True)
 class _RegisteredPattern[T]:
     name: str
     patterns: tuple[re.Pattern[str], ...]
     repeat: bool
+    locale: str | None = None
     events: list[T] = field(default_factory=list)
     matches: list[re.Match[str]] = field(default_factory=list)
 
 
 class Chat:
-    def __init__(self, packets, name: str, *, _xuid: str = ""):
+    def __init__(
+        self, packets, name: str, *, resource_pack_index: ResourcePackIndex | None = None, _xuid: str = "",
+    ):
         self.packets = packets
         self.name = name
         self._xuid = _xuid
+        self._resource_pack_index = resource_pack_index
         self._text = packets.protocol.binding.packets[9]
         self._pattern_ids = count(1)
         self._patterns: dict[int, _RegisteredPattern[ChatMessage]] = {}
@@ -266,7 +289,7 @@ class Chat:
         self._display_completed: list[DisplayMatch] = []
         self._subscriptions_closed = False
         self._message_observers: list[Callable[[ChatMessage], None]] = []
-        self._text_observers: list[Callable[[TextEvent], None]] = []
+        self._text_observers: list[Callable[[_IncomingText], None]] = []
         self._match_observers: list[Callable[[ChatMatch], None]] = []
         self._content_waits: set[asyncio.Future[str]] = set()
         # A disconnect can precede the first subscription while the reader is still running.
@@ -356,9 +379,11 @@ class Chat:
 
     async def wait_for_content(
         self, *matchers: str | re.Pattern[str] | Sequence[str | re.Pattern[str]], timeout: float = 15,
-        include_text_objects: bool = False,
+        include_text_objects: bool = False, locale: str | None = None,
     ) -> str:
-        """Return the first matching player chat or literal server text."""
+        """Return the first matching text, resolving pack translations for an explicit locale."""
+        if locale is not None:
+            _validate_locale(locale)
         alternatives = tuple(
             item for matcher in matchers
             for item in (matcher if isinstance(matcher, Sequence)
@@ -371,12 +396,13 @@ class Chat:
                for item in alternatives):
             raise TypeError("text matchers must be strings or compiled string regexes")
 
+        self._require_subscription_stream()
         received = asyncio.get_running_loop().create_future()
 
-        def observe(event: TextEvent) -> None:
+        def observe(incoming: _IncomingText) -> None:
             if received.done():
                 return
-            content = _text_content(event, include_text_objects=include_text_objects)
+            content = incoming.content(locale, include_text_objects=include_text_objects)
             if content is not None and any(
                 content == item if isinstance(item, str) else item.search(content)
                 for item in alternatives
@@ -385,7 +411,7 @@ class Chat:
                 self._content_waits.discard(received)
                 received.set_result(content)
 
-        unsubscribe = self.subscribe_text(observe)
+        unsubscribe = PacketConnection._subscribe(self._text_observers, observe)
         self._content_waits.add(received)
         try:
             async with asyncio.timeout(timeout):
@@ -397,12 +423,17 @@ class Chat:
     def add_pattern(self, name: str, pattern: ChatPatterns, *, repeat: bool = True) -> int:
         return self._add_pattern(self._patterns, name, pattern, repeat=repeat)
 
-    def add_display_pattern(self, name: str, pattern: ChatPatterns, *, repeat: bool = True) -> int:
+    def add_display_pattern(
+        self, name: str, pattern: ChatPatterns, *, repeat: bool = True, locale: str | None = None,
+    ) -> int:
+        if locale is not None:
+            _validate_locale(locale)
         self._require_subscription_stream()
-        return self._add_pattern(self._display_patterns, name, pattern, repeat=repeat)
+        return self._add_pattern(self._display_patterns, name, pattern, repeat=repeat, locale=locale)
 
     def _add_pattern[T](
         self, registrations: dict[int, _RegisteredPattern[T]], name: str, pattern: ChatPatterns, *, repeat: bool,
+        locale: str | None = None,
     ) -> int:
         if isinstance(pattern, (str, re.Pattern)):
             pattern = (pattern,)
@@ -414,7 +445,7 @@ class Chat:
         if any(not isinstance(regex.pattern, str) for regex in patterns):
             raise TypeError("chat patterns must match strings")
         pattern_id = next(self._pattern_ids)
-        registrations[pattern_id] = _RegisteredPattern(name, patterns, repeat)
+        registrations[pattern_id] = _RegisteredPattern(name, patterns, repeat, locale=locale)
         return pattern_id
 
     def remove_pattern(self, name_or_id: str | int) -> int:
@@ -475,8 +506,13 @@ class Chat:
         author: str | None = None,
     ) -> Callable[[], None]:
         self._require_subscription_stream()
-        return self._subscribe(self._text_observers, callback,
-                               lambda event: self._matches_text(event.kind, event.author, kind, author))
+
+        def observe(incoming: _IncomingText) -> None:
+            event = incoming.event
+            if self._matches_text(event.kind, event.author, kind, author):
+                callback(event)
+
+        return PacketConnection._subscribe(self._text_observers, observe)
 
     def subscribe_match(
         self, name_or_id: str | int, callback: Callable[[ChatMatch], None],
@@ -577,15 +613,14 @@ class Chat:
             return
         packet = self.packets.protocol.decode(raw)
         message = self._chat_message(packet.body)
-        if message is not None:
-            self._advance_patterns(self._patterns, self._completed, message, message.message, ChatMatch)
-        event = self._text_event(packet) if self._display_patterns or self._text_observers else None
-        if self._display_patterns and event is not None:
-            content = _text_content(event, include_text_objects=True)
-            if content is not None:
-                self._advance_patterns(self._display_patterns, self._display_completed, event, content, DisplayMatch)
-        if self._text_observers:
-            self._notify(self._text_observers, event)
+        if message is not None and self._patterns:
+            self._advance_patterns(self._patterns, self._completed, message, lambda _: message.message, ChatMatch)
+        if self._display_patterns or self._text_observers:
+            incoming = _IncomingText(self._text_event(packet), self._resource_pack_index)
+            self._advance_patterns(
+                self._display_patterns, self._display_completed, incoming.event, incoming.content, DisplayMatch,
+            )
+            self._notify(self._text_observers, incoming)
         if message is not None:
             self._notify(self._message_observers, message)
         for completed in self._completed:
@@ -593,10 +628,14 @@ class Chat:
 
     @staticmethod
     def _advance_patterns[T, M](
-        registrations: dict[int, _RegisteredPattern[T]], completions: list[M], event: T, content: str,
+        registrations: dict[int, _RegisteredPattern[T]], completions: list[M], event: T,
+        content_for: Callable[[str | None], str | None],
         make_match: Callable[[int, str, tuple[T, ...], tuple[re.Match[str], ...]], M],
     ) -> None:
         for pattern_id, pattern in tuple(registrations.items()):
+            content = content_for(pattern.locale)
+            if content is None:
+                continue
             match = pattern.patterns[len(pattern.matches)].search(content)
             if match is None:
                 continue
