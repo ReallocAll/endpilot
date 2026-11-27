@@ -362,6 +362,20 @@ class Containers:
         ):
             before[index] = self._slots.get(index)
 
+    def _write_window_correction(self, index, updated, before, *, additional_to=None):
+        if additional_to is not None:
+            endpoint = self._block_transfer_endpoint(index)
+            if endpoint is not None:
+                self.inventory._mark_range_overlap((endpoint,), except_request=additional_to)
+        if updated is self._slots.get(index):
+            return
+        self._record_slot_before(index, before)
+        if updated is None:
+            self._slots.pop(index, None)
+        else:
+            self._slots[index] = updated
+        self._slots_updated.set()
+
     def _notify_slot_changes(self, window, before, *, complete=False) -> None:
         if before is None or self.window is not window or not self._slot_observers or (not complete and not before):
             return
@@ -1746,15 +1760,11 @@ class Containers:
                             self._set_anvil_slot(index, correct(current, current, index == chest_slot, slot),
                                                  before, corrected=True)
                             continue
-                        updated = correct(current, original_chest, index == chest_slot, slot)
-                        if updated is current:
-                            continue
-                        self._record_slot_before(index, before)
-                        if updated is None:
-                            self._slots.pop(index, None)
-                        else:
-                            self._slots[index] = updated
-                        self._slots_updated.set()
+                        additional_to = self.inventory._pending_requests[request_id] if index != chest_slot else None
+                        self._write_window_correction(
+                            index, correct(current, original_chest, index == chest_slot, slot), before,
+                            additional_to=additional_to,
+                        )
                     elif name in _PLAYER_CONTAINERS:
                         if preserve_player_slot:
                             continue
@@ -1868,6 +1878,125 @@ class Containers:
         finally:
             if stop_watching is not None:
                 stop_watching()
+
+    def _can_plan_chest_slot(self, index: int) -> bool:
+        endpoint = self._block_transfer_endpoint(index)
+        return (index not in self._unconfirmed_transfer_slots and endpoint is not None
+                and not any(old.matches(endpoint, allow_possible=True) for old in self._unconfirmed_block_slots))
+
+    async def _move_within_chest(self, window, source, destination, amount, *, timeout, expected,
+                                 window_is_current, on_submitted, on_confirmed):
+        indices = source, destination
+        originals = dict(zip(indices, expected, strict=True))
+        endpoints = frozenset(self._block_transfer_endpoint(index) for index in indices)
+        if None in endpoints:
+            raise _InventoryMoveNotSubmitted("window_changed")
+        inventory = self.inventory
+        if inventory._requests_for_endpoints(endpoints):
+            raise _InventoryMoveNotSubmitted("unconfirmed")
+
+        b = self.packets.protocol.binding
+        cereal = b.ItemStackRequestCereal
+        address = b.FullContainerName(name=b.ContainerEnumName.LEVEL_ENTITY_CONTAINER, dynamic_id=None)
+        request_id = inventory._allocate_request_id()
+        origin, target = (
+            cereal.SlotInfoData(full_container_name=address, slot=index,
+                                net_id_variant=int(originals[index].net_id_variant or 0))
+            for index in indices
+        )
+        request = b.ItemStackRequestPacketData.RequestData(
+            client_request_id=b.ItemStackRequestId(raw_id=request_id),
+            actions=[cereal.PlaceActionData(amount=amount, source=origin, destination=target)],
+            strings_to_filter=[],
+            strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
+        )
+        observations = {}
+        conflicted = False
+
+        def at_write():
+            if not window_is_current():
+                raise _InventoryMoveNotSubmitted("window_changed")
+            own = inventory._pending_requests[request_id]
+            if any(pending is not own for pending in inventory._requests_for_endpoints(endpoints)):
+                raise _InventoryMoveNotSubmitted("unconfirmed")
+            # A replaced descriptor is a newer observation even when its values repeat.
+            if any(not self._can_plan_chest_slot(index) or self._slots.get(index) is not originals[index]
+                   for index in indices):
+                raise _InventoryMoveNotSubmitted("unobserved")
+            on_submitted(own.reply)
+
+        def mark_conflict():
+            nonlocal conflicted
+            conflicted = True
+
+        def observe(endpoint, item):
+            if not window_is_current():
+                return
+            index = endpoint.slot
+            if index in observations and not _same_slot(observations[index], item):
+                mark_conflict()
+            if not _same_slot(originals[index], item):
+                observations[index] = item
+
+        def apply(response):
+            if not window_is_current() or response.result.name != "SUCCESS":
+                return
+            receipts = {}
+            for group in response.containers or ():
+                container = group.full_container_name
+                if container.name == address.name and container.dynamic_id is None:
+                    for slot in group.slots:
+                        if 0 <= slot.slot < self._window_slot_count:
+                            receipts.setdefault(slot.slot, []).append(slot)
+            corrections = {index: entries[0] for index, entries in receipts.items()
+                           if len(entries) == 1 and entries[0].requested_slot == index}
+            current = {index: self._slots.get(index) for index in indices}
+            before = {} if self._slot_observers else None
+
+            def apply_endpoints():
+                source_reply, destination_reply = map(corrections.get, indices)
+                if conflicted or any(slot is None or (
+                    slot.amount and (slot.item_stack_net_id is None or not slot.item_stack_net_id.raw_id)
+                ) for slot in (source_reply, destination_reply)):
+                    return None
+                moved = originals[source].stack_size - source_reply.amount
+                if not 0 < moved <= amount or moved != destination_reply.amount - originals[destination].stack_size:
+                    return None
+                corrected = {index: _response_item(b, originals[index], originals[source], corrections[index])
+                             for index in indices}
+                if any(current[index] is not originals[index] and not _same_slot(current[index], corrected[index])
+                       for index in indices):
+                    return None
+                for index in indices:
+                    if current[index] is originals[index]:
+                        self._write_window_correction(index, corrected[index], before)
+                return moved
+
+            moved = apply_endpoints()
+            if moved is not None:
+                on_confirmed(moved)
+            else:
+                self._unconfirmed_block_slots.update(
+                    endpoint for endpoint in endpoints if current[endpoint.slot] is originals[endpoint.slot]
+                )
+
+            # Unrelated corrections can resolve a known stack, but do not
+            # establish that another pending request moved it.
+            own = inventory._pending_requests[request_id]
+            for index, slot in corrections.items():
+                if index in originals:
+                    continue
+                observed = self._slots.get(index)
+                updated = None
+                if not slot.amount or (observed is not None and observed.net_id_variant):
+                    updated = _correct_observed_item(b, observed, slot)
+                self._write_window_correction(index, updated, before, additional_to=own)
+            self._notify_slot_changes(window, before)
+
+        return await inventory._request_item_stack(
+            request, apply, timeout=timeout, _endpoints=endpoints, _range_step=True,
+            _on_unconfirmed=mark_conflict, _on_slot_observed=observe, _at_write=at_write,
+        )
 
     def close(self) -> None:
         if self._unsubscribe is None:

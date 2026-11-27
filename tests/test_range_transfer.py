@@ -5,7 +5,8 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from endpilot import (
-    Bot, HeldItemStack, ItemRegistrySnapshot, RangeTransferResult, RangeTransferStep, transfer_item, transfer_range,
+    Bot, HeldItemStack, ItemRegistrySnapshot, RangeTransferResult, RangeTransferStep, transfer_container_range,
+    transfer_item, transfer_range,
 )
 from endpilot.block_data import _catalog
 from endpilot.login import JoinSession
@@ -175,6 +176,295 @@ class RangeTransferTests(unittest.IsolatedAsyncioTestCase):
         source, destination = (chest, player) if direction == "take" else (player, chest)
         return await transfer_range(self.bot, direction=direction, item=item_name, count=count,
                                     source_slots=source, destination_slots=destination, timeout=timeout)
+
+    async def within_chest(self, count=6, *, source=range(20, 22), destination=range(2, 4), match=None, timeout=1):
+        return await transfer_container_range(
+            self.bot, item="minecraft:paper", count=count, source_slots=source, destination_slots=destination,
+            match=match, timeout=timeout,
+        )
+
+    def seed_chest_move(self):
+        slots = [self.stack() for _ in range(22)]
+        slots[3], slots[20], slots[21] = self.stack(PAPER, 62, 51), self.stack(PAPER, 5, 52), self.stack(PAPER, 8, 53)
+        self.open_chest(*slots)
+
+    async def test_same_chest_places_into_compatible_then_empty_without_touching_player(self):
+        self.seed_chest_move()
+        self.player_slot(20, self.stack(STICK, 64, 90))
+        self.answer(
+            ((20, 3, 2, 52, 51), [(CHEST, 20, 3, 52), (CHEST, 3, 64, 51)]),
+            ((20, 2, 3, 52, 0), [(CHEST, 20, 0, None), (CHEST, 2, 3, 54)]),
+            ((21, 2, 1, 53, 54), [(CHEST, 21, 7, 53), (CHEST, 2, 4, 54)]),
+        )
+        result = await self.within_chest(match=lambda stack: isinstance(stack, HeldItemStack) and not stack.user_data_buffer)
+        self.assertEqual((result.stop_reason, result.confirmed_count), ("complete", 6))
+        self.assertEqual([step.confirmed for step in result.steps], [2, 3, 1])
+        self.assertEqual(len(self.outgoing()), 3)
+        for request in self.outgoing():
+            self.assertIsInstance(request.actions[0], self.b.ItemStackRequestCereal.PlaceActionData)
+            self.assertEqual(self.action_addresses(request), (CHEST, CHEST))
+        self.assertEqual([self.bot.container_slots[i].stack_size for i in (2, 3, 20, 21)], [4, 64, 0, 7])
+        self.assertEqual(self.bot.inventory_slots[20].stack_size, 64)
+
+    async def test_same_chest_preserves_partial_progress_on_rejection(self):
+        self.seed_chest_move()
+        pending = self.hold_requests()
+        task = self.start(self.within_chest())
+        first = await asyncio.wait_for(pending.get(), 1)
+        self.assertEqual(self.action(first), (20, 3, 2, 52, 51))
+        self.reply(first, [(CHEST, 20, 4, 52), (CHEST, 3, 63, 51)])
+        second = await asyncio.wait_for(pending.get(), 1)
+        self.assertEqual(self.action(second), (20, 3, 1, 52, 51))
+        self.reply(second, verdict="ERROR")
+        result = await task
+        self.assertEqual((result.stop_reason, result.confirmed_count), ("rejected", 1))
+        self.assertEqual([step.confirmed for step in result.steps], [1, 0])
+        self.assertEqual([self.bot.container_slots[i].stack_size for i in (3, 20)], [63, 4])
+
+    async def test_same_chest_missing_endpoint_is_unconfirmed_until_fresh_slots(self):
+        self.seed_chest_move()
+        pending = self.hold_requests()
+        task = self.start(self.within_chest(2))
+        request = await asyncio.wait_for(pending.get(), 1)
+        self.reply(request, [(CHEST, 20, 3, 52)])
+        result = await task
+        self.assertEqual((result.stop_reason, result.confirmed_count), ("unconfirmed", 0))
+        step, = result.steps
+        self.assertEqual((step.verdict, step.confirmed), ("SUCCESS", None))
+        self.assertEqual([self.bot.container_slots[i].stack_size for i in (3, 20)], [62, 5])
+        checked = await self.within_chest(2, source=range(20, 21), destination=range(3, 4))
+        self.assertEqual((checked.stop_reason, checked.steps), ("unobserved", ()))
+        self.assertEqual(len(self.outgoing()), 1)
+
+    async def test_same_chest_late_reply_does_not_rewrite_same_id_reopened_window(self):
+        pending = self.hold_requests()
+        for cancel in (True, False):
+            with self.subTest(cancel=cancel):
+                self.seed_chest_move()
+                moving = self.start(self.within_chest(2, timeout=1 if cancel else 0.1))
+                request = await asyncio.wait_for(pending.get(), 1)
+                blocked = await self.within_chest(1, source=range(20, 21), destination=range(3, 4))
+                self.assertEqual(blocked, RangeTransferResult(1, (), "unconfirmed"))
+                if cancel:
+                    moving.cancel()
+                with self.assertRaises(asyncio.CancelledError if cancel else TimeoutError) as error:
+                    await moving
+                progress = error.exception.transfer_progress
+                step, = progress.steps
+                self.assertEqual((progress.stop_reason, step.request_id, step.confirmed),
+                                 ("cancelled" if cancel else "unconfirmed", int(request.client_request_id.raw_id), None))
+                old_window = self.bot.open_window
+                self.seed_chest_move()
+                self.assertEqual(old_window.container_id, self.bot.open_window.container_id)
+                self.assertIsNot(old_window, self.bot.open_window)
+                self.set_slot(2, 3, self.stack(PAPER, 11, 61))
+                self.set_slot(2, 20, self.stack(PAPER, 9, 62))
+                blocked = await self.within_chest(1, source=range(20, 21), destination=range(3, 4))
+                self.assertEqual(blocked, RangeTransferResult(1, (), "unconfirmed"))
+                self.reply(request, [(CHEST, 20, 3, 52), (CHEST, 3, 64, 51)])
+                self.assertEqual([self.bot.container_slots[i].stack_size for i in (3, 20)], [11, 9])
+                retry = self.start(self.within_chest(1, source=range(20, 21), destination=range(3, 4)))
+                next_request = await asyncio.wait_for(pending.get(), 1)
+                self.assertEqual(self.action(next_request), (20, 3, 1, 62, 61))
+                self.reply(next_request, [(CHEST, 20, 8, 62), (CHEST, 3, 12, 61)])
+                self.assertEqual((await retry).confirmed_count, 1)
+
+    async def test_same_chest_uses_newer_observation_and_only_accepts_a_matching_echo(self):
+        pending = self.hold_requests()
+        for early_count in (64, 20):
+            with self.subTest(early_count=early_count):
+                self.seed_chest_move()
+                moving = self.start(self.within_chest(2))
+                request = await asyncio.wait_for(pending.get(), 1)
+                self.set_slot(2, 3, self.stack(PAPER, early_count, 51))
+                self.reply(request, [(CHEST, 20, 3, 52), (CHEST, 3, 64, 51)])
+                result = await moving
+                self.assertEqual(result.stop_reason, "complete" if early_count == 64 else "unconfirmed")
+                self.assertEqual(self.bot.container_slots[3].stack_size, early_count)
+
+    async def test_same_chest_conflicts_with_inflight_transfer_on_either_chest_endpoint(self):
+        self.seed_chest_move()
+        self.player_slot(9, self.stack())
+        pending = self.hold_requests()
+        take = self.start(self.transfer(1, chest=range(3, 4), player=range(9, 10)))
+        request = await asyncio.wait_for(pending.get(), 1)
+        self.assertEqual(await self.within_chest(2), RangeTransferResult(2, (), "unconfirmed"))
+        self.assertEqual(len(self.outgoing()), 1)
+        self.reply(request, [(CHEST, 3, 61, 51), (PLAYER, 9, 1, 54)])
+        self.assertEqual((await take).confirmed_count, 1)
+
+    async def test_same_chest_rechecks_each_observed_slot_at_write(self):
+        self.seed_chest_move()
+        send = self.stream.send
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def pause(packet, **kwargs):
+            if isinstance(packet, self.b.ItemStackRequestPacket):
+                entered.set()
+                await release.wait()
+            await send(packet, **kwargs)
+
+        self.stream.send = pause
+        moving = self.start(self.within_chest(2))
+        await asyncio.wait_for(entered.wait(), 1)
+        self.set_slot(2, 3, self.stack(PAPER, 62, 51))
+        release.set()
+        self.assertEqual(await moving, RangeTransferResult(2, (), "unobserved"))
+        self.assertEqual(self.outgoing(), [])
+
+    async def test_same_chest_keeps_applied_receipt_if_window_reopens_before_wait_resumes(self):
+        self.seed_chest_move()
+        pending = self.hold_requests()
+        moving = self.start(self.within_chest())
+        request = await asyncio.wait_for(pending.get(), 1)
+        self.reply(request, [(CHEST, 20, 3, 52), (CHEST, 3, 64, 51)])
+        self.assertEqual([self.bot.container_slots[i].stack_size for i in (3, 20)], [64, 3])
+        old_window = self.bot.open_window
+        self.seed_chest_move()
+        self.assertEqual(self.bot.open_window.container_id, old_window.container_id)
+        self.assertIsNot(self.bot.open_window, old_window)
+        self.assertEqual(await moving, RangeTransferResult(
+            6, (RangeTransferStep(20, 3, 2, 2, int(request.client_request_id.raw_id), "SUCCESS"),), "window_changed",
+        ))
+        self.assertEqual([self.bot.container_slots[i].stack_size for i in (3, 20)], [62, 5])
+        self.assertEqual(len(self.outgoing()), 1)
+
+    async def test_same_chest_round_trip_block_replacement_invalidates_the_write(self):
+        self.seed_chest_move()
+        send = self.stream.send
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def pause(packet, **kwargs):
+            if isinstance(packet, self.b.ItemStackRequestPacket):
+                entered.set()
+                await release.wait()
+            await send(packet, **kwargs)
+
+        self.stream.send = pause
+        moving = self.start(self.within_chest(2))
+        await asyncio.wait_for(entered.wait(), 1)
+        self.observe_block("minecraft:air")
+        self.observe_block("minecraft:chest")
+        release.set()
+        self.assertEqual(await moving, RangeTransferResult(2, (), "window_changed"))
+        self.assertEqual(self.outgoing(), [])
+
+    async def test_same_chest_applies_additional_correction_without_confirming_another_request(self):
+        self.seed_chest_move()
+        pending = self.hold_requests()
+        changes = []
+        self.addCleanup(self.bot.subscribe_container_slot_changes(changes.append, slot=21))
+        first = self.start(self.within_chest(2, source=range(20, 21), destination=range(3, 4)))
+        request = await asyncio.wait_for(pending.get(), 1)
+        second = self.start(self.within_chest(4, source=range(21, 22), destination=range(2, 3)))
+        concurrent = await asyncio.wait_for(pending.get(), 1)
+        self.reply(request, [(CHEST, 20, 3, 52), (CHEST, 3, 64, 51), (CHEST, 21, 4, 53)])
+        self.assertEqual((await first).confirmed_count, 2)
+        self.assertEqual(self.bot.container_slots[21].stack_size, 4)
+        self.assertEqual([(change.slot, change.before.count, change.after.count) for change in changes], [(21, 8, 4)])
+        self.reply(concurrent, [(CHEST, 21, 4, 53), (CHEST, 2, 4, 54)])
+        outcome = await second
+        self.assertEqual((outcome.stop_reason, outcome.confirmed_count), ("unconfirmed", 0))
+        self.assertEqual(self.bot.container_slots[2].stack_size, 0)
+
+    async def test_same_chest_keeps_watching_replacement_until_abandoned_request_is_settled(self):
+        pending = self.hold_requests()
+        for cancel in (True, False):
+            with self.subTest(cancel=cancel):
+                self.seed_chest_move()
+                moving = self.start(self.within_chest(2, timeout=1 if cancel else 0.1))
+                request = await asyncio.wait_for(pending.get(), 1)
+                if cancel:
+                    moving.cancel()
+                with self.assertRaises(asyncio.CancelledError if cancel else TimeoutError) as error:
+                    await moving
+                progress = error.exception.transfer_progress
+                self.assertEqual(progress.steps, (RangeTransferStep(
+                    20, 3, 2, None, int(request.client_request_id.raw_id), None,
+                ),))
+                retained = len(self.bot._containers._transfer_block_watches)
+                self.observe_block("minecraft:air")
+                self.observe_block("minecraft:chest")
+                self.reply(request, [(CHEST, 20, 3, 52), (CHEST, 3, 64, 51)])
+                await asyncio.sleep(0)
+                self.assertEqual([self.bot.container_slots[i].stack_size for i in (3, 20)], [62, 5])
+                self.assertEqual(retained, 1)
+                self.assertFalse(self.bot._containers._transfer_block_watches)
+                self.assertEqual(progress.confirmed_count, 0)
+
+    async def test_same_chest_clears_block_watch_on_unsent_cancellation_window_close_and_session_end(self):
+        self.seed_chest_move()
+        entered = asyncio.Event()
+        send = self.stream.send
+
+        async def pause(packet, **kwargs):
+            if isinstance(packet, self.b.ItemStackRequestPacket):
+                entered.set()
+                await asyncio.Future()
+            await send(packet, **kwargs)
+
+        self.stream.send = pause
+        moving = self.start(self.within_chest(2))
+        await asyncio.wait_for(entered.wait(), 1)
+        self.assertEqual(len(self.bot._containers._transfer_block_watches), 1)
+        moving.cancel()
+        with self.assertRaises(asyncio.CancelledError) as error:
+            await moving
+        self.assertIsNone(error.exception.transfer_progress.steps[0].request_id)
+        self.assertFalse(self.bot._containers._transfer_block_watches)
+        self.assertEqual(self.outgoing(), [])
+
+        self.stream.send = send
+        pending = self.hold_requests()
+        for close_session in (False, True):
+            with self.subTest(close_session=close_session):
+                self.seed_chest_move()
+                moving = self.start(self.within_chest(2))
+                request = await asyncio.wait_for(pending.get(), 1)
+                moving.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await moving
+                self.assertEqual(len(self.bot._containers._transfer_block_watches), 1)
+                if close_session:
+                    self.bot._inventory._end_requests()
+                    await asyncio.sleep(0)
+                else:
+                    self.emit(self.b.ContainerClosePacket(container_id=2, container_type=self.b.ContainerType.CONTAINER))
+                    self.assertFalse(self.bot._containers._transfer_block_watches)
+                    self.reply(request, [(CHEST, 20, 3, 52), (CHEST, 3, 64, 51)])
+                self.assertFalse(self.bot._containers._transfer_block_watches)
+
+    async def test_take_additional_correction_does_not_confirm_a_pending_same_chest_move(self):
+        self.seed_chest_move()
+        self.player_slot(9, self.stack())
+        pending = self.hold_requests()
+        take = self.start(self.bot.take_from_container(20, 9, 1))
+        take_request = await asyncio.wait_for(pending.get(), 1)
+        inside = self.start(self.within_chest(4, source=range(21, 22), destination=range(2, 3)))
+        inside_request = await asyncio.wait_for(pending.get(), 1)
+        self.reply(take_request, [(CHEST, 20, 4, 52), (PLAYER, 9, 1, 54), (CHEST, 21, 4, 53)])
+        self.assertEqual((await take).result.name, "SUCCESS")
+        self.assertEqual(self.bot.container_slots[21].stack_size, 4)
+        self.reply(inside_request, [(CHEST, 21, 4, 53), (CHEST, 2, 4, 55)])
+        outcome = await inside
+        self.assertEqual((outcome.stop_reason, outcome.confirmed_count), ("unconfirmed", 0))
+        self.assertEqual([self.bot.container_slots[i].stack_size for i in (2, 21)], [0, 4])
+
+    async def test_same_chest_requires_observed_single_chest_and_disjoint_ranges(self):
+        self.open_chest(width=None)
+        self.assertEqual((await self.within_chest(1)).stop_reason, "unobserved")
+        self.open_chest(width=54)
+        with self.assertRaisesRegex(RuntimeError, "27 slots"):
+            await self.within_chest(1)
+        self.observe_block("minecraft:barrel")
+        self.open_chest()
+        with self.assertRaisesRegex(RuntimeError, "ordinary single chest"):
+            await self.within_chest(1)
+        with self.assertRaisesRegex(ValueError, "must not overlap"):
+            await self.within_chest(source=range(2, 5))
+        with self.assertRaisesRegex(ValueError, "0..27"):
+            await self.within_chest(destination=range(2, 28))
+        self.assertEqual(self.outgoing(), [])
 
     async def test_transfers_across_multiple_sources_merge_before_empty_in_both_directions(self):
         original_send = self.stream.send

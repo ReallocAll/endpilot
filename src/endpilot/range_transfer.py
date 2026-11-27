@@ -463,6 +463,36 @@ async def transfer_inventory_range(
     Results count matching server corrections to both endpoints. A predicate
     or wait error carries transfer_progress on the original exception.
     """
+    return await _transfer_within(
+        bot, item=item, count=count, source_slots=source_slots, destination_slots=destination_slots,
+        match=match, timeout=timeout, in_chest=False,
+    )
+
+
+async def transfer_container_range(
+    bot: Bot,
+    *,
+    item: str,
+    count: int,
+    source_slots: range,
+    destination_slots: range,
+    match: Callable[[HeldItemStack], bool] | None = None,
+    timeout: float = 15,
+) -> RangeTransferResult:
+    """Move a registered item between disjoint ranges in an open single chest.
+
+    Use an observed 27-slot ordinary chest. Fill compatible stacks before
+    empty slots, and count only moves confirmed by both server corrections.
+    The optional synchronous match and transfer_progress follow
+    transfer_inventory_range.
+    """
+    return await _transfer_within(
+        bot, item=item, count=count, source_slots=source_slots, destination_slots=destination_slots,
+        match=match, timeout=timeout, in_chest=True,
+    )
+
+
+async def _transfer_within(bot, *, item, count, source_slots, destination_slots, match, timeout, in_chest):
     if not isinstance(item, str) or not item:
         raise ValueError("item must be a nonempty registered name")
     if type(count) is not int or count < 0:
@@ -471,10 +501,13 @@ async def transfer_inventory_range(
         raise ValueError("timeout must be finite and nonnegative")
     if match is not None and not callable(match):
         raise TypeError("match must be callable")
-    _check_range(source_slots, _PLAYER_SIZE, "source_slots")
-    _check_range(destination_slots, _PLAYER_SIZE, "destination_slots")
+    slot_limit = _SINGLE_CONTAINER_SIZE if in_chest else _PLAYER_SIZE
+    _check_range(source_slots, slot_limit, "source_slots")
+    _check_range(destination_slots, slot_limit, "destination_slots")
     if (source_slots and destination_slots and source_slots.start < destination_slots.stop
             and destination_slots.start < source_slots.stop):
+        if in_chest:
+            raise ValueError("container transfer ranges must not overlap")
         raise ValueError("inventory transfer ranges must not overlap")
     if not count:
         return RangeTransferResult(0, (), "complete")
@@ -488,21 +521,53 @@ async def transfer_inventory_range(
         nonlocal overlapped
         overlapped = True
 
+    stop_watching = None
+    submitted_reply = None
+
+    def retain_watch_until(reply):
+        nonlocal submitted_reply
+        submitted_reply = reply
+
     try:
         inventory, containers = bot._inventory, bot._containers
         window = bot.open_window
-        if inventory is None or containers is None or window is None or window.container_type != "INVENTORY":
-            raise RuntimeError("open the player inventory before transferring items")
+        kind = "CONTAINER" if in_chest else "INVENTORY"
+        if inventory is None or containers is None or window is None or window.container_type != kind:
+            target = "an ordinary single chest" if in_chest else "the player inventory"
+            raise RuntimeError(f"open {target} before transferring items")
+        if in_chest:
+            if window.position is None or window.entity_unique_id != -1:
+                raise RuntimeError("open an ordinary single chest before transferring items")
+            name = containers._observed_window_block_name(window)
+            current_name = containers._current_window_block_name(window)
+            slot_count = containers._observed_window_slot_count(window)
+            if name is None or slot_count is None or current_name is None:
+                return result("unobserved")
+            if name != "minecraft:chest" or slot_count != _SINGLE_CONTAINER_SIZE:
+                raise RuntimeError("the active window must match an ordinary single chest with 27 slots")
+            if current_name != name:
+                return result("window_changed")
         layout = containers._layout_token
+
+        target_replaced = False
+
+        def observe_target(name):
+            nonlocal target_replaced
+            if name is not None and name != "minecraft:chest":
+                target_replaced = True
 
         def window_is_current():
             return (bot._inventory is inventory and bot._containers is containers
-                    and containers.window is window and containers._layout_token is layout)
+                    and containers.window is window and containers._layout_token is layout
+                    and not target_replaced
+                    and (not in_chest or containers._current_window_block_name(window) == "minecraft:chest"))
 
         registry = bot.item_registry
         item_id = None if registry is None else registry.id_for_name(item)
         if not item_id:
             return result("unobserved")
+        if in_chest:
+            stop_watching = containers._watch_transfer_block(window.position, observe_target)
         limit = STACK_LIMITS.get(item) if bot.protocol.number == 2225 else None
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -510,15 +575,24 @@ async def transfer_inventory_range(
         while remaining:
             if not window_is_current():
                 return result("window_changed")
-            slots = inventory.slots
-            predicted = inventory.client_slots()
+            if in_chest:
+                slots = containers.slots
 
-            def observed(indices):
-                return {index: stack for index, stack in _known_slots(slots, indices).items()
-                        if index not in inventory._unconfirmed_transfer_slots and _same_slot(stack, predicted.get(index))}
+                def observed(indices):
+                    return {index: stack for index, stack in _known_slots(slots, indices).items()
+                            if containers._can_plan_chest_slot(index)}
+            else:
+                slots = inventory.slots
+                predicted = inventory.client_slots()
+
+                def observed(indices):
+                    return {index: stack for index, stack in _known_slots(slots, indices).items()
+                            if index not in inventory._unconfirmed_transfer_slots
+                            and _same_slot(stack, predicted.get(index))}
 
             source, destination = observed(source_slots), observed(destination_slots)
-            plan = _plan_step(source, destination, item_id, remaining, limit, source_slots, destination_slots, match=match)
+            plan = _plan_step(source, destination, item_id, remaining, limit, source_slots, destination_slots,
+                              match=match, window_is_current=window_is_current if in_chest else None)
             if isinstance(plan, str):
                 return result(plan)
             origin, target, amount = plan
@@ -529,15 +603,23 @@ async def transfer_inventory_range(
             step = RangeTransferStep(origin, target, amount, None, None, None)
             steps.append(step)
             overlapped = False
+            chest_confirmed = None
+
+            def confirm_chest(moved):
+                nonlocal chest_confirmed
+                chest_confirmed = moved
 
             def record_reply(reply):
-                observed = replace(step, request_id=int(reply.client_request_id.raw_id), verdict=reply.result.name)
+                observed = replace(step, request_id=int(reply.client_request_id.raw_id), verdict=reply.result.name,
+                                   confirmed=chest_confirmed)
                 steps[-1] = observed
                 if not window_is_current():
                     return "window_changed"
                 if observed.verdict != "SUCCESS":
                     steps[-1] = replace(observed, confirmed=0)
                     return "rejected"
+                if in_chest:
+                    return "unconfirmed" if chest_confirmed is None else None
                 if overlapped:
                     return "unconfirmed"
 
@@ -552,11 +634,18 @@ async def transfer_inventory_range(
                 return None
 
             try:
-                reply = await inventory.move_item(
-                    origin, target, amount, timeout=time_left, _window_is_current=window_is_current,
-                    _expected_slots=(_stack_snapshot(source[origin]), _stack_snapshot(destination[target])),
-                    _on_unconfirmed=mark_unconfirmed,
-                )
+                expected = source[origin], destination[target]
+                if in_chest:
+                    reply = await containers._move_within_chest(
+                        window, origin, target, amount, timeout=time_left, expected=expected,
+                        window_is_current=window_is_current, on_submitted=retain_watch_until,
+                        on_confirmed=confirm_chest,
+                    )
+                else:
+                    reply = await inventory.move_item(
+                        origin, target, amount, timeout=time_left, _window_is_current=window_is_current,
+                        _expected_slots=tuple(map(_stack_snapshot, expected)), _on_unconfirmed=mark_unconfirmed,
+                    )
             except _InventoryMoveNotSubmitted as stopped:
                 steps.pop()
                 return result(str(stopped))
@@ -579,3 +668,11 @@ async def transfer_inventory_range(
     except (Exception, asyncio.CancelledError) as error:
         error.transfer_progress = result("cancelled" if isinstance(error, asyncio.CancelledError) else "unconfirmed")
         raise
+    finally:
+        if stop_watching is not None:
+            if submitted_reply is None or submitted_reply.done():
+                stop_watching()
+            else:
+                # The window also detaches its watches when it closes.
+                # A submitted request can still apply a verdict after its caller leaves.
+                submitted_reply.add_done_callback(lambda _: stop_watching())

@@ -1,5 +1,13 @@
 # Inventory and items
 
+## Move items within a chest
+
+Call `transfer_container_range()` with two non-overlapping ranges in the
+active ordinary 27-slot chest. Use `await bot.wait_for_container_slots()`
+after opening the chest to observe its slots. Check `confirmed_count`
+and `stop_reason` before continuing, especially after a partial move.
+[Choose ranges and interpret partial results](../tutorials/containers.md#choose-ranges-and-interpret-partial-results)
+
 ## Move a horse saddle
 
 Stand near a tamed horse while holding sneak with an empty hand. Open it

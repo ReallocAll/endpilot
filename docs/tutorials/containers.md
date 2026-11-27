@@ -214,7 +214,12 @@ quote in place of storage transfers.
   A double chest uses its server-reported 54-slot order. Main inventory
   slots are in `range(36)`. For `transfer_inventory_range()`, open the
   player inventory screen and use two non-overlapping main inventory ranges.
-- Use the exact registered item name. Both range helpers accept an optional
+- Use `transfer_container_range()` to move items within the open window
+  of an observed ordinary 27-slot chest with two non-overlapping ranges.
+  For example, `await transfer_container_range(bot, item="minecraft:paper",
+  count=6, source_slots=range(20, 22), destination_slots=range(2, 4))`
+  fills compatible stacks first, then uses observed empty chest slots.
+- Use the exact registered item name. The range helpers accept an optional
   synchronous `match` that sees immutable `HeldItemStack` observations
   with fields such as `aux_value` and `user_data_buffer`. Keep the
   predicate free of side effects because it can run again before each step.

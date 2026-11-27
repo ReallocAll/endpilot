@@ -45,7 +45,10 @@ from .navigation import (
 )
 from .placement import BoatPlacementResult, EntityPlacementResult, PlacementInventoryChange, PlacementResult, WaterBucketFillResult
 from .player_state import DeathEvent, GlideBoostEvent, PlayerAbilities, PlayerEffect, PlayerVitals
-from .range_transfer import RangeTransferResult, RangeTransferStep, transfer_inventory_range, transfer_item, transfer_range
+from .range_transfer import (
+    RangeTransferResult, RangeTransferStep, transfer_container_range, transfer_inventory_range, transfer_item,
+    transfer_range,
+)
 from .recoverable_error import RecoverableError
 from .resource_packs import (
     LoadedResourcePack, ResourcePackCancelled, ResourcePackDecision, ResourcePackDetails,
@@ -213,6 +216,7 @@ __all__ = [
     "WorldTime",
     "XZGoal",
     "YGoal",
+    "transfer_container_range",
     "transfer_inventory_range",
     "transfer_item",
     "transfer_range",
