@@ -2786,10 +2786,11 @@ class Movement:
             yaw = math.atan2(-dx, dz)
             lip = 0.5 + _PLAYER_HALF_WIDTH
             clearance = 0.5 - _PLAYER_HALF_WIDTH
-            strength = 0.12
+            lip_strength = 0.12
             # Reserve space for a complete neutral coast at air drag, even
             # though the first neutral frame normally still has ground drag.
-            max_step = 0.1 * _GROUND_ACCELERATION * strength / (1 - _GROUND_FRICTION)
+            acceleration = 0.1 * _GROUND_ACCELERATION
+            max_step = acceleration * lip_strength / (1 - _GROUND_FRICTION)
             # Continue just beyond whole-body lip clearance before neutral.
             stop_at = lip + 0.035
             margin = 0.005
@@ -2801,6 +2802,12 @@ class Movement:
                 x, z = x - source[0] - 0.5, z - source[2] - 0.5
                 return x * dx + z * dz, z * dx - x * dz
 
+            def step_limit(along):
+                # Still leave one side clearance of overlap on the upper deck
+                # before returning to the measured low-speed lip approach.
+                fast_step = 0.04
+                return fast_step if along + fast_step <= lip - clearance else max_step
+
             def check_short_step(origin, proposal):
                 along, across = offsets(origin)
                 end, side = offsets(proposal)
@@ -2810,7 +2817,7 @@ class Movement:
                 if (abs(side) + abs(side - across) * coast >= side_safe
                         or end + max(0, delta) * coast >= last_safe
                         or end + min(0, delta) * coast <= min_progress
-                        or delta > max_step + 0.00001):
+                        or delta > step_limit(along) + 0.00001):
                     raise _StraightWalkUnsafe
 
             approach_column = (source[0], source[2])
@@ -2912,10 +2919,14 @@ class Movement:
                     else:
                         await self.look_at((landing[0] + 0.5, y, landing[2] + 0.5))
                 first_step = forward and step_tick is None
+                strength = 0.0
+                if short and forward:
+                    vx, _, vz = self._velocity
+                    strength = max(0.0, (step_limit(progress) - (vx * dx + vz * dz)) / acceleration)
                 try:
                     tick = await send_input(
                         forward, landing_target=(landing[1], lower_columns) if first_step else None,
-                        move_vector=(0., strength if forward else 0.) if short else None,
+                        move_vector=(0., strength) if short else None,
                         validate_step=check_short_step if short else None,
                     )
                 except _StraightWalkUnsafe:
