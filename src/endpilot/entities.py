@@ -113,6 +113,17 @@ class EntityState:
     sneaking: bool | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class EntityMovementUpdate:
+    """A movement packet's applied entity snapshot and reported rotation and ground state."""
+
+    entity: EntityState
+    pitch: float | None
+    yaw: float | None
+    head_yaw: float | None
+    on_ground: bool
+
+
 _EntityLifecycleReason = Literal[
     "spawn_packet", "remove_actor", "pickup", "replaced", "roster_removed", "identity_invalidated",
     "dimension_changed",
@@ -403,6 +414,11 @@ def _unsupported_view_pose(words: _PlayerFlagWords, binding) -> bool:
                for flag in (flags.RIDING, flags.GLIDING, flags.SWIMMING, flags.SLEEPING, flags.CRAWLING))
 
 
+def _actor_angle(value: int) -> float:
+    # Packed actor angles are unsigned fractions of a turn.
+    return (int(value) & 255) * 360 / 256
+
+
 def _player_rotation(packet) -> _PlayerRotation | None:
     rotation = getattr(packet, "rot", None)
     if rotation is None:
@@ -470,6 +486,7 @@ class Entities:
         self._lifecycle_observers: dict[object, Callable[[EntityLifecycleEvent], None]] = {}
         self._actor_instances: dict[int, _ActorInstance] = {}
         self._movement_waiters: dict[int, _MovementWaiters] = {}
+        self._movement_observers: list[_EntityObserver[EntityMovementUpdate]] = []
         self._cursor_bodies: dict[int, _CursorBody] = {}
         self._player_equipment: dict[int, PlayerEquipmentSnapshot] = {}
         self._equipment_waiters: dict[int, set[asyncio.Future[PlayerEquipmentSnapshot]]] = {}
@@ -520,6 +537,7 @@ class Entities:
         self._player_list_observers.clear()
         self._player_skin_observers.clear()
         self._lifecycle_observers.clear()
+        self._movement_observers.clear()
         self._end_movement_waiters(ConnectionError, "entity session is closed", _cause)
         self._clear_player_equipment(ConnectionError, "entity session is closed", _cause)
         for observers in (self._swing_observers, self._critical_effect_observers, self._health_observers,
@@ -1789,7 +1807,7 @@ class Entities:
                     self._player_views[runtime_id] = replace(
                         view, rotation=rotation, ordinary_move=ordinary_move,
                     )
-                self._match_movement_waiters(state)
+                self._observe_movement(state, move, packet_id)
         elif packet_id == b.TakeItemActorPacket.ID:
             packet = self.packets.protocol.decode(raw)
             runtime_id, collector = int(packet.item_id), int(packet.actor_id)
@@ -1836,15 +1854,14 @@ class Entities:
                         instance.feet_known = False
             rotation = state.boat_rotation
             if rotation is not None:
-                # Packed actor angles are unsigned fractions of a turn.
                 rotation = tuple(
-                    old if value is None else (int(value) & 255) * 360 / 256
+                    old if value is None else _actor_angle(value)
                     for old, value in zip(rotation, (move.rot_x, move.rot_y))
                 )
             state = replace(state, position=position, boat_rotation=rotation)
             self._by_runtime[runtime_id] = state
             self._player_feet_by_runtime.pop(runtime_id, None)
-            self._match_movement_waiters(state)
+            self._observe_movement(state, move, packet_id)
 
         # Other packet observers may already have changed the subscriptions.
         if lifecycle_events and not self._closed:
@@ -2078,6 +2095,10 @@ class Entities:
             b.RemoveActorPacket.ID, match=matches, timeout=timeout
         )
 
+    def subscribe_entity_movement(self, callback: Callable[[EntityMovementUpdate], None]) -> Callable[[], None]:
+        self._require_live()
+        return self.packets._subscribe(self._movement_observers, _EntityObserver(None, callback))
+
     async def wait_for_movement(self, runtime_id: int, *, timeout: float = 15) -> EntityMovement:
         """Observe the next movement packet for a specific actor runtime ID.
 
@@ -2148,6 +2169,29 @@ class Entities:
             waiters.pop(future)
             if not waiters and self._movement_waiters.get(runtime_id) is waiters:
                 del self._movement_waiters[runtime_id]
+
+    def _observe_movement(self, state: EntityState, move, packet_id: int) -> None:
+        # Predicates can change subscriptions while matching this packet.
+        observers = ()
+        if self._movement_observers and state.runtime_id != self._own_runtime_id:
+            observers = tuple(self._movement_observers)
+        self._match_movement_waiters(state)
+        if not observers or self._closed:
+            return
+
+        b = self.packets.protocol.binding
+        if packet_id == b.MovePlayerPacket.ID:
+            rotation = move.rot
+            pitch, yaw, head_yaw = float(rotation.x), float(rotation.y), float(move.y_head_rot)
+            on_ground = bool(move.on_ground)
+        else:
+            pitch, yaw, head_yaw = (
+                None if angle is None else _actor_angle(angle)
+                for angle in (move.rot_x, move.rot_y, move.rot_y_head)
+            )
+            on_ground = bool(move.header & 1) if packet_id == b.MoveActorAbsolutePacket.ID else bool(move.is_on_ground)
+        event = EntityMovementUpdate(state, pitch, yaw, head_yaw, on_ground)
+        self._notify_entity_observers(observers, event, state.runtime_id, "entity movement observer failed")
 
     def _match_movement_waiters(self, state: EntityState) -> None:
         waiters = self._movement_waiters.get(state.runtime_id)

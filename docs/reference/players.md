@@ -178,6 +178,34 @@ packet reader stops, or the bot closes. Registration raises `RuntimeError`
 before joining or after closing the bot, and `ConnectionError` after the
 joined connection ends.
 
+## Observe remote entity movement
+
+`bot.subscribe_entity_movement(callback)` delivers one immutable
+`EntityMovementUpdate` per received `MovePlayer`, `MoveActorAbsolute`, or
+`MoveActorDelta` applied to a visible remote entity, including look-only and
+repeated reports. Spawns, velocity packets, and movement for the local player
+or actors outside the cache produce no updates.
+
+The `entity` snapshot reflects the cache after applying the packet. Its
+`position` uses the cache's packet coordinate reference, with omitted delta
+axes carried forward from the previous snapshot. `pitch`, `yaw`, and
+`head_yaw` hold the angles reported in that packet in degrees. Player angles
+retain their reported values, even when head and body yaw differ. Actor angles
+use units of `360 / 256` degrees, and a delta packet's omitted angles are
+`None`. `on_ground` is the packet's ground flag.
+
+The callback runs synchronously on the packet reader in packet order, after
+cache updates and movement predicates. Changes to subscriptions during
+delivery or a movement predicate take effect for future packets. Callback
+failures go to the event loop's exception handler.
+
+The subscription sends no packets and returns an idempotent unsubscribe
+function. It starts with future packets and continues across entity
+replacement and dimension changes. It ends when the server disconnects, the
+packet reader stops, or the bot closes. Registration raises `RuntimeError`
+before joining or after closing the bot, and `ConnectionError` after the
+joined connection ends.
+
 ## Observe remote player equipment
 
 `bot.observed_player_equipment(runtime_id)` reads the latest immutable

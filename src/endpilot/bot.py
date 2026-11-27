@@ -36,8 +36,8 @@ from .enchanting import Enchanting, EnchantOption
 from .entities import (
     Entities, EntityActorEvent, EntityAttributeUpdate, EntityCriticalEffect, EntityCriticalEffectKind,
     EntityCursorResult, EntityEffectUpdate, EntityHealthEvent, EntityHealthEventKind, EntityLifecycleEvent,
-    EntityMovement, EntitySpawn, EntityState, EntitySwing, ItemPickup, PlayerEquipmentSnapshot, PlayerListChange,
-    PlayerListEntry, VehicleLink, VehicleLinkChange,
+    EntityMovement, EntityMovementUpdate, EntitySpawn, EntityState, EntitySwing, ItemPickup,
+    PlayerEquipmentSnapshot, PlayerListChange, PlayerListEntry, VehicleLink, VehicleLinkChange,
 )
 from .expression import skin_packet
 from .fishing import Fishing, FishingResult
@@ -3105,6 +3105,17 @@ class Bot:
         if self._entities is None:
             raise RuntimeError("player has not joined")
         return self._entities.subscribe_entity_effect_updates(callback, runtime_id=runtime_id)
+
+    def subscribe_entity_movement(self, callback: Callable[[EntityMovementUpdate], None]) -> Callable[[], None]:
+        """Observe future movement packets for visible remote entities during this session.
+
+        The synchronous callback receives an immutable update after the cache is
+        updated. The returned unsubscribe function is idempotent. Subscriptions
+        continue across dimension changes and entity replacement.
+        """
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return self._entities.subscribe_entity_movement(callback)
 
     async def wait_for_entity_movement(
         self, runtime_id: int, *, timeout: float = 15
