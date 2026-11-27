@@ -1322,43 +1322,68 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await putting).result.name, "SUCCESS")
         self.assertEqual((self.bot.container_slots[0].stack_size, self.bot.inventory_slots[3].stack_size), (5, 0))
 
-    async def test_undyed_shulker_exact_transfers_use_its_own_slot_domain(self):
+    async def test_vanilla_shulker_exact_transfers_use_their_slot_domain(self):
         b = self.b
-        await self.deliver(
-            self.block("minecraft:undyed_shulker_box"), self.opened(-1), self.storage_content(27),
-            b.InventorySlotPacket(inventory_id=b.ContainerID.INVENTORY, slot=3, item=self.storage_item(5, 61)),
-        )
-        putting, request = await self.submit_stack(self.bot.put_into_container(3, 26, 3))
-        action, = request.actions
-        self.assertEqual((int(action.destination.full_container_name.name), action.destination.slot), (30, 26))
-        await self.reply_stack(request, ("SHULKER_BOX_CONTAINER", 26, 3, 31),
-                               ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 3, 2, 61))
-        self.assertEqual((await putting).result.name, "SUCCESS")
-        self.assertEqual((self.bot.container_slots[26].stack_size, self.bot.inventory_slots[3].stack_size), (3, 2))
+        for color in (
+            "black", "blue", "brown", "cyan", "gray", "green", "light_blue", "light_gray",
+            "lime", "magenta", "orange", "pink", "purple", "red", "undyed", "white", "yellow",
+        ):
+            with self.subTest(color=color):
+                await self.deliver(
+                    self.closed(), self.block(f"minecraft:{color}_shulker_box"), self.opened(-1),
+                    self.storage_content(27),
+                    b.InventorySlotPacket(inventory_id=b.ContainerID.INVENTORY, slot=3,
+                                          item=self.storage_item(5, 61)),
+                )
+                putting, request = await self.submit_stack(self.bot.put_into_container(3, 26, 3))
+                action, = request.actions
+                self.assertEqual((int(action.destination.full_container_name.name), action.destination.slot), (30, 26))
+                await self.reply_stack(request, ("SHULKER_BOX_CONTAINER", 26, 3, 31),
+                                       ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 3, 2, 61))
+                self.assertEqual((await putting).result.name, "SUCCESS")
+                self.assertEqual((self.bot.container_slots[26].stack_size, self.bot.inventory_slots[3].stack_size),
+                                 (3, 2))
 
-        taking, request = await self.submit_stack(self.bot.take_from_container(26, 3, 1))
-        action, = request.actions
-        self.assertEqual((int(action.source.full_container_name.name), action.source.slot, action.source.net_id_variant),
-                         (30, 26, 31))
-        await self.reply_stack(request, ("SHULKER_BOX_CONTAINER", 26, 2, 31),
-                               ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 3, 3, 61))
-        self.assertEqual((await taking).result.name, "SUCCESS")
-        self.assertEqual((self.bot.container_slots[26].stack_size, self.bot.inventory_slots[3].stack_size), (2, 3))
+                taking, request = await self.submit_stack(self.bot.take_from_container(26, 3, 1))
+                action, = request.actions
+                self.assertEqual((int(action.source.full_container_name.name), action.source.slot,
+                                  action.source.net_id_variant), (30, 26, 31))
+                await self.reply_stack(request, ("SHULKER_BOX_CONTAINER", 26, 2, 31),
+                                       ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 3, 3, 61))
+                self.assertEqual((await taking).result.name, "SUCCESS")
+                self.assertEqual((self.bot.container_slots[26].stack_size, self.bot.inventory_slots[3].stack_size),
+                                 (2, 3))
 
-    async def test_undyed_shulker_requires_complete_matching_window_before_exact_transfer(self):
+    async def test_only_exact_vanilla_shulker_names_select_the_shulker_domain(self):
+        for name in ("custom:red_shulker_box", "minecraft:future_shulker_box", "minecraft:shulker_box"):
+            with self.subTest(name=name):
+                state = SimpleNamespace(name=name)
+                with patch.object(self.bot._blocks, "_vanilla_state", return_value=state):
+                    await self.deliver(self.closed(), self.block("minecraft:chest"), self.opened(-1),
+                                       self.storage_content(27, (26, 5, 31)))
+                    taking, request = await self.submit_stack(self.bot.take_from_container(26, 3))
+                    self.assertEqual(int(request.actions[0].source.full_container_name.name), 7)
+                    await self.reply_stack(request, ("LEVEL_ENTITY_CONTAINER", 26, 4, 31),
+                                           ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 3, 1, 61))
+                    self.assertEqual((await taking).result.name, "SUCCESS")
+
+    async def test_shulker_requires_complete_matching_window_before_exact_transfer(self):
         b = self.b
-        await self.deliver(self.block("minecraft:undyed_shulker_box"), self.opened(-1), self.storage_content(1),
-                           b.InventorySlotPacket(inventory_id=2, slot=26, item=self.storage_item(5, 31)))
-        sent_before = list(self.wire.sent)
-        with self.assertRaisesRegex(RuntimeError, "unsupported slot count"):
-            await self.bot.take_from_container(26, 3)
-        await self.deliver(self.storage_content(27, (26, 5, 31)))
-        with self.assertRaisesRegex(ValueError, "range"):
-            await self.bot.take_from_container(27, 3)
-        await self.deliver(self.block("minecraft:chest"))
-        with self.assertRaisesRegex(RuntimeError, "no longer matches"):
-            await self.bot.take_from_container(26, 3)
-        self.assertEqual(self.wire.sent, sent_before)
+        for opened, replaced in (("undyed_shulker_box", "chest"), ("red_shulker_box", "blue_shulker_box")):
+            with self.subTest(opened=opened, replaced=replaced):
+                await self.deliver(self.closed(), self.block(f"minecraft:{opened}"), self.opened(-1),
+                                   self.storage_content(1),
+                                   b.InventorySlotPacket(inventory_id=2, slot=26, item=self.storage_item(5, 31)))
+                sent_before = list(self.wire.sent)
+                with self.assertRaisesRegex(RuntimeError, "unsupported slot count"):
+                    await self.bot.take_from_container(26, 3)
+                await self.deliver(self.storage_content(27, (26, 5, 31)))
+                with self.assertRaisesRegex(ValueError, "range"):
+                    await self.bot.take_from_container(27, 3)
+                await self.deliver(self.block(f"minecraft:{replaced}"))
+                with self.assertRaisesRegex(RuntimeError, "no longer matches"):
+                    await self.bot.take_from_container(26, 3)
+                self.assertEqual(self.wire.sent, sent_before)
 
     def hold_stack_writes(self):
         entered = asyncio.Event()
@@ -1378,6 +1403,7 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_exact_block_transfer_rejects_observed_replacement_at_transport_write(self):
         shulker = "minecraft:undyed_shulker_box"
+        red_shulker, blue_shulker = "minecraft:red_shulker_box", "minecraft:blue_shulker_box"
         b = self.b
         air_section = b.SubChunkPacket(
             dimension_type=0, center_pos=b.SubChunkPos(x=0, y=6, z=0),
@@ -1387,13 +1413,18 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
             )],
         )
         for initial, changes in (
+            (None, (self.block(red_shulker),)),
             (shulker, (self.block("minecraft:chest"),)),
             (shulker, (self.block("minecraft:air"), self.block(shulker))),
             (shulker, (air_section, self.block(shulker))),
             ("minecraft:chest", (self.block(shulker),)),
+            (red_shulker, (self.block(blue_shulker),)),
+            (red_shulker, (self.block(blue_shulker), self.block(red_shulker))),
         ):
             with self.subTest(initial=initial, changes=[type(packet).__name__ for packet in changes]):
-                await self.deliver(self.block(initial), self.opened(-1), self.storage_content(27, (26, 5, 31)))
+                if initial is not None:
+                    await self.deliver(self.block(initial))
+                await self.deliver(self.opened(-1), self.storage_content(27, (26, 5, 31)))
                 observers = self.transfer_observers()
                 hold, entered, released = self.hold_stack_writes()
                 with hold:
@@ -1461,25 +1492,36 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.transfer_observers(), observers)
                 self.assertEqual(self.wire.sent, sent_before)
 
-    async def test_late_shulker_reply_cannot_change_a_reused_chest_window(self):
-        await self.deliver(self.block("minecraft:undyed_shulker_box"), self.opened(-1),
-                           self.storage_content(27, (26, 5, 31)))
-        taking, request = await self.submit_stack(self.bot.take_from_container(26, 3))
-        original = self.bot.open_window
-        await self.deliver(self.closed(), self.block("minecraft:chest"), self.opened(-1),
-                           self.storage_content(27, (26, 9, 41)))
-        self.assertEqual(self.bot.open_window.container_id, original.container_id)
-        self.assertIsNot(self.bot.open_window, original)
-        await self.reply_stack(request, ("SHULKER_BOX_CONTAINER", 26, 4, 31),
-                               ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 3, 1, 61))
-        self.assertEqual((await taking).result.name, "SUCCESS")
-        self.assertEqual((self.bot.container_slots[26].stack_size, self.bot.inventory_slots[3].stack_size), (9, 1))
+    async def test_late_shulker_reply_cannot_change_a_reused_window(self):
+        b = self.b
+        for opened, replaced, domain, domain_id in (
+            ("undyed_shulker_box", "chest", "LEVEL_ENTITY_CONTAINER", 7),
+            ("undyed_shulker_box", "ender_chest", "LEVEL_ENTITY_CONTAINER", 7),
+            ("red_shulker_box", "blue_shulker_box", "SHULKER_BOX_CONTAINER", 30),
+        ):
+            with self.subTest(opened=opened, replaced=replaced):
+                await self.deliver(self.closed(), self.block(f"minecraft:{opened}"), self.opened(-1),
+                                   self.storage_content(27, (26, 5, 31)),
+                                   b.InventorySlotPacket(inventory_id=b.ContainerID.INVENTORY, slot=3,
+                                                         item=b.SerializedNetworkItemStackDescriptor()))
+                taking, request = await self.submit_stack(self.bot.take_from_container(26, 3))
+                original = self.bot.open_window
+                # The replacement can reuse both the window ID and the stack descriptor.
+                await self.deliver(self.closed(), self.block(f"minecraft:{replaced}"), self.opened(-1),
+                                   self.storage_content(27, (26, 5, 31)))
+                self.assertEqual(self.bot.open_window.container_id, original.container_id)
+                self.assertIsNot(self.bot.open_window, original)
+                await self.reply_stack(request, ("SHULKER_BOX_CONTAINER", 26, 4, 31),
+                                       ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 3, 1, 61))
+                self.assertEqual((await taking).result.name, "SUCCESS")
+                self.assertEqual((self.bot.container_slots[26].stack_size, self.bot.inventory_slots[3].stack_size),
+                                 (5, 1))
 
-        taking, request = await self.submit_stack(self.bot.take_from_container(26, 3))
-        self.assertEqual(int(request.actions[0].source.full_container_name.name), 7)
-        await self.reply_stack(request, ("LEVEL_ENTITY_CONTAINER", 26, 8, 41),
-                               ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 3, 2, 61))
-        self.assertEqual((await taking).result.name, "SUCCESS")
+                taking, request = await self.submit_stack(self.bot.take_from_container(26, 3))
+                self.assertEqual(int(request.actions[0].source.full_container_name.name), domain_id)
+                await self.reply_stack(request, (domain, 26, 4, 31),
+                                       ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 3, 2, 61))
+                self.assertEqual((await taking).result.name, "SUCCESS")
 
     async def test_block_range_and_reopened_cart_share_only_the_player_slot(self):
         b = self.b

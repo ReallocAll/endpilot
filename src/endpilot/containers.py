@@ -134,7 +134,12 @@ _ANVIL_SLOTS = {1: "ANVIL_INPUT_CONTAINER", 2: "ANVIL_MATERIAL_CONTAINER"}
 _ANVIL_WINDOW_SLOTS = {0: 1, 1: 2}
 _ANVIL_UI_SLOTS = {1: 1, 2: 2}
 _CHEST_FACINGS = {3162850062: "north", 741882976: "south", 1429214429: "west", 2001328343: "east"}
-_UNDYED_SHULKER_BOX = "minecraft:undyed_shulker_box"
+_SHULKER_BOXES = frozenset(
+    f"minecraft:{color}_shulker_box" for color in (
+        "black", "blue", "brown", "cyan", "gray", "green", "light_blue", "light_gray",
+        "lime", "magenta", "orange", "pink", "purple", "red", "undyed", "white", "yellow",
+    )
+)
 
 
 def _same_stack(before, current):
@@ -1385,10 +1390,9 @@ class Containers:
             # the distinct item-stack address to the observed block and its window layout.
             name = self._observed_window_block_name(window)
             target_name = self._current_window_block_name(window)
-            current_shulker = target_name == _UNDYED_SHULKER_BOX
-            shulker = name == _UNDYED_SHULKER_BOX or current_shulker
+            shulker = name in _SHULKER_BOXES or target_name in _SHULKER_BOXES
             if shulker:
-                if name != _UNDYED_SHULKER_BOX or not current_shulker:
+                if name != target_name:
                     raise RuntimeError("the shulker box no longer matches the active window")
                 if not 0 <= chest_slot < 27:
                     raise ValueError("the shulker box slot must be in range(27)")
@@ -1411,7 +1415,7 @@ class Containers:
                 # A first observation can establish a legacy window's target.
                 # A different address or air invalidates the prepared request.
                 target_name = name
-                target_replaced = (name in ("minecraft:air", _UNDYED_SHULKER_BOX)
+                target_replaced = (name == "minecraft:air" or name in _SHULKER_BOXES
                                    or (name == "minecraft:barrel" and container_name != "BARREL_CONTAINER"))
             elif name != target_name:
                 target_replaced = True
@@ -1680,7 +1684,7 @@ class Containers:
                     if exact_block:
                         name = self._current_window_block_name(window)
                         observe_target(name)
-                        if target_replaced or (shulker and name != _UNDYED_SHULKER_BOX):
+                        if target_replaced or (shulker and name != target_name):
                             raise RuntimeError("the target block no longer matches the active window")
                 finally:
                     if stop_watching is not None:
