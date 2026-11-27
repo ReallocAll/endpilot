@@ -52,7 +52,7 @@ from .login import (
     JoinSession, SessionEnd, _PendingOnlineJoin, _SessionEndState, _close_after_failed_join, _validate_join,
 )
 from .movement import BlockApproach, FlightResult, ForwardInput, Movement, MovementState
-from .navigation import NavigationGoal, NavigationPlan, NavigationResult, NavigationRules
+from .navigation import NavigationEvent, NavigationGoal, NavigationPlan, NavigationResult, NavigationRules
 from .placement import BoatPlacementResult, PlacementResult, observe_boat_placement, observe_placement
 from .player_state import DeathEvent, GlideBoostEvent, PlayerAbilities, PlayerEffect, PlayerState, PlayerVitals
 from .qa import PacketTimeline
@@ -1107,7 +1107,8 @@ class Bot:
 
     async def navigate(self, goal: NavigationGoal, *, rules: NavigationRules = NavigationRules(),
                        ticks: int = 160, timeout: float = 15,
-                       on_plan: Callable[[NavigationPlan], None] | None = None) -> NavigationResult:
+                       on_plan: Callable[[NavigationPlan], None] | None = None,
+                       on_event: Callable[[NavigationEvent], None] | None = None) -> NavigationResult:
         """Plan from the actual start, then move while rechecking terrain and the goal.
 
         The starting search bounds, expansion limit, frame budget and timeout
@@ -1117,11 +1118,16 @@ class Bot:
         If supplied, on_plan runs synchronously each time this call adopts a
         route, before sending movement for it. Callback exceptions propagate
         to this caller after movement cleanup.
+
+        If supplied, on_event synchronously observes this call's searches,
+        route changes and outcome. Observer exceptions go to the event loop's
+        exception handler. Time spent observing before completion counts
+        toward timeout.
         """
         if self._movement is None or self._blocks is None:
             raise RuntimeError("player has not joined")
         return await self._movement.navigate(
-            self._blocks, goal, rules, ticks=ticks, timeout=timeout, on_plan=on_plan,
+            self._blocks, goal, rules, ticks=ticks, timeout=timeout, on_plan=on_plan, on_event=on_event,
         )
 
     async def approach_block(self, position: tuple[int, int, int], *,

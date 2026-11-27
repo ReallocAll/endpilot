@@ -322,6 +322,19 @@ class NavigationResult:
     matches: tuple[BlockFaceMatch, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class NavigationEvent:
+    """An observation from one execution of the requested navigation goal."""
+
+    kind: Literal["started", "plan", "invalidated", "transition_completed", "finished"]
+    goal: NavigationGoal
+    plan: NavigationPlan | None = None
+    adopted: bool | None = None
+    reason: Literal["position_changed", "stance_unavailable", "edge_unavailable", "goal_unmatched",
+                    "dimension_changed", "cancelled", "error"] | None = None
+    result: NavigationResult | None = None
+
+
 class _VisibilityBudgetExhausted(Exception):
     pass
 

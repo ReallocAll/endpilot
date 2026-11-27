@@ -37,7 +37,7 @@ from .movement import BlockApproach, ForwardInput, MovementState
 from .navigation import (
     AllGoal, AnyGoal, BlockFaceGoal, BlockFaceMatch, BlockInteractionGoal, BlockInteractionMatch,
     BlockPlacementGoal, BlockPlacementMatch, EntityNearGoal, EntityVisibilityGoal, FootGoal, NavigationCosts,
-    NavigationGoal, NavigationPlan, NavigationResult, NavigationRules, NearGoal, NearXZGoal, XZGoal, YGoal,
+    NavigationEvent, NavigationGoal, NavigationPlan, NavigationResult, NavigationRules, NearGoal, NearXZGoal, XZGoal, YGoal,
 )
 from .placement import BoatPlacementResult, PlacementInventoryChange, PlacementResult
 from .player_state import DeathEvent, GlideBoostEvent, PlayerAbilities, PlayerEffect, PlayerVitals
@@ -140,6 +140,7 @@ __all__ = [
     "MiningTarget",
     "MovementState",
     "NavigationCosts",
+    "NavigationEvent",
     "NavigationGoal",
     "NavigationPlan",
     "NavigationResult",

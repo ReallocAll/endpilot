@@ -13,7 +13,7 @@ from bedrock_protocol import nbt
 from endpilot import (
     AllGoal, AnyGoal, BlockApproach, BlockFaceGoal, BlockFaceMatch, BlockInteractionGoal, BlockInteractionMatch,
     BlockPlacementGoal, BlockPlacementMatch, Bot, DimensionTransition, EntityNearGoal, EntityVisibilityGoal,
-    FootGoal, NavigationCosts, NavigationResult, NavigationRules, NearGoal, NearXZGoal, XZGoal, YGoal,
+    FootGoal, NavigationCosts, NavigationEvent, NavigationResult, NavigationRules, NearGoal, NearXZGoal, XZGoal, YGoal,
 )
 from endpilot.blocks import Blocks
 from endpilot.compression import PacketConnection
@@ -980,6 +980,7 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
     async def test_ladder_uses_ordered_own_ascent_and_braking_then_replans_on_the_top(self):
         _, target = self.prepare_ladder()
         first = brake = landing_tick = None
+        events = []
 
         def report():
             nonlocal first, brake, landing_tick
@@ -1002,8 +1003,13 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                     landing_tick = tick
 
         self.stream.on_send = report
-        result = await self.bot.navigate(FootGoal(target), rules=NavigationRules(search_radius=7), ticks=140, timeout=8)
+        result = await self.bot.navigate(FootGoal(target), rules=NavigationRules(search_radius=7),
+                                         ticks=140, timeout=8, on_event=events.append)
         self.assertEqual((result.status, result.stand_position), ("reached", target))
+        self.assertEqual([event.kind for event in events],
+                         ["started", "plan", "transition_completed", "plan", "finished"])
+        self.assertEqual((events[1].plan.start[1], events[3].plan.start[1]), (100, target[1]))
+        self.assertIs(events[-1].result, result)
         self.assertEqual(self.jump_input(), [])
         self.assertTrue(all(p.pos_delta.y == 0 for p in self.stream.sent))
         before_brake = [p for p in self.moving_input() if p.client_tick < brake]
@@ -1921,14 +1927,17 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         goal = self.prepare_gap()
         rules = NavigationRules(search_radius=2, vertical_radius=0)
         flags = self.binding.PlayerAuthInputPacket.InputData
+        events = []
 
         def report_teleport():
             if flags.START_JUMPING in self.stream.sent[-1].input_data:
                 self.set_position(0.5, 1.5, teleport=True, on_ground=True)
 
         self.stream.on_send = report_teleport
-        result = await self.bot.navigate(goal, rules=rules, ticks=100)
+        result = await self.bot.navigate(goal, rules=rules, ticks=100, on_event=events.append)
         self.assertEqual((result.status, result.frames, result.stand_position), ("unreachable", 1, None))
+        self.assertEqual([event.kind for event in events], ["started", "plan", "invalidated", "finished"])
+        self.assertEqual(events[2].reason, "position_changed")
         self.assertEqual(len(self.jump_input()), 1)
         self.assertIsNone(self.movement._pending_landing)
         self.assertAlmostEqual(self.movement.position[2], 1.5)
@@ -3301,9 +3310,17 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
             (XZGoal((2, 0)), "unreachable"),
         ):
             with self.subTest(goal=goal):
-                self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, status)
-                result = await self.bot.navigate(goal, rules=rules)
+                events = []
+                plans = []
+                plan = self.bot.plan_navigation(goal, rules=rules)
+                self.assertEqual(plan.status, status)
+                result = await self.bot.navigate(goal, rules=rules, on_plan=plans.append, on_event=events.append)
                 self.assertEqual((result.status, result.frames), (status, 0))
+                self.assertEqual([event.kind for event in events], ["started", "plan", "finished"])
+                self.assertEqual(events[1].plan, plan)
+                self.assertIs(events[1].adopted, False)
+                self.assertIs(events[-1].result, result)
+                self.assertEqual(plans, [])
         fallback = AnyGoal((near, YGoal(100)))
         self.assertEqual(self.bot.plan_navigation(fallback, rules=rules).endpoint, (0, 100, 0))
         self.set_block((1, 101, 0), self.AIR)
@@ -3704,6 +3721,26 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.stream.sent), 4)
         self.assert_released()
 
+        self.set_position(0.5, 0.5, on_ground=True)
+        self.stream.sent.clear()
+        send = self.stream.send
+        release_error = ConnectionError("neutral send failed")
+        events = []
+
+        async def fail_neutral_send(packet):
+            if packet.move.x == packet.move.y == 0.0:
+                raise release_error
+            await send(packet)
+
+        with patch.object(self.stream, "send", fail_neutral_send):
+            with self.assertRaises(ConnectionError) as caught:
+                await self.bot.navigate(goal, rules=rules, on_event=events.append)
+        self.assertIs(caught.exception, release_error)
+        self.assertEqual(len(self.stream.sent), 2)
+        self.assertEqual([event.kind for event in events], ["started", "plan", "finished"])
+        self.assertEqual(events[-1].reason, "error")
+        self.assertIsNone(events[-1].result)
+
     async def test_entity_visibility_checks_the_shared_ray_limit_at_final_stance(self):
         self.prepare_visibility_terrain()
         unique_id, _ = self.spawn_navigation_actor(x=0.5)
@@ -3770,14 +3807,17 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         goal = EntityVisibilityGoal(unique_id, aim_offset=(0, 1.5, 0), max_distance=0.8)
         rules = NavigationRules(search_radius=2, vertical_radius=0)
         plans = []
+        events = []
 
         def move_after_first_frame():
             if len(self.stream.sent) == 1:
                 self.move_villager(runtime_id, z=1.5)
 
         self.stream.on_send = move_after_first_frame
-        result = await self.bot.navigate(goal, rules=rules, on_plan=plans.append)
+        result = await self.bot.navigate(goal, rules=rules, on_plan=plans.append, on_event=events.append)
         self.assertEqual([plan.endpoint for plan in plans], [(0, 100, 2), (0, 100, 1)])
+        self.assertEqual([event.kind for event in events], ["started", "plan", "invalidated", "plan", "finished"])
+        self.assertEqual(events[2].reason, "goal_unmatched")
         self.assertEqual((result.status, result.stand_position), ("reached", (0, 100, 1)))
         self.assert_released()
 
@@ -4064,6 +4104,7 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                 initial = self.bot.plan_navigation(goal, rules=NavigationRules(vertical_radius=0))
                 limit = initial.expanded + 1 if resource == "search" else 16384
                 plans = []
+                events = []
 
                 def block_after_first_frame():
                     if len(self.stream.sent) == 1:
@@ -4072,11 +4113,15 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                 self.stream.on_send = block_after_first_frame
                 result = await self.bot.navigate(goal, rules=NavigationRules(vertical_radius=0, max_expansions=limit),
                                                  ticks=1 if resource == "frames" else 160,
-                                                 on_plan=plans.append)
+                                                 on_plan=plans.append, on_event=events.append)
                 self.assertEqual((result.status, result.frames, len(self.stream.sent)), ("budget", 1, 3))
                 plan, = plans
                 self.assertEqual((plan.status, plan.nodes, plan.expanded),
                                  ("found", initial.nodes, initial.expanded))
+                self.assertEqual([event.kind for event in events],
+                                 ["started", "plan", "invalidated", "plan", "finished"])
+                self.assertEqual(events[3].plan.status, "budget" if resource == "search" else "found")
+                self.assertIs(events[3].adopted, False)
                 if resource == "search":
                     self.assertEqual(result.expanded, limit)
                 else:
@@ -4088,6 +4133,8 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         goal = FootGoal((3, 100, 0))
         rules = NavigationRules(vertical_radius=0)
         obstacle = (1, 100, 0)
+        events = []
+        plans = []
         observed = []
 
         def block_after_first_frame():
@@ -4095,13 +4142,32 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                 self.set_block(obstacle, self.STONE)
 
         def on_plan(plan):
-            observed.append((plan, len(self.stream.sent)))
+            plans.append(plan)
+            observed.append(("on_plan", len(self.stream.sent)))
+
+        def on_event(event):
+            events.append(event)
+            observed.append((event.kind, len(self.stream.sent)))
 
         self.stream.on_send = block_after_first_frame
-        result = await self.bot.navigate(goal, rules=rules, on_plan=on_plan)
+        result = await self.bot.navigate(goal, rules=rules, on_plan=on_plan, on_event=on_event)
 
-        (initial, before_initial), (detour, before_detour) = observed
-        self.assertEqual((before_initial, before_detour), (0, 1))
+        initial, detour = plans
+        self.assertEqual(observed, [
+            ("started", 0), ("plan", 0), ("on_plan", 0), ("invalidated", 1),
+            ("plan", 1), ("on_plan", 1), ("finished", len(self.stream.sent)),
+        ])
+        started, first_plan, invalidated, next_plan, finished = events
+        self.assertIsInstance(started, NavigationEvent)
+        self.assertTrue(all(event.goal is goal for event in events))
+        with self.assertRaises(FrozenInstanceError):
+            started.kind = "finished"
+        self.assertIs(first_plan.plan, initial)
+        self.assertIs(next_plan.plan, detour)
+        self.assertIs(first_plan.adopted, True)
+        self.assertIs(next_plan.adopted, True)
+        self.assertEqual(invalidated.reason, "edge_unavailable")
+        self.assertIs(finished.result, result)
         self.assertEqual(initial.nodes, tuple((x, 100, 0) for x in range(4)))
         self.assertNotIn(obstacle, detour.nodes)
         self.assertEqual((initial.start, detour.start), ((0, 100, 0), (0, 100, 0)))
@@ -4121,11 +4187,15 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         self.prepare_terrain()
         goal = FootGoal((0, 100, 0))
         plans = []
+        events = []
 
-        result = await self.bot.navigate(goal, ticks=0, on_plan=plans.append)
+        result = await self.bot.navigate(goal, ticks=0, on_plan=plans.append, on_event=events.append)
 
         plan, = plans
         self.assertEqual((plan.status, plan.nodes, plan.cost), ("found", (goal.position,), Fraction(0)))
+        self.assertEqual([event.kind for event in events], ["started", "plan", "finished"])
+        self.assertIs(events[1].plan, plan)
+        self.assertIs(events[1].adopted, True)
         self.assertEqual(result, NavigationResult("reached", 0, plan.expanded, goal.position))
         self.assertEqual(self.stream.sent, [])
 
@@ -4140,11 +4210,15 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         rules = NavigationRules(vertical_radius=0)
         search = self.bot.plan_navigation(goal, rules=rules)
         plans = []
+        events = []
 
-        result = await self.bot.navigate(goal, rules=rules, ticks=0, on_plan=plans.append)
+        result = await self.bot.navigate(goal, rules=rules, ticks=0, on_plan=plans.append, on_event=events.append)
 
         self.assertEqual(search.status, "found")
         self.assertEqual(result, NavigationResult("budget", 0, search.expanded))
+        self.assertEqual([event.kind for event in events], ["started", "plan", "finished"])
+        self.assertEqual(events[1].plan, search)
+        self.assertIs(events[1].adopted, False)
         self.assertEqual(plans, [])
         self.assertEqual(self.stream.sent, [])
 
@@ -4201,6 +4275,35 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((result.status, result.frames), ("budget", 0))
         self.assertEqual(self.stream.sent, [])
 
+    async def test_navigate_reports_event_observer_errors_and_keeps_moving(self):
+        self.prepare_terrain()
+        goal = FootGoal((1, 100, 0))
+        loop = asyncio.get_running_loop()
+        errors = {"started": RuntimeError("start observer failed"), "plan": asyncio.CancelledError("plan observer failed")}
+        observed = []
+        reports = []
+
+        def on_event(event):
+            observed.append(event.kind)
+            if event.kind in errors:
+                raise errors[event.kind]
+
+        def on_plan(plan):
+            observed.append("on_plan")
+
+        handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda loop, context: reports.append(context))
+        try:
+            result = await self.bot.navigate(goal, on_plan=on_plan, on_event=on_event)
+        finally:
+            loop.set_exception_handler(handler)
+
+        self.assertEqual([report["exception"] for report in reports], list(errors.values()))
+        self.assertEqual(observed, ["started", "plan", "on_plan", "finished"])
+        self.assertEqual((result.status, result.stand_position), ("reached", goal.position))
+        self.assertGreater(result.frames, 0)
+        self.assert_released()
+
     async def test_navigate_stops_delivering_plans_on_stop_or_cancellation_and_releases_movement(self):
         self.prepare_terrain()
         goal = FootGoal((3, 100, 0))
@@ -4210,24 +4313,67 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
 
         for cancel in (False, True):
             with self.subTest(cancel=cancel):
+                events = []
+                finished_state = []
+
+                def on_event(event):
+                    events.append(event)
+                    if event.kind == "finished":
+                        finished_state.append((len(self.stream.sent), self.movement._action_lock.locked()))
+
                 plans.clear()
                 first_frame.clear()
                 self.set_position(0.5, 0.5)
                 self.stream.sent.clear()
-                task = asyncio.create_task(self.bot.navigate(goal, on_plan=plans.append))
+                task = asyncio.create_task(self.bot.navigate(goal, on_plan=plans.append, on_event=on_event))
                 await asyncio.wait_for(first_frame.wait(), 1)
                 if cancel:
                     task.cancel()
                     with self.assertRaises(asyncio.CancelledError):
                         await asyncio.wait_for(task, 1)
+                    self.assertIsNone(events[-1].result)
+                    self.assertEqual(events[-1].reason, "cancelled")
                 else:
                     await asyncio.wait_for(self.bot.stop_moving(), 1)
-                    self.assertEqual((await task).status, "stopped")
+                    stopped = await task
+                    self.assertEqual(stopped.status, "stopped")
+                    self.assertIs(events[-1].result, stopped)
+                    self.assertIsNone(events[-1].reason)
+                self.assertEqual(finished_state, [(len(self.stream.sent), False)])
                 self.assert_released()
                 self.assertEqual(await asyncio.wait_for(self.bot.walk_forward(1), 1), 1)
                 result = await self.bot.navigate(FootGoal((0, 100, 0)))
                 self.assertEqual(result.status, "reached")
+                self.assertEqual([event.kind for event in events], ["started", "plan", "finished"])
                 self.assertEqual(len(plans), 1)
+
+    async def test_navigate_reports_timeout_and_cancellation_while_queued_for_movement(self):
+        self.prepare_terrain()
+        goal = FootGoal((1, 100, 0))
+        events = []
+        with self.assertRaises(ValueError):
+            await self.bot.navigate(goal, ticks=-1, on_event=events.append)
+        self.assertEqual(events, [])
+
+        async with self.movement._action_lock:
+            task = asyncio.create_task(self.bot.navigate(goal, on_event=events.append))
+            await asyncio.sleep(0)
+            queued_events = list(events)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 1)
+            self.assertTrue(self.movement._action_lock.locked())
+            self.assertEqual([event.kind for event in queued_events], ["started"])
+            self.assertEqual([event.kind for event in events], ["started", "finished"])
+            self.assertEqual(events[-1].reason, "cancelled")
+            self.assertIsNone(events[-1].result)
+
+            events.clear()
+            result = await asyncio.wait_for(self.bot.navigate(goal, timeout=0.02, on_event=events.append), 1)
+            self.assertEqual(result, NavigationResult("budget", 0))
+            self.assertEqual([event.kind for event in events], ["started", "finished"])
+            self.assertIs(events[-1].result, result)
+        self.assertEqual(self.stream.sent, [])
 
     async def test_navigate_callback_error_propagates_after_movement_cleanup(self):
         goal = FootGoal((3, 100, 0))
@@ -4240,6 +4386,8 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                 self.set_position(0.5, 0.5)
                 self.stream.sent.clear()
                 plans = []
+                events = []
+                finished_state = []
                 cleanup_started = asyncio.Event()
                 expected_error = error_type("route observer failed")
 
@@ -4257,11 +4405,21 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                     if len(plans) == 2:
                         raise expected_error
 
+                def on_event(event):
+                    events.append(event)
+                    if event.kind == "finished":
+                        finished_state.append((cleanup_started.is_set(), self.movement._action_lock.locked()))
+
                 with patch.object(self.stream, "send", send_with_obstruction):
                     with self.assertRaises(error_type) as caught:
-                        await self.bot.navigate(goal, rules=rules, on_plan=on_plan, timeout=0.2 if stall_release else 5)
+                        await self.bot.navigate(goal, rules=rules, on_plan=on_plan, on_event=on_event,
+                                                timeout=0.2 if stall_release else 5)
                 self.assertIs(caught.exception, expected_error)
                 self.assertTrue(cleanup_started.is_set())
+                self.assertEqual(finished_state, [(True, False)])
+                self.assertEqual([event.kind for event in events], ["started", "plan", "invalidated", "plan", "finished"])
+                self.assertIsNone(events[-1].result)
+                self.assertEqual(events[-1].reason, "cancelled" if error_type is asyncio.CancelledError else "error")
                 self.assertEqual(len(self.moving_input()), 1)
                 if not stall_release:
                     self.assert_released()
@@ -4273,6 +4431,7 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         b = self.binding
         target = FootGoal((1, 100, 0))
         changed = False
+        events = []
 
         def reload_dimension():
             nonlocal changed
@@ -4291,11 +4450,18 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.bot.plan_navigation(target).status, "unknown")
 
         self.stream.on_send = reload_dimension
-        result = await self.bot.navigate(target)
+        result = await self.bot.navigate(target, on_event=events.append)
         self.assertEqual((result.status, result.stand_position), ("unknown", None))
+        self.assertEqual([event.kind for event in events], ["started", "plan", "invalidated", "finished"])
+        self.assertIs(events[1].adopted, True)
+        self.assertEqual(events[2].reason, "dimension_changed")
+        self.assertIs(events[2].plan, events[1].plan)
+        self.assertIs(events[3].result, result)
         self.assertTrue(changed)
         self.assertEqual(len(self.stream.sent), result.frames + 1)
-        self.assertEqual((await self.bot.navigate(target, ticks=0)).status, "unknown")
+        events.clear()
+        self.assertEqual((await self.bot.navigate(target, ticks=0, on_event=events.append)).status, "unknown")
+        self.assertEqual([event.kind for event in events], ["started", "finished"])
         self.movement._dimensions.active = None
         self.assertEqual((await self.bot.navigate(target, ticks=0)).status, "reached")
 
@@ -4385,6 +4551,50 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.stream.sent, attempts[:1])
         finally:
             self.stream.send = send
+
+    async def test_navigation_preserves_failure_when_releasing_input_also_fails(self):
+        self.prepare_terrain()
+        goal = FootGoal((3, 100, 0))
+        send = self.stream.send
+        for cancel in (True, False):
+            with self.subTest(cancel=cancel):
+                self.set_position(0.5, 0.5)
+                self.stream.sent.clear()
+                first_frame = asyncio.Event()
+                events = []
+                attempts = []
+                moving_error = BrokenPipeError("moving send failed")
+                release_error = ConnectionError("neutral send failed")
+
+                async def send_with_failures(packet):
+                    moving = self.up in packet.input_data
+                    attempts.append(moving)
+                    if not moving:
+                        raise release_error
+                    if first_frame.is_set():
+                        raise moving_error
+                    await send(packet)
+                    first_frame.set()
+
+                with patch.object(self.stream, "send", send_with_failures):
+                    task = asyncio.create_task(self.bot.navigate(goal, on_event=events.append))
+                    if cancel:
+                        await asyncio.wait_for(first_frame.wait(), 1)
+                        task.cancel("navigation cancelled")
+                        with self.assertRaises(asyncio.CancelledError) as caught:
+                            await asyncio.wait_for(task, 1)
+                        self.assertEqual(caught.exception.args, ("navigation cancelled",))
+                    else:
+                        with self.assertRaises(BrokenPipeError) as caught:
+                            await asyncio.wait_for(task, 1)
+                        self.assertIs(caught.exception, moving_error)
+
+                self.assertEqual(attempts, [True, False] if cancel else [True, True, False])
+                self.assertEqual(len(self.stream.sent), 1)
+                self.assertEqual([event.kind for event in events], ["started", "plan", "finished"])
+                self.assertEqual(events[-1].reason, "cancelled" if cancel else "error")
+                self.assertIsNone(events[-1].result)
+                self.assertEqual(await asyncio.wait_for(self.bot.walk_forward(1), 1), 1)
 
     async def test_timed_out_ascent_preserves_stance_and_the_next_teleport_ack(self):
         target, jumps, landings = self.ascent_route(steps=1)

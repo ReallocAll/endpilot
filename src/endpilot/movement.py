@@ -4,6 +4,7 @@ import asyncio
 import math
 from collections import deque
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from time import perf_counter_ns
 from typing import Literal
@@ -12,8 +13,8 @@ from .client_clock import ClientClock, TICK_PERIOD_NS
 from .entities import Entities, EntityState, VehicleLinkChange
 from .expression import animation
 from .navigation import (
-    AllGoal, AnyGoal, BlockFaceGoal, Cell, EntityNearGoal, EntityVisibilityGoal, NavigationGoal, NavigationPlan,
-    NavigationResult, NavigationRules,
+    AllGoal, AnyGoal, BlockFaceGoal, Cell, EntityNearGoal, EntityVisibilityGoal, NavigationEvent, NavigationGoal,
+    NavigationPlan, NavigationResult, NavigationRules,
     _LADDER_APPROACH, _LADDER_DECK_LENGTH, _LADDER_STRIDE, _STANDING_HEAD_HEIGHT, _StandingGraph,
     _VisibilityBudgetExhausted, _VisibilityScanBudget, _WATER_DECK_LENGTH, _WATER_STRIDE, _aim_point,
     _block_face_cells, _is_gap_jump, _is_ladder_climb, _is_two_block_drop,
@@ -2135,14 +2136,39 @@ class Movement:
 
     async def navigate(self, blocks, goal: NavigationGoal, rules: NavigationRules, *,
                        ticks: int, timeout: float,
-                       on_plan: Callable[[NavigationPlan], None] | None = None) -> NavigationResult:
+                       on_plan: Callable[[NavigationPlan], None] | None = None,
+                       on_event: Callable[[NavigationEvent], None] | None = None) -> NavigationResult:
         _require_goal(goal)
         if not isinstance(rules, NavigationRules):
             raise TypeError("expected NavigationRules")
         if not isinstance(ticks, int) or ticks < 0 or not 0 <= timeout < math.inf:
             raise ValueError("ticks must be a nonnegative integer and timeout finite and nonnegative")
-        deadline = asyncio.get_running_loop().time() + timeout
-        return await self._navigate_goal(blocks, goal, rules, ticks, deadline=deadline, on_plan=on_plan)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        if on_event is None:
+            return await self._navigate_goal(blocks, goal, rules, ticks, deadline=deadline, on_plan=on_plan)
+
+        def emit(event: NavigationEvent) -> None:
+            try:
+                on_event(event)
+            except (Exception, asyncio.CancelledError) as error:
+                loop.call_exception_handler({
+                    "message": "navigation observer failed", "exception": error, "callback": on_event,
+                })
+
+        emit(NavigationEvent("started", goal))
+        try:
+            result = await self._navigate_goal(
+                blocks, goal, rules, ticks, deadline=deadline, on_plan=on_plan, emit_event=emit,
+            )
+        except asyncio.CancelledError:
+            emit(NavigationEvent("finished", goal, reason="cancelled"))
+            raise
+        except Exception:
+            emit(NavigationEvent("finished", goal, reason="error"))
+            raise
+        emit(NavigationEvent("finished", goal, result=result))
+        return result
 
     async def approach_block(self, blocks, position: tuple[int, int, int], *,
                              ticks: int = 160, search_radius: int = 8,
@@ -2156,7 +2182,8 @@ class Movement:
         return BlockApproach(status, result.frames, result.stand_position, face)
 
     async def _navigate_goal(self, blocks, goal, rules, ticks, *, deadline=None, legacy=False, preferred_goal=None,
-                             on_plan: Callable[[NavigationPlan], None] | None = None):
+                             on_plan: Callable[[NavigationPlan], None] | None = None,
+                             emit_event: Callable[[NavigationEvent], None] | None = None):
         loop = asyncio.get_running_loop()
         instances = self._navigation_instances(goal, preferred_goal)
 
@@ -2207,7 +2234,7 @@ class Movement:
                 self._pending_landing = None
                 return await self._navigate_from(
                     blocks, goal, rules, ticks, start, dimension, epoch, deadline, legacy,
-                    instances=instances, preferred_goal=preferred_goal, on_plan=on_plan,
+                    instances=instances, preferred_goal=preferred_goal, on_plan=on_plan, emit_event=emit_event,
                 )
             finally:
                 self._active_done = None
@@ -2216,7 +2243,8 @@ class Movement:
             self._action_lock.release()
 
     async def _navigate_from(self, blocks, goal, rules, ticks, start, dimension, epoch, deadline, legacy, *,
-                             instances, preferred_goal=None, on_plan: Callable[[NavigationPlan], None] | None = None):
+                             instances, preferred_goal=None, on_plan: Callable[[NavigationPlan], None] | None = None,
+                             emit_event: Callable[[NavigationEvent], None] | None = None):
         calibrated = not legacy and self._standard_ground_motion(blocks)
         graph = _StandingGraph(blocks, start, rules, allow_vertical=not (self._sprint_key or self._sneaking),
                                allow_gap=calibrated, allow_drop_two=calibrated, allow_ladder=calibrated,
@@ -2236,10 +2264,23 @@ class Movement:
         used_ascents = set()
         aimed_cell = None
         route = None
-        callback_error = None
+        original_goal = goal
+        active_plan = None
+        pending_error = None
 
         def outcome(status, cell=None, matches=()):
             return NavigationResult(status, submitted, expanded, cell, matches)
+
+        def invalidate(reason):
+            nonlocal route, active_plan
+            route = None
+            if emit_event is not None and active_plan is not None:
+                plan, active_plan = active_plan, None
+                emit_event(NavigationEvent("invalidated", original_goal, plan=plan, reason=reason))
+
+        def abandon(status, reason):
+            invalidate(reason)
+            return outcome(status)
 
         def at_center(cell, x, z):
             return math.hypot(cell[0] + 0.5 - x, cell[2] + 0.5 - z) <= 0.12
@@ -2269,7 +2310,7 @@ class Movement:
             if self._server_disconnected:
                 raise ConnectionError("server disconnected during movement")
             if not dimension_is_current():
-                return outcome("unknown")
+                return abandon("unknown", "dimension_changed")
             if self._stop_requested:
                 return outcome("stopped")
             self._require_ground_input()
@@ -2298,6 +2339,26 @@ class Movement:
                     await asyncio.sleep(0.05)
             return True
 
+        @asynccontextmanager
+        async def release_on_exit(*, sneak_changed=False):
+            nonlocal pending_error
+            unwinding_error = False
+            try:
+                yield
+            except (Exception, asyncio.CancelledError) as error:
+                unwinding_error = not isinstance(error, _VisibilityBudgetExhausted) or pending_error is error
+                if not sneak_changed and unwinding_error and not isinstance(error, asyncio.CancelledError):
+                    pending_error = error
+                raise
+            finally:
+                needs_release = release_sneak if sneak_changed else release_input and not release_sneak
+                if needs_release:
+                    try:
+                        await release(sneak_changed=sneak_changed)
+                    except Exception:
+                        if not unwinding_error:
+                            raise
+
         async def descend(source, landing):
             nonlocal remaining, submitted, release_input, accepted_level
             buffer = _runout(source, landing)
@@ -2317,28 +2378,28 @@ class Movement:
                 if result is not None:
                     return result
                 if self._teleport_pending is not None and self._tick > entry_tick:
-                    return None
+                    return "position_changed"
 
                 x, y, z = self._input_position
                 column = (math.floor(x), math.floor(z))
                 on_lower = column in lower_columns
                 if (not lower_y - 0.05 <= y <= upper_y + 0.05
                         or (not on_lower and (column != approach_column or abs(y - upper_y) > 0.05))):
-                    return outcome("unreachable")
+                    return abandon("unreachable", "position_changed")
                 if not on_lower:
                     target = self._navigation_goal(blocks, goal).block_exists if legacy else True
                     status = stance_failure(blocks._flat_stance(source), target)
                     if status is not None:
-                        return outcome(status)
+                        return abandon(status, "stance_unavailable")
                     off_axis = (abs(x - source[0] - 0.5) if source[0] == landing[0]
                                 else abs(z - source[2] - 0.5))
                     if not crossed and off_axis > 0.12:
-                        return None
+                        return "position_changed"
 
                 # The launch stance was checked while the player was in the upper column.
                 clear = graph.edge(source, landing, check_descent_source=False)
                 if clear is not True:
-                    return outcome("unknown" if clear is None else "unreachable")
+                    return abandon("unknown" if clear is None else "unreachable", "edge_unavailable")
                 if on_lower:
                     progress = ((x - source[0] - 0.5) * (landing[0] - source[0])
                                 + (z - source[2] - 0.5) * (landing[2] - source[2]))
@@ -2355,7 +2416,7 @@ class Movement:
                         return None
                     if not on_lower:
                         self._pending_landing = None
-                        return None
+                        return "position_changed"
                 if remaining <= 0 or asyncio.get_running_loop().time() >= deadline:
                     return outcome("budget")
 
@@ -2405,7 +2466,7 @@ class Movement:
                 if result is not None:
                     return result
                 if self._teleport_pending is not None and self._tick > entry_tick:
-                    return None
+                    return "position_changed"
                 x, y, z = self._input_position
                 column = (math.floor(x), math.floor(z))
                 lateral = x - sx - 0.5 if dz else z - sz - 0.5
@@ -2413,17 +2474,17 @@ class Movement:
                 # Keep the 0.6-wide body within the two checked columns.
                 if (abs(lateral) > 0.20 or not -0.20 <= progress <= 1.20
                         or not lower_eye - 0.05 <= y <= upper_eye + 0.30):
-                    return outcome("unreachable")
+                    return abandon("unreachable", "position_changed")
                 target = self._navigation_goal(blocks, goal).block_exists if legacy else True
                 status = stance_failure(graph.edge(source, landing), target)
                 if status is not None:
-                    return outcome(status)
+                    return abandon(status, "edge_unavailable")
 
                 ground_tick = self._ground_correction_tick
                 if (jump_tick is not None and ground_tick is not None
                         and jump_tick <= ground_tick < self._tick and self._input_position == self.position):
                     if abs(y - upper_eye) > 0.05 or raised_surface(x, z) is None:
-                        return outcome("unreachable")
+                        return abandon("unreachable", "position_changed")
                     if column == (lx, lz):
                         accepted_level = ly
                         use_ground_velocity = True
@@ -2434,7 +2495,7 @@ class Movement:
                 jump = jump_tick is None and brake == 0
                 if jump:
                     if not at_center(source, x, z):
-                        return None
+                        return "position_changed"
                     await self.look_at((lx + 0.5, y, lz + 0.5))
                 braking_at_edge = (braking_at_edge or progress >= 0.7
                                    or (advancing and y < upper_eye - 0.0001))
@@ -2516,12 +2577,12 @@ class Movement:
                         return result
                     if self._teleport_pending is not None and self._tick > entry_tick:
                         use_ground_velocity = True
-                        return None
+                        return "position_changed"
                     if failed_landing:
-                        return outcome("unreachable")
+                        return abandon("unreachable", "position_changed")
                     status = stance_failure(graph.edge(source, landing), self._standard_ground_motion(blocks))
                     if status is not None:
-                        return outcome(status)
+                        return abandon(status, "edge_unavailable")
 
                     x, y, z = self._input_position
                     if step_tick is None:
@@ -2534,7 +2595,7 @@ class Movement:
                                 or max(abs(self._velocity[0]), abs(self._velocity[2])) >= _REST_SPEED
                                 or y != observed[1]
                                 or (self._ground_correction_tick is None and abs(y - wire_eye) > wire_step)):
-                            return outcome("unknown")
+                            return abandon("unknown", "edge_unavailable")
                         if self._teleport_pending is not None or self._jump_was_pressed:
                             await self._send_input(False, move_vector=(0.0, 0.0))
                             remaining -= 1
@@ -2553,7 +2614,7 @@ class Movement:
                         continue
 
                     if not in_corridor(self._input_position):
-                        return outcome("unreachable")
+                        return abandon("unreachable", "position_changed")
                     grounding = self._server_grounding
                     if (air_tick is not None and grounding is not None and grounding[1]
                             and air_tick < grounding[0] < self._tick):
@@ -2679,12 +2740,12 @@ class Movement:
                         return result
                     if self._teleport_pending is not None and self._tick > entry_tick:
                         use_ground_velocity = True
-                        return None
+                        return "position_changed"
                     if departed:
-                        return outcome("unreachable")
+                        return abandon("unreachable", "position_changed")
                     status = stance_failure(graph.edge(source, landing), self._standard_ground_motion(blocks))
                     if status is not None:
-                        return outcome(status)
+                        return abandon(status, "edge_unavailable")
                     predicted = self._input_position
                     x, y, z = predicted
                     if first_tick is None:
@@ -2697,7 +2758,7 @@ class Movement:
                                 or max(abs(self._velocity[0]), abs(self._velocity[2])) >= _REST_SPEED
                                 or y != observed[1]
                                 or (self._ground_correction_tick is None and abs(y - wire_eye) > wire_step)):
-                            return outcome("unknown")
+                            return abandon("unknown", "edge_unavailable")
                         if self._teleport_pending is not None or self._jump_was_pressed:
                             await self._send_input(False)
                             remaining -= 1
@@ -2706,7 +2767,7 @@ class Movement:
                         first_tick = self._tick
                         use_ground_velocity = False
                     elif not in_travel(predicted):
-                        return outcome("unreachable")
+                        return abandon("unreachable", "position_changed")
 
                     if (grounded_at is not None and self._observed_ground is True
                             and on_deck(self.position) and predicted == self.position):
@@ -2722,7 +2783,7 @@ class Movement:
                     if remaining <= 0:
                         return outcome("budget")
                     if neutral_frames >= _LADDER_NEUTRAL_FRAMES:
-                        return outcome("unknown")
+                        return abandon("unknown", "edge_unavailable")
 
                     forward = (brake_tick is None and forward_frames < forward_limit
                                and progress(predicted) < _LADDER_RELEASE_PROGRESS)
@@ -2824,11 +2885,11 @@ class Movement:
                     status = stance_failure(graph.edge(source, landing),
                                             self._standard_ground_motion(blocks, owns_sneak=owns_sneak))
                     if status is not None:
-                        return outcome(status)
+                        return abandon(status, "edge_unavailable")
                     if invalidated:
-                        return outcome("unreachable")
+                        return abandon("unreachable", "position_changed")
                     if phase != "align" and self._teleport_pending is not None:
-                        return outcome("unknown")
+                        return abandon("unknown", "position_changed")
 
                     predicted = self._input_position
                     x, y, z = predicted
@@ -2838,17 +2899,17 @@ class Movement:
                     if phase == "align":
                         if (not self._at_standing_height(sy) or self._observed_ground is False
                                 or abs(lateral) > 0.20 or not 1.30 <= forward <= 2.20):
-                            return outcome("unknown")
+                            return abandon("unknown", "position_changed")
                         if self._teleport_pending is None and not self._jump_was_pressed:
                             if resting and abs(lateral) <= 0.02 and 1.70 <= forward <= 1.92:
                                 stage("approach")
                             else:
                                 directions = self._ground_target_directions(align_x - x, align_z - z, yaw)
                                 if directions is None:
-                                    return outcome("unknown")
+                                    return abandon("unknown", "edge_unavailable")
                     if phase == "approach":
                         if abs(lateral) > 0.18 or y < bottom_eye or forward < 0.20:
-                            return outcome("unreachable")
+                            return abandon("unreachable", "position_changed")
                         if forward <= 0.33:
                             # Brake on submitted position. The first airborne correction
                             # can arrive after the first neutral sneak frame.
@@ -2858,18 +2919,18 @@ class Movement:
                             directions = (0.0, -0.15)
                     if phase == "hold" and frames >= _LADDER_DESCENT_HOLD_FRAMES and hold_height is not None:
                         if not in_rung(self.position) or self._observed_ground is not False:
-                            return outcome("unknown")
+                            return abandon("unknown", "edge_unavailable")
                         lower_tick = self._tick
                         stage("lower")
                     if phase == "lower" and grounded:
                         if not self._observed_ground or not at_base(self.position) or not at_base(predicted):
-                            return outcome("unknown")
+                            return abandon("unknown", "edge_unavailable")
                         self._observe_travel_position = None
                         stage("exit")
                     if phase in ("exit", "settle"):
                         if (self._observed_ground is not True or not self._at_standing_height(ly)
                                 or abs(lateral) > 0.18 or not exit_edge + 0.30 <= forward <= 0.65):
-                            return outcome("unreachable")
+                            return abandon("unreachable", "position_changed")
                         if phase == "exit":
                             if forward <= exit_edge + 0.80:
                                 stage("settle")
@@ -2883,7 +2944,7 @@ class Movement:
                     if remaining <= 0:
                         return outcome("budget")
                     if frames >= _LADDER_DESCENT_PHASE_FRAMES[phase]:
-                        return outcome("unknown")
+                        return abandon("unknown", "edge_unavailable")
                     sneak_changed = frames == 0 and phase in ("hold", "lower")
                     if sneak_changed:
                         self._sneaking = phase == "hold"
@@ -2989,15 +3050,15 @@ class Movement:
                     if result is not None:
                         return result
                     if self._teleport_pending is not None and self._tick > entry_tick:
-                        return outcome("unknown")
+                        return abandon("unknown", "position_changed")
                     if departed:
-                        return outcome("unreachable")
+                        return abandon("unreachable", "position_changed")
                     air = self._navigation_air_supply()
                     status = stance_failure(graph.edge(source, landing), self._standard_motion(blocks, owns_sprint=owns_sprint))
                     if status is not None:
-                        return outcome(status)
+                        return abandon(status, "edge_unavailable")
                     if air is None or air < 80:
-                        return outcome("unknown")
+                        return abandon("unknown", "edge_unavailable")
                     if first_tick is None:
                         reserved = _WATER_MIN_TICKS
                         if remaining < reserved or (deadline is not None and loop.time() + reserved * 0.05 > deadline):
@@ -3011,7 +3072,7 @@ class Movement:
                                 or max(abs(self._velocity[0]), abs(self._velocity[2])) >= _REST_SPEED
                                 or y != observed[1]
                                 or (self._ground_correction_tick is None and abs(y - wire_eye) > height_step)):
-                            return outcome("unknown")
+                            return abandon("unknown", "edge_unavailable")
                         if self._teleport_pending is not None or self._jump_was_pressed:
                             await self._send_input(False, move_vector=(0.0, 0.0))
                             remaining -= 1
@@ -3054,7 +3115,7 @@ class Movement:
                     if phase == "settle":
                         if (grounded is None or self._observed_ground is not True or not on_deck(self.position)
                                 or not exited_swimming()):
-                            return outcome("unknown")
+                            return abandon("unknown", "edge_unavailable")
                         if grounded[0] != settle_ground_tick:
                             settle_ground_tick = grounded[0]
                             frames = 0
@@ -3068,7 +3129,7 @@ class Movement:
                     if remaining <= 2:
                         return outcome("budget")
                     if frames >= _WATER_PHASE_TICKS[phase]:
-                        return outcome("unknown")
+                        return abandon("unknown", "edge_unavailable")
                     forward = (0.45 if phase == "enter" else 1.0 if phase in ("start", "wall", "rise", "lip") else 0.0)
                     self._rotation = (-60.0 if phase in ("rise", "lip", "brake", "settle") else 0.0, heading)
                     if phase == "start" and swim_tick is None:
@@ -3126,10 +3187,10 @@ class Movement:
                     return result
                 if self._teleport_pending is not None and self._tick > entry_tick:
                     use_ground_velocity = True
-                    return None
+                    return "position_changed"
                 status = stance_failure(graph.edge(source, landing), self._standard_ground_motion(blocks))
                 if status is not None:
-                    return outcome(status)
+                    return abandon(status, "edge_unavailable")
                 x, y, z = self._input_position
                 from_center_x, from_center_z = x - sx - 0.5, z - sz - 0.5
                 if jump_tick is None:
@@ -3138,7 +3199,7 @@ class Movement:
                         return outcome("budget")
                     if (self._foot_cell(self._input_position) != source or not self._at_standing_height(sy)
                             or self._observed_ground is False):
-                        return outcome("unreachable")
+                        return abandon("unreachable", "position_changed")
                     self._rotation = (self._rotation[0], heading)
                     still = (math.hypot(from_center_x, from_center_z) <= 0.05
                              and max(abs(self._velocity[0]), abs(self._velocity[2])) < _REST_SPEED)
@@ -3147,7 +3208,7 @@ class Movement:
                             self._ground_target_directions(-from_center_x, -from_center_z, yaw)
                         )
                         if directions is None:
-                            return outcome("unreachable")
+                            return abandon("unreachable", "edge_unavailable")
                         if any(directions) or self._velocity[0] or self._velocity[2]:
                             before_alignment = self.position
                         await self._send_input(False, move_vector=directions)
@@ -3159,14 +3220,15 @@ class Movement:
                         continue
                     # A predicted alignment can settle before BDS corrects the player.
                     observed = self.position
-                    if (observed is None or observed is before_alignment
-                            or abs(observed[1] - eye_y) > 0.05
+                    if observed is None or observed is before_alignment:
+                        return abandon("unknown", "edge_unavailable")
+                    if (abs(observed[1] - eye_y) > 0.05
                             or math.hypot(observed[0] - sx - 0.5, observed[2] - sz - 0.5) > 0.05):
-                        return outcome("unknown")
+                        return abandon("unknown", "position_changed")
                     # Vanilla can report the adjacent float32 value for the stone surface.
                     if y != observed[1] or (self._ground_correction_tick is None
                                            and abs(y - wire_eye_y) > wire_height_step):
-                        return outcome("unknown")
+                        return abandon("unknown", "edge_unavailable")
                     jump_tick = await self._send_input(
                         True, jump_pressed=True, landing_target=(sy, landing_columns),
                     )
@@ -3179,12 +3241,12 @@ class Movement:
                     continue
 
                 if not in_corridor(x, z) or not eye_y - 0.05 <= y <= eye_y + 1.30:
-                    return outcome("unreachable")
+                    return abandon("unreachable", "position_changed")
 
                 grounding = self._server_grounding
                 if grounding is not None and grounding[1] and jump_tick + _GAP_FORWARD_FRAMES <= grounding[0] < self._tick:
                     if not on_landing(grounding[2]):
-                        return outcome("unreachable")
+                        return abandon("unreachable", "position_changed")
                     if self._observed_ground is True and on_landing(self.position) and self._input_position == self.position:
                         if self.position != settled_at:
                             settled_at, settled_frames = self.position, 0
@@ -3211,9 +3273,10 @@ class Movement:
                     settled_frames += 1
                 await asyncio.sleep(0.05)
 
-        try:
-            async with timeout:
-                try:
+        # A held sneak release must still be sent after the action deadline.
+        async with release_on_exit(sneak_changed=True):
+            try:
+                async with timeout, release_on_exit():
                     while True:
                         result = interrupted()
                         if result is not None:
@@ -3223,12 +3286,12 @@ class Movement:
                         current_y = current[1]
                         # Position-only updates cannot turn an airborne correction into a stance.
                         if not self._at_standing_height(current_y) or not graph.in_bounds(current):
-                            return outcome("unreachable")
+                            return abandon("unreachable", "position_changed")
                         if self._teleport_pending is not None:
                             accepted_level = current_y
                             use_ground_velocity |= current_y > start[1]
                         elif current_y != accepted_level:
-                            return outcome("unreachable")
+                            return abandon("unreachable", "position_changed")
 
                         requested_goal = goal if preferred_goal is None else preferred_goal
                         current_goal = self._navigation_goal(blocks, requested_goal, instances,
@@ -3237,8 +3300,8 @@ class Movement:
                         status = stance_failure(blocks._flat_stance(current, allow_vegetation=True), target)
                         if status is not None:
                             if legacy or status == "unreachable":
-                                return outcome(status)
-                            route = None
+                                return abandon(status, "stance_unavailable")
+                            invalidate("stance_unavailable")
                         elif current == aimed_cell and reached_cell(current, x, z) and self._teleport_pending is None:
                             matches, faces = current_goal.check(current, eye=(x, y, z),
                                                                 visibility_standing=visibility_standing)
@@ -3247,6 +3310,11 @@ class Movement:
                                 if point is not None:
                                     await self.look_at(point)
                                 return outcome("reached", current, faces)
+                            if route is None:
+                                invalidate("goal_unmatched")
+                        elif route is None and active_plan is not None:
+                            # The pose changed after the tentative arrival and input release.
+                            invalidate("position_changed")
 
                         if route is not None:
                             next_cell = route[0]
@@ -3254,18 +3322,30 @@ class Movement:
                             off_axis = (abs(x - (anchor[0] + 0.5)) if anchor[0] == next_cell[0]
                                         else abs(z - (anchor[2] + 0.5)))
                             if (self._teleport_pending is not None or current not in (anchor, next_cell)
-                                    or (anchor != next_cell and off_axis > 0.12)
-                                    or graph.edge(anchor, next_cell) is not True
-                                    or current_goal.check(route[-1])[0] is not True):
-                                route = None
+                                    or (anchor != next_cell and off_axis > 0.12)):
+                                invalidate("position_changed")
+                            elif graph.edge(anchor, next_cell) is not True:
+                                invalidate("edge_unavailable")
+                            elif current_goal.check(route[-1])[0] is not True:
+                                invalidate("goal_unmatched")
                         if route is None:
+                            # An invalidation observer can synchronously request a stop.
+                            if emit_event is not None and self._stop_requested:
+                                return interrupted()
                             limit = None if legacy else rules.max_expansions - expanded
                             start_eye = (x, y, z) if reached_cell(current, x, z) else None
                             plan = graph.plan(current, current_goal, limit=limit, used_ascents=used_ascents,
                                               expired=None if legacy else expired, start_eye=start_eye,
                                               start_visibility_standing=visibility_standing)
                             expanded += plan.expanded
-                            if expired():
+                            search_expired = expired()
+                            adopted = (not search_expired and plan.status == "found" and (legacy or remaining >= 0)
+                                       and (remaining > 0 or (start_eye is not None and len(plan.nodes) == 1)))
+                            if emit_event is not None:
+                                if adopted:
+                                    active_plan = plan
+                                emit_event(NavigationEvent("plan", original_goal, plan=plan, adopted=adopted))
+                            if search_expired:
                                 return outcome("budget")
                             if preferred_goal is not None:
                                 # Choose once from the synchronized pose while this action owns movement.
@@ -3280,14 +3360,15 @@ class Movement:
                                 return outcome("budget")
                             anchor = current
                             route = deque(plan.nodes)
-                            if (on_plan is not None
-                                    and (remaining > 0 or (start_eye is not None and len(plan.nodes) == 1))):
+                            notify_plan = on_plan is not None and adopted
+                            if notify_plan:
                                 try:
                                     on_plan(plan)
                                 except (Exception, asyncio.CancelledError) as error:
-                                    # Preserve the callback error through deadline-limited input release.
-                                    callback_error = error
-                                    break
+                                    # Keep an explicit callback failure if the deadline interrupts cleanup.
+                                    pending_error = error
+                                    raise
+                            if emit_event is not None or notify_plan:
                                 result = interrupted()
                                 if result is not None:
                                     return result
@@ -3306,7 +3387,7 @@ class Movement:
                                 matches, faces = current_goal.check(anchor, eye=(x, y, z),
                                                                     visibility_standing=visibility_standing)
                                 if matches is not True:
-                                    route = None
+                                    invalidate("goal_unmatched")
                                     continue
                                 point = _aim_point(faces)
                                 if point is not None:
@@ -3324,7 +3405,7 @@ class Movement:
                                 route = None
                                 continue
                             if graph.edge(anchor, route[0]) is not True:
-                                route = None
+                                invalidate("edge_unavailable")
                                 continue
 
                         if _is_gap_jump(anchor, route[0]):
@@ -3345,8 +3426,13 @@ class Movement:
                             transition = None
                         if transition is not None:
                             result = await transition(anchor, route[0])
-                            if result is not None:
+                            if isinstance(result, str):
+                                invalidate(result)
+                            elif result is not None:
                                 return result
+                            elif emit_event is not None and active_plan is not None:
+                                emit_event(NavigationEvent("transition_completed", original_goal, plan=active_plan))
+                                active_plan = None
                             route = aimed_cell = None
                             continue
                         if remaining <= 0:
@@ -3359,7 +3445,7 @@ class Movement:
                             self._rotation = (self._rotation[0], math.degrees(yaw))
                             directions = self._ground_target_directions(dx, dz, yaw)
                             if directions is None:
-                                return outcome("unreachable")
+                                return abandon("unreachable", "edge_unavailable")
                             await self._send_input(False, move_vector=directions)
                             submitted += int(max(map(abs, directions)) > 0.01)
                         else:
@@ -3377,24 +3463,16 @@ class Movement:
                         remaining -= 1
                         aimed_cell = None
                         await asyncio.sleep(0.05)
-                finally:
-                    if release_input and not release_sneak:
-                        await release()
-        except _VisibilityBudgetExhausted:
-            return outcome("budget")
-        except Exception as error:
-            if callback_error is not None:
-                raise callback_error from error
-            if isinstance(error, TimeoutError) and timeout.expired():
+            except _VisibilityBudgetExhausted as error:
+                if pending_error is error:
+                    raise
                 return outcome("budget")
-            raise
-        finally:
-            if release_sneak:
-                # A held sneak release must still be sent after the action deadline.
-                await release(sneak_changed=True)
-
-        if callback_error is not None:
-            raise callback_error
+            except TimeoutError as error:
+                if not timeout.expired() or pending_error is error:
+                    raise
+                if pending_error is not None:
+                    raise pending_error from error
+                return outcome("budget")
 
     async def send_item_use(self, transaction) -> int:
         """Serialize an item action in the same client-tick stream as movement."""

@@ -190,6 +190,33 @@ Each snapshot's `expanded` counts the work of its own search. An exception from
 the callback ends this navigation and propagates to its caller after movement
 cleanup. Time spent in the callback counts toward `timeout`.
 
+## Observe a navigation action
+
+Pass `on_event` to collect immutable `NavigationEvent` objects from one
+`navigate()` call. Every event carries the original `goal`.
+
+```python
+events = []
+result = await bot.navigate(goal, rules=rules, on_event=events.append)
+for event in events:
+    if event.kind == "plan":
+        print(event.plan.status, event.adopted, event.plan.expanded)
+    elif event.kind == "invalidated":
+        print(event.reason, event.plan.endpoint)
+```
+
+| Event | When it runs |
+| --- | --- |
+| `started` | After argument validation, before waiting for the movement lock. |
+| `plan` | When an execution search returns a `plan`, including unsuccessful searches. `adopted` tells whether the search produced a route eligible for `on_plan`. This event comes before `on_plan` and the first input for that route. |
+| `invalidated` | When the action abandons an adopted `plan`. `reason` is `position_changed`, `stance_unavailable`, `edge_unavailable`, `goal_unmatched`, or `dimension_changed`. A dimension reload can invalidate a route even when the dimension ID stays the same. |
+| `transition_completed` | When the action completes a special edge in the adopted `plan`, such as a confirmed ascent or descent, before planning from the observed landing. |
+| `finished` | Once after the action exits and releases any movement lock it acquired. `result` is the exact object returned, including for `stopped` and `budget`. An action that raises delivers `reason="cancelled"` or `reason="error"` and propagates the exception. |
+
+The synchronous observer runs on the event loop. The event loop's exception
+handler receives errors from `on_event` and the action continues. Time spent in
+the observer before completion counts toward `timeout`.
+
 ## Choose a goal
 
 | Goal | What it matches |
