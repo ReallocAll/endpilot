@@ -244,6 +244,7 @@ class _BlockCollector:
         self, bot: "Bot", positions: Iterable[tuple[int, int, int]], *, count: int | None = None,
         ticks: int = 160, search_radius: int = 8, timeout: float = 15, tool_chest: HarvestToolChest | None = None,
         tool_chests: Sequence[HarvestToolChest] | None = None, storage: CollectionStorage | None = None,
+        requested_drop_id: int | None = None,
     ) -> BlockCollectionBatch:
         if count is not None and (not isinstance(count, int) or count < 0):
             raise ValueError("collection count must be a nonnegative integer")
@@ -260,6 +261,7 @@ class _BlockCollector:
             await self._run(self._collect_batch(
                 bot, progress, before, epoch, ticks=ticks, search_radius=search_radius, timeout=timeout,
                 tool_chest=tool_chest, tool_chests=tool_chests, storage=storage, storage_item_id=storage_item_id,
+                requested_drop_id=requested_drop_id,
             ))
         except (Exception, asyncio.CancelledError) as error:
             error.collection_progress = progress.snapshot()
@@ -319,7 +321,7 @@ class _BlockCollector:
                 await self._run(self._collect_batch(
                     bot, progress, observations, epoch, ticks=ticks, search_radius=search_radius,
                     timeout=timeout, tool_chest=tool_chest, tool_chests=tool_chests,
-                    storage=storage, storage_item_id=storage_item_id,
+                    storage=storage, storage_item_id=storage_item_id, requested_drop_id=item_id,
                 ))
         except (Exception, asyncio.CancelledError) as error:
             error.collection_progress = progress.snapshot()
@@ -399,7 +401,7 @@ class _BlockCollector:
         self, bot: "Bot", progress: _BatchProgress, observations: tuple[BlockObservation | None, ...], epoch: int, *,
         ticks: int, search_radius: int, timeout: float, tool_chest: HarvestToolChest | None,
         tool_chests: tuple[HarvestToolChest, ...] | None, storage: CollectionStorage | None,
-        storage_item_id: int | None,
+        storage_item_id: int | None, requested_drop_id: int | None,
     ) -> None:
         counted = progress if isinstance(progress, _CountedProgress) else None
         ordered_refill = tool_chests is not None
@@ -407,7 +409,7 @@ class _BlockCollector:
         refill = None if not chests else partial(
             self._refill_tool, bot, dimension=progress.dimension_id, epoch=epoch,
             ticks=ticks, search_radius=search_radius, timeout=timeout, ordered=ordered_refill,
-            requested_drop_id=counted.item_id if counted is not None else None,
+            requested_drop_id=requested_drop_id,
         )
         store = None if storage is None else partial(
             self._store_for_drop, bot, storage, storage_item_id,
@@ -422,6 +424,7 @@ class _BlockCollector:
                     position, before, progress.dimension_id, ticks=ticks, search_radius=search_radius,
                     timeout=timeout, epoch=epoch, progress=progress, refill=refill, refill_chests=chests,
                     ordered_refill=ordered_refill, store=store, settle_before_approach=settle_before_approach,
+                    requested_drop_id=requested_drop_id,
                 )
                 progress.results.append(result)
                 progress.active = None
@@ -700,7 +703,7 @@ class _BlockCollector:
         ticks: int, search_radius: int, timeout: float, epoch: int | None = None,
         progress: _BatchProgress | _MixedProgress | None = None, refill: _ToolRefill | None = None,
         refill_chests: tuple[HarvestToolChest, ...] = (), ordered_refill: bool = False,
-        store: _StoreForDrop | None = None, settle_before_approach: bool = False,
+        store: _StoreForDrop | None = None, settle_before_approach: bool = False, requested_drop_id: int | None = None,
     ) -> BlockCollection:
         if before is None or before.is_air is None:
             return BlockCollection(position, "target_unobserved", before)
@@ -709,7 +712,6 @@ class _BlockCollector:
         if progress is not None and self.blocks.observed_block(position) != before:
             return BlockCollection(position, "target_changed", before)
         counted = progress if isinstance(progress, _CountedProgress) else None
-        requested_drop_id = counted.item_id if counted is not None else None
         epoch = self.blocks._mining_epoch if epoch is None else epoch
         evidence = BlockCollection(position, "interrupted", before)
 
@@ -814,7 +816,7 @@ class _BlockCollector:
         result = await _observe_mined_block(
             self.blocks, self.entities, position, face=match.face, timeout=timeout, follow_ticks=120,
             epoch=epoch, prepare_start=prepare_start, record=record if progress is not None else None, store=store,
-            search_radius=search_radius, requested_drop_id=requested_drop_id,
+            search_radius=search_radius, requested_drop_id=counted.item_id if counted is not None else None,
         )
         result = with_equipment(result)
         remember(result)

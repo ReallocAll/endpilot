@@ -48,6 +48,7 @@ async def collect_and_store(
 ) -> CollectAndStoreResult:
     """Collect the ordered targets, then store the confirmed quantity of one item.
 
+    Tool selection honors the requested item for known tool-dependent drops.
     A matching window already open is borrowed. Otherwise, approach the chest
     and use the face selected on arrival. The approach uses the supplied ticks,
     search_radius and timeout budgets. Omit chest_slots to use the full observed
@@ -74,8 +75,8 @@ async def collect_and_store(
     if on_progress is not None and not callable(on_progress):
         raise TypeError("on_progress must be callable")
 
-    containers, blocks = bot._containers, bot._blocks
-    if containers is None or blocks is None:
+    containers, blocks, collector = bot._containers, bot._blocks, bot._block_collector
+    if containers is None or blocks is None or collector is None:
         raise RuntimeError("player has not joined")
     registry = bot.item_registry
     item_id, item_name = _registered_storage_item(registry, item)
@@ -96,7 +97,9 @@ async def collect_and_store(
         if current is not None and not _target_window(current, chest):
             return publish(phase="finished", stop_reason="window_busy")
 
-        collection = await bot.collect_targets(positions, ticks=ticks, search_radius=search_radius, timeout=timeout)
+        collection = await collector.collect_targets(
+            bot, positions, requested_drop_id=item_id, ticks=ticks, search_radius=search_radius, timeout=timeout,
+        )
         picked_up = _matching_pickups(collection, item_id, item_name)
         last = collection.results[-1] if collection.results else None
         collection_stop = last.status if last is not None and last.status != "collected" else None

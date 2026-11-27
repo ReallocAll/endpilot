@@ -10,7 +10,7 @@ from endpilot.collect_and_store import collect_and_store
 from endpilot.compression import PacketConnection
 from endpilot.login import JoinSession
 
-from test_collection import ORE, PLAYER, SECOND_TARGET, TARGET, Wire
+from test_collection import DIAMOND_PICKAXE, ORE, PLAIN_PICK_DATA, PLAYER, SECOND_TARGET, SILK_PICK_DATA, TARGET, Wire
 from test_container_take import item
 from test_scheduled_input import ManualClock
 
@@ -40,6 +40,7 @@ class CollectAndStoreTests(unittest.IsolatedAsyncioTestCase):
             b.ItemData(id=IRON_PICKAXE, name="minecraft:iron_pickaxe"),
             b.ItemData(id=DIAMOND, name="minecraft:diamond"),
             b.ItemData(id=OTHER, name="minecraft:dirt"),
+            b.ItemData(id=DIAMOND_PICKAXE, name="minecraft:diamond_pickaxe"),
         ])
         session._replace_item_registry(registry)
         session.entity_packets.append(protocol.encode(registry))
@@ -51,6 +52,8 @@ class CollectAndStoreTests(unittest.IsolatedAsyncioTestCase):
         palette, hashes = _catalog()
         self.chest_hash = next(runtime for runtime, index in hashes.items()
                                if palette[index] is not None and palette[index].name == "minecraft:chest")
+        iron_pick = item(b, IRON_PICKAXE, 1, 11)
+        iron_pick.user_data_buffer = PLAIN_PICK_DATA
         await self.emit(
             b.MovePlayerPacket(player_id=PLAYER, pos=b.Vec3(x=-2.5, y=101.62, z=3.5),
                                rot=b.Vec2(x=0, y=0), on_ground=True, reset_position=0),
@@ -60,7 +63,7 @@ class CollectAndStoreTests(unittest.IsolatedAsyncioTestCase):
             self.block((-3, 100, 3), HASHED_AIR_RUNTIME_ID, layer=1),
             self.block((-3, 101, 3), HASHED_AIR_RUNTIME_ID, layer=1),
             self.block(TARGET, ORE), self.block(SECOND_TARGET, ORE), self.block(CHEST, self.chest_hash),
-            self.contents(0, PLAYER_CONTAINER, 36, {1: item(b, IRON_PICKAXE, 1, 11), 2: item(b, DIAMOND, 5, 12)}),
+            self.contents(0, PLAYER_CONTAINER, 36, {1: iron_pick, 2: item(b, DIAMOND, 5, 12)}),
         )
 
     async def emit(self, *packets):
@@ -213,7 +216,12 @@ class CollectAndStoreTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_two_ore_pickups_store_only_the_new_quantity(self):
+        silk_pick = item(self.b, DIAMOND_PICKAXE, 1, 14)
+        silk_pick.user_data_buffer = SILK_PICK_DATA
+        await self.emit(self.b.InventorySlotPacket(inventory_id=0, slot=4, item=silk_pick))
         task = self.start(item_key="minecraft:diamond")
+        equipped = await self.outgoing(self.b.MobEquipmentPacket)
+        self.assertEqual(equipped.item.id, IRON_PICKAXE)
         await self.collect_two()
         await self.open_chest()
         await self.reply(await self.expect_store(2), player_count=5, chest_count=2)
