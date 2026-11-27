@@ -43,8 +43,8 @@ class PlacementResult:
 
 
 @dataclass(frozen=True, slots=True)
-class BoatPlacementResult:
-    """Local submission and independent server observations for an oak boat click."""
+class EntityPlacementResult:
+    """Local submission and independent server observations for an entity placement click."""
 
     dimension_id: int
     position: tuple[int, int, int]
@@ -53,6 +53,11 @@ class BoatPlacementResult:
     reason: _PlacementReason
     spawn: EntitySpawn | None
     inventory_change: PlacementInventoryChange | None
+
+
+@dataclass(frozen=True, slots=True)
+class BoatPlacementResult(EntityPlacementResult):
+    """Local submission and independent server observations for an oak boat click."""
 
 
 class _PreconditionChanged(Exception):
@@ -259,7 +264,7 @@ async def observe_placement(
     )
 
 
-async def observe_boat_placement(
+async def observe_entity_placement[Result: EntityPlacementResult](
     containers: Containers,
     blocks: Blocks,
     creative: CreativeInventory,
@@ -267,9 +272,10 @@ async def observe_boat_placement(
     get_item_registry: Callable[[], ItemRegistrySnapshot | None],
     position: tuple[int, int, int],
     *,
+    result_type: type[Result],
     timeout: float = 15,
-) -> BoatPlacementResult:
-    """Submit one click on observed source water and wait for boat and inventory evidence."""
+) -> Result:
+    """Submit one top-face click and wait for entity and inventory observations."""
     if not isfinite(timeout) or timeout < 0:
         raise ValueError("placement timeout must be a finite nonnegative number")
 
@@ -286,41 +292,82 @@ async def observe_boat_placement(
     inventory_change = None
     inventory_baseline = None
 
-    def result(reason: _PlacementReason) -> BoatPlacementResult:
-        return BoatPlacementResult(dimension, position, slot, submitted, reason, spawn, inventory_change)
+    def result(reason: _PlacementReason) -> Result:
+        return result_type(dimension, position, slot, submitted, reason, spawn, inventory_change)
 
-    def is_oak_boat(item_id: int) -> bool:
+    def registry_name(item_id: int) -> str | None:
         registry = get_item_registry()
-        return registry is not None and registry.name_for_id(item_id) == "minecraft:oak_boat"
+        return None if registry is None else registry.name_for_id(item_id)
 
     if blocks._closed or packets._reader_end_result()[0]:
         return result("disconnected")
     if movement._changing_dimension:
         return result("dimension_changed")
     if (creative.game_mode != binding.GameType.SURVIVAL
-        or before is None or before.item_id == 0 or before.count <= 0 or held.predicted_count is not None
-        or not is_oak_boat(before.item_id)):
+        or before is None or before.item_id == 0 or before.count <= 0 or held.predicted_count is not None):
         return result("precondition_failed")
 
-    water = blocks.observed_block_state(position)
-    if water is None or water.name != "minecraft:water":
+    item_name = registry_name(before.item_id)
+    legacy_oak_boat = result_type is BoatPlacementResult
+    if legacy_oak_boat and item_name != "minecraft:oak_boat":
         return result("precondition_failed")
-    depth = water.properties.get("liquid_depth")
-    if type(depth) is not int or depth != 0:
+
+    clicked = blocks.observed_block_state(position)
+    if clicked is None:
         return result("precondition_failed")
+
+    variant = None
+    clearance = ()
+    match item_name:
+        case "minecraft:oak_boat" | "minecraft:spruce_boat" | "minecraft:spruce_chest_boat":
+            depth = clicked.properties.get("liquid_depth")
+            if clicked.name != "minecraft:water" or type(depth) is not int or depth != 0:
+                return result("precondition_failed")
+            actor_type = "minecraft:chest_boat" if item_name == "minecraft:spruce_chest_boat" else "minecraft:boat"
+            if not legacy_oak_boat:
+                variant = 0 if item_name == "minecraft:oak_boat" else 1
+            click_pos = spawn_offset = (0.5, 0.875, 0.5)
+        case "minecraft:minecart" | "minecraft:chest_minecart":
+            direction = clicked.properties.get("rail_direction")
+            if clicked.name != "minecraft:rail" or type(direction) is not int or direction != 0:
+                return result("precondition_failed")
+            actor_type = item_name
+            click_pos = (0.5, 0.125, 0.5)
+            spawn_offset = (0.5, 0.5, 0.5)
+        case "minecraft:armor_stand":
+            if clicked.name != "minecraft:stone":
+                return result("precondition_failed")
+            clearance = (
+                blocks.observed_block((x, y + 1, z)),
+                blocks.observed_block((x, y + 2, z)),
+                *(blocks.observed_block((x, y + offset, z), layer=1) for offset in (0, 1, 2)),
+            )
+            if any(block is None or block.is_air is not True for block in clearance):
+                return result("precondition_failed")
+            actor_type = item_name
+            click_pos = spawn_offset = (0.5, 1.0, 0.5)
+        case _:
+            return result("precondition_failed")
+
     if timeout == 0:
         return result("timed_out")
 
-    click_pos = (0.5, 0.875, 0.5)
     # AddActor carries native float32 coordinates, including when a half block rounds away.
-    wire_click = binding.Vec3(x=x + click_pos[0], y=y + click_pos[1], z=z + click_pos[2])
-    world_click = (wire_click.x, wire_click.y, wire_click.z)
+    wire_spawn = binding.Vec3(x=x + spawn_offset[0], y=y + spawn_offset[1], z=z + spawn_offset[2])
+    world_spawn = (wire_spawn.x, wire_spawn.y, wire_spawn.z)
     seen_ids = {actor.entity_id for actor in entities.snapshot()}
     finished = asyncio.get_running_loop().create_future()
 
     def finish(reason: _PlacementReason) -> None:
         if not finished.done():
             finished.set_result(reason)
+
+    def matches_variant(actor) -> bool:
+        if variant is None:
+            return True
+        payloads = [entry.payload for entry in actor.data.data if int(entry.id) == int(binding.ActorDataIDs.VARIANT)]
+        return (len(payloads) == 1 and isinstance(payloads[0], binding.DataItemIntPayload)
+                and payloads[0].value == variant)
 
     def on_inventory(change: InventorySlotChange) -> None:
         nonlocal inventory_change
@@ -347,9 +394,9 @@ async def observe_boat_placement(
                 return
             # A retransmission of an earlier actor cannot establish a new spawn after send.
             seen_ids.add(entity_id)
-            if submitted is True and actor.actor_type == "minecraft:boat":
+            if submitted is True and actor.actor_type == actor_type:
                 location = (float(actor.pos.x), float(actor.pos.y), float(actor.pos.z))
-                if location == world_click:
+                if location == world_spawn and matches_variant(actor):
                     spawn = EntitySpawn(entity_id, int(actor.runtime_id), actor.actor_type, location)
                     if inventory_change is not None:
                         finish("observations_complete")
@@ -364,7 +411,8 @@ async def observe_boat_placement(
         if (finished.done() or creative.game_mode != binding.GameType.SURVIVAL
             or inventory.selection_revision != selection_revision
             or current.slot != slot or current.observed_item != before or current.predicted_count is not None
-            or not is_oak_boat(before.item_id) or blocks.observed_block_state(position) != water):
+            or registry_name(before.item_id) != item_name or blocks.observed_block_state(position) != clicked
+            or any(blocks.observed_block(block.position, layer=block.layer) != block for block in clearance)):
             raise _PreconditionChanged
         submitted = None
 

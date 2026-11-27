@@ -131,30 +131,51 @@ support, then `read_block` to record that update. Call `place_against` with
 the support coordinates. The returned tick confirms input submission. Check
 the target block or server state to verify placement.
 
-## Place an oak boat
+## Place a boat, minecart, or armor stand
 
-In Survival, select a hotbar slot with a server-observed oak boat stack and
-move within reach of a known source water block. Pass the water block's
-coordinates to `await bot.place_oak_boat(position, timeout=15)`. The call
-checks the held item against the current session's item registry and requires
-protocol 2225's vanilla `minecraft:water` with `liquid_depth=0` in the main
-layer. It synchronizes the player's position and submits one top-face click
-at the block-local point `(0.5, 0.875, 0.5)`.
+In Survival on protocol 2225, select a server-observed stack of a supported
+item and move within reach of the required block. Pass that block's
+coordinates to `await bot.place_entity(position, timeout=15)`. The SDK
+resolves the selected item name through the current session's registry and
+sends one top-face click when the terrain and held item still match.
 
-`BoatPlacementResult` records the original dimension, water block, selected
-slot, and local submission state. `submitted` is `False` before the write,
-`None` if the write began without local confirmation, and `True` after the
-transport confirms the send. `observations_complete` means the SDK received
-both an `AddActorPacket` for a new `minecraft:boat` at the exact click
-position and a one-item decrease in the selected slot after the send. These
-are independent server observations with no request ID linking them to the
-click.
+| Held item | Observed block | Local click point | Matching `AddActorPacket` |
+| --- | --- | --- | --- |
+| `minecraft:oak_boat` | Source water | `(0.5, 0.875, 0.5)` | `minecraft:boat`, integer `VARIANT=0` |
+| `minecraft:spruce_boat` | Source water | `(0.5, 0.875, 0.5)` | `minecraft:boat`, integer `VARIANT=1` |
+| `minecraft:spruce_chest_boat` | Source water | `(0.5, 0.875, 0.5)` | `minecraft:chest_boat`, integer `VARIANT=1` |
+| `minecraft:minecart` | North–south straight rail | `(0.5, 0.125, 0.5)` | `minecraft:minecart` |
+| `minecraft:chest_minecart` | North–south straight rail | `(0.5, 0.125, 0.5)` | `minecraft:chest_minecart` |
+| `minecraft:armor_stand` | Stone with clearance | `(0.5, 1.0, 0.5)` | `minecraft:armor_stand` |
+
+Source water is vanilla `minecraft:water` with `liquid_depth=0`. The rail
+is vanilla `minecraft:rail` with `rail_direction=0`. The armor stand needs
+vanilla `minecraft:stone` and observed air in the two main-layer cells above
+it. Layer 1 must also have observed air in the stone cell and both cells
+above it. Boat and armor stand spawns match the world click coordinates.
+Minecart spawns match the rail block center, offset `(0.5, 0.5, 0.5)`.
+Coordinates are compared at the wire's float32 precision.
+
+`EntityPlacementResult` records the original dimension, clicked block,
+selected slot, and local submission state. `submitted` is `False` before
+the write, `None` if the write began without local confirmation, and `True`
+after the transport confirms the send. `observations_complete` means the SDK
+observed both a matching new spawn and a one-item decrease in the original
+selected slot after sending. These are independent server observations with
+no request ID linking them to the click.
 
 The timeout covers position synchronization, submission, and observations.
 The result preserves either observation on timeout, dimension change, or
 disconnect. If the caller cancels after the action starts, the original
 `CancelledError` carries the partial result in `placement_progress`.
 [Placement tests](../../tests/test_placement.py)
+
+## Place an oak boat
+
+`await bot.place_oak_boat(position, timeout=15)` uses the same source-water
+requirements and click point. It returns `BoatPlacementResult` and matches a
+new `minecraft:boat` at the exact spawn coordinates using its actor type and
+position. Use `place_entity` to require the oak `VARIANT` on that spawn.
 
 ## Observe and answer forms
 

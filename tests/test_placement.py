@@ -4,7 +4,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock
 
-from endpilot import BoatPlacementResult, Bot, ItemRegistrySnapshot, PlacementInventoryChange, PlacementResult
+from endpilot import (
+    BoatPlacementResult, Bot, EntityPlacementResult, ItemRegistrySnapshot, PlacementInventoryChange, PlacementResult,
+)
 from endpilot.blocks import Blocks, HASHED_AIR_RUNTIME_ID
 from endpilot.compression import PacketConnection
 from endpilot.containers import Containers
@@ -414,7 +416,7 @@ BOAT_ITEM, BOAT_SLOT = 496, 8
 BOAT_POSITION = (4.5, 90.875, 7.5)
 
 
-class BoatPlacementTests(_PlacementHarness):
+class _EntityPlacementHarness(_PlacementHarness):
     async def asyncSetUp(self):
         await super().asyncSetUp()
         self.bot._entities = Entities(self.packets)
@@ -461,6 +463,8 @@ class BoatPlacementTests(_PlacementHarness):
             self.inventory._slot_observers, self.packets._subscribers, self.packets._reader_end_subscribers,
         ))), self.subscribers)
 
+
+class BoatPlacementTests(_EntityPlacementHarness):
     async def test_exact_click_and_two_independent_observations(self):
         for spawn_first, count, entity_id in ((True, 2, -40), (False, 1, -41)):
             with self.subTest(spawn_first=spawn_first):
@@ -669,3 +673,87 @@ class BoatPlacementTests(_PlacementHarness):
         self.assertFalse(self.inventory._slot_observers)
         self.assertTrue(set(self.packets._subscribers).issubset(self.subscribers[1]))
         self.assertFalse(self.packets._reader_end_subscribers)
+
+
+class EntityPlacementTests(_EntityPlacementHarness):
+    async def arm_entity(self, *, surface, click_height):
+        pending = await self.arm_click(self.bot.place_entity(SUPPORT, timeout=0.6))
+        packet, = self.wire.sent
+        self.assertIsInstance(packet, self.b.InventoryTransactionPacket)
+        tx = packet.variant_transaction
+        self.assertEqual(tx.action_type, self.b.ItemUseInventoryTransaction.ActionType.PLACE)
+        self.assertEqual((tx.pos.x, tx.pos.y, tx.pos.z), SUPPORT)
+        self.assertEqual((tx.click_pos.x, tx.click_pos.y, tx.click_pos.z), (0.5, click_height, 0.5))
+        self.assertEqual((tx.face, tx.slot, tx.target_block_id), (1, BOAT_SLOT, surface))
+        self.assertEqual((tx.item.id, tx.item.stack_size), (BOAT_ITEM, 1))
+        return pending
+
+    async def assert_entity_placement_rejected(self):
+        result = await self.bot.place_entity(SUPPORT, timeout=0.1)
+        self.assertEqual((result.submitted, result.reason), (False, "precondition_failed"))
+        self.assertEqual(self.wire.sent, [])
+
+    def assert_entity_placement_completed(self, result, spawn):
+        self.assertIsInstance(result, EntityPlacementResult)
+        self.assertEqual((result.position, result.slot), (SUPPORT, BOAT_SLOT))
+        self.assertEqual((result.submitted, result.reason), (True, "observations_complete"))
+        self.assertEqual(result.spawn, spawn)
+        before, after = result.inventory_change.before, result.inventory_change.after
+        self.assertEqual((before.item_id, before.count, after.item_id, after.count), (BOAT_ITEM, 1, 0, 0))
+        self.assertEqual(len(self.wire.sent), 1)
+        self.assert_observers_restored()
+
+    async def test_spruce_boat_requires_the_integer_variant_in_its_spawn(self):
+        b = self.b
+
+        def spruce_candidate(entity_id, payload):
+            packet = self.spawn(entity_id)
+            packet.data = b.SynchedActorData.CopyableDataList(data=[
+                b.DataItemEntry(id=int(b.ActorDataIDs.VARIANT), payload=payload),
+            ])
+            return packet
+
+        await self.deliver(self.registry_packet("minecraft:spruce_boat"), self.boat_slot(1))
+        pending = await self.arm_entity(surface=WATER, click_height=0.875)
+        await self.deliver(self.boat_slot(0), self.spawn(-50),
+                           spruce_candidate(-51, b.DataItemIntPayload(value=0)),
+                           spruce_candidate(-52, b.DataItemBytePayload(value=1)))
+        self.assertFalse(pending.done())
+        await self.deliver(spruce_candidate(-53, b.DataItemIntPayload(value=1)))
+        self.assert_entity_placement_completed(await pending, EntitySpawn(-53, 53, "minecraft:boat", BOAT_POSITION))
+
+    async def test_minecart_uses_straight_rail_click_height_and_separate_spawn_height(self):
+        straight_rail, ascending_rail = 2560510590, 2683460236
+        x, y, z = SUPPORT
+        actor_type = "minecraft:minecart"
+        await self.deliver(self.registry_packet(actor_type), self.boat_slot(1),
+                           self.block((x, y - 1, z), STONE), self.block(SUPPORT, ascending_rail))
+        self.assertEqual(self.bot.observed_block_state(SUPPORT).properties["rail_direction"], 2)
+        await self.assert_entity_placement_rejected()
+
+        await self.deliver(self.block(SUPPORT, straight_rail))
+        pending = await self.arm_entity(surface=straight_rail, click_height=0.125)
+        await self.deliver(self.boat_slot(0), self.spawn(-60, position=(x + 0.5, y + 0.125, z + 0.5),
+                                                        actor_type=actor_type))
+        self.assertFalse(pending.done())
+        position = (x + 0.5, y + 0.5, z + 0.5)
+        await self.deliver(self.spawn(-61, position=position, actor_type=actor_type))
+        self.assert_entity_placement_completed(await pending, EntitySpawn(-61, 61, actor_type, position))
+
+    async def test_armor_stand_requires_both_clear_cells_above_the_support(self):
+        x, y, z = SUPPORT
+        upper = (x, y + 2, z)
+        actor_type = "minecraft:armor_stand"
+        await self.deliver(self.registry_packet(actor_type), self.boat_slot(1), self.block(SUPPORT, STONE),
+                           self.block(SUPPORT, layer=1), self.block(TARGET, layer=1), self.block(upper, layer=1))
+        await self.assert_entity_placement_rejected()
+        await self.deliver(self.block(upper, STONE))
+        await self.assert_entity_placement_rejected()
+        await self.deliver(self.block(upper), self.block(upper, WATER, layer=1))
+        await self.assert_entity_placement_rejected()
+
+        await self.deliver(self.block(upper, layer=1))
+        pending = await self.arm_entity(surface=STONE, click_height=1.0)
+        position = (x + 0.5, y + 1.0, z + 0.5)
+        await self.deliver(self.spawn(-70, position=position, actor_type=actor_type), self.boat_slot(0))
+        self.assert_entity_placement_completed(await pending, EntitySpawn(-70, 70, actor_type, position))

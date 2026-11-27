@@ -54,7 +54,9 @@ from .login import (
 )
 from .movement import BlockApproach, FlightResult, ForwardInput, Movement, MovementState
 from .navigation import NavigationEvent, NavigationGoal, NavigationPlan, NavigationResult, NavigationRules
-from .placement import BoatPlacementResult, PlacementResult, observe_boat_placement, observe_placement
+from .placement import (
+    BoatPlacementResult, EntityPlacementResult, PlacementResult, observe_entity_placement, observe_placement,
+)
 from .player_state import DeathEvent, GlideBoostEvent, PlayerAbilities, PlayerEffect, PlayerState, PlayerVitals
 from .qa import PacketTimeline
 from .qa_terrain import _TerrainObserver
@@ -2016,6 +2018,16 @@ class Bot:
             replace=replace, click_pos=click_pos, timeout=timeout,
         )
 
+    async def place_entity(
+        self, position: tuple[int, int, int], *, timeout: float = 15,
+    ) -> EntityPlacementResult:
+        """Click verified terrain once with the selected boat, minecart or armor stand in Survival.
+
+        Report a matching new spawn and a one-item decrease in the selected slot
+        when each observation arrives after submission.
+        """
+        return await self._place_entity(position, EntityPlacementResult, timeout)
+
     async def place_oak_boat(
         self, position: tuple[int, int, int], *, timeout: float = 15,
     ) -> BoatPlacementResult:
@@ -2025,12 +2037,18 @@ class Bot:
         decrease in the selected slot, when each is observed after submission.
         These server observations carry no request ID linking them to the click.
         """
+        return await self._place_entity(position, BoatPlacementResult, timeout)
+
+    async def _place_entity[Result: EntityPlacementResult](
+        self, position: tuple[int, int, int], result_type: type[Result], timeout: float,
+    ) -> Result:
         session = self._session
         containers, blocks, creative, entities = self._containers, self._blocks, self._creative, self._entities
         if session is None or containers is None or blocks is None or creative is None or entities is None:
             raise RuntimeError("player has not joined")
-        return await observe_boat_placement(
-            containers, blocks, creative, entities, lambda: session.item_registry, position, timeout=timeout,
+        return await observe_entity_placement(
+            containers, blocks, creative, entities, lambda: session.item_registry, position,
+            result_type=result_type, timeout=timeout,
         )
 
     async def open_container(
