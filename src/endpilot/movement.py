@@ -16,9 +16,10 @@ from .expression import animation
 from .navigation import (
     AllGoal, AnyGoal, BlockFaceGoal, Cell, EntityNearGoal, EntityVisibilityGoal, NavigationEvent, NavigationGoal,
     NavigationPlan, NavigationResult, NavigationRules, Point,
-    _GoalState, _LADDER_APPROACH, _LADDER_DECK_LENGTH, _LADDER_STRIDE, _STANDING_HEAD_HEIGHT, _StandingGraph,
+    _GoalState, _LADDER_APPROACH, _LADDER_DECK_LENGTH, _LADDER_STRIDE, _LOWER_SLAB_STRIDE, _STANDING_HEAD_HEIGHT,
+    _StandingGraph,
     _VisibilityBudgetExhausted, _VisibilityScanBudget, _WATER_DECK_LENGTH, _WATER_STRIDE, _aim_point,
-    _block_face_cells, _is_gap_jump, _is_ladder_climb, _is_two_block_drop,
+    _block_face_cells, _is_gap_jump, _is_ladder_climb, _is_lower_slab_lane, _is_two_block_drop,
     _is_water_crossing, _ladder_descent_geometry, _require_goal, _resolve_goal, _runout,
 )
 from .player_state import PlayerState, movement_speed_attribute, swimming_metadata
@@ -52,6 +53,10 @@ _GAP_MIN_TICKS = _GAP_FORWARD_FRAMES + 3 + _GAP_SETTLE_FRAMES
 _DROP_TWO_FORWARD_FRAMES = 9
 _DROP_TWO_SETTLE_FRAMES = 6
 _DROP_TWO_MIN_TICKS = _DROP_TWO_FORWARD_FRAMES + 6 + _DROP_TWO_SETTLE_FRAMES
+_LOWER_SLAB_SETTLE_FRAMES = 6
+# The calibrated walk used 35 moving frames, then three to receive the exit correction and one to stop.
+_LOWER_SLAB_MIN_TICKS = 35 + 4 + _LOWER_SLAB_SETTLE_FRAMES
+_LOWER_SLAB_NEUTRAL_LIMIT = 24
 _LADDER_RELEASE_PROGRESS = 2.0
 _LADDER_NEUTRAL_FRAMES = 24
 _LADDER_SETTLE_FRAMES = 6
@@ -134,6 +139,10 @@ class _FlightInput:
 
 
 class _FlightInterrupted(Exception):
+    pass
+
+
+class _LowerSlabDeparture(Exception):
     pass
 
 
@@ -2367,6 +2376,7 @@ class Movement:
         calibrated = self._standard_ground_motion(blocks)
         graph = _StandingGraph(blocks, start, rules, allow_vertical=not (self._sprint_key or self._sneaking),
                                allow_gap=calibrated, allow_drop_two=calibrated, allow_ladder=calibrated,
+                               allow_lower_slab_lane=calibrated,
                                allow_water=calibrated and rules.allow_swimming and self._water_ready())
         current_goal = self._navigation_goal(blocks, goal, visibility_budget=_VisibilityScanBudget(rules.max_expansions))
         return graph.plan(start, current_goal, limit=rules.max_expansions,
@@ -2496,6 +2506,7 @@ class Movement:
         calibrated = not legacy and self._standard_ground_motion(blocks)
         graph = _StandingGraph(blocks, start, rules, allow_vertical=not (self._sprint_key or self._sneaking),
                                allow_gap=calibrated, allow_drop_two=calibrated, allow_ladder=calibrated,
+                               allow_lower_slab_lane=calibrated,
                                allow_water=calibrated and rules.allow_swimming and self._water_ready())
         if legacy and not any(map(graph.in_bounds, _block_face_cells(goal.position))):
             return NavigationResult("unreachable", 0)
@@ -2579,13 +2590,15 @@ class Movement:
                     and self._boat_input is None
                     and (self._entities is None or self._entities.vehicle() is None))
 
-        async def release(*, budgeted=False, sneak_changed=False) -> bool:
+        async def release(*, budgeted=False, sneak_changed=False, guard=None) -> bool:
             nonlocal remaining
             neutral = (0.0, 0.0) if use_ground_velocity else None
             for frame in range(2):
                 if not can_release_input():
                     break
                 if (expired() and not sneak_changed) or (budgeted and remaining <= 0):
+                    return False
+                if guard is not None and not guard():
                     return False
                 await self._send_input(False, move_vector=neutral, sneak_changed=sneak_changed and frame == 0)
                 # A release counts against ticks if navigation subsequently continues.
@@ -2596,7 +2609,7 @@ class Movement:
             return True
 
         @asynccontextmanager
-        async def release_on_exit(*, sneak_changed=False):
+        async def release_on_exit(*, sneak_changed=False, budgeted=False, guard=None):
             nonlocal pending_error
             unwinding_error = False
             try:
@@ -2610,7 +2623,7 @@ class Movement:
                 needs_release = release_sneak if sneak_changed else release_input and not release_sneak
                 if needs_release:
                     try:
-                        await release(sneak_changed=sneak_changed)
+                        await release(sneak_changed=sneak_changed, budgeted=budgeted, guard=guard)
                     except (Exception, asyncio.CancelledError):
                         if not unwinding_error:
                             raise
@@ -3417,6 +3430,157 @@ class Movement:
                     # The deadline may end before a neutral frame can be submitted.
                     self._sprint_release_pending = self._sprinting
 
+        async def cross_lower_slab_lane(source, landing):
+            nonlocal remaining, submitted, release_input, use_ground_velocity
+            sx, sy, sz = source
+            lx, _, lz = landing
+            dx, dz = (lx - sx) // _LOWER_SLAB_STRIDE, (lz - sz) // _LOWER_SLAB_STRIDE
+            heading = math.degrees(math.atan2(-dx, dz))
+            bank_eye = sy + 1.62
+            slab_eye = bank_eye - 0.5
+            wire_eye = float(self.packets.protocol.binding.Vec3(y=bank_eye).y)
+            wire_step = math.ldexp(1.0, math.frexp(wire_eye)[1] - 24)
+            strip_margin = 0.5 - _PLAYER_HALF_WIDTH
+            first_slab_footing = 0.5 + _PLAYER_HALF_WIDTH
+            exit_column = _LOWER_SLAB_STRIDE - 0.5
+            exit_overlap = exit_column - _PLAYER_HALF_WIDTH
+            landing_target = (sy, frozenset({(lx, lz)}))
+            proposals = {}
+            low_tick = exit_tick = None
+            departed = False
+            neutral_frames = settled_frames = 0
+            settled_at = None
+
+            def progress(position):
+                return (position[0] - sx - 0.5) * dx + (position[2] - sz - 0.5) * dz
+
+            def in_travel(position):
+                x, y, z = position
+                lateral = x - sx - 0.5 if dz else z - sz - 0.5
+                return (abs(lateral) <= strip_margin
+                        and -strip_margin <= progress(position) <= _LOWER_SLAB_STRIDE + strip_margin
+                        and slab_eye - 0.05 <= y <= bank_eye + 0.05)
+
+            def on_exit(position):
+                return progress(position) >= exit_column and abs(position[1] - bank_eye) <= 0.05
+
+            def observe(tick, on_ground, position, _vertical_delta):
+                nonlocal low_tick, exit_tick, departed
+                if departed or not proposals:
+                    return
+                proposal = self._input_position if tick is None else proposals.get(tick)
+                if proposal is None:
+                    return
+                if (not in_travel(position)
+                        or math.hypot(position[0] - proposal[0], position[2] - proposal[2]) > _PLAYER_HALF_WIDTH):
+                    departed = True
+                    return
+                along = progress(position)
+                over_slabs = first_slab_footing <= along <= exit_overlap
+                at_bank_height = abs(position[1] - bank_eye) <= 0.05
+                if exit_tick is not None:
+                    departed = on_ground is False or not on_exit(position)
+                elif low_tick is not None and on_ground and over_slabs and at_bank_height:
+                    # A grounded position report can contradict the low footing without a client tick.
+                    departed = True
+                if tick is None or not on_ground or departed:
+                    return
+                if abs(position[1] - slab_eye) <= 0.05:
+                    if over_slabs:
+                        low_tick = tick
+                    else:
+                        departed = True
+                elif at_bank_height and low_tick is not None and low_tick < tick and along > exit_overlap:
+                    # The footprint can step up before its center reaches the exit column.
+                    if along >= exit_column:
+                        exit_tick = tick
+                elif low_tick is not None or not at_bank_height or along > first_slab_footing:
+                    departed = True
+
+            def register_step(_origin, position):
+                if not in_travel(position):
+                    raise _LowerSlabDeparture
+                # send() can synchronously dispatch a correction for the tick it is submitting.
+                proposals[self._tick] = position
+
+            def can_brake():
+                if (departed or self._teleport_pending is not None or graph.edge(source, landing) is not True
+                        or not self._standard_ground_motion(blocks)):
+                    return False
+                x, y, z = self._input_position
+                vx, _, vz = self._velocity
+                return in_travel((x, y, z)) and in_travel((x + vx, y, z + vz))
+
+            self._observe_travel_position = observe
+            try:
+                async with release_on_exit(budgeted=True, guard=can_brake):
+                    while True:
+                        result = interrupted()
+                        if result is not None:
+                            return result
+                        if departed or (proposals and self._teleport_pending is not None):
+                            return abandon("unreachable", "position_changed")
+                        status = stance_failure(graph.edge(source, landing), self._standard_ground_motion(blocks))
+                        if status is not None:
+                            return abandon(status, "edge_unavailable")
+
+                        position = self._input_position
+                        x, y, z = position
+                        vx, _, vz = self._velocity
+                        still = max(abs(vx), abs(vz)) < _REST_SPEED
+                        if not proposals:
+                            if (remaining < _LOWER_SLAB_MIN_TICKS
+                                    or (deadline is not None and loop.time() + _LOWER_SLAB_MIN_TICKS * 0.05 > deadline)):
+                                return outcome("budget")
+                            observed = self.position
+                            if (not self._at_standing_height(sy) or self._observed_ground is False or not still
+                                    or observed is None or not at_center(source, x, z)
+                                    or not at_center(source, observed[0], observed[2]) or y != observed[1]
+                                    or (self._ground_correction_tick is None and abs(y - wire_eye) > wire_step)):
+                                return abandon("unknown", "edge_unavailable")
+                            if self._teleport_pending is not None or self._jump_was_pressed:
+                                await send_input(False, move_vector=(0.0, 0.0))
+                                remaining -= 1
+                                await asyncio.sleep(0.05)
+                                continue
+                            use_ground_velocity = True
+                        elif not in_travel(position):
+                            return abandon("unreachable", "position_changed")
+
+                        resting_on_exit = (exit_tick is not None and self._observed_ground is True and still
+                                           and on_exit(position) and at_center(landing, x, z))
+                        if resting_on_exit:
+                            if settled_at is None or math.dist(position, settled_at) > 0.025:
+                                settled_at, settled_frames = position, 0
+                            if settled_frames >= _LOWER_SLAB_SETTLE_FRAMES:
+                                self._pending_landing = None
+                                return None
+                        else:
+                            settled_at, settled_frames = None, 0
+                        if remaining <= 0:
+                            return outcome("budget")
+                        if neutral_frames >= _LOWER_SLAB_NEUTRAL_LIMIT:
+                            return abandon("unknown", "edge_unavailable")
+
+                        # Aim for the first bank's center including the distance of an ordinary release.
+                        coast = (vx * dx + vz * dz) * _GROUND_FRICTION / (1 - _GROUND_FRICTION)
+                        distance = _LOWER_SLAB_STRIDE - progress(position) - coast
+                        forward = 0.0 if abs(distance) <= 0.025 else max(-0.22, min(0.55, distance * 1.8))
+                        self._rotation = (0.0, heading)
+                        await send_input(False, move_vector=(0.0, forward), validate_step=register_step,
+                                         landing_target=landing_target if not proposals else None)
+                        remaining -= 1
+                        submitted += int(abs(forward) > 0.01)
+                        release_input = forward != 0.0
+                        neutral_frames = 0 if release_input else neutral_frames + 1
+                        settled_frames = settled_frames + 1 if resting_on_exit and not release_input else 0
+                        await asyncio.sleep(0.05)
+            except _LowerSlabDeparture:
+                return abandon("unreachable", "position_changed")
+            finally:
+                self._observe_travel_position = None
+                release_input = False
+
         async def cross_gap(source, landing):
             nonlocal remaining, submitted, release_input, use_ground_velocity
             sx, sy, sz = source
@@ -3685,6 +3849,8 @@ class Movement:
                             transition = descend_ladder
                         elif _is_water_crossing(anchor, route[0]):
                             transition = cross_water
+                        elif _is_lower_slab_lane(anchor, route[0]):
+                            transition = cross_lower_slab_lane
                         elif route[0][1] > anchor[1]:
                             transition = ascend
                         elif route[0][1] < anchor[1]:

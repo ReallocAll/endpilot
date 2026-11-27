@@ -1488,6 +1488,136 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                     self.set_block(cell, self.STONE if cell in support else self.AIR)
                     self.set_block(cell, self.AIR, layer=1)
 
+    def prepare_lower_slab_lane(self, *, missing_extra=None):
+        self.blocks._player_game_type = "SURVIVAL"
+        self.movement._gap_jump_allowed = lambda: True
+        self.correct_position(5.5, 221.62, 7.5, on_ground=True, tick=self.movement._tick - 1)
+        floors = {5: self.STONE, 6: 98367658, 7: 98367658, 8: 98367658, 9: self.STONE}
+        for x in range(11):
+            for z in range(2, 13):
+                for y in range(217, 225):
+                    cell = x, y, z
+                    self.set_block(cell, floors.get(x, self.AIR) if y == 219 and z == 7 else self.AIR)
+                    if cell != missing_extra:
+                        self.set_block(cell, self.AIR, layer=1)
+
+    async def test_lower_slab_lane_plans_only_with_known_dry_support_and_clearance(self):
+        middle = (7, 219, 7)
+        head = (7, 221, 7)
+        self.prepare_lower_slab_lane(missing_extra=middle)
+        start, goal = (5, 220, 7), FootGoal((9, 220, 7))
+        rules = NavigationRules(search_radius=4, vertical_radius=2, costs=NavigationCosts(walk=2.5))
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unknown")
+
+        self.set_block(middle, self.AIR, layer=1)
+        plan = self.bot.plan_navigation(goal, rules=rules)
+        self.assertEqual((plan.status, plan.nodes, plan.cost), ("found", (start, goal.position), Fraction(10)))
+
+        self.set_block(middle, 0x483B8B2A, layer=1)  # Waterlogged slab.
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unreachable")
+        self.set_block(middle, self.AIR, layer=1)
+        self.set_block(head, self.STONE)
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unreachable")
+        self.assertEqual(self.stream.sent, [])
+
+    async def run_lower_slab_lane(self, correction, *, early_overlap=False):
+        self.prepare_lower_slab_lane()
+        self.stream.sent.clear()
+        goal = FootGoal((9, 220, 7))
+        rules = NavigationRules(search_radius=4, vertical_radius=2)
+        half_tick = exit_tick = None
+        overlap_reported = False
+        exit_eye = 221.62 if early_overlap else 221.12
+        sleep = asyncio.sleep
+
+        async def yield_frame(_delay):
+            await sleep(0)
+
+        def report():
+            nonlocal half_tick, exit_tick, overlap_reported
+            frame = self.stream.sent[-1]
+            tick = int(frame.client_tick)
+            if half_tick is None and frame.pos.x >= 7.6 and self.up in frame.input_data:
+                half_tick = tick
+                if correction != "missing_half":
+                    self.correct_position(frame.pos.x, 221.12, 7.5, on_ground=True, tick=tick)
+                if correction == "contradicted_half":
+                    # Two own position reports can follow the matched correction before navigation resumes.
+                    self.set_position(frame.pos.x, 7.5, y=221.62, on_ground=True)
+                    self.set_position(frame.pos.x, 7.5, y=221.12, on_ground=True)
+            if early_overlap and not overlap_reported and frame.pos.x >= 8.8 and self.up in frame.input_data:
+                overlap_reported = True
+                # Stock feet rise onto the far bank while their center remains over the last slab.
+                self.correct_position(8.871, 221.62, 7.5, on_ground=True, tick=tick)
+            if (half_tick is not None and exit_tick is None and abs(frame.pos.y - exit_eye) < 0.01
+                    and abs(frame.pos.x - 9.5) < 0.11 and abs(frame.pos_delta.x) < 0.02
+                    and not (frame.move.x or frame.move.y)):
+                exit_tick = tick
+                if correction != "missing_exit":
+                    self.correct_position(9.498, 221.62, 8.5 if correction == "outside_exit" else 7.5,
+                                          on_ground=True, tick=half_tick if correction == "stale_exit" else tick)
+
+        self.stream.on_send = report
+        with patch("endpilot.movement.asyncio.sleep", yield_frame):
+            result = await self.bot.navigate(goal, rules=rules, ticks=120)
+        return result, half_tick, exit_tick
+
+    async def test_lower_slab_lane_crosses_after_matched_ground_corrections(self):
+        result, half_tick, exit_tick = await self.run_lower_slab_lane("matched")
+        self.assertEqual((result.status, result.stand_position), ("reached", (9, 220, 7)))
+        self.assertIsNotNone(half_tick)
+        self.assertIsNotNone(exit_tick)
+        self.assertLess(half_tick, exit_tick)
+        before = [frame for frame in self.stream.sent if frame.client_tick <= half_tick]
+        below = [frame for frame in self.stream.sent if half_tick < frame.client_tick <= exit_tick]
+        after = [frame for frame in self.stream.sent if frame.client_tick > exit_tick]
+        self.assertTrue(all(abs(frame.pos.y - 221.62) < 0.01 for frame in before))
+        self.assertTrue(all(abs(frame.pos.y - 221.12) < 0.01 for frame in below))
+        self.assertTrue(any(self.up in frame.input_data for frame in below))
+        self.assertFalse(below[-1].move.x or below[-1].move.y)
+        self.assertTrue(after)
+        self.assertTrue(all(abs(frame.pos.y - 221.62) < 0.01 for frame in after))
+        self.assertTrue(all(abs(frame.pos.z - 7.5) < 0.01 and not frame.pos_delta.y for frame in self.stream.sent))
+        self.assertAlmostEqual(max(frame.move.y for frame in before), 0.55, delta=1e-6)
+        flags = self.binding.PlayerAuthInputPacket.InputData
+        self.assertTrue(all(not {flags.SPRINTING, flags.START_FLYING} & set(frame.input_data)
+                            for frame in self.stream.sent))
+        self.assertEqual(self.jump_input(), [])
+        self.assert_released()
+
+    async def test_lower_slab_lane_cannot_reach_without_current_in_lane_corrections(self):
+        for correction in ("missing_half", "missing_exit", "stale_exit", "outside_exit"):
+            with self.subTest(correction=correction):
+                result, half_tick, exit_tick = await self.run_lower_slab_lane(correction)
+                self.assertIsNotNone(half_tick)
+                if correction != "missing_half":
+                    self.assertIsNotNone(exit_tick)
+                self.assertNotEqual(result.status, "reached")
+                self.assertIsNone(result.stand_position)
+
+    async def test_lower_slab_lane_stops_after_contradictory_ground_report(self):
+        result, half_tick, exit_tick = await self.run_lower_slab_lane("contradicted_half")
+        self.assertIsNotNone(half_tick)
+        self.assertNotEqual(result.status, "reached")
+        self.assertIsNone(result.stand_position)
+        self.assertIsNone(exit_tick)
+        self.assertTrue(all(not (frame.move.x or frame.move.y)
+                            for frame in self.stream.sent if frame.client_tick > half_tick))
+
+    async def test_lower_slab_lane_accepts_far_bank_overlap_and_waits_for_centered_correction(self):
+        for correction in ("matched", "missing_exit"):
+            with self.subTest(correction=correction):
+                result, half_tick, exit_tick = await self.run_lower_slab_lane(correction, early_overlap=True)
+                self.assertIsNotNone(half_tick)
+                self.assertIsNotNone(exit_tick)
+                self.assertTrue(any(8.871 < frame.pos.x < 9.2 and abs(frame.pos.y - 221.62) < 0.01
+                                    for frame in self.moving_input()))
+                if correction == "matched":
+                    self.assertEqual((result.status, result.stand_position), ("reached", (9, 220, 7)))
+                else:
+                    self.assertNotEqual(result.status, "reached")
+                    self.assertIsNone(result.stand_position)
+
     async def test_drop_two_is_a_distinct_zero_send_edge_with_two_downward_units(self):
         self.prepare_drop_two()
         goal = FootGoal((1, 98, 0))

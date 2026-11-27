@@ -287,3 +287,12 @@ Elevation changes require server landing evidence before continuing. A ladder
 descent waits for a grounded server correction at the ladder foot before
 stepping off. Use `reached` and the final match to choose a click, then observe
 the server effect separately.
+
+With standard Survival movement, navigation can cross a straight lane of
+three contiguous dry lower smooth-stone slabs between observed dry stone banks.
+Both clearance levels must have observed air in the main and extra block layers.
+The crossing is one edge between integer-height standing cells and costs four
+walking steps. Missing terrain that could affect the route can yield `unknown`.
+The crossing requires grounded server corrections at slab height and then bank
+height, each matched to a submitted input. The bot releases movement input and
+settles on the far bank before resuming ordinary walking.

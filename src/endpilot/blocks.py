@@ -1390,6 +1390,37 @@ class Blocks:
             return False
         return True if state is not None and extra is True else None
 
+    def _lower_smooth_stone_slab(self, position: tuple[int, int, int]) -> bool | None:
+        floor = self.observed_block(position)
+        extra = self._stance_air(self.observed_block(position, layer=1))
+        if extra is False or (floor is not None and floor.is_air is True):
+            return False
+        state = None if floor is None else self._vanilla_state(floor.runtime_id)
+        if state is None:
+            return None
+        if state.name != "minecraft:smooth_stone_slab" or state.outline != (0, 0, 0, 1, 0.5, 1):
+            return False
+        properties = _vanilla_state_properties(state.name, floor.runtime_id, hashed=self.hashed_runtime_ids)
+        return extra if properties.get("minecraft:vertical_half") == "bottom" else False
+
+    def _lower_slab_lane(self, source: tuple[int, int, int], dx: int, dz: int, stride: int) -> bool | None:
+        """Check the dry, straight strip between two integer-height stone stances."""
+        sx, y, sz = source
+        known = True
+        for column in (*range(1, stride), 0, stride):
+            x, z = sx + column * dx, sz + column * dz
+            floor = (x, y - 1, z)
+            support = (self._ordinary_stone_support(floor) if column in (0, stride)
+                       else self._lower_smooth_stone_slab(floor))
+            if support is False:
+                return False
+            feet = self._stance_clearance((x, y, z))
+            head = self._stance_clearance((x, y + 1, z))
+            if feet is False or head is False:
+                return False
+            known = known and support is True and feet is True and head is True
+        return True if known else None
+
     def _still_water(self, position: tuple[int, int, int]) -> bool | None:
         block = self.observed_block(position)
         extra = self._stance_air(self.observed_block(position, layer=1))

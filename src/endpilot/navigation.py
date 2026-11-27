@@ -21,6 +21,7 @@ _LADDER_APPROACH = 2
 _LADDER_STRIDE = _LADDER_APPROACH + 1
 _LADDER_DECK_LENGTH = 5
 _LADDER_DESCENT_HEIGHTS = range(4, 7)
+_LOWER_SLAB_STRIDE = 4
 _WATER_STRIDE = 6
 _WATER_DECK_LENGTH = 5
 
@@ -539,6 +540,11 @@ def _is_two_block_drop(source: Cell, landing: Cell) -> bool:
             and abs(landing[0] - source[0]) + abs(landing[2] - source[2]) == 1)
 
 
+def _is_lower_slab_lane(source: Cell, destination: Cell) -> bool:
+    dx, dz = abs(destination[0] - source[0]), abs(destination[2] - source[2])
+    return destination[1] == source[1] and (dx, dz) in ((_LOWER_SLAB_STRIDE, 0), (0, _LOWER_SLAB_STRIDE))
+
+
 def _is_water_crossing(source: Cell, landing: Cell) -> bool:
     dx, dz = abs(landing[0] - source[0]), abs(landing[2] - source[2])
     return landing[1] == source[1] and (dx, dz) in ((_WATER_STRIDE, 0), (0, _WATER_STRIDE))
@@ -586,7 +592,7 @@ def _block_face_cells(position: Cell):
 class _StandingGraph:
     def __init__(self, blocks, start: Cell, rules: NavigationRules, *, allow_vertical: bool,
                  allow_gap: bool = False, allow_drop_two: bool = False, allow_ladder: bool = False,
-                 allow_water: bool = False):
+                 allow_water: bool = False, allow_lower_slab_lane: bool = False):
         self.blocks = blocks
         self.origin = start
         self.rules = rules
@@ -595,6 +601,7 @@ class _StandingGraph:
         self.allow_drop_two = allow_drop_two
         self.allow_ladder = allow_ladder
         self.allow_water = allow_water
+        self.allow_lower_slab_lane = allow_lower_slab_lane
 
     def in_bounds(self, cell: Cell) -> bool:
         return (abs(cell[0] - self.origin[0]) <= self.rules.search_radius
@@ -612,6 +619,12 @@ class _StandingGraph:
             return self.blocks._still_water_crossing(source, dx, dz, _WATER_STRIDE, _WATER_DECK_LENGTH) if (
                 self.allow_water and self.in_bounds(last)
             ) else False
+        if _is_lower_slab_lane(source, destination):
+            if not self.allow_lower_slab_lane or not self.in_bounds(source):
+                return False
+            dx = (destination[0] - source[0]) // _LOWER_SLAB_STRIDE
+            dz = (destination[2] - source[2]) // _LOWER_SLAB_STRIDE
+            return self.blocks._lower_slab_lane(source, dx, dz, _LOWER_SLAB_STRIDE)
         if _is_gap_jump(source, destination):
             return self.blocks._gap_jump(source, destination) if self.allow_gap else False
         if source[1] == destination[1]:
@@ -723,6 +736,8 @@ class _StandingGraph:
         steps = [(0, 1, walk), (1, 1, up), (-1, 1, down)]
         if self.allow_gap:
             steps.append((0, 2, 2 * walk))
+        if self.allow_lower_slab_lane:
+            steps.append((0, _LOWER_SLAB_STRIDE, _LOWER_SLAB_STRIDE * walk))
         if self.allow_drop_two:
             steps.append((-2, 1, 2 * down))
         if self.allow_ladder:
