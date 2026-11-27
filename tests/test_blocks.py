@@ -50,7 +50,9 @@ class PacketStream:
         finally:
             unsubscribe()
 
-    async def send(self, packet):
+    async def send(self, packet, *, _before_send=None):
+        if _before_send is not None:
+            _before_send()
         self.sent.append(packet)
 
     def _defer_receiving_until(self, _ready):

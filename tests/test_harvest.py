@@ -93,8 +93,8 @@ class HarvestTests(unittest.IsolatedAsyncioTestCase):
         b = self.binding
         original_send = self.stream.send
 
-        async def send(packet):
-            await original_send(packet)
+        async def send(packet, *, _before_send=None):
+            await original_send(packet, _before_send=_before_send)
             if isinstance(packet, b.InteractPacket):
                 self.assertEqual(packet.action, b.InteractPacket.Action.OPEN_INVENTORY)
                 if answer_open:
@@ -347,8 +347,8 @@ class HarvestTests(unittest.IsolatedAsyncioTestCase):
                 self.reply_to_transfers(bot, "SUCCESS")
                 original_send = self.stream.send
 
-                async def send(packet):
-                    await original_send(packet)
+                async def send(packet, *, _before_send=None):
+                    await original_send(packet, _before_send=_before_send)
                     if isinstance(packet, getattr(b, packet_type_name)):
                         self.assertEqual(bot.inventory_slots[0].net_id_variant, 500)
                         self.inventory_slot(0, 1201, user_data=enchanted)
@@ -378,8 +378,8 @@ class HarvestTests(unittest.IsolatedAsyncioTestCase):
                 self.reply_to_transfers(bot, "SUCCESS")
                 original_send = self.stream.send
 
-                async def send(packet):
-                    await original_send(packet)
+                async def send(packet, *, _before_send=None):
+                    await original_send(packet, _before_send=_before_send)
                     if when == "opening" and isinstance(packet, b.InteractPacket):
                         self.inventory_slot(source, 1201, user_data=enchantment_data(b, 1))
                     if (when == "closing" and isinstance(packet, b.ContainerClosePacket)
@@ -454,12 +454,13 @@ class HarvestTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNot(replacement, initial)
 
                 async def wait(packet_id, *, timeout, match=None):
-                    if replace_at == "close_waiter" and packet_id == b.ContainerClosePacket.ID:
+                    packet_ids = (packet_id,) if isinstance(packet_id, int) else packet_id
+                    if replace_at == "close_waiter" and b.ContainerClosePacket.ID in packet_ids:
                         replace_inventory_window()
                     return await original_wait(packet_id, timeout=timeout, match=match)
 
-                async def send(packet):
-                    await original_send(packet)
+                async def send(packet, *, _before_send=None):
+                    await original_send(packet, _before_send=_before_send)
                     if isinstance(packet, b.InteractPacket):
                         self.open_window(b.ContainerType.INVENTORY, 2)
                         self.assertIsNotNone(bot.open_window)
@@ -562,8 +563,8 @@ class HarvestTests(unittest.IsolatedAsyncioTestCase):
         original_send = self.stream.send
         submitted = asyncio.Event()
 
-        async def send(packet):
-            await original_send(packet)
+        async def send(packet, *, _before_send=None):
+            await original_send(packet, _before_send=_before_send)
             if isinstance(packet, b.InteractPacket):
                 submitted.set()
 
@@ -592,8 +593,8 @@ class HarvestTests(unittest.IsolatedAsyncioTestCase):
                 submitted = asyncio.Event()
                 original_send = self.stream.send
 
-                async def send(packet):
-                    await original_send(packet)
+                async def send(packet, *, _before_send=None):
+                    await original_send(packet, _before_send=_before_send)
                     if isinstance(packet, b.InteractPacket):
                         self.open_window(b.ContainerType.CONTAINER, 5)
                         submitted.set()
