@@ -629,6 +629,9 @@ class Inventory:
         reply = self._qa_requests.get(request_id)
         return reply.result() if reply is not None and reply.done() else None
 
+    def _main_inventory_has_count_gaps(self) -> bool:
+        return any(0 <= slot < _MAIN_INVENTORY_SIZE for slot in self._count_observation_gaps)
+
     def count_item(self, item_id: int) -> int:
         """Sum the latest server-described inventory slots for a numeric item ID."""
         return sum(

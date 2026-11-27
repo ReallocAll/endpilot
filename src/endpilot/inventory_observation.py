@@ -2,11 +2,14 @@
 
 from collections import Counter
 
-from .inventory import Inventory
+from .inventory import Inventory, _MAIN_INVENTORY_SIZE
 
 
 def _main_slots(inventory: Inventory) -> dict[int, tuple[int, int]]:
-    return {slot: (int(item.id), int(item.stack_size)) for slot, item in inventory.slots.items() if 0 <= slot < 36}
+    return {
+        slot: (int(item.id), int(item.stack_size))
+        for slot, item in inventory.slots.items() if 0 <= slot < _MAIN_INVENTORY_SIZE
+    }
 
 
 def _counts(slots: dict[int, tuple[int, int]]) -> Counter[int]:
@@ -21,7 +24,10 @@ class _InventoryObservation:
     def __init__(self, inventory: Inventory, *, require_all_slots: bool = False):
         self._inventory = inventory
         self._before = self._after = _main_slots(inventory)
-        self._missing_baseline = not self._before or (require_all_slots and len(self._before) != 36)
+        self._missing_baseline = (
+            not self._before or inventory._main_inventory_has_count_gaps()
+            or (require_all_slots and len(self._before) != _MAIN_INVENTORY_SIZE)
+        )
         self._uncertain_ids = set()
 
     def observe(self, raw) -> None:
@@ -42,7 +48,7 @@ class _InventoryObservation:
             source = action.source
             if (source.type != binding.InventorySourceType.CONTAINER_INVENTORY
                 or source.container_id != binding.ContainerID.INVENTORY
-                or not 0 <= int(action.slot) < 36):
+                or not 0 <= int(action.slot) < _MAIN_INVENTORY_SIZE):
                 continue
             old, new = action.from_item_descriptor, action.to_item_descriptor
             if int(old.id):
@@ -54,7 +60,8 @@ class _InventoryObservation:
         self._uncertain_ids.update(item for item in reported.keys() | cached.keys() if reported[item] != cached[item])
 
     def delta(self, item_id: int) -> int | None:
-        if (self._missing_baseline or item_id in self._uncertain_ids or self._before.keys() != self._after.keys()):
+        if (self._missing_baseline or self._inventory._main_inventory_has_count_gaps()
+                or item_id in self._uncertain_ids or self._before.keys() != self._after.keys()):
             return None
         return (
             sum(count for item, count in self._after.values() if item == item_id)

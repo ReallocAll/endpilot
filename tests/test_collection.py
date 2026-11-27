@@ -1479,6 +1479,54 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             search_radius=search_radius, timeout=timeout,
         ))
 
+    async def count_log_after_losing_a_slot_update(self, *, before_start=False, refresh=None):
+        bot = await self.log_bot(TARGET)
+        await self.emit(self.slot(4, OAK_LOG_ITEM, 1, net_id=14))
+        loop = asyncio.get_running_loop()
+
+        async def lose_clear():
+            failure = RuntimeError("main inventory slot update failed")
+            with (patch.object(bot._inventory, "_set_slot", side_effect=failure) as apply,
+                  patch.object(loop, "call_exception_handler") as report):
+                await self.emit(self.slot(4))
+            apply.assert_called_once()
+            index, stack = apply.call_args.args
+            self.assertEqual((index, int(stack.id)), (4, 0))
+            report.assert_called_once()
+            self.assertIs(report.call_args.args[0]["exception"], failure)
+            self.assertEqual(bot.inventory_count(OAK_LOG_ITEM), 1)
+
+        if before_start:
+            await lose_clear()
+        task = self.collect_logs(bot, count=1, timeout=0.3)
+        await self.expect_batch_start(TARGET)
+        if not before_start:
+            await lose_clear()
+        if refresh is not None:
+            await self.emit(refresh)
+        await self.finish_batch_break(TARGET, runtime_id=101, total=1, item_id=OAK_LOG_ITEM, net_id=15)
+        result = await task
+
+        attempt, = result.results
+        self.assertTrue(attempt.block_after.is_air)
+        self.assertEqual(attempt.collector_id, PLAYER)
+        drop, = attempt.drops
+        self.assertEqual((drop.entity_id, drop.runtime_id, drop.item_network_id, drop.item_count),
+                         (1101, 101, OAK_LOG_ITEM, 1))
+        self.assert_no_more_collection_inputs()
+        return result.collected_count, attempt.status, attempt.inventory_delta
+
+    async def test_counted_collection_keeps_pickup_evidence_but_cannot_count_across_a_lost_slot_update(self):
+        self.assertEqual(await self.count_log_after_losing_a_slot_update(), (0, "inventory_unconfirmed", None))
+
+    async def test_counted_collection_refresh_cannot_repair_an_untrusted_inventory_baseline(self):
+        self.assertEqual(await self.count_log_after_losing_a_slot_update(before_start=True, refresh=self.slot(4)),
+                         (0, "inventory_unconfirmed", None))
+
+    async def test_counted_collection_refresh_recovers_net_change_after_a_trusted_inventory_baseline(self):
+        self.assertEqual(await self.count_log_after_losing_a_slot_update(refresh=self.slot(4)),
+                         (0, "inventory_unconfirmed", 0))
+
     async def test_counted_collection_refills_and_stops_at_the_requested_inventory_gain(self):
         bot = await self.refill_bot()
         await self.emit(self.block(ORE), self.slot(2, DIRT, 4, net_id=15))
