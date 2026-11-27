@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 from bedrock_protocol import nbt
 
-from endpilot import Bot
+from endpilot import Bot, transfer_range
 from endpilot.block_data import _catalog
 from endpilot.blocks import BlockObservation
 from endpilot.containers import Containers, ContainerWindow
@@ -696,6 +696,173 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(int(click.runtime_id), runtime_id)
         self.assertEqual(click.action_type, b.ItemUseOnActorInventoryTransaction.ActionType.INTERACT)
         return task
+
+    def boat(self, unique=-204):
+        b = self.b
+        return b.AddActorPacket(runtime_id=34, entity_id=unique, actor_type="minecraft:chest_boat",
+                                pos=b.Vec3(x=1.5, y=100, z=0.5))
+
+    def sneak_pose(self, sneaking, *, runtime_id=7):
+        b = self.b
+        flags = 1 << int(b.ActorFlags.SNEAKING) if sneaking else 0
+        return b.SetActorDataPacket(id=runtime_id, packed_items=b.SynchedActorData.CopyableDataList(data=[
+            b.DataItemEntry(id=0, payload=b.DataItemInt64Payload(value=flags)),
+        ]))
+
+    def main_slot(self, slot=0, item=None):
+        b = self.b
+        return b.InventorySlotPacket(inventory_id=b.ContainerID.INVENTORY, slot=slot,
+                                     item=b.SerializedNetworkItemStackDescriptor() if item is None else item)
+
+    def clicks(self):
+        return [packet.variant_transaction for packet in self.wire.sent
+                if isinstance(packet, self.b.InventoryTransactionPacket)]
+
+    async def test_chest_boat_waits_for_own_sneak_and_requires_a_known_empty_hand(self):
+        b = self.b
+        await self.deliver(self.boat(), self.position(), self.sneak_pose(False))
+        with self.assertRaisesRegex(RuntimeError, "hold sneak"):
+            await self.bot.open_entity_container(34)
+        await self.bot.set_sneaking(True)
+        with self.assertRaisesRegex(RuntimeError, "observed empty main hand"):
+            await self.bot.open_entity_container(34)
+        await self.deliver(self.main_slot(item=self.storage_item(1, 32)))
+        with self.assertRaisesRegex(RuntimeError, "observed empty main hand"):
+            await self.bot.open_entity_container(34)
+        await self.deliver(self.main_slot())
+
+        waiting = asyncio.Event()
+        original_wait = self.bot.packets.wait_for_packet
+
+        async def wait(packet_id, **kwargs):
+            if packet_id == b.SetActorDataPacket.ID:
+                waiting.set()
+            return await original_wait(packet_id, **kwargs)
+
+        with patch.object(self.bot.packets, "wait_for_packet", side_effect=wait):
+            opening = self.start(self.start_open(34))
+            await asyncio.wait_for(waiting.wait(), 1)
+            await self.deliver(self.sneak_pose(True, runtime_id=31))
+            self.assertEqual(self.clicks(), [])
+            await self.deliver(self.sneak_pose(True))
+            pending = await opening
+        click, = self.clicks()
+        self.assertEqual((click.slot, int(click.item.id), int(click.item.stack_size)), (0, 0, 0))
+        await self.deliver(self.opened(-204))
+        self.assertIs(await pending, self.bot.open_window)
+
+    async def test_cancelled_sneak_input_cannot_open_chest_boat(self):
+        b = self.b
+        await self.deliver(self.boat(), self.position(), self.main_slot(), self.sneak_pose(False))
+        started = asyncio.Event()
+        original_send = self.bot.packets.send
+
+        async def send(packet, **kwargs):
+            if isinstance(packet, b.PlayerAuthInputPacket):
+                started.set()
+                await asyncio.Future()
+            await original_send(packet, **kwargs)
+
+        with patch.object(self.bot.packets, "send", side_effect=send):
+            sneaking = self.start(self.bot.set_sneaking(True))
+            await asyncio.wait_for(started.wait(), 1)
+            await self.cancel(sneaking)
+            with self.assertRaises(TimeoutError):
+                await self.bot.open_entity_container(34, timeout=0.03)
+        self.assertEqual(self.clicks(), [])
+
+    async def test_chest_boat_rechecks_pose_hand_and_actor_at_the_click_write(self):
+        b = self.b
+        await self.deliver(self.boat(), self.position(), self.main_slot(), self.main_slot(1), self.sneak_pose(True))
+        await self.bot.set_sneaking(True)
+        original_send = self.bot.packets.send
+
+        async def send(packet, **kwargs):
+            if isinstance(packet, b.InventoryTransactionPacket):
+                await change()
+            await original_send(packet, **kwargs)
+
+        async def select_other_empty_slot():
+            await self.deliver(b.PlayerHotbarPacket(selected_slot=1, container_id=b.ContainerID.INVENTORY,
+                                                    should_select_slot=True))
+
+        async def stand():
+            await self.bot.set_sneaking(False)
+
+        async def recreate():
+            await self.deliver(b.RemoveActorPacket(entity_id=-204), self.boat())
+
+        async def respawn():
+            await self.deliver(b.RespawnPacket(runtime_id=7, state=b.PlayerRespawnState.SEARCHING_FOR_SPAWN))
+
+        with patch.object(self.bot.packets, "send", side_effect=send):
+            for change, error in ((select_other_empty_slot, "selected main hand changed"),
+                                  (stand, "hold sneak"), (recreate, "chest boat is no longer observed"),
+                                  (respawn, "pose changed generation")):
+                with self.subTest(change=change.__name__):
+                    await self.bot.set_sneaking(True)
+                    with self.assertRaisesRegex(RuntimeError, error):
+                        await self.bot.open_entity_container(34, timeout=1)
+        self.assertEqual(self.clicks(), [])
+
+    async def test_chest_boat_rechecks_new_equipment_then_accepts_a_fresh_empty_slot(self):
+        b = self.b
+        await self.deliver(self.boat(), self.position(), self.main_slot(), self.sneak_pose(True))
+        await self.bot.set_sneaking(True)
+        original_send = self.bot.packets.send
+
+        async def send(packet, **kwargs):
+            if isinstance(packet, b.InventoryTransactionPacket):
+                await self.deliver(b.MobEquipmentPacket(runtime_id=7, container_id=b.ContainerID.INVENTORY,
+                                                        selected_slot=0, slot=0, item=self.storage_item(1, 31)))
+                self.assertEqual(self.bot.held_item.observed_item.item_id, 0)
+            await original_send(packet, **kwargs)
+            if isinstance(packet, b.InventoryTransactionPacket):
+                await self.deliver(self.opened(-204))
+
+        with patch.object(self.bot.packets, "send", side_effect=send):
+            with self.assertRaisesRegex(RuntimeError, "observed empty main hand"):
+                await self.bot.open_entity_container(34, timeout=1)
+        with self.assertRaisesRegex(RuntimeError, "observed empty main hand"):
+            await self.bot.open_entity_container(34, timeout=1)
+        self.assertEqual(self.clicks(), [])
+
+        await self.deliver(self.main_slot())
+        opening = await self.start_open(34)
+        self.assertEqual(len(self.clicks()), 1)
+        await self.deliver(self.opened(-204))
+        self.assertIs(await opening, self.bot.open_window)
+
+    async def test_chest_boat_exact_and_range_require_the_matching_complete_layout(self):
+        b = self.b
+        await self.deliver(self.boat(), self.position(), self.main_slot(), self.sneak_pose(True))
+        await self.bot.set_sneaking(True)
+        opening = await self.start_open(34)
+        await self.deliver(self.opened(-204, "HOPPER"), self.storage_content(27, (26, 3, 31)))
+        with self.assertRaisesRegex(RuntimeError, "different container"):
+            await opening
+        with self.assertRaisesRegex(RuntimeError, "unsupported container type"):
+            await self.bot.take_from_container(26, 1)
+
+        await self.deliver(self.closed(), self.opened(-204), self.storage_content(28, (26, 3, 31)))
+        for operation in (self.bot.take_from_container(26, 1), self.bot.put_into_container(1, 26),
+                          transfer_range(self.bot, direction="take", item="minecraft:diamond", count=1,
+                                         source_slots=range(26, 27), destination_slots=range(1, 2))):
+            with self.assertRaisesRegex(RuntimeError, "unsupported slot count"):
+                await operation
+        await self.deliver(self.storage_content(27, (26, 3, 31)))
+        with self.assertRaisesRegex(ValueError, r"range\(27\)"):
+            await self.bot.take_from_container(27, 1)
+        self.assertFalse(any(isinstance(packet, b.ItemStackRequestPacket) for packet in self.wire.sent))
+        taking, request = await self.submit_stack(self.bot.take_from_container(26, 1))
+        self.assertEqual(int(request.actions[0].source.slot), 26)
+        await self.reply_stack(request, ("LEVEL_ENTITY_CONTAINER", 26, 2, 31),
+                               ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 1, 1, 32))
+        self.assertEqual((await taking).result.name, "SUCCESS")
+        self.assertEqual(self.bot.container_slots[26].stack_size, 2)
+        await self.deliver(b.RemoveActorPacket(entity_id=-204), self.boat())
+        with self.assertRaisesRegex(RuntimeError, "chest boat is no longer observed"):
+            await self.bot.put_into_container(1, 26)
 
     async def test_wrong_entity_window_is_observed_but_fails_the_requested_open(self):
         await self.deliver(self.position())

@@ -71,9 +71,11 @@ class _InventoryOpen:
     completion: asyncio.Future[ContainerWindow | None]
 
 
-_MINECART_LAYOUTS = {
+_CHEST_BOAT = "minecraft:chest_boat"
+_ENTITY_CONTAINER_LAYOUTS = {
     "minecraft:chest_minecart": ("CONTAINER", 27),
     "minecraft:hopper_minecart": ("HOPPER", 5),
+    _CHEST_BOAT: ("CONTAINER", 27),
 }
 
 
@@ -85,9 +87,10 @@ class _EntityContainer:
     actor_type: str
     instance: object
 
-    def minecart_slot_count(self, window: ContainerWindow) -> int | None:
-        layout = _MINECART_LAYOUTS.get(self.actor_type)
-        if layout is not None and layout[0] == window.container_type and self.entity_id == window.entity_unique_id:
+    def slot_count(self, window: ContainerWindow | None) -> int | None:
+        layout = _ENTITY_CONTAINER_LAYOUTS.get(self.actor_type)
+        if (layout is not None and window is not None and layout[0] == window.container_type
+                and self.entity_id == window.entity_unique_id):
             return layout[1]
         return None
 
@@ -96,7 +99,7 @@ class _EntityContainer:
 
     def require_visible(self) -> None:
         if not self.is_visible():
-            name = "hopper minecart" if self.actor_type == "minecraft:hopper_minecart" else "chest minecart"
+            name = self.actor_type.removeprefix("minecraft:").replace("_", " ")
             raise RuntimeError(f"the {name} is no longer observed")
 
 
@@ -414,6 +417,10 @@ class Containers:
     def _observe_transfer_slot(self, index: int, item: object) -> None:
         entity = self._entity_container
         if entity is not None:
+            if entity.actor_type == _CHEST_BOAT:
+                count = entity.slot_count(self.window)
+                if count is None or self._window_slot_count != count or not 0 <= index < count:
+                    return
             if self.inventory is not None and entity.is_visible():
                 self.inventory._observe_transfer_slot((entity.instance, index), item)
             return
@@ -447,11 +454,11 @@ class Containers:
             window = self._decode_open(raw)
             self._set_window(window)
             self._observed_window_block_name(window)
-            if self._entities is not None and window.container_type in ("CONTAINER", "HOPPER"):
+            if self._entities is not None:
                 actor = self._entities._get_by_unique_id(window.entity_unique_id)
                 entity = _observed_entity_container(self._entities, actor)
                 if entity is not None and (
-                    entity.minecart_slot_count(window) is not None
+                    entity.actor_type == _CHEST_BOAT or entity.slot_count(window) is not None
                     or (window.container_type == "CONTAINER" and entity.actor_type != "minecraft:hopper_minecart")
                 ):
                     self._entity_container = entity
@@ -821,56 +828,97 @@ class Containers:
                 pending.exception()
 
     async def open_entity(self, runtime_id: int, entities: Entities, *, timeout: float = 15) -> ContainerWindow:
-        """Open an observed chest or hopper minecart and return its active server window."""
+        """Open an observed storage entity and return its active server window."""
         if self._unsubscribe is None:
             raise ConnectionError("container session is closed")
         if self.window is not None or self._entity_opening:
             raise RuntimeError("a container window is open or opening")
         actor = entities.get(runtime_id)
         target = _observed_entity_container(entities, actor)
-        if target is None or target.actor_type not in _MINECART_LAYOUTS:
-            raise ValueError("an observed chest minecart or hopper minecart with a known identity is required")
+        if target is None or target.actor_type not in _ENTITY_CONTAINER_LAYOUTS:
+            raise ValueError("an observed chest minecart, hopper minecart, or chest boat with a known identity is required")
         b = self.packets.protocol.binding
+        boat = target.actor_type == _CHEST_BOAT
+        move = self.movement
+        generation = move._pose_generation if boat else None
+        layout = self._layout_token
         submitted = False
         opened = None
 
-        def before_send():
-            nonlocal submitted
+        def require_target():
             target.require_visible()
-            if self.window is not None:
+            if boat and move._pose_generation != generation:
+                raise RuntimeError("player pose changed generation while opening the chest boat")
+
+        def require_boat_input():
+            if not move._sneaking:
+                raise RuntimeError("hold sneak to open a chest boat")
+            held = self.inventory.held_item
+            item = held.observed_item
+            # A server equipment correction can precede the matching inventory update.
+            equipment = self.inventory._damage_descriptors.get((None, held.slot))
+            if (item is None or item.item_id != 0 or item.count != 0 or held.predicted_count is not None
+                    or (equipment is not None and (equipment.id != 0 or equipment.stack_size != 0))
+                    or held.slot in self.inventory._unconfirmed_transfer_slots
+                    or self.inventory._requests_for_endpoints(((None, held.slot),))):
+                raise RuntimeError("opening a chest boat requires an observed empty main hand")
+
+        def confirmed_sneaking(_raw=None):
+            require_target()
+            require_boat_input()
+            return move._actor_flag(b.ActorFlags.SNEAKING) is True
+
+        def before_send(slot, item):
+            nonlocal submitted
+            require_target()
+            if self.window is not None or (boat and self._layout_token is not layout):
                 raise RuntimeError("a container window opened before the interaction")
+            if boat:
+                if not confirmed_sneaking():
+                    raise RuntimeError("the server no longer confirms the player's chest boat sneak pose")
+                if slot != self.inventory.selected_slot or item.id or item.stack_size:
+                    raise RuntimeError("the selected main hand changed before the chest boat interaction")
             submitted = True
+
+        async def interact():
+            if boat and not confirmed_sneaking():
+                await self.packets.wait_for_packet(b.SetActorDataPacket.ID, timeout=None, match=confirmed_sneaking)
+            await entities.interact(move, self.inventory, runtime_id, _before_send=before_send)
 
         def matches(raw):
             nonlocal opened
             if raw.packet_id == b.DisconnectPacket.ID:
-                raise ConnectionError("server disconnected while opening the minecart")
+                raise ConnectionError("server disconnected while opening the entity container")
             if raw.packet_id == b.ChangeDimensionPacket.ID:
-                raise RuntimeError("dimension changed while opening the minecart")
-            target.require_visible()
-            if raw.packet_id != b.ContainerOpenPacket.ID or not submitted:
+                raise RuntimeError("dimension changed while opening the entity container")
+            require_target()
+            if raw.packet_id != b.ContainerOpenPacket.ID:
+                return False
+            if not submitted:
+                if boat:
+                    raise RuntimeError("a container window opened before the interaction")
                 return False
             window = self.window
-            if window is None or target.minecart_slot_count(window) is None:
+            if window is None or target.slot_count(window) is None:
                 raise RuntimeError("the server opened a different container")
             opened = window
             self._entity_container = target
             return True
 
+        if boat:
+            require_boat_input()
         self._entity_opening = True
         tasks = []
         try:
             async with asyncio.timeout(timeout):
                 pending = asyncio.create_task(self.packets.wait_for_packet(
                     (b.ContainerOpenPacket.ID, b.ChangeDimensionPacket.ID, b.DisconnectPacket.ID,
-                     b.RemoveActorPacket.ID, b.AddActorPacket.ID),
+                     b.RemoveActorPacket.ID, b.AddActorPacket.ID, b.RespawnPacket.ID),
                     timeout=None, match=matches,
                 ))
                 tasks.append(pending)
                 await asyncio.sleep(0)
-                interacting = asyncio.create_task(entities.interact(
-                    self.movement, self.inventory, runtime_id, _before_send=before_send,
-                ))
+                interacting = asyncio.create_task(interact())
                 tasks.append(interacting)
                 done, _ = await asyncio.wait((pending, interacting), return_when=asyncio.FIRST_COMPLETED)
                 if pending in done:
@@ -878,8 +926,8 @@ class Containers:
                 await interacting
                 await pending
                 if opened is None or self.window is not opened:
-                    raise RuntimeError("the minecart window closed or changed during open")
-                target.require_visible()
+                    raise RuntimeError("the entity container window closed or changed during open")
+                require_target()
                 return opened
         finally:
             try:
@@ -1187,11 +1235,13 @@ class Containers:
         if _expected_slot_count is not None and observed_slot_count != _expected_slot_count:
             raise RuntimeError("container slot count changed before transfer")
         entity_container = self._entity_container
-        hopper_slot_count = None
+        strict_slot_count = None
         if entity_container is not None:
             entity_container.require_visible()
-            if window.container_type == "HOPPER":
-                hopper_slot_count = entity_container.minecart_slot_count(window)
+            if entity_container.actor_type == _CHEST_BOAT or window.container_type == "HOPPER":
+                strict_slot_count = entity_container.slot_count(window)
+                if strict_slot_count is None:
+                    raise RuntimeError("the entity window has an unsupported container type")
         elif window.container_type in ("CONTAINER", "HOPPER") and window.entity_unique_id not in (-1, 0):
             raise RuntimeError("cannot transfer through an unbound entity container")
         if not 0 <= source_slot <= 255 or not 0 <= destination_slot <= 255:
@@ -1199,11 +1249,11 @@ class Containers:
         if not 1 <= amount <= 255:
             raise ValueError("item-stack request amount must be between 1 and 255")
         chest_slot, player_slot = (destination_slot, source_slot) if into_container else (source_slot, destination_slot)
-        if hopper_slot_count is not None:
-            if not 0 <= chest_slot < hopper_slot_count:
-                raise ValueError(f"the hopper minecart slot must be in range({hopper_slot_count})")
-            if observed_slot_count != hopper_slot_count:
-                raise RuntimeError("the active hopper minecart has an unsupported slot count")
+        if strict_slot_count is not None:
+            if not 0 <= chest_slot < strict_slot_count:
+                raise ValueError(f"the entity container slot must be in range({strict_slot_count})")
+            if observed_slot_count != strict_slot_count:
+                raise RuntimeError("the active entity container has an unsupported slot count")
         if block_container is not None and (
             block_container not in ("LEVEL_ENTITY_CONTAINER", "BARREL_CONTAINER")
             or window.container_type != "CONTAINER" or window.position is None
@@ -1386,7 +1436,7 @@ class Containers:
                         matches_window = _ANVIL_SLOTS.get(index) == name
                     else:
                         matches_window = name == container_name and (
-                            hopper_slot_count is None or 0 <= index < hopper_slot_count
+                            strict_slot_count is None or 0 <= index < strict_slot_count
                         )
                     preserve_window_slot = preserve_player_slot = False
                     if matches_window and index == chest_slot:
@@ -1507,7 +1557,7 @@ class Containers:
             _endpoints=endpoints, _range_step=_expected_slots is not None,
             _wait_for=blockers, _on_unconfirmed=_on_unconfirmed,
             _on_slot_observed=observe_pending_slot if brewing or _on_unconfirmed is not None else None,
-            _at_write=before_write if _range_window_current is not None or hopper_slot_count is not None else None,
+            _at_write=before_write if _range_window_current is not None or strict_slot_count is not None else None,
         )
 
     def close(self) -> None:

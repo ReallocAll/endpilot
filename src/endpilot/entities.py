@@ -2149,7 +2149,7 @@ class Entities:
                               hit_height=hit_height, interact=False)
 
     async def interact(self, movement, inventory, runtime_id: int, *,
-                       hit_height: float = 0.5, _before_send: Callable[[], None] | None = None) -> None:
+                       hit_height: float = 0.5, _before_send: Callable[[int, object], None] | None = None) -> None:
         """Submit a right-click actor transaction; no server effect is implied."""
         await self._use_actor(movement, inventory, runtime_id,
                               hit_height=hit_height, interact=True, _before_send=_before_send)
@@ -2168,7 +2168,7 @@ class Entities:
 
     async def _use_actor(self, movement, inventory, runtime_id: int, *,
                          hit_height: float, interact: bool, mounting: bool = False,
-                         _before_send: Callable[[], None] | None = None) -> None:
+                         _before_send: Callable[[int, object], None] | None = None) -> None:
         """Use an ItemUseOnActor transaction with the selected item and position."""
         self._require_live()
         actor = self.get(runtime_id)
@@ -2229,7 +2229,7 @@ class Entities:
         if _before_send is None:
             await self.packets.send(packet)
         else:
-            await self.packets.send(packet, _before_send=_before_send)
+            await self.packets.send(packet, _before_send=lambda: _before_send(slot, item))
 
     async def wait_for_spawn(self, *, actor_type: str | None = None, timeout: float = 15) -> EntitySpawn:
         """Wait for AddActor, also accepting AddPainting for a painting filter."""
