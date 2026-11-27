@@ -41,11 +41,18 @@ def stack_response(b, request, *rows, result="SUCCESS"):
     )
 
 
+class AnvilPacketStream(PacketStream):
+    async def send(self, packet, *, _before_send=None):
+        if _before_send is not None:
+            _before_send()
+        await super().send(packet)
+
+
 class AnvilTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.bot = Bot("AnvilTest", protocol=2225)
         self.b = self.bot.protocol.binding
-        self.wire = PacketStream(self.bot.protocol)
+        self.wire = AnvilPacketStream(self.bot.protocol)
         inventory = self.bot._inventory = Inventory(self.wire, 1)
         containers = self.bot._containers = Containers(self.wire, None, inventory)
         self.bot._creative = CreativeInventory(self.wire, inventory, containers, 9, {}, (
@@ -249,16 +256,19 @@ class AnvilTests(unittest.IsolatedAsyncioTestCase):
             await applying
         self.assertEqual(self.wire.sent, [])
 
-    async def test_apply_requires_survival_and_observed_anvil(self):
+    async def test_apply_requires_supported_mode_and_observed_anvil(self):
         self.open("CONTAINER")
         with self.assertRaisesRegex(RuntimeError, "observed anvil"):
             await self.bot.apply_anvil(4, "No anvil")
         self.open()
         self.ui(item(self.b, 318, 1, 11))
-        self.emit(self.b.SetPlayerGameTypePacket(player_game_type=self.b.GameType.CREATIVE))
-        with self.assertRaisesRegex(RuntimeError, "survival"):
-            await self.bot.apply_anvil(4, "Creative mode")
-        self.assertEqual(self.wire.sent, [])
+        modes = self.b.GameType
+        for mode in (modes.ADVENTURE, modes.SPECTATOR, modes.UNDEFINED):
+            with self.subTest(mode=mode):
+                self.emit(self.b.SetPlayerGameTypePacket(player_game_type=mode))
+                with self.assertRaisesRegex(RuntimeError, "observed survival or creative"):
+                    await self.bot.apply_anvil(4, "Unsupported mode")
+                self.assertEqual(self.wire.sent, [])
 
     async def test_both_anvil_content_layouts_preserve_distinct_nonempty_input_and_material(self):
         b = self.b
@@ -339,7 +349,7 @@ class AnvilTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.inventory_slots[5].net_id_variant, 12)
 
 
-class AnvilPreviewTests(unittest.IsolatedAsyncioTestCase):
+class AnvilSessionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.enterContext(ManualClock().patch_scheduler())
         self.bot = Bot("PreviewAnvil", protocol=2225)
@@ -408,6 +418,46 @@ class AnvilPreviewTests(unittest.IsolatedAsyncioTestCase):
         verdict = stack_response(self.b, request, *rows, result=result)
         await self.deliver(self.b.ItemStackResponsePacket(responses=[verdict]))
         self.assertEqual((await pending).result.name, result)
+
+    async def test_anvil_mode_change_while_waiting_to_write_leaves_staging_intact(self):
+        b = self.b
+        await self.stage_inputs(self.sword(11), self.sword(12))
+        await self.deliver(b.SetPlayerGameTypePacket(player_game_type=b.GameType.CREATIVE))
+        ready = asyncio.Event()
+        release = asyncio.Event()
+        send = self.bot.packets.send
+
+        async def delay_request(packet, *, _before_send=None):
+            ready.set()
+            await release.wait()
+            await send(packet, _before_send=_before_send)
+
+        with patch.object(self.bot.packets, "send", delay_request):
+            applying = asyncio.create_task(self.bot.apply_anvil(4, "Creative rename", timeout=1))
+            try:
+                await asyncio.wait_for(ready.wait(), timeout=1)
+                await self.deliver(b.SetPlayerGameTypePacket(player_game_type=b.GameType.SURVIVAL))
+            finally:
+                release.set()
+            with self.assertRaisesRegex(RuntimeError, "game mode changed before anvil submission"):
+                await applying
+        self.assertEqual(self.wire.sent, [])
+        self.assertEqual([self.bot.container_slots[slot].net_id_variant for slot in (1, 2)], [11, 12])
+        self.assertEqual(self.bot.inventory_slots[4].id, 0)
+
+    async def test_anvil_creative_keeps_matching_server_verdict_after_mode_changes(self):
+        b = self.b
+        await self.stage_inputs(self.sword(11), self.sword(12))
+        await self.deliver(b.SetPlayerGameTypePacket(player_game_type=b.GameType.CREATIVE))
+        submitted = await self.submit(self.bot.apply_anvil(4, "Creative rename"))
+        _, request = submitted
+        self.assertEqual(tuple(request.strings_to_filter), ("Creative rename",))
+        self.assertEqual([action.source.net_id_variant for action in request.actions[1:3]], [11, 12])
+        await self.deliver(b.SetPlayerGameTypePacket(player_game_type=b.GameType.SURVIVAL))
+        await self.complete(submitted, (INPUT, 1, 0, None, "", 0), (MATERIAL, 2, 0, None, "", 0),
+                            (PLAYER, 4, 1, 13, "Creative rename", 0))
+        self.assertEqual([self.bot.container_slots[slot].id for slot in (1, 2)], [0, 0])
+        self.assertEqual(self.bot.inventory_slots[4].net_id_variant, 13)
 
     async def test_rename_cost_uses_observed_item_registry_without_experience_destination_or_stack_id(self):
         b = self.b

@@ -1102,9 +1102,9 @@ class Containers:
 
     async def apply_anvil(
         self, destination_slot: int, new_name: str | None, *,
-        material_count: int | None = None, timeout: float,
+        material_count: int | None = None, timeout: float, check_game_mode: Callable[[], None],
     ):
-        """Commit the staged survival anvil inputs and return the BDS verdict."""
+        """Commit the staged anvil inputs and return the BDS verdict."""
         window, slots = self.window, self._slots
         if window is None or window.container_type != "ANVIL" or slots is None:
             raise RuntimeError("open an observed anvil first")
@@ -1162,7 +1162,8 @@ class Containers:
         origins = {}
         submitted_inputs = {}
 
-        def before_send():
+        def before_write():
+            check_game_mode()
             if self.window is not window or self._slots is None:
                 raise RuntimeError("the anvil window changed before submission")
             if any(not _same_slot(item, self._slots.get(index)) for index, item in inputs.items()):
@@ -1215,7 +1216,7 @@ class Containers:
                         self._unconfirmed_transfer_slots.add(index)
             self._notify_slot_changes(window, before)
 
-        return await self.inventory._request_item_stack(request, apply, timeout=timeout, before_send=before_send)
+        return await self.inventory._request_item_stack(request, apply, timeout=timeout, _at_write=before_write)
 
     async def _transfer(
         self, source_slot: int, destination_slot: int, amount: int,

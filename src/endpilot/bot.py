@@ -1898,8 +1898,9 @@ class Bot:
         self, destination_slot: int, new_name: str | None = None, *,
         material_count: int | None = None, timeout: float = 15,
     ):
-        """Commit the open survival anvil and await BDS's verdict.
+        """Commit the open anvil in survival or creative and await BDS's verdict.
 
+        The server-observed game mode must still match when the request is sent.
         Stage the item in slot 1 and any material in slot 2 using
         put_into_container. The destination must be an observed empty slot.
         Omitting the name during a repair can restore the item's default name
@@ -1911,10 +1912,17 @@ class Bot:
         """
         if self._containers is None:
             raise RuntimeError("player has not joined")
-        if self.game_mode != self.protocol.binding.GameType.SURVIVAL:
-            raise RuntimeError("anvil transactions require an observed survival game mode")
+        mode = self.game_mode
+        game_type = self.protocol.binding.GameType
+        if mode not in (game_type.SURVIVAL, game_type.CREATIVE):
+            raise RuntimeError("anvil transactions require an observed survival or creative game mode")
+
+        def check_game_mode():
+            if self.game_mode != mode:
+                raise RuntimeError("game mode changed before anvil submission")
+
         return await self._containers.apply_anvil(
-            destination_slot, new_name, material_count=material_count, timeout=timeout,
+            destination_slot, new_name, material_count=material_count, timeout=timeout, check_game_mode=check_game_mode,
         )
 
     @property
