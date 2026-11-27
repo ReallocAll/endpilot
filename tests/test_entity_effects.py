@@ -155,6 +155,36 @@ class EntityEffectTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await waiting, seen[0])
         self.assertEqual(old_instance, [])
 
+    async def test_visible_effect_ids_decode_supported_metadata_without_changing_the_raw_value(self):
+        await self.join(before_spawn=(self.sheep(),))
+        initial = self.entity()
+        self.assertIsNone(initial.visible_effects_value)
+        self.assertIsNone(initial.visible_effect_ids)
+
+        # The three- and eight-effect values were captured on stock protocol 2225.
+        capacity = 2278536027409434
+        cases = (
+            (35352, (12, 10, 1)),
+            (capacity, (13, 12, 11, 10, 8, 5, 3, 2)),
+            (35352 | (1 << 7), None),  # Low bit set in the second entry.
+            (capacity - (1 << 63), None),  # Sign bit set.
+            (capacity | (2 << 56), None),  # Ninth entry with ID 1.
+            (24 | (2 << 14), None),  # Gap before ID 1.
+            (2 | (24 << 7), None),  # Ascending IDs.
+            (24 | (24 << 7), None),  # Duplicate IDs.
+            (0, ()),
+        )
+        seen = []
+        self.bot.subscribe_entity_visible_effect_changes(seen.append)
+        await self.deliver(*(self.visible_effects(value) for value, _ in cases))
+
+        self.assertEqual(
+            tuple((event.entity.visible_effects_value, event.entity.visible_effect_ids) for event in seen),
+            cases,
+        )
+        current = self.entity()
+        self.assertEqual((current.visible_effects_value, current.visible_effect_ids), (0, ()))
+
     async def test_login_replays_effects_in_wire_order_across_start_game(self):
         await self.join(
             before_start=(

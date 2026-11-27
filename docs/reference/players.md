@@ -512,6 +512,11 @@ unknown, and `0` is a reported value. The spawn packet can supply the initial
 value. Later packets that omit the field or carry an unexpected type preserve
 the last valid value.
 
+`EntityState.visible_effect_ids` reads the IDs encoded in the protocol 2225
+metadata as a tuple in descending order. A reported zero yields `()`. Missing
+metadata or unsupported packing yields `None`. For unsupported packing,
+`visible_effects_value` still holds the exact signed integer.
+
 `bot.subscribe_entity_visible_effect_changes(callback, runtime_id=...)`
 calls a synchronous callback with an immutable `EntityVisibleEffectUpdate`.
 The event includes the committed `EntityState` and the packet tick. The
@@ -529,8 +534,9 @@ unsubscribe function is idempotent. A deadline raises `TimeoutError`.
 Use `timeout=None` to wait without a deadline. Connection end closes
 subscriptions and raises `ConnectionError` in pending waits.
 
-Visible-effect metadata is a visual observation. Hidden effects may leave
-the value unchanged, and the SDK preserves the integer as received.
+Visible-effect metadata is a visual observation and represents up to eight IDs.
+Hidden effects may leave the value unchanged, and even a tuple with eight IDs
+can omit other active effects.
 `EntityState.status_effects` continues to reflect separately received
 `MobEffect` packets, which can report effect IDs, amplifiers, and durations.
 

@@ -91,6 +91,7 @@ class EntityState:
 
     ``visible_effects_value`` retains the latest signed visual-effect metadata
     value, when the server supplies it for this remote actor instance.
+    ``visible_effect_ids`` reads the IDs represented by supported metadata.
 
     ``attributes`` holds the latest server report for each observed attribute of
     this actor instance. An empty tuple means no attributes have been observed.
@@ -120,6 +121,26 @@ class EntityState:
     sleeping: bool | None = None
     firework_attached_entity_id: int | None = None
     visible_effects_value: int | None = None
+
+    @property
+    def visible_effect_ids(self) -> tuple[int, ...] | None:
+        """Encoded effect IDs in descending order, or None for unknown metadata."""
+        value = self.visible_effects_value
+        # Protocol 2225 packs up to eight 7-bit entries, least significant first.
+        if value is None or not 0 <= value < (1 << (7 * 8)):
+            return None
+
+        effect_ids: list[int] = []
+        previous_id = 1 << 6  # One above the highest 6-bit ID.
+        while value:
+            entry = value & 0x7F
+            effect_id = entry >> 1
+            if entry & 1 or not 0 < effect_id < previous_id:
+                return None
+            effect_ids.append(effect_id)
+            previous_id = effect_id
+            value >>= 7
+        return tuple(effect_ids)
 
 
 @dataclass(frozen=True, slots=True)
