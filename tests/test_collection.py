@@ -5,8 +5,8 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from endpilot import (
-    BlockCollectionBatch, Bot, CollectionStorage, CountedBlockCollection, DropCollection,
-    MiningAborted, MixedCollectionBatch, NavigationRules,
+    BlockCollectionBatch, BlockObservation, Bot, CollectionStorage, CountedBlockCollection, DropCollection,
+    MiningAborted, MiningEvent, MiningTarget, MixedCollectionBatch, NavigationRules,
 )
 from endpilot.block_data import _catalog
 from endpilot.block_raycast import trace_blocks
@@ -421,6 +421,8 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mine_block_timeout_during_submitted_start_releases_input(self):
         bot = await self.public_bot()
+        events = []
+        self.addCleanup(bot.subscribe_mining_events(events.append))
         self.wire.pause_start = True
         timeout_at = asyncio.timeout_at
         deadlines = []
@@ -449,6 +451,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.assertTrue(self.wire.outgoing.empty())
         self.assertIsNone(bot.mining_target)
+        self.assertEqual(events, [MiningEvent("aborted", 0, MiningTarget(TARGET, 4), reason="timeout")])
 
     def observe_mining_release_wait(self, lock):
         attempted = asyncio.Event()
@@ -2210,6 +2213,8 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_counted_collection_stops_after_subchunk_break_wait_times_out(self):
         bot = await self.log_bot(SECOND_TARGET, TARGET)
+        events = []
+        self.addCleanup(bot.subscribe_mining_events(events.append))
         task = self.collect_logs(bot, count=2, timeout=0.2)
         await self.expect_batch_start(SECOND_TARGET)
         b = self.b
@@ -2235,6 +2240,9 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(attempt.block_after.is_air)
         self.assertEqual(result.collected_count, 1)
         self.assertEqual(bot.observed_block(TARGET).runtime_id, OAK_LOG_BLOCK)
+        event, = events
+        self.assertEqual((event.kind, event.block, event.reason),
+                         ("completed", BlockObservation(SECOND_TARGET, HASHED_AIR_RUNTIME_ID, 0, True), None))
         self.assert_no_more_collection_inputs()
 
     async def test_counted_collection_requires_a_positive_integer_count(self):
@@ -2919,6 +2927,8 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_batch_stopped_during_second_break_keeps_completed_and_active_evidence(self):
         bot = await self.batch_bot()
+        events = []
+        self.addCleanup(bot.subscribe_mining_events(events.append))
         positions = TARGET, SECOND_TARGET, THIRD_TARGET
         async with asyncio.timeout(2):
             task = asyncio.create_task(bot.collect_targets(positions, timeout=2))
@@ -2941,6 +2951,9 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
                          ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
         self.assertTrue(self.wire.outgoing.empty())
         self.assertEqual(bot.observed_block(THIRD_TARGET).runtime_id, ORE)
+        self.assertEqual([event.kind for event in events], ["completed", "aborted"])
+        self.assertEqual(events[0].block, BlockObservation(TARGET, HASHED_AIR_RUNTIME_ID, 0, True))
+        self.assertEqual((events[1].target.position, events[1].reason), (SECOND_TARGET, "stopped"))
 
     def ready_to_spawn(self, runtime_id):
         b = self.b

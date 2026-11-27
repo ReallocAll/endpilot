@@ -21,7 +21,7 @@ from .beds import BedObservation, Beds, PlayerRespawnPoint, _BedEvent
 from .block_raycast import BlockRaycastResult, MiningFaceResult
 from .blocks import (
     Blocks, BlockChange, BlockEntityUpdate, BlockMatch, BlockObservation, BlockSearchResult, BlockStateObservation,
-    BlockUpdate, ColumnCoverage, ColumnCoverageEvent, DimensionBounds, MiningTarget,
+    BlockUpdate, ColumnCoverage, ColumnCoverageEvent, DimensionBounds, MiningEvent, MiningTarget,
 )
 from .books import BookEdit, BookSnapshot, Books
 from .boss_bars import BossBar, BossBarEvent, BossBarEventKind, BossBars
@@ -2230,6 +2230,16 @@ class Bot:
         if self._blocks is None:
             raise RuntimeError("player has not joined")
         return self._blocks.mining_face(position)
+
+    def subscribe_mining_events(self, callback: Callable[[MiningEvent], None]) -> Callable[[], None]:
+        """Observe mining outcomes on this session's event loop and return an unsubscribe callback.
+
+        Completion reports observed air at the target, regardless of what broke
+        it. Creative finish observes a matching update for up to 15 seconds.
+        """
+        if self._blocks is None:
+            raise RuntimeError("player has not joined")
+        return self._blocks.subscribe_mining_events(callback)
 
     async def start_mining(self, position: tuple[int, int, int], *, face: int = 1) -> int:
         """Begin holding an observed target; return its submitted client tick."""

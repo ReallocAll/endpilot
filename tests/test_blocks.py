@@ -1,12 +1,15 @@
 import asyncio
+from dataclasses import FrozenInstanceError
 import unittest
 from unittest.mock import patch
 
-from endpilot import MiningAborted
+from endpilot import MiningAborted, MiningEvent
 from endpilot.blocks import HASHED_AIR_RUNTIME_ID, Blocks, BlockObservation, BlockUpdate, MiningTarget
 from endpilot.inventory import Inventory
 from endpilot.movement import Movement
 from endpilot.protocol import Protocol
+
+from test_subchunks import solid_sub_chunk
 
 
 class PacketStream:
@@ -59,7 +62,7 @@ class PacketStream:
 
 
 class BlocksTests(unittest.IsolatedAsyncioTestCase):
-    def mining_fixture(self):
+    def mining_fixture(self, *, hashed=True):
         protocol = Protocol(2225)
         b = protocol.binding
         stream = PacketStream(protocol)
@@ -67,15 +70,15 @@ class BlocksTests(unittest.IsolatedAsyncioTestCase):
         movement.position = movement._input_position = (0.5, 101.62, 0.5)
         movement._updated.set()
         inventory = Inventory(stream, 7)
-        blocks = Blocks(stream, movement, inventory, hashed_runtime_ids=True)
+        blocks = Blocks(stream, movement, inventory, hashed_runtime_ids=hashed)
         blocks.start()
         self.addCleanup(inventory.close)
         self.addCleanup(blocks.close)
 
-        def observe(position, runtime_id=0x80310E21):
+        def observe(position, runtime_id=0x80310E21, *, layer=0):
             x, y, z = position
             stream.emit(protocol.encode(b.UpdateBlockPacket(
-                pos=b.BlockPos(x=x, y=y, z=z), runtime_id=runtime_id, layer=0,
+                pos=b.BlockPos(x=x, y=y, z=z), runtime_id=runtime_id, layer=layer,
             )))
 
         return protocol, stream, blocks, observe
@@ -105,11 +108,335 @@ class BlocksTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(blocks.mining_target)
         self.assertEqual(await blocks.stop_mining(), 4)
 
+    async def test_mining_event_captures_first_sparse_air_even_when_the_same_packet_overwrites_it(self):
+        protocol, stream, blocks, observe = self.mining_fixture()
+        b = protocol.binding
+        target = (1, 100, 0)
+        observe(target)
+        calls, errors = [], []
+
+        def observer(event):
+            calls.append((event, blocks.observed_block(target)))
+
+        def broken(_event):
+            raise ValueError("observer failed")
+
+        unsubscribe = blocks.subscribe_mining_events(observer)
+        remove_observer = blocks.subscribe_mining_events(observer)
+        remove_broken = blocks.subscribe_mining_events(broken)
+        unsubscribe()
+        unsubscribe()
+        await blocks.start_mining(target, face=4)
+        observe((2, 100, 0), HASHED_AIR_RUNTIME_ID)
+        observe(target, HASHED_AIR_RUNTIME_ID, layer=1)
+        await asyncio.sleep(0)
+        self.assertEqual(calls, [])
+
+        pos = b.BlockPos(x=1, y=100, z=0)
+        update = b.UpdateSubChunkBlocksPacket(
+            sub_chunk_block_position=pos,
+            blocks_changed=b.UpdateSubChunkBlocksChangedInfo(standards=[
+                b.UpdateSubChunkNetworkBlockInfo(pos=pos, runtime_id=HASHED_AIR_RUNTIME_ID),
+                b.UpdateSubChunkNetworkBlockInfo(pos=pos, runtime_id=0x80310E21),
+            ]),
+        )
+        loop = asyncio.get_running_loop()
+        before = loop.get_exception_handler()
+        try:
+            loop.set_exception_handler(lambda loop, context: errors.append(context["exception"]))
+            stream.emit(protocol.encode(update))
+            await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(before)
+            remove_observer()
+            remove_broken()
+        (event, current), = calls
+        self.assertEqual(event, MiningEvent("completed", 0, MiningTarget(target, 4),
+                                            BlockObservation(target, HASHED_AIR_RUNTIME_ID, 0, True)))
+        self.assertFalse(current.is_air)
+        self.assertEqual(len(stream.sent), 1)  # No second client action caused the observation.
+        self.assertEqual([str(error) for error in errors], ["observer failed"])
+        with self.assertRaises(FrozenInstanceError):
+            event.kind = "aborted"
+        with self.assertRaises(FrozenInstanceError):
+            event.block.is_air = False
+
+    async def test_mining_events_use_real_air_from_the_target_section(self):
+        protocol, stream, blocks, observe = self.mining_fixture()
+        b = protocol.binding
+        target = (1, 100, 0)
+        events = []
+        remove = blocks.subscribe_mining_events(events.append)
+        self.addCleanup(remove)
+
+        def section(x, dimension, data):
+            result = b.SubChunkPacket.SubChunkRequestResult
+            stream.emit(protocol.encode(b.SubChunkPacket(
+                dimension_type=dimension, center_pos=b.SubChunkPos(x=x, y=6, z=0),
+                sub_chunk_data=[b.SubChunkPacket.SubChunkPacketData(
+                    sub_chunk_pos_offset=b.SubChunkPacket.SubChunkPosOffset(x=0, y=0, z=0),
+                    result=result.SUCCESS_ALL_AIR if data is None else result.SUCCESS,
+                    serialized_sub_chunk=data,
+                )],
+            )))
+
+        for data in (None, solid_sub_chunk(HASHED_AIR_RUNTIME_ID)):
+            observe(target)
+            await blocks.start_mining(target, face=4)
+            section(1, 0, None)
+            section(0, 1, None)
+            section(0, 0, bytes([9, 0, 6]))  # No main-layer storage.
+            await asyncio.sleep(0)
+            self.assertEqual(events, [])
+            section(0, 0, data)
+            await asyncio.sleep(0)
+            self.assertEqual(events, [MiningEvent("completed", 0, MiningTarget(target, 4),
+                                                 BlockObservation(target, HASHED_AIR_RUNTIME_ID, 0, True))])
+            events.clear()
+
+    async def test_mining_events_distinguish_continue_replacement_and_same_cell_restart(self):
+        _, _, blocks, observe = self.mining_fixture()
+        a, b = (1, 100, 0), (2, 100, 0)
+        observe(a)
+        observe(b)
+        events = []
+        self.addCleanup(blocks.subscribe_mining_events(events.append))
+        await blocks.start_mining(a, face=4)
+        await blocks.continue_mining(a, face=1)
+        await asyncio.sleep(0)
+        self.assertEqual(events, [])
+        await blocks.continue_mining(b, face=4)
+        await blocks.start_mining(b, face=1)
+        observe(b, HASHED_AIR_RUNTIME_ID)
+        await asyncio.sleep(0)
+        self.assertEqual(events, [
+            MiningEvent("aborted", 0, MiningTarget(a, 4), reason="replaced"),
+            MiningEvent("aborted", 0, MiningTarget(b, 4), reason="replaced"),
+            MiningEvent("completed", 0, MiningTarget(b, 1), BlockObservation(b, HASHED_AIR_RUNTIME_ID, 0, True)),
+        ])
+        self.assertEqual(await blocks.stop_mining(), 5)
+        await asyncio.sleep(0)
+        self.assertEqual(len(events), 3)
+
+    async def test_creative_mining_event_observes_only_its_target_and_window(self):
+        protocol, stream, blocks, observe = self.mining_fixture()
+        b = protocol.binding
+        target = (1, 100, 0)
+        observe(target)
+        stream.emit(protocol.encode(b.SetPlayerGameTypePacket(player_game_type=b.GameType.CREATIVE)))
+        events = []
+        self.addCleanup(blocks.subscribe_mining_events(events.append))
+
+        with patch("endpilot.blocks._CREATIVE_MINING_OBSERVATION_TIMEOUT", 0):
+            self.assertEqual(await blocks.finish_mining(target, face=4), 1)
+        observe(target, HASHED_AIR_RUNTIME_ID)  # The deadline has already passed.
+        await asyncio.sleep(0)
+        self.assertEqual(events, [])
+
+        observe(target)
+        self.assertEqual(await blocks.finish_mining(target, face=4), 2)
+        observe((2, 100, 0), HASHED_AIR_RUNTIME_ID)
+        observe(target, HASHED_AIR_RUNTIME_ID, layer=1)
+        await asyncio.sleep(0)
+        self.assertEqual(events, [])  # Returning a tick is just submission.
+        observe(target, HASHED_AIR_RUNTIME_ID)
+        await asyncio.sleep(0)
+        self.assertEqual(events, [MiningEvent("completed", 0, MiningTarget(target, 4),
+                                             BlockObservation(target, HASHED_AIR_RUNTIME_ID, 0, True))])
+
+    async def test_creative_finish_continues_an_existing_attempt_with_air_during_send(self):
+        protocol, stream, blocks, observe = self.mining_fixture()
+        b = protocol.binding
+        target = (1, 100, 0)
+        observe(target)
+        stream.emit(protocol.encode(b.SetPlayerGameTypePacket(player_game_type=b.GameType.CREATIVE)))
+        events = []
+        self.addCleanup(blocks.subscribe_mining_events(events.append))
+        await blocks.start_mining(target, face=4)
+        send = stream.send
+
+        async def finish_on_wire(frame):
+            await send(frame)
+            self.assertEqual([a.player_action_type.name for a in frame.player_block_actions],
+                             ["CONTINUE_DESTROY_BLOCK", "PREDICT_DESTROY_BLOCK"])
+            observe(target, HASHED_AIR_RUNTIME_ID)
+            await asyncio.sleep(0)
+
+        stream.send = finish_on_wire
+        self.assertEqual(await blocks.finish_mining(target, face=4), 2)
+        self.assertEqual(events, [MiningEvent("completed", 0, MiningTarget(target, 4),
+                                             BlockObservation(target, HASHED_AIR_RUNTIME_ID, 0, True))])
+
+    async def check_creative_finish_after_replacing_a_completed_cell(self, *, queued):
+        protocol, stream, blocks, observe = self.mining_fixture()
+        b = protocol.binding
+        target = (1, 100, 0)
+        observe(target)
+        stream.emit(protocol.encode(b.SetPlayerGameTypePacket(player_game_type=b.GameType.CREATIVE)))
+        events = []
+        self.addCleanup(blocks.subscribe_mining_events(events.append))
+        self.assertEqual(await blocks.start_mining(target, face=4), 1)
+
+        if queued:
+            async with blocks.movement._action_lock:
+                finishing = asyncio.create_task(blocks.finish_mining(target, face=1))
+                await asyncio.sleep(0)
+                self.assertTrue(blocks._mining_lock.locked())
+                self.assertFalse(finishing.done())
+                observe(target, HASHED_AIR_RUNTIME_ID)
+                observe(target)
+            self.assertEqual(await finishing, 2)
+        else:
+            pos = b.BlockPos(x=1, y=100, z=0)
+            stream.emit(protocol.encode(b.UpdateSubChunkBlocksPacket(
+                sub_chunk_block_position=pos,
+                blocks_changed=b.UpdateSubChunkBlocksChangedInfo(standards=[
+                    b.UpdateSubChunkNetworkBlockInfo(pos=pos, runtime_id=HASHED_AIR_RUNTIME_ID),
+                    b.UpdateSubChunkNetworkBlockInfo(pos=pos, runtime_id=0x80310E21),
+                ]),
+            )))
+            self.assertEqual(await blocks.finish_mining(target, face=1), 2)
+
+        observe(target, HASHED_AIR_RUNTIME_ID)
+        await asyncio.sleep(0)
+        air = BlockObservation(target, HASHED_AIR_RUNTIME_ID, 0, True)
+        self.assertEqual(events, [MiningEvent("completed", 0, MiningTarget(target, 4), air),
+                                  MiningEvent("completed", 0, MiningTarget(target, 1), air)])
+        self.assertEqual(len(stream.sent), 2)
+        actions = stream.sent[-1].player_block_actions
+        self.assertEqual([action.player_action_type.name for action in actions], [
+            "STOP_DESTROY_BLOCK", "START_DESTROY_BLOCK", "CONTINUE_DESTROY_BLOCK", "PREDICT_DESTROY_BLOCK",
+        ])
+        self.assertEqual([action.facing for action in actions[1:]], [1, 1, 1])
+        self.assertEqual(stream.sent[-1].item_use_transaction.transaction.face, 1)
+
+    async def test_creative_finish_starts_a_new_attempt_after_sparse_air_and_replacement(self):
+        await self.check_creative_finish_after_replacing_a_completed_cell(queued=False)
+
+    async def test_queued_creative_finish_starts_a_new_attempt_after_air_and_replacement(self):
+        await self.check_creative_finish_after_replacing_a_completed_cell(queued=True)
+
+    async def test_sparse_replacement_can_start_a_new_held_attempt_during_packet_dispatch(self):
+        protocol, stream, blocks, observe = self.mining_fixture()
+        b = protocol.binding
+        target = (1, 100, 0)
+        observe(target)
+        events, restarted = [], []
+        self.addCleanup(blocks.subscribe_mining_events(events.append))
+        self.assertEqual(await blocks.start_mining(target, face=4), 1)
+
+        def restart(change):
+            if change.before is not None and change.before.is_air is True and change.after.is_air is False:
+                restarted.append(asyncio.eager_task_factory(asyncio.get_running_loop(), blocks.start_mining(target, face=1)))
+
+        self.addCleanup(blocks.subscribe_block_changes(restart, position=target, layer=0))
+        pos = b.BlockPos(x=1, y=100, z=0)
+        stream.emit(protocol.encode(b.UpdateSubChunkBlocksPacket(
+            sub_chunk_block_position=pos,
+            blocks_changed=b.UpdateSubChunkBlocksChangedInfo(standards=[
+                b.UpdateSubChunkNetworkBlockInfo(pos=pos, runtime_id=HASHED_AIR_RUNTIME_ID),
+                b.UpdateSubChunkNetworkBlockInfo(pos=pos, runtime_id=0x80310E21),
+                b.UpdateSubChunkNetworkBlockInfo(pos=b.BlockPos(x=2, y=100, z=0), runtime_id=HASHED_AIR_RUNTIME_ID),
+            ]),
+        )))
+        new_start, = restarted
+        self.assertEqual(new_start.result(), 2)
+        self.assertEqual(blocks.mining_target, MiningTarget(target, 1))
+        self.assertEqual(await blocks.continue_mining(target, face=1), 3)
+        continuation, = stream.sent[-1].player_block_actions
+        self.assertEqual(continuation.player_action_type.name, "CONTINUE_DESTROY_BLOCK")
+        observe(target, HASHED_AIR_RUNTIME_ID)
+        self.assertEqual(await blocks.stop_mining(), 4)
+        release, = stream.sent[-1].player_block_actions
+        self.assertEqual(release.player_action_type.name, "STOP_DESTROY_BLOCK")
+        await asyncio.sleep(0)
+        air = BlockObservation(target, HASHED_AIR_RUNTIME_ID, 0, True)
+        self.assertEqual(events, [MiningEvent("completed", 0, MiningTarget(target, 4), air),
+                                  MiningEvent("completed", 0, MiningTarget(target, 1), air)])
+
+    async def test_restarting_creative_finish_cancels_the_old_window(self):
+        protocol, stream, blocks, observe = self.mining_fixture()
+        b = protocol.binding
+        target = (1, 100, 0)
+        observe(target)
+        stream.emit(protocol.encode(b.SetPlayerGameTypePacket(player_game_type=b.GameType.CREATIVE)))
+        events = []
+        self.addCleanup(blocks.subscribe_mining_events(events.append))
+        await blocks.finish_mining(target, face=4)
+        old_expiry = blocks._mining_attempt.expiry
+        await blocks.finish_mining(target, face=1)
+        self.assertTrue(old_expiry.cancelled())
+        observe(target, HASHED_AIR_RUNTIME_ID)
+        await asyncio.sleep(0)
+        self.assertEqual(events, [
+            MiningEvent("aborted", 0, MiningTarget(target, 4), reason="replaced"),
+            MiningEvent("completed", 0, MiningTarget(target, 1), BlockObservation(target, HASHED_AIR_RUNTIME_ID, 0, True)),
+        ])
+
+    async def test_palette_non_air_can_settle_mine_block_without_a_completion_event(self):
+        _, stream, blocks, observe = self.mining_fixture(hashed=False)
+        target = (1, 100, 0)
+        observe(target, 3317)
+        events = []
+        self.addCleanup(blocks.subscribe_mining_events(events.append))
+        send = stream.send
+
+        async def report_non_air(frame):
+            await send(frame)
+            if len(stream.sent) == 1:
+                observe(target, 17896)
+
+        stream.send = report_non_air
+        self.assertEqual(await blocks.mine_block(target, face=4, timeout=1), BlockUpdate(target, 17896, 0))
+        observe(target, 18894)
+        await asyncio.sleep(0)
+        self.assertEqual(events, [])
+
+    async def test_mining_events_end_on_own_respawn_dimension_change_and_disconnect(self):
+        protocol, stream, blocks, observe = self.mining_fixture()
+        b = protocol.binding
+        target = (1, 100, 0)
+        changes = []
+
+        def observe_event(event):
+            changes.append((event, blocks.dimension_id, blocks.mining_target))
+
+        self.addCleanup(blocks.subscribe_mining_events(observe_event))
+        observe(target)
+        await blocks.start_mining(target, face=4)
+        stream.emit(protocol.encode(b.RespawnPacket(runtime_id=8, state=b.PlayerRespawnState.READY_TO_SPAWN)))
+        await asyncio.sleep(0)
+        self.assertEqual(changes, [])
+        stream.emit(protocol.encode(b.RespawnPacket(runtime_id=7, state=b.PlayerRespawnState.READY_TO_SPAWN)))
+        await asyncio.sleep(0)
+        self.assertEqual(changes[-1], (MiningEvent("aborted", 0, MiningTarget(target, 4), reason="respawn"), 0, None))
+
+        await blocks.start_mining(target, face=4)
+        stream.emit(protocol.encode(b.ChangeDimensionPacket(dimension_id=1)))
+        await asyncio.sleep(0)
+        self.assertEqual(changes[-1], (MiningEvent("aborted", 0, MiningTarget(target, 4),
+                                                 reason="dimension_changed"), 1, None))
+
+        observe(target)
+        stream.emit(protocol.encode(b.SetPlayerGameTypePacket(player_game_type=b.GameType.CREATIVE)))
+        await blocks.finish_mining(target, face=4)
+        timer = blocks._mining_attempt.expiry
+        stream.emit(protocol.encode(b.DisconnectPacket()))
+        await asyncio.sleep(0)
+        self.assertEqual(changes[-1], (MiningEvent("aborted", 1, MiningTarget(target, 4),
+                                                 reason="disconnected"), 1, None))
+        self.assertEqual(len(changes), 3)
+        self.assertTrue(timer.cancelled())
+        with self.assertRaises(ConnectionError):
+            blocks.subscribe_mining_events(observe_event)
+
     async def test_whole_mine_cancellation_cannot_stop_the_next_phased_target(self):
         _, stream, blocks, observe = self.mining_fixture()
         a, b = (1, 100, 0), (2, 100, 0)
         observe(a)
         observe(b)
+        events = []
+        self.addCleanup(blocks.subscribe_mining_events(events.append))
         started = asyncio.Event()
         original = stream.send
 
@@ -130,6 +457,7 @@ class BlocksTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([a.player_action_type.name for a in stream.sent[-1].player_block_actions],
                          ["START_DESTROY_BLOCK"])
         self.assertEqual(blocks.mining_target, MiningTarget(b, 4))
+        self.assertEqual(events, [MiningEvent("aborted", 0, MiningTarget(a, 4), reason="cancelled")])
 
     async def test_stop_interrupts_blocked_start_and_never_stops_the_queued_break(self):
         async with asyncio.timeout(2):
@@ -186,6 +514,8 @@ class BlocksTests(unittest.IsolatedAsyncioTestCase):
                     _, stream, blocks, observe = self.mining_fixture()
                     target = (1, 100, 0)
                     observe(target)
+                    events = []
+                    self.addCleanup(blocks.subscribe_mining_events(events.append))
                     on_wire = asyncio.Event()
                     finish_start = asyncio.Event()
                     original_send = stream.send
@@ -210,9 +540,12 @@ class BlocksTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(await stopped, stream.sent[1].client_tick)
                     if update_first:
                         self.assertEqual(await mining, BlockUpdate(target, HASHED_AIR_RUNTIME_ID, 0))
+                        self.assertEqual(events, [MiningEvent("completed", 0, MiningTarget(target, 4),
+                                                             BlockObservation(target, HASHED_AIR_RUNTIME_ID, 0, True))])
                     else:
                         with self.assertRaises(MiningAborted):
                             await mining
+                        self.assertEqual(events, [MiningEvent("aborted", 0, MiningTarget(target, 4), reason="stopped")])
                     self.assertEqual(len(stream.sent), 2)
                     self.assertEqual([action.player_action_type.name for action in stream.sent[-1].player_block_actions],
                                      ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
@@ -225,6 +558,8 @@ class BlocksTests(unittest.IsolatedAsyncioTestCase):
                     previous, target = (1, 100, 0), (2, 100, 0)
                     observe(previous)
                     observe(target)
+                    events = []
+                    self.addCleanup(blocks.subscribe_mining_events(events.append))
                     if hold:
                         await blocks.start_mining(previous, face=4)
                     async with blocks.movement._action_lock:
@@ -244,9 +579,11 @@ class BlocksTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(abort.player_action_type.name, "ABORT_DESTROY_BLOCK")
                         self.assertEqual((abort.pos.x, abort.pos.y, abort.pos.z), previous)
                         self.assertEqual(stop.player_action_type.name, "STOP_DESTROY_BLOCK")
+                        self.assertEqual(events, [MiningEvent("aborted", 0, MiningTarget(previous, 4), reason="stopped")])
                     else:
                         self.assertIsNone(tick)
                         self.assertEqual(stream.sent, [])
+                        self.assertEqual(events, [])
 
     async def test_session_invalidation_ends_blocked_start_without_releasing_into_the_next_world(self):
         async with asyncio.timeout(2):

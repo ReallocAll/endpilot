@@ -29,6 +29,7 @@ _SOURCE_WATER_HASH = 0x483B8B2A
 FACE_OFFSETS = {0: (0, -1, 0), 1: (0, 1, 0), 2: (0, 0, -1),
                 3: (0, 0, 1), 4: (-1, 0, 0), 5: (1, 0, 0)}
 _ORDINARY_MINING_REACH = 4.5
+_CREATIVE_MINING_OBSERVATION_TIMEOUT = 15
 # Inclusive lower and exclusive upper section indices for vanilla dimensions.
 _VANILLA_SECTION_RANGES = {0: (-4, 20), 1: (0, 8), 2: (0, 16)}
 # Bedrock r26_u6 palette indices and collision boxes checked against vanilla explosion exposure.
@@ -159,6 +160,34 @@ class MiningTarget:
     face: int
 
 
+_MiningAbortReason = Literal[
+    "stopped", "replaced", "timeout", "cancelled", "respawn", "dimension_changed", "disconnected", "closed",
+    "failed",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class MiningEvent:
+    """An observed end to a mining attempt in its original dimension.
+
+    A completed event carries the first observed main-layer air at the target.
+    The update can come from any cause. An aborted event carries a local reason.
+    """
+
+    kind: Literal["completed", "aborted"]
+    dimension_id: int
+    target: MiningTarget
+    block: BlockObservation | None = None
+    reason: _MiningAbortReason | None = None
+
+
+@dataclass(slots=True)
+class _MiningAttempt:
+    dimension_id: int
+    target: MiningTarget
+    expiry: asyncio.TimerHandle | None = None
+
+
 class MiningFaceUnavailable(RuntimeError):
     """Automatic face selection could not safely submit START."""
 
@@ -279,6 +308,8 @@ class Blocks:
         self._mining_epoch = 0
         self._mining_close: tuple[str, BaseException | None] | None = None
         self._mining_operation: _MiningOperation | None = None
+        self._mining_attempt: _MiningAttempt | None = None
+        self._mining_observers: dict[object, Callable[[MiningEvent], None]] = {}
         self._published_bounds: tuple[int, int, int, int] | None = None
         self._dimension_definitions: dict[int, DimensionBounds] = {}
         self._replayed_dimension_data: deque[tuple[RawPacket, tuple[DimensionBounds, ...]]] = deque()
@@ -323,9 +354,11 @@ class Blocks:
             self._unsubscribe_end()
             self._unsubscribe_end = None
         self._observe_block_entity = None
-        self._end_observation()
+        self._end_observation(closed=True)
 
-    def _end_observation(self, cause: BaseException | None = None, *, disconnected: bool = False) -> None:
+    def _end_observation(
+        self, cause: BaseException | None = None, *, disconnected: bool = False, closed: bool = False,
+    ) -> None:
         if self._closed:
             return
         self._closed = True
@@ -336,7 +369,7 @@ class Blocks:
         else:
             message = "mining session is closed"
         self._mining_close = (message, cause)
-        self._invalidate_mining()
+        self._invalidate_mining("closed" if closed else "disconnected")
         self._dimension_definitions.clear()
         self._replayed_dimension_data.clear()
         self._updates.clear()
@@ -358,6 +391,8 @@ class Blocks:
         for remove in self._block_entity_observers.values():
             remove()
         self._block_entity_observers.clear()
+        if self._mining_observers:
+            asyncio.get_running_loop().call_soon(self._mining_observers.clear)
 
     def _on_packet(self, raw) -> None:
         if self._closed:
@@ -365,7 +400,7 @@ class Blocks:
         self._applied_block_entity = None
         b = self.packets.protocol.binding
         if raw.packet_id == b.ChangeDimensionPacket.ID:
-            self._invalidate_mining()
+            self._invalidate_mining("dimension_changed")
             previous_dimension = self.dimension_id
             new_dimension = int(self.packets.protocol.decode(raw).dimension_id)
             self.dimension_id = new_dimension
@@ -470,18 +505,13 @@ class Blocks:
             self._end_observation(disconnected=True)
         elif raw.packet_id == b.RespawnPacket.ID:
             if self._own_ready_respawn(raw):
-                self._invalidate_mining()
+                self._invalidate_mining("respawn")
         elif raw.packet_id == b.SetPlayerGameTypePacket.ID:
             self._player_game_type = self.packets.protocol.decode(raw).player_game_type.name
         elif raw.packet_id == b.UpdatePlayerGameTypePacket.ID:
             packet = self.packets.protocol.decode(raw)
             if int(packet.target_player) == self._player_unique_id:
                 self._player_game_type = packet.player_game_type.name
-        if (self._mining_target is not None and not self._mining_completed
-                and raw.packet_id in (b.UpdateBlockPacket.ID, b.UpdateSubChunkBlocksPacket.ID, b.SubChunkPacket.ID)):
-            block = self.observed_block(self._mining_target.position)
-            if block is not None and block.is_air is True:
-                self._mining_completed = True
 
     def _own_ready_respawn(self, raw) -> bool:
         b = self.packets.protocol.binding
@@ -490,7 +520,7 @@ class Blocks:
         return (packet.runtime_id in (0, player_id)
                 and packet.state == b.PlayerRespawnState.READY_TO_SPAWN)
 
-    def _invalidate_mining(self) -> None:
+    def _invalidate_mining(self, reason: _MiningAbortReason) -> None:
         self._mining_epoch += 1
         self._mining_target = None
         self._mining_completed = False
@@ -500,6 +530,7 @@ class Blocks:
                 operation.interrupted.set_result(None)
             if operation.pending_release is not None:
                 operation.pending_release.cancel()
+        self._end_mining_attempt(reason=reason)
 
     @property
     def published_bounds(self) -> tuple[int, int, int, int] | None:
@@ -614,6 +645,7 @@ class Blocks:
         before = self.observed_block(position, layer=layer) if self._block_observers else None
         self._updates[(*position, layer)] = int(change.runtime_id)
         if layer == 0:
+            self._observe_mining_air(position)
             self._set_block_entity(position, None)
         if self._block_observers:
             after = self.observed_block(position, layer=layer)
@@ -625,6 +657,12 @@ class Blocks:
         for pos in tuple(self._updates):
             if (pos[0] >> 4, pos[1] >> 4, pos[2] >> 4) == key:
                 del self._updates[pos]
+        attempt = self._mining_attempt
+        target = self.mining_target if attempt is None else attempt.target
+        if target is not None:
+            ax, ay, az = target.position
+            if (ax >> 4, ay >> 4, az >> 4) == key:
+                self._observe_mining_air((ax, ay, az))
         self._set_section_block_entities(key, block_entities or {})
         x, y, z = key
         column = (x, z)
@@ -1736,6 +1774,71 @@ class Blocks:
     def mining_target(self) -> MiningTarget | None:
         return None if self._mining_completed else self._mining_target
 
+    def subscribe_mining_events(self, callback: Callable[[MiningEvent], None]) -> Callable[[], None]:
+        if self._closed or self.packets._reader_end_result()[0]:
+            raise ConnectionError("mining session is closed")
+        key = object()
+        self._mining_observers[key] = callback
+
+        def unsubscribe():
+            self._mining_observers.pop(key, None)
+
+        return unsubscribe
+
+    def _begin_mining_attempt(self, target: MiningTarget) -> _MiningAttempt:
+        self._end_mining_attempt(reason="replaced")
+        attempt = _MiningAttempt(self.dimension_id, target)
+        self._mining_attempt = attempt
+        return attempt
+
+    def _end_mining_attempt(
+        self, *, block: BlockObservation | None = None, reason: _MiningAbortReason | None = None,
+    ) -> None:
+        attempt = self._mining_attempt
+        if attempt is None:
+            return
+        self._mining_attempt = None
+        if attempt.expiry is not None:
+            attempt.expiry.cancel()
+        if self._mining_observers and (block is not None or reason is not None):
+            loop = asyncio.get_running_loop()
+            if attempt.expiry is not None and loop.time() >= attempt.expiry.when():
+                return
+            target = MiningTarget(tuple(attempt.target.position), attempt.target.face)
+            event = MiningEvent("completed" if block is not None else "aborted", attempt.dimension_id,
+                                target, block, reason)
+            # Finish the packet dispatch or input commit before running caller code.
+            loop.call_soon(self._deliver_mining_event, event, tuple(self._mining_observers))
+
+    def _deliver_mining_event(self, event: MiningEvent, registrations: tuple[object, ...]) -> None:
+        observers = self._mining_observers
+        self._notify_observers((observers[key] for key in registrations if key in observers), event)
+
+    def _observe_mining_air(self, position: tuple[int, int, int]) -> None:
+        held = self.mining_target
+        attempt = self._mining_attempt
+        held_here = held is not None and tuple(held.position) == position
+        attempt_here = attempt is not None and tuple(attempt.target.position) == position
+        if not held_here and not attempt_here:
+            return
+        block = self.observed_block(position)
+        if block is None or block.is_air is not True:
+            return
+        if held_here:
+            self._mining_completed = True
+        if attempt_here:
+            self._end_mining_attempt(block=block)
+
+    @staticmethod
+    def _mining_abort_reason(error: BaseException) -> _MiningAbortReason:
+        if isinstance(error, asyncio.CancelledError):
+            return "cancelled"
+        if isinstance(error, TimeoutError):
+            return "timeout"
+        if isinstance(error, MiningAborted):
+            return "stopped"
+        return "failed"
+
     def _check_mining_epoch(self, epoch: int) -> None:
         if self._mining_close is not None:
             message, cause = self._mining_close
@@ -1826,7 +1929,7 @@ class Blocks:
     async def _submit_mining(
         self, actions, target: MiningTarget | None, epoch: int, *,
         validate: Callable[[], None] | None = None, build_item_use: Callable[[], object] | None = None,
-        continuing_generation: int | None = None,
+        continuing_generation: int | None = None, on_commit: Callable[[], None] | None = None,
     ) -> int:
         def commit():
             self._check_mining_epoch(epoch)
@@ -1840,6 +1943,10 @@ class Blocks:
                 self._mining_generation += 1
             self._mining_target = target
             self._mining_completed = False
+            if target is not None and continuing_generation is None:
+                self._begin_mining_attempt(target)
+            if on_commit is not None:
+                on_commit()
 
         return await self.movement.send_block_actions(
             actions, before_send=commit, build_item_use=build_item_use,
@@ -1863,10 +1970,15 @@ class Blocks:
             else:
                 actions = self._release_mining_actions()
                 actions.append(("START_DESTROY_BLOCK", target.position, target.face))
-            return await self._submit_mining(
-                actions, target, epoch, validate=lambda: self._observed_mining_input(target, allow_edge_hit=True),
-                continuing_generation=generation,
-            )
+            try:
+                return await self._submit_mining(
+                    actions, target, epoch, validate=lambda: self._observed_mining_input(target, allow_edge_hit=True),
+                    continuing_generation=generation,
+                )
+            except (Exception, asyncio.CancelledError) as error:
+                if self._mining_target is target:
+                    self._end_mining_attempt(reason=self._mining_abort_reason(error))
+                raise
 
     async def stop_mining(self) -> int | None:
         operation = self._mining_operation
@@ -1875,6 +1987,7 @@ class Blocks:
             if operation.accepts_stop and not operation.interrupted.done():
                 operation.stop_requested = True
                 operation.interrupted.set_result(None)
+                self._end_mining_attempt(reason="stopped")
             submitted, tick, failure = await asyncio.shield(operation.released)
             if not submitted:
                 self._check_mining_epoch(operation.epoch)
@@ -1887,8 +2000,10 @@ class Blocks:
             self._check_mining_epoch(epoch)
             actions = self._release_mining_actions()
             if not actions:
+                self._end_mining_attempt(reason="stopped")
                 return None
-            return await self._submit_mining(actions, None, epoch)
+            return await self._submit_mining(actions, None, epoch,
+                                             on_commit=lambda: self._end_mining_attempt(reason="stopped"))
 
     async def finish_mining(self, position: tuple[int, int, int], *, face: int = 1) -> int:
         """Submit a creative break using the server-reported game type."""
@@ -1897,12 +2012,27 @@ class Blocks:
         epoch = self._mining_epoch
         async with self._mining_lock:
             self._check_mining_epoch(epoch)
+            actions = []
+            continued = None
+            attempt = None
 
             def build_item_use():
+                nonlocal continued
                 self._check_mining_epoch(epoch)
                 if self._player_game_type != "CREATIVE":
                     raise RuntimeError("instant break requires server-reported creative mode")
                 block, eye, click = self._observed_mining_input(target)
+                # The old block can complete and be replaced while we wait for the input lock.
+                previous = self.mining_target
+                active = self._mining_attempt
+                if (previous is not None and previous.position == position
+                        and active is not None and active.target.position == position):
+                    continued = active
+                else:
+                    actions.extend(self._release_mining_actions())
+                    actions.append(("START_DESTROY_BLOCK", position, face))
+                actions.extend((("CONTINUE_DESTROY_BLOCK", position, face),
+                                ("PREDICT_DESTROY_BLOCK", position, face)))
                 slot = self.inventory.selected_slot
                 transaction = b.ItemUseInventoryTransaction(
                     transaction=b.InventoryTransaction(actions=[]),
@@ -1921,14 +2051,23 @@ class Blocks:
                     id=b.ItemStackLegacyRequestId(raw_id=0), slots=None, transaction=transaction,
                 )
 
-            previous = self.mining_target
-            actions = []
-            if previous is None or previous.position != position:
-                actions = self._release_mining_actions()
-                actions.append(("START_DESTROY_BLOCK", position, face))
-            actions.extend((("CONTINUE_DESTROY_BLOCK", position, face),
-                            ("PREDICT_DESTROY_BLOCK", position, face)))
-            return await self._submit_mining(actions, None, epoch, build_item_use=build_item_use)
+            def commit():
+                nonlocal attempt
+                attempt = self._begin_mining_attempt(target) if continued is None else continued
+
+            def expire():
+                if self._mining_attempt is attempt:
+                    self._end_mining_attempt()
+
+            try:
+                tick = await self._submit_mining(actions, None, epoch, build_item_use=build_item_use, on_commit=commit)
+            except (Exception, asyncio.CancelledError) as error:
+                if self._mining_attempt is attempt:
+                    self._end_mining_attempt(reason=self._mining_abort_reason(error))
+                raise
+            if attempt is not None and self._mining_attempt is attempt:
+                attempt.expiry = asyncio.get_running_loop().call_later(_CREATIVE_MINING_OBSERVATION_TIMEOUT, expire)
+            return tick
 
     async def mine_block(
         self, position: tuple[int, int, int], *, face: int | None = 1, timeout: float = 15,
@@ -2033,6 +2172,11 @@ class Blocks:
             if prepare_start is not None:
                 prepare_start()
 
+        def end_attempt(error=None):
+            attempt = self._mining_attempt
+            if attempt is not None and attempt.target is target:
+                self._end_mining_attempt(reason=None if error is None else self._mining_abort_reason(error))
+
         waiter = asyncio.create_task(self.packets.wait_for_packet(
             (b.UpdateBlockPacket.ID, b.ChangeDimensionPacket.ID, b.DisconnectPacket.ID, b.RespawnPacket.ID),
             timeout=None, match=matches,
@@ -2066,13 +2210,20 @@ class Blocks:
             update = BlockUpdate(position, int(packet.runtime_id), int(packet.layer))
         except BaseException as failure:
             error = failure
+            end_attempt(failure)
             raise
         finally:
             operation.accepts_stop = False
             pending = (waiter,) if submission is None else (waiter, submission)
             for task in pending:
                 task.cancel()
-            await self._settle_mining(operation, pending, target if started else None, update is not None, error)
+            try:
+                await self._settle_mining(operation, pending, target if started else None, update is not None, error)
+            except (Exception, asyncio.CancelledError) as cleanup_error:
+                end_attempt(cleanup_error)
+                raise
+            finally:
+                end_attempt()
         return update
 
     async def _settle_mining(

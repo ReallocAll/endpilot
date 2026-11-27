@@ -7,7 +7,8 @@ from .biome_data import VanillaBiome, vanilla_biomes
 from .block_raycast import BlockRaycastResult, MiningFaceResult
 from .blocks import (
     BlockChange, BlockEntityUpdate, BlockMatch, BlockObservation, BlockSearchResult, BlockStateObservation, ColumnCoverage,
-    ColumnCoverageEvent, ColumnCoverageInvalidated, DimensionBounds, MiningAborted, MiningFaceUnavailable, MiningTarget,
+    ColumnCoverageEvent, ColumnCoverageInvalidated, DimensionBounds, MiningAborted, MiningEvent, MiningFaceUnavailable,
+    MiningTarget,
 )
 from .books import BookSnapshot
 from .boss_bars import BossBar, BossBarEvent, BossBarEventKind
@@ -142,6 +143,7 @@ __all__ = [
     "LoadedResourcePack",
     "MiningFaceResult",
     "MiningAborted",
+    "MiningEvent",
     "MiningFaceUnavailable",
     "MixedCollectionBatch",
     "MiningTarget",
