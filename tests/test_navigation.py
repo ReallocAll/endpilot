@@ -372,6 +372,7 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
             "air": (self.AIR, 18894),
             "stone": (self.STONE, 3317),
             "dandelion": (self.DANDELION, 23959),
+            "fern": (0xBBAB0B0A, 17492),
             "short_grass": (0xA88E6325, 18720),
             "wildflowers": (0x819A4272, 22056),
             "water": (0x483B8B2A, 14122),
@@ -393,7 +394,7 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         rules = NavigationRules(search_radius=2, vertical_radius=0)
         for hashed in (True, False):
             ids = self.prepare_vegetation_corridor(hashed=hashed)
-            for block in ("air", "dandelion", "short_grass", "wildflowers"):
+            for block in ("air", "dandelion", "fern", "short_grass", "wildflowers"):
                 with self.subTest(hashed=hashed, block=block):
                     self.set_position(0.5, 0.5, on_ground=True)
                     self.stream.sent.clear()

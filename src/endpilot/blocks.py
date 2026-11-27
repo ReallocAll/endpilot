@@ -1214,7 +1214,7 @@ class Blocks:
         if allow_vegetation and block is not None and block.is_air is False:
             state = self._vanilla_state(block.runtime_id)
             body = None if state is None else state.name in (
-                "minecraft:dandelion", "minecraft:short_grass", "minecraft:wildflowers",
+                "minecraft:dandelion", "minecraft:fern", "minecraft:short_grass", "minecraft:wildflowers",
             )
         else:
             body = self._stance_air(block)
