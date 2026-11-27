@@ -35,11 +35,12 @@ def _validate_slot(slot: int) -> None:
 
 
 class Books:
-    def __init__(self, inventory: Inventory, item_names: dict[int, str], player_name: str):
+    def __init__(self, inventory: Inventory, item_names: dict[int, str], player_name: str, *, _xuid: str = ""):
         self._inventory = inventory
         self._packets = inventory.packets
         self._item_names = item_names
         self._player_name = player_name
+        self._xuid = _xuid
 
     def _item_name(self, item) -> str | None:
         return None if item is None or not item.stack_size else self._item_names.get(int(item.id))
@@ -105,5 +106,5 @@ class Books:
     async def sign(self, slot: int, title: str, author: str | None) -> None:
         self._require_writable(slot)
         binding = self._packets.protocol.binding
-        sign = binding.Finalize(title=title, author=author or self._player_name, xuid="")
+        sign = binding.Finalize(title=title, author=author or self._player_name, xuid=self._xuid)
         await self._packets.send(binding.BookEditPacket(book_slot=slot, operation=sign))

@@ -315,6 +315,8 @@ class Bot:
     def _start_session(self, session: JoinSession, *, load_announced_terrain: bool = False) -> None:
         self._clock = session.clock
         self._session = session
+        identity = session.identity
+        xuid = identity._xuid if isinstance(identity, _OnlineIdentity) else ""
         session._observe_session_end()
         session.observe_chunk_radius()
         self._entities = Entities(
@@ -334,7 +336,7 @@ class Bot:
         for raw in session.inventory_packets:
             self._inventory._on_packet(raw)
         session.inventory_packets.clear()
-        self._books = Books(self._inventory, session.item_names, session.identity.name)
+        self._books = Books(self._inventory, session.item_names, identity.name, _xuid=xuid)
         self._item_use = ItemUse(session.packets, self._movement, self._inventory, session.player_id)
         self._blocks = Blocks(
             session.packets, self._movement, self._inventory,
@@ -367,7 +369,7 @@ class Bot:
             self._blocks, self._inventory, self._containers, session.item_names,
         )
         self._signs = Signs(session.packets, self._blocks, self._movement, self._inventory, session.player_id)
-        self._chat = Chat(session.packets, session.identity.name)
+        self._chat = Chat(session.packets, identity.name, _xuid=xuid)
         self._titles = Titles(session.packets, session._end_state)
         self._commands = Commands(
             session.packets, session.identity.uuid, session.player_unique_id,
@@ -2871,11 +2873,15 @@ class Bot:
 
     async def emote(self, piece_id: str, mute_chat: bool = False) -> None:
         """Submit this player's emote and its requested chat preference."""
-        packets = self.packets
+        session = self._session
+        if session is None or session.player_id is None:
+            raise RuntimeError("player has not joined")
+        identity = session.identity
+        xuid = identity._xuid if isinstance(identity, _OnlineIdentity) else ""
         binding = self.protocol.binding
-        await packets.send(binding.EmotePacket(
-            runtime_id=self.player_id, piece_id=piece_id, emote_ticks=0,
-            xuid="", platform_id="", flags=int(binding.EmotePacket.Flags.MUTE_EMOTE_CHAT) if mute_chat else 0,
+        await session.packets.send(binding.EmotePacket(
+            runtime_id=session.player_id, piece_id=piece_id, emote_ticks=0,
+            xuid=xuid, platform_id="", flags=int(binding.EmotePacket.Flags.MUTE_EMOTE_CHAT) if mute_chat else 0,
         ))
 
     async def change_skin(self, skin_id: str | Skin, rgba: Sequence[int] | None = None) -> None:

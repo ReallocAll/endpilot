@@ -254,9 +254,10 @@ class _RegisteredPattern[T]:
 
 
 class Chat:
-    def __init__(self, packets, name: str):
+    def __init__(self, packets, name: str, *, _xuid: str = ""):
         self.packets = packets
         self.name = name
+        self._xuid = _xuid
         self._text = packets.protocol.binding.packets[9]
         self._pattern_ids = count(1)
         self._patterns: dict[int, _RegisteredPattern[ChatMessage]] = {}
@@ -278,7 +279,7 @@ class Chat:
         packet = text(
             localize=False,
             body=text.AuthorAndMessage(type=TextPacketType.CHAT, author=self.name, message=message),
-            xuid="",
+            xuid=self._xuid,
             platform_id="",
             filtered_message=None,
         )

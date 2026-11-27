@@ -54,7 +54,7 @@ def _online_identity() -> _OnlineIdentity:
     return _OnlineIdentity(
         "VerifiedName", UUID(int=7), ec.generate_private_key(ec.SECP384R1()),
         BedrockCredentials(("local-test-certificate",), "local-test-token"),
-        "http://127.0.0.1/test-issuer/", "local-test-signer", time.time() + 60,
+        "http://127.0.0.1/test-issuer/", "local-test-signer", time.time() + 60, xuid="2535417953249031",
     )
 
 

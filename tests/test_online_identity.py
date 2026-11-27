@@ -10,9 +10,12 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature, encode_dss_signature
 
-from endpilot import BedrockCredentials
+from endpilot import BedrockCredentials, Bot
 from endpilot.authentication import acquire_online_identity
-from endpilot.protocol import Protocol
+from endpilot.login import LoginRefused
+from endpilot.protocol import Protocol, read_batch, write_batch
+
+from test_join import FakeTransport, _spawn_transport
 
 
 NOW = 1_800_000_000
@@ -147,6 +150,71 @@ class OnlineIdentityTests(unittest.IsolatedAsyncioTestCase):
     async def test_explicit_uuid_matches_signed_leaf_and_es384_multiplayer_is_supported(self):
         identity = await acquire_online_identity(self._provider(token={"leguuid": str(LEGACY_UUID)}, ec_token=True))
         self.assertEqual(identity.uuid, LEGACY_UUID)
+
+    async def test_action_packets_use_the_current_session_xuid(self):
+        bot = Bot("Offline Player")
+        self.addAsyncCleanup(bot.close)
+        protocol = bot.protocol
+        binding = protocol.binding
+        slot = 4
+        initial = (
+            binding.ItemRegistryPacket(items=[binding.ItemData(name="minecraft:writable_book", id=199)]),
+            binding.InventorySlotPacket(inventory_id=binding.ContainerID.INVENTORY, slot=slot,
+                                        item=binding.SerializedNetworkItemStackDescriptor(id=199, stack_size=1)),
+        )
+        rejected = FakeTransport()
+        for packet in (
+            binding.NetworkSettingsPacket(compression_algorithm=binding.PacketCompressionAlgorithm.NONE),
+            binding.DisconnectPacket(),
+        ):
+            rejected.received.put_nowait(write_batch([protocol.encode(packet)]))
+
+        async def check_actions(wire, name, xuid, player_id):
+            first = len(wire.sent)
+            await bot.send_chat("hello")
+            await bot.emote("4c8ae710-df2e-47cd-814d-cc7bf21a3d67", mute_chat=True)
+            await bot.sign_book(slot, "Draft", author="Book Author")
+            action_ids = (binding.TextPacket.ID, binding.EmotePacket.ID, binding.BookEditPacket.ID)
+            chat, emote, book = [
+                protocol.decode(raw) for batch in wire.sent[first:] for raw in read_batch(batch)
+                if raw.packet_id in action_ids
+            ]
+            self.assertEqual((chat.body.author, chat.body.message, chat.xuid), (name, "hello", xuid))
+            self.assertEqual((emote.runtime_id, emote.flags, emote.xuid), (player_id, 2, xuid))
+            self.assertIsInstance(book.operation, binding.Finalize)
+            self.assertEqual((book.book_slot, book.operation.title, book.operation.author, book.operation.xuid),
+                             (slot, "Draft", "Book Author", xuid))
+
+        async def join_and_check(join, endpoint, player_id, name, xuid):
+            wire = _spawn_transport(protocol, player_id, *initial)
+            provider = self._provider(token={"xname": name, "xid": xuid},
+                                      profile={"displayName": name, "XUID": xuid}) if xuid else None
+            transport = join.__name__.removeprefix("join_")
+            with patch(f"endpilot.transport.{transport}.connect", return_value=wire):
+                await join(endpoint, credential_provider=provider, timeout=1)
+            try:
+                await check_actions(wire, name, xuid, player_id)
+            finally:
+                await bot.close()
+            self.assertTrue(wire.closed)
+            for action, args in ((bot.send_chat, ("closed",)), (bot.emote, ("closed",)),
+                                 (bot.sign_book, (slot, "closed"))):
+                with self.assertRaisesRegex(RuntimeError, "has not joined"):
+                    await action(*args)
+
+        with self.subTest(session="first online login"):
+            await join_and_check(bot.join_nethernet, "http://127.0.0.1:19132", 41, NAME, XUID)
+        with self.subTest(session="different online account"):
+            await join_and_check(bot.join_raknet, "127.0.0.1", 42, "Another Player", "2535417953249032")
+
+        rejected_xuid = "2535417953249033"
+        provider = self._provider(token={"xid": rejected_xuid}, profile={"XUID": rejected_xuid})
+        with patch("endpilot.transport.raknet.connect", return_value=rejected):
+            with self.assertRaises(LoginRefused):
+                await bot.join_raknet("127.0.0.1", credential_provider=provider, timeout=1)
+        self.assertTrue(rejected.closed)
+        with self.subTest(session="offline retry after refused online login"):
+            await join_and_check(bot.join_raknet, "127.0.0.1", 43, "Offline Player", "")
 
     async def test_rejects_each_credential_bound_to_a_different_key(self):
         other = _public_key(self.chain_root.public_key())

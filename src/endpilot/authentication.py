@@ -157,7 +157,7 @@ class OfflineIdentity(_ClientIdentity):
 class _OnlineIdentity(_ClientIdentity):
     def __init__(
         self, name: str, player_uuid: uuid.UUID, key: ec.EllipticCurvePrivateKey,
-        credentials: BedrockCredentials, issuer: str, first_signer: str, expires_at: int | float,
+        credentials: BedrockCredentials, issuer: str, first_signer: str, expires_at: int | float, *, xuid: str,
     ):
         super().__init__(name, player_uuid, key)
         self.multiplayer_token = credentials.multiplayer_token
@@ -165,6 +165,11 @@ class _OnlineIdentity(_ClientIdentity):
         self._certificate_chain = credentials.certificate_chain
         self._first_signer = first_signer
         self._expires_at = expires_at
+        self.__xuid = xuid
+
+    @property
+    def _xuid(self) -> str:
+        return self.__xuid
 
     def login_request(
         self, address: str, *, protocol: int = 2225, chunk_radius: int = 8, locale: str = DEFAULT_LOCALE,
@@ -363,4 +368,6 @@ async def acquire_online_identity(provider: BedrockCredentialProvider) -> _Onlin
         player_uuid = _identity_uuid(explicit_uuid, "multiplayer token")
         if player_uuid != legacy_uuid:
             raise ValueError("multiplayer token UUID does not match the leaf certificate")
-    return _OnlineIdentity(name, player_uuid, key, credentials, issuer, first_signer, min(token_expiry, chain_expiry))
+    return _OnlineIdentity(
+        name, player_uuid, key, credentials, issuer, first_signer, min(token_expiry, chain_expiry), xuid=xuid,
+    )
