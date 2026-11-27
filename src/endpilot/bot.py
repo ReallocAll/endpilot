@@ -27,6 +27,7 @@ from .boss_bars import BossBar, BossBarEvent, BossBarEventKind, BossBars
 from .chat import Chat, ChatMatch, ChatMessage, ChatPatterns, DisplayMatch, TextEvent, TextPacketType
 from .client_clock import ClientClock
 from .collection import BlockCollection, BlockCollectionBatch, CountedBlockCollection, MixedCollectionBatch, _BlockCollector
+from .collection_storage import CollectionStorage
 from .commands import CommandCatalog, Commands
 from .compression import PacketConnection
 from .containers import BrewingProgress, Containers, ContainerSlotChange, ContainerWindow, FurnaceProgress
@@ -2124,7 +2125,7 @@ class Bot:
     async def collect_targets(
         self, positions: Iterable[tuple[int, int, int]], *, count: int | None = None,
         ticks: int = 160, search_radius: int = 8, timeout: float = 15, tool_chest: HarvestToolChest | None = None,
-        tool_chests: Sequence[HarvestToolChest] | None = None,
+        tool_chests: Sequence[HarvestToolChest] | None = None, storage: CollectionStorage | None = None,
     ) -> BlockCollectionBatch:
         """Collect unique targets in input order, up to count.
 
@@ -2141,18 +2142,24 @@ class Bot:
         confirmed shortage in a closed chest or an unreachable approach
         before clicking permits the next attempt. Read tool_refill_attempts
         for the sequence of outcomes on each target.
+
+        With storage, a sole live drop blocked by a fully observed inventory
+        can trigger one trip to store an authorized stack. The next target
+        requires a complete transfer, matching close and confirmed pickup
+        of the original drop. Read storage_attempt for the target's evidence.
         """
         if self._block_collector is None:
             raise RuntimeError("player has not joined")
         return await self._block_collector.collect_targets(
             self, positions, count=count, ticks=ticks, search_radius=search_radius, timeout=timeout,
-            tool_chest=tool_chest, tool_chests=tool_chests,
+            tool_chest=tool_chest, tool_chests=tool_chests, storage=storage,
         )
 
     async def collect_by_count(
         self, names: str | int | Iterable[str] | Iterable[int], *, item_id: int, count: int,
         radius: int = 16, ticks: int = 160, search_radius: int = 8, timeout: float = 15,
         tool_chest: HarvestToolChest | None = None, tool_chests: Sequence[HarvestToolChest] | None = None,
+        storage: CollectionStorage | None = None,
     ) -> CountedBlockCollection:
         """Collect a positive count of one item from nearby observed matching blocks.
 
@@ -2163,20 +2170,21 @@ class Bot:
 
         Pass tool_chest or tool_chests to enable the same shortage refills as
         collect_targets. A change during an unsettled ordered refill ends
-        the batch.
+        the batch. Pass storage to free space as in collect_targets.
         """
         if self._block_collector is None:
             raise RuntimeError("player has not joined")
         return await self._block_collector.collect_by_count(
             self, names, item_id=item_id, count=count, radius=radius, ticks=ticks,
             search_radius=search_radius, timeout=timeout, tool_chest=tool_chest, tool_chests=tool_chests,
+            storage=storage,
         )
 
     async def collect_vein_by_count(
         self, seed: tuple[int, int, int], *, item_id: int, count: int, max_blocks: int = 100,
         max_distance: int = 16, flood_radius: int = 1, ticks: int = 160,
         search_radius: int = 8, timeout: float = 15, tool_chest: HarvestToolChest | None = None,
-        tool_chests: Sequence[HarvestToolChest] | None = None,
+        tool_chests: Sequence[HarvestToolChest] | None = None, storage: CollectionStorage | None = None,
     ) -> CountedBlockCollection:
         """Collect a positive count of one item from an observed block vein.
 
@@ -2187,7 +2195,7 @@ class Bot:
         carry known collection_progress.
 
         Pass tool_chest or tool_chests to enable the same shortage refills as
-        collect_by_count.
+        collect_by_count. Pass storage to free space as in collect_targets.
         """
         if self._block_collector is None:
             raise RuntimeError("player has not joined")
@@ -2196,7 +2204,7 @@ class Bot:
         return await self._block_collector.collect_vein_by_count(
             self, seed, item_id=item_id, count=count, max_blocks=max_blocks, max_distance=max_distance,
             flood_radius=flood_radius, ticks=ticks, search_radius=search_radius, timeout=timeout,
-            tool_chest=tool_chest, tool_chests=tool_chests,
+            tool_chest=tool_chest, tool_chests=tool_chests, storage=storage,
         )
 
     async def collect_mixed_targets(

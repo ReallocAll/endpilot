@@ -14,6 +14,7 @@ from .boss_bars import BossBar, BossBarEvent, BossBarEventKind
 from .bot import Bot
 from .chat import ChatMatch, ChatMessage, DisplayMatch, TextEvent, TextPacketType
 from .collection import BlockCollection, BlockCollectionBatch, CountedBlockCollection, DropCollection, MixedCollectionBatch
+from .collection_storage import CollectionStorage, CollectionStorageResult
 from .commands import CommandCatalog, CommandCatalogEntry
 from .containers import BrewingProgress, ContainerSlotChange, FurnaceProgress
 from .creative_inventory import (
@@ -89,6 +90,8 @@ __all__ = [
     "ColumnCoverage",
     "ColumnCoverageEvent",
     "ColumnCoverageInvalidated",
+    "CollectionStorage",
+    "CollectionStorageResult",
     "CommandCatalog",
     "CommandCatalogEntry",
     "ContainerSlotChange",

@@ -7,18 +7,24 @@ from functools import partial
 import math
 from typing import TYPE_CHECKING
 
+from ._stack_limits_2225 import STACK_LIMITS
 from .blocks import BlockObservation, BlockSearchResult, Blocks, MiningFaceUnavailable, _ORDINARY_MINING_REACH
+from .collection_storage import (
+    CollectionStorage, CollectionStorageResult, _registered_storage_item, _store_for_collection,
+)
 from .entities import Entities, EntityState, ItemPickup
 from .harvest import HarvestTool, HarvestToolAcquisition, HarvestToolChest, HarvestTools
+from .inventory import _InventoryMoveNotSubmitted, _MAIN_INVENTORY_SIZE, _stack_snapshot
 from .inventory_observation import _InventoryObservation
-from .movement import BlockApproach, Movement
-from .navigation import AllGoal, BlockFaceGoal, BlockInteractionGoal, BlockInteractionMatch, NavigationRules
+from .movement import BlockApproach, Movement, _PLAYER_HALF_WIDTH
+from .navigation import AllGoal, BlockFaceGoal, BlockInteractionGoal, BlockInteractionMatch, EntityNearGoal, NavigationRules
 
 if TYPE_CHECKING:
     from .bot import Bot
 
 
 _ToolRefill = Callable[[HarvestToolChest, BlockObservation], Awaitable[HarvestToolAcquisition | None]]
+_STORAGE_PICKUP_RADIUS = 1.2
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +35,7 @@ class BlockCollection:
     source may be indistinguishable on this stream. The collector and inventory
     delta refer to a sole candidate. An unknown delta is None. Ordered refills
     record each chest and its available acquisition evidence in tool_refill_attempts.
+    An opted-in storage trip records its transfer and stopping reason in storage_attempt.
     """
 
     position: tuple[int, int, int]
@@ -45,12 +52,18 @@ class BlockCollection:
     tool_refill_attempts: tuple[tuple[HarvestToolChest, HarvestToolAcquisition | None], ...] = field(
         default=(), kw_only=True,
     )
+    storage_attempt: CollectionStorageResult | None = field(default=None, kw_only=True)
     _pickup_confirmed: bool = field(default=False, kw_only=True, repr=False)
 
     @property
     def pickup_confirmed(self) -> bool:
         """Whether the bot's pickup and matching main-inventory gain were confirmed."""
         return self.status == "collected" or self._pickup_confirmed
+
+
+_StoreForDrop = Callable[
+    ["_CollectionObservation", float, Callable[[BlockCollection], None] | None], Awaitable[None],
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +189,17 @@ def _settled_refill_miss(acquisition: HarvestToolAcquisition | None) -> bool:
             or (acquisition.status == "chest_approach_unreachable" and acquisition.window is None))
 
 
+def _storage_item_id(bot: "Bot", storage: CollectionStorage | None, timeout: float) -> int | None:
+    if storage is None:
+        return None
+    if not isinstance(storage, CollectionStorage):
+        raise TypeError("storage must be a CollectionStorage")
+    if timeout is None or not 0 < timeout < math.inf:
+        raise ValueError("collection timeout must be finite and positive when storage is enabled")
+    item_id, _ = _registered_storage_item(bot.item_registry, storage.item)
+    return item_id
+
+
 def _confirmed_item_count(result: BlockCollection, item_id: int, *, item_name: str | None = None) -> int:
     if not result.pickup_confirmed:
         return 0
@@ -212,11 +236,12 @@ class _BlockCollector:
     async def collect_targets(
         self, bot: "Bot", positions: Iterable[tuple[int, int, int]], *, count: int | None = None,
         ticks: int = 160, search_radius: int = 8, timeout: float = 15, tool_chest: HarvestToolChest | None = None,
-        tool_chests: Sequence[HarvestToolChest] | None = None,
+        tool_chests: Sequence[HarvestToolChest] | None = None, storage: CollectionStorage | None = None,
     ) -> BlockCollectionBatch:
         if count is not None and (not isinstance(count, int) or count < 0):
             raise ValueError("collection count must be a nonnegative integer")
         tool_chests = _snapshot_tool_chests(tool_chest, tool_chests)
+        storage_item_id = _storage_item_id(bot, storage, timeout)
         positions = tuple(dict.fromkeys(map(_position, positions)))[:count]
         progress = _BatchProgress(self.blocks.dimension_id, positions)
         try:
@@ -227,7 +252,7 @@ class _BlockCollector:
             before = tuple(self.blocks.observed_block(position) for position in positions)
             await self._run(self._collect_batch(
                 bot, progress, before, epoch, ticks=ticks, search_radius=search_radius, timeout=timeout,
-                tool_chest=tool_chest, tool_chests=tool_chests,
+                tool_chest=tool_chest, tool_chests=tool_chests, storage=storage, storage_item_id=storage_item_id,
             ))
         except (Exception, asyncio.CancelledError) as error:
             error.collection_progress = progress.snapshot()
@@ -238,29 +263,31 @@ class _BlockCollector:
         self, bot: "Bot", names: str | int | Iterable[str] | Iterable[int], *, item_id: int, count: int,
         radius: int = 16, ticks: int = 160, search_radius: int = 8, timeout: float = 15,
         tool_chest: HarvestToolChest | None = None, tool_chests: Sequence[HarvestToolChest] | None = None,
+        storage: CollectionStorage | None = None,
     ) -> CountedBlockCollection:
         return await self._collect_counted(
             bot, partial(self.blocks.find_blocks, names, radius=radius, limit=None),
             item_id=item_id, count=count, ticks=ticks, search_radius=search_radius, timeout=timeout,
-            tool_chest=tool_chest, tool_chests=tool_chests,
+            tool_chest=tool_chest, tool_chests=tool_chests, storage=storage,
         )
 
     async def collect_vein_by_count(
         self, bot: "Bot", seed: tuple[int, int, int], *, item_id: int, count: int,
         max_blocks: int, max_distance: int, flood_radius: int, ticks: int, search_radius: int, timeout: float,
         tool_chest: HarvestToolChest | None = None, tool_chests: Sequence[HarvestToolChest] | None = None,
+        storage: CollectionStorage | None = None,
     ) -> CountedBlockCollection:
         return await self._collect_counted(
             bot, partial(self.blocks.find_block_vein, seed, max_blocks=max_blocks, max_distance=max_distance,
                          flood_radius=flood_radius),
             item_id=item_id, count=count, ticks=ticks, search_radius=search_radius, timeout=timeout,
-            tool_chest=tool_chest, tool_chests=tool_chests, report_completeness=True,
+            tool_chest=tool_chest, tool_chests=tool_chests, storage=storage, report_completeness=True,
         )
 
     async def _collect_counted(
         self, bot: "Bot", find_candidates: Callable[[], BlockSearchResult], *, item_id: int, count: int,
         ticks: int, search_radius: int, timeout: float, tool_chest: HarvestToolChest | None,
-        tool_chests: Sequence[HarvestToolChest] | None,
+        tool_chests: Sequence[HarvestToolChest] | None, storage: CollectionStorage | None,
         report_completeness: bool = False,
     ) -> CountedBlockCollection:
         if not isinstance(item_id, int) or isinstance(item_id, bool) or item_id == 0:
@@ -268,6 +295,7 @@ class _BlockCollector:
         if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
             raise ValueError("collection count must be a positive integer")
         tool_chests = _snapshot_tool_chests(tool_chest, tool_chests)
+        storage_item_id = _storage_item_id(bot, storage, timeout)
         progress = _CountedProgress(self.blocks.dimension_id, item_id, count)
         try:
             self._check_connection()
@@ -284,6 +312,7 @@ class _BlockCollector:
                 await self._run(self._collect_batch(
                     bot, progress, observations, epoch, ticks=ticks, search_radius=search_radius,
                     timeout=timeout, tool_chest=tool_chest, tool_chests=tool_chests,
+                    storage=storage, storage_item_id=storage_item_id,
                 ))
         except (Exception, asyncio.CancelledError) as error:
             error.collection_progress = progress.snapshot()
@@ -362,7 +391,8 @@ class _BlockCollector:
     async def _collect_batch(
         self, bot: "Bot", progress: _BatchProgress, observations: tuple[BlockObservation | None, ...], epoch: int, *,
         ticks: int, search_radius: int, timeout: float, tool_chest: HarvestToolChest | None,
-        tool_chests: tuple[HarvestToolChest, ...] | None,
+        tool_chests: tuple[HarvestToolChest, ...] | None, storage: CollectionStorage | None,
+        storage_item_id: int | None,
     ) -> None:
         counted = progress if isinstance(progress, _CountedProgress) else None
         ordered_refill = tool_chests is not None
@@ -371,17 +401,25 @@ class _BlockCollector:
             self._refill_tool, bot, dimension=progress.dimension_id, epoch=epoch,
             ticks=ticks, search_radius=search_radius, timeout=timeout, ordered=ordered_refill,
         )
+        store = None if storage is None else partial(
+            self._store_for_drop, bot, storage, storage_item_id,
+            dimension=progress.dimension_id, ticks=ticks, search_radius=search_radius,
+        )
         async with self._lock:
+            settle_after_storage = False
             for position, before in zip(progress.positions, observations, strict=True):
                 self._check_connection()
                 self.blocks._check_mining_epoch(epoch)
                 result = await self._collect_one(
                     position, before, progress.dimension_id, ticks=ticks, search_radius=search_radius,
                     timeout=timeout, epoch=epoch, progress=progress, refill=refill, refill_chests=chests,
-                    ordered_refill=ordered_refill,
+                    ordered_refill=ordered_refill, store=store, settle_after_storage=settle_after_storage,
                 )
                 progress.results.append(result)
                 progress.active = None
+                if result.approach is not None or result.status != "target_changed":
+                    settle_after_storage = (result.status == "collected" and result.storage_attempt is not None
+                                            and result.storage_attempt.stop_reason == "complete")
                 if counted is None:
                     if result.status != "collected":
                         break
@@ -471,7 +509,7 @@ class _BlockCollector:
                 follow.cancel()
             await asyncio.gather(follow, return_exceptions=True)
 
-    async def _approach(self, position, *, ticks, search_radius, timeout):
+    async def _approach(self, position, *, ticks, search_radius, timeout, settle_epoch: int | None = None):
         if not (0 <= ticks < math.inf and 0 <= search_radius < math.inf):
             raise ValueError("ticks and search radii must be finite and nonnegative")
         deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
@@ -479,7 +517,7 @@ class _BlockCollector:
         adjacent = AllGoal((BlockFaceGoal(position), visible))
         rules = NavigationRules(search_radius=int(search_radius))
         route = await self.movement._navigate_goal(
-            self.blocks, visible, rules, ticks, deadline=deadline, preferred_goal=adjacent,
+            self.blocks, visible, rules, ticks, deadline=deadline, preferred_goal=adjacent, settle_epoch=settle_epoch,
         )
         status = {"unknown": "unobserved", "budget": "budget_exhausted"}.get(route.status, route.status)
         match = next((face for face in route.matches if isinstance(face, BlockInteractionMatch)), None)
@@ -550,11 +588,93 @@ class _BlockCollector:
             return replace(acquisition, status="window_changed")
         return acquisition
 
+    def _pickup_is_blocked(self, slots, drop: EntityState, *, submitting: int | None = None) -> bool:
+        if not self.harvest._inventory_is_observed(slots, submitting=submitting):
+            return False
+        main = (slots[index] for index in range(_MAIN_INVENTORY_SIZE))
+        matching = []
+        for stack in main:
+            if not stack.id:
+                return False
+            if stack.id == drop.item_network_id:
+                matching.append(stack)
+        if not matching:
+            return True
+        limit = STACK_LIMITS.get(drop.item_id) if self.blocks.packets.protocol.number == 2225 else None
+        return limit is not None and all(stack.stack_size == limit for stack in matching)
+
+    async def _store_for_drop(
+        self, bot: "Bot", storage: CollectionStorage, item_id: int, observation: "_CollectionObservation",
+        timeout: float, record: Callable[[BlockCollection], None] | None, *,
+        dimension: int, ticks: int, search_radius: int,
+    ) -> None:
+        drop, = observation.candidates.values()
+        if observation.live_drop(drop) is None:
+            return
+        inventory = self.blocks.inventory
+        slots = inventory.slots
+        if not self._pickup_is_blocked(slots, drop):
+            return
+
+        def remember(attempt: CollectionStorageResult) -> None:
+            observation.storage_attempt = attempt
+            result = observation.result()
+            observation.storage_pickup_confirmed |= result.pickup_confirmed
+            if record is not None:
+                record(result)
+
+        source_slot = next((slot for slot in storage.inventory_slots if slots[slot].id == item_id), None)
+        if source_slot is None:
+            remember(CollectionStorageResult("source_exhausted"))
+            return
+        source = _stack_snapshot(slots[source_slot])
+        observation.storage_item_id = item_id
+        # The original drop is still present, so its pickup cannot precede
+        # this settled snapshot. Earlier unrelated inventory changes can.
+        observation.inventory_feedback = _InventoryObservation(inventory, require_all_slots=True)
+
+        def authorize(request_id: int | None) -> None:
+            self._check_connection()
+            if self.blocks.dimension_id != dimension or self.blocks._mining_epoch != observation.epoch:
+                raise _InventoryMoveNotSubmitted("world_changed")
+            if observation.live_drop(drop) is None:
+                raise _InventoryMoveNotSubmitted("drop_changed")
+            if not observation.storage_write_seen:
+                current_slots = inventory.slots
+                if _stack_snapshot(current_slots.get(source_slot)) != source:
+                    raise _InventoryMoveNotSubmitted("source_changed")
+                if not self._pickup_is_blocked(current_slots, drop, submitting=request_id):
+                    raise _InventoryMoveNotSubmitted("inventory_available")
+            # After the first write the storage helper checks its selected
+            # slot against the last matching source receipt.
+            if request_id is not None:
+                observation.storage_write_seen = True
+
+        try:
+            attempt = await _store_for_collection(
+                bot, storage, source_slot=source_slot, count=source.count,
+                dimension_id=dimension, epoch=observation.epoch, ticks=ticks, search_radius=search_radius,
+                timeout=timeout, authorize=authorize, record=remember,
+            )
+        except (Exception, asyncio.CancelledError) as error:
+            if observation.storage_attempt is None:
+                reason = ("cancelled" if isinstance(error, asyncio.CancelledError) else
+                          "timeout" if isinstance(error, TimeoutError) else "error")
+                remember(CollectionStorageResult(reason, getattr(error, "transfer_progress", None)))
+            raise
+        if attempt.stop_reason == "complete":
+            transfer = attempt.transfer
+            if transfer is None or transfer.stop_reason != "complete" or transfer.confirmed_count != source.count:
+                attempt = replace(attempt, stop_reason="unconfirmed")
+        if observation.storage_attempt != attempt:
+            remember(attempt)
+
     async def _collect_one(
         self, position: tuple[int, int, int], before: BlockObservation | None, dimension: int, *,
         ticks: int, search_radius: int, timeout: float, epoch: int | None = None,
         progress: _BatchProgress | _MixedProgress | None = None, refill: _ToolRefill | None = None,
         refill_chests: tuple[HarvestToolChest, ...] = (), ordered_refill: bool = False,
+        store: _StoreForDrop | None = None, settle_after_storage: bool = False,
     ) -> BlockCollection:
         if before is None or before.is_air is None:
             return BlockCollection(position, "target_unobserved", before)
@@ -589,7 +709,11 @@ class _BlockCollector:
 
         remember(evidence)
         while True:
-            approach, match = await self._approach(position, ticks=ticks, search_radius=search_radius, timeout=timeout)
+            approach, match = await self._approach(
+                position, ticks=ticks, search_radius=search_radius, timeout=timeout,
+                settle_epoch=epoch if settle_after_storage else None,
+            )
+            settle_after_storage = False
             remember(replace(evidence, approach=approach))
             # A changed target can itself make a route unreachable or unobserved.
             status = check_target(check_observation=(
@@ -658,7 +782,8 @@ class _BlockCollector:
 
         result = await _observe_mined_block(
             self.blocks, self.entities, position, face=match.face, timeout=timeout, follow_ticks=120,
-            epoch=epoch, prepare_start=prepare_start, record=record if progress is not None else None,
+            epoch=epoch, prepare_start=prepare_start, record=record if progress is not None else None, store=store,
+            search_radius=search_radius,
         )
         result = with_equipment(result)
         remember(result)
@@ -737,7 +862,9 @@ def _drop_identity(drop: EntityState) -> tuple[int | None, int | None]:
 
 
 class _CollectionObservation:
-    def __init__(self, blocks: Blocks, entities: Entities, before: BlockObservation, epoch: int):
+    def __init__(
+        self, blocks: Blocks, entities: Entities, before: BlockObservation, epoch: int, *, bind_drops: bool = False,
+    ):
         self.blocks = blocks
         self.entities = entities
         self.inventory = blocks.inventory
@@ -750,7 +877,12 @@ class _CollectionObservation:
         self.known_drops = {}
         self.seen_drops = {_drop_identity(drop) for drop in entities.drops()}
         self.candidates = {}
+        self.instances = {} if bind_drops else None
         self.pickups = {}
+        self.storage_item_id: int | None = None
+        self.storage_attempt: CollectionStorageResult | None = None
+        self.storage_write_seen = False
+        self.storage_pickup_confirmed = False
         self.changed = asyncio.Event()
 
     def start(self):
@@ -785,6 +917,8 @@ class _CollectionObservation:
                 for corner, value in zip(self.before.position, drop.position)
             ) and drop.item_network_id != 0 and drop.item_count > 0:
                 self.candidates[identity] = drop
+                if self.instances is not None:
+                    self.instances[identity] = self.entities._actor_instance(runtime_id)
             self.seen_drops.add(identity)
         elif not self.started:
             return False
@@ -794,27 +928,93 @@ class _CollectionObservation:
                 if current is not None and current.is_air is True:
                     self.after = current
         elif packet_id == b.TakeItemActorPacket.ID:
-            packet = protocol.decode(raw)
-            runtime_id = int(packet.item_id)
-            drop = self.known_drops.get(runtime_id)
-            identity = _drop_identity(drop) if drop is not None else None
-            collectors, _ = self.pickups.setdefault(identity, (set(), drop))
-            collectors.add(int(packet.actor_id))
-        elif self.inventory_feedback is not None:
+            self._observe_pickup(raw)
+        elif packet_id != b.RemoveActorPacket.ID and self.inventory_feedback is not None:
             self.inventory_feedback.observe(raw)
+        if self.storage_item_id is not None and self.pickups and not self.storage_pickup_confirmed:
+            self.storage_pickup_confirmed = self.result().pickup_confirmed
         self.changed.set()
         return False
+
+    def _observe_pickup(self, raw) -> None:
+        if self.instances is None:
+            packet = self.blocks.packets.protocol.decode(raw)
+            player_id = int(packet.actor_id)
+            drop = self.known_drops.get(int(packet.item_id))
+            identity = _drop_identity(drop) if drop is not None else None
+        else:
+            observed = self.entities._observed_pickup(raw)
+            if observed is None:
+                return
+            pickup, instance = observed
+            player_id, drop = pickup.collector_runtime_id, pickup.item
+            identity = _drop_identity(drop) if drop is not None else None
+            candidate = self.candidates.get(identity)
+            if candidate is not None and (
+                instance is None or self.instances[identity] is not instance
+                or pickup.item_runtime_id != candidate.runtime_id
+                or not candidate.entity_id or pickup.item_entity_id != candidate.entity_id
+                or drop.item_network_id != candidate.item_network_id or drop.item_count != candidate.item_count
+            ):
+                identity, drop = None, None
+        collectors, _ = self.pickups.setdefault(identity, (set(), drop))
+        collectors.add(player_id)
 
     def live_drop(self, drop: EntityState) -> EntityState | None:
         identity = _drop_identity(drop)
         if (self.blocks._mining_epoch != self.epoch or not drop.entity_id
                 or len(self.candidates) != 1 or identity in self.pickups):
             return None
-        current = self.entities._get_by_unique_id(drop.entity_id)
+        if self.instances is None:
+            current = self.entities._get_by_unique_id(drop.entity_id)
+        else:
+            instance = self.instances[identity]
+            current = None if instance is None else self.entities._bound_item(drop, instance)
         if (current is not None and current.actor_type == "minecraft:item"
-            and current.item_network_id == drop.item_network_id):
+            and current.item_network_id == drop.item_network_id
+            and (self.instances is None or current.item_count == drop.item_count)):
             return current
         return None
+
+    def drop_anchor(self, drop: EntityState) -> tuple[float, float, float] | None:
+        current = self.live_drop(drop)
+        return None if current is None else self.entities._item_navigation_anchor(current)
+
+    def pickup_clearance(self, feet, anchor) -> bool | None:
+        # A horizontal approach must reach an item at the standing body's height.
+        if anchor[1] < feet[1]:
+            return False
+        dx, dz = anchor[0] - feet[0], anchor[2] - feet[2]
+        distance = math.hypot(dx, dz)
+        # Stop when the anchor is inside the standing player's horizontal footprint.
+        scale = 0.0 if distance <= _PLAYER_HALF_WIDTH else 1.0 - _PLAYER_HALF_WIDTH / distance
+        return self.blocks._flight_clearance(feet, (feet[0] + dx * scale, feet[1], feet[2] + dz * scale))
+
+    def pickup_stance(self, anchor: tuple[float, float, float] | None) -> tuple[float, float, float] | None:
+        movement = self.blocks.movement
+        origin = movement.input_position
+        if anchor is None or origin is None:
+            return None
+        cell_x, feet_y, cell_z = movement._foot_cell(origin)
+        if (not movement._at_standing_height(feet_y)
+                or math.dist((cell_x + 0.5, feet_y, cell_z + 0.5), anchor) > _STORAGE_PICKUP_RADIUS):
+            return None
+        return origin[0], feet_y, origin[2]
+
+    def nearby_drop(self, drop: EntityState) -> EntityState | None:
+        current = self.live_drop(drop)
+        anchor = None if current is None else self.entities._item_navigation_anchor(current)
+        feet = self.pickup_stance(anchor)
+        return current if feet is not None and self.pickup_clearance(feet, anchor) is True else None
+
+    def _pickup_delta(self, item_id: int) -> int | None:
+        delta = self.inventory_feedback.delta(item_id)
+        if delta is None or not self.storage_write_seen or item_id != self.storage_item_id:
+            return delta
+        transfer = None if self.storage_attempt is None else self.storage_attempt.transfer
+        if transfer is None or any(step.confirmed is None for step in transfer.steps):
+            return None
+        return delta + transfer.confirmed_count
 
     def result(self, *, timed_out: bool = False, dimension_changed: bool = False) -> BlockCollection:
         drops = tuple(self.candidates.values())
@@ -829,7 +1029,7 @@ class _CollectionObservation:
                 drop, = drops
                 identity = _drop_identity(drop)
                 collectors, _ = self.pickups.get(identity, (set(), None))
-                delta = self.inventory_feedback.delta(drop.item_network_id)
+                delta = self._pickup_delta(drop.item_network_id)
                 if len(collectors) > 1:
                     status = "ambiguous_drop"
                 elif not collectors:
@@ -844,10 +1044,17 @@ class _CollectionObservation:
                         for other, (players, source) in self.pickups.items()
                     ):
                         status = "ambiguous_drop"
-                    elif delta == drop.item_count:
+                    elif self.storage_pickup_confirmed or delta == drop.item_count:
                         status = "collected"
+                        delta = drop.item_count
                     else:
                         status = "inventory_unconfirmed"
+        pickup_confirmed = status == "collected"
+        attempt = self.storage_attempt
+        if attempt is not None and attempt.stop_reason != "complete":
+            status = "storage_incomplete" if pickup_confirmed else "pickup_unconfirmed"
+            if timed_out and attempt.stop_reason == "cancelled":
+                attempt = replace(attempt, stop_reason="timeout")
         return BlockCollection(
             position=self.before.position,
             status="dimension_changed" if dimension_changed else status,
@@ -857,7 +1064,8 @@ class _CollectionObservation:
             collector_id=collector_id,
             inventory_delta=delta,
             timed_out=timed_out,
-            _pickup_confirmed=dimension_changed and status == "collected",
+            storage_attempt=attempt,
+            _pickup_confirmed=pickup_confirmed and (dimension_changed or status != "collected"),
         )
 
 
@@ -866,6 +1074,8 @@ async def _observe_mined_block(
     face: int, timeout: float, follow_ticks: int = 0, epoch: int | None = None,
     prepare_start: Callable[[], None] | None = None,
     record: Callable[[BlockCollection], None] | None = None,
+    store: _StoreForDrop | None = None,
+    search_radius: int = 8,
 ) -> BlockCollection:
     before = blocks.observed_block(position)
     if before is None or before.is_air is None:
@@ -876,15 +1086,19 @@ async def _observe_mined_block(
     packets = blocks.packets
     b = packets.protocol.binding
     epoch = blocks._mining_epoch if epoch is None else epoch
-    observation = _CollectionObservation(blocks, entities, before, epoch)
+    observation = _CollectionObservation(blocks, entities, before, epoch, bind_drops=store is not None)
+    deadline = asyncio.timeout(timeout)
+    watched_packets = (
+        b.UpdateBlockPacket.ID, b.UpdateSubChunkBlocksPacket.ID, b.AddItemActorPacket.ID,
+        b.TakeItemActorPacket.ID, b.InventoryContentPacket.ID, b.InventorySlotPacket.ID,
+        b.InventoryTransactionPacket.ID, b.DisconnectPacket.ID, b.ChangeDimensionPacket.ID,
+        b.RespawnPacket.ID,
+    )
+    if store is not None:
+        watched_packets += (b.ItemStackResponsePacket.ID, b.RemoveActorPacket.ID)
 
     async def watch():
-        await packets.wait_for_packet((
-            b.UpdateBlockPacket.ID, b.UpdateSubChunkBlocksPacket.ID, b.AddItemActorPacket.ID,
-            b.TakeItemActorPacket.ID, b.InventoryContentPacket.ID, b.InventorySlotPacket.ID,
-            b.InventoryTransactionPacket.ID, b.DisconnectPacket.ID, b.ChangeDimensionPacket.ID,
-            b.RespawnPacket.ID,
-        ), timeout=None, match=observation.observe)
+        await packets.wait_for_packet(watched_packets, timeout=None, match=observation.observe)
 
     async def mine_and_wait():
         blocks._check_mining_epoch(epoch)
@@ -895,18 +1109,56 @@ async def _observe_mined_block(
         except _BeforeStartRejected as error:
             return BlockCollection(position, error.status, before)
         followed = False
+        remaining_follow_ticks = follow_ticks
         while True:
             result = observation.result()
             if result.status in ("collected", "ambiguous_drop", "taken_by_other"):
                 return result
-            if follow_ticks and not followed and result.status == "pickup_unconfirmed":
+            if store is not None and observation.storage_attempt is None and result.status == "pickup_unconfirmed":
+                drop, = result.drops
+                remaining = deadline.when() - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    return observation.result(timed_out=True)
+                await store(observation, remaining, record)
+                attempt = observation.storage_attempt
+                if attempt is not None:
+                    result = observation.result()
+                    # A matching pickup removes the actor before its inventory update can arrive.
+                    if (attempt.stop_reason != "complete" or result.pickup_confirmed
+                            or (result.status != "inventory_unconfirmed" and observation.live_drop(drop) is None)):
+                        return result
+                    if result.status == "pickup_unconfirmed" and follow_ticks:
+                        goal = EntityNearGoal(drop.entity_id, _STORAGE_PICKUP_RADIUS)
+                        movement = blocks.movement
+                        start_tick = movement._tick
+                        route = await movement._navigate_goal(
+                            blocks, goal, NavigationRules(search_radius=int(search_radius)), follow_ticks,
+                            deadline=deadline.when(), near_anchor=lambda: observation.drop_anchor(drop),
+                            near_clearance=observation.pickup_clearance,
+                        )
+                        result = observation.result()
+                        reached = route.status == "reached"
+                        if result.status != "inventory_unconfirmed" and (
+                            result.status != "pickup_unconfirmed"
+                            or (not reached and observation.pickup_stance(observation.drop_anchor(drop)) is None)
+                        ):
+                            timed_out = asyncio.get_running_loop().time() >= deadline.when()
+                            return replace(result, timed_out=timed_out)
+                        remaining_follow_ticks = max(0, follow_ticks - (movement._tick - start_tick)) if reached else 0
+                        followed = False
+            if result.status == "pickup_unconfirmed" and (not followed or observation.storage_attempt is not None):
                 drop, = result.drops
                 current = observation.live_drop(drop)
-                if current is not None:
+                if current is None and observation.storage_attempt is not None:
+                    return result
+                resolve = observation.live_drop if observation.storage_attempt is None else observation.nearby_drop
+                if current is not None and remaining_follow_ticks and not followed and resolve(drop) is not None:
                     followed = True
                     await blocks.movement.follow_entity(
-                        entities, current.runtime_id, ticks=follow_ticks, stop_distance=0,
-                        _resolve=lambda _: observation.live_drop(drop),
+                        entities, current.runtime_id, ticks=remaining_follow_ticks,
+                        stop_distance=0 if observation.storage_attempt is None else _PLAYER_HALF_WIDTH,
+                        _resolve=lambda _: resolve(drop),
+                        _clearance=None if observation.storage_attempt is None else blocks._flight_clearance,
                     )
                     continue
             observation.changed.clear()
@@ -915,28 +1167,42 @@ async def _observe_mined_block(
     # Start observing before mining registers its own, narrower block waiter.
     watcher = asyncio.create_task(watch())
     action = asyncio.create_task(mine_and_wait())
+    timed_out = dimension_changed = False
     try:
-        async with asyncio.timeout(timeout) as deadline:
+        async with deadline:
             done, _ = await asyncio.wait((watcher, action), return_when=asyncio.FIRST_COMPLETED)
         if watcher in done:
             await watcher
         if observation.end_packet == b.DisconnectPacket.ID:
             raise ConnectionError("server disconnected while collecting a block")
         if observation.end_packet == b.ChangeDimensionPacket.ID:
-            return observation.result(dimension_changed=True)
-        if observation.end_packet is not None:
+            dimension_changed = True
+        elif observation.end_packet is not None:
             if observation.after is None:
                 blocks._check_mining_epoch(epoch)
-            return observation.result()
-        return await action
+        else:
+            return await action
+        if observation.storage_item_id is None:
+            return observation.result(dimension_changed=dimension_changed)
     except TimeoutError:
         if not deadline.expired():
             raise
-        return observation.result(timed_out=True)
+        timed_out = True
+        if observation.storage_item_id is None:
+            return observation.result(timed_out=True)
     finally:
-        for task in (action, watcher):
-            if not task.done():
-                task.cancel()
+        if not action.done():
+            action.cancel()
+        if observation.storage_item_id is not None:
+            # A storage detour can publish a partial result while closing its
+            # owned window. Keep observing pickups until that cleanup settles.
+            await asyncio.gather(action, return_exceptions=True)
+        if not watcher.done():
+            watcher.cancel()
         await asyncio.gather(action, watcher, return_exceptions=True)
         if record is not None and observation.started:
-            record(observation.result())
+            record(observation.result(
+                timed_out=timed_out and observation.storage_item_id is not None,
+                dimension_changed=dimension_changed and observation.storage_item_id is not None,
+            ))
+    return observation.result(timed_out=timed_out, dimension_changed=dimension_changed)

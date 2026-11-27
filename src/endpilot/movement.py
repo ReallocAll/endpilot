@@ -5,7 +5,7 @@ import math
 from collections import deque
 from collections.abc import Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import perf_counter_ns
 from typing import Literal
 
@@ -14,8 +14,8 @@ from .entities import Entities, EntityState, VehicleLinkChange
 from .expression import animation
 from .navigation import (
     AllGoal, AnyGoal, BlockFaceGoal, Cell, EntityNearGoal, EntityVisibilityGoal, NavigationEvent, NavigationGoal,
-    NavigationPlan, NavigationResult, NavigationRules,
-    _LADDER_APPROACH, _LADDER_DECK_LENGTH, _LADDER_STRIDE, _STANDING_HEAD_HEIGHT, _StandingGraph,
+    NavigationPlan, NavigationResult, NavigationRules, Point,
+    _GoalState, _LADDER_APPROACH, _LADDER_DECK_LENGTH, _LADDER_STRIDE, _STANDING_HEAD_HEIGHT, _StandingGraph,
     _VisibilityBudgetExhausted, _VisibilityScanBudget, _WATER_DECK_LENGTH, _WATER_STRIDE, _aim_point,
     _block_face_cells, _is_gap_jump, _is_ladder_climb, _is_two_block_drop,
     _is_water_crossing, _ladder_descent_geometry, _require_goal, _resolve_goal, _runout,
@@ -197,6 +197,19 @@ class _BoatInput:
 
 class _FollowTargetLost(Exception):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class _StandingNearState(_GoalState):
+    clearance: Callable[[Point, Point], bool | None] = field(kw_only=True)
+
+    def check(self, cell, *, eye=None, visibility_standing=None):
+        near, matches = _GoalState.check(self, cell, eye=eye, visibility_standing=visibility_standing)
+        if near is not True:
+            return near, matches
+        x, feet_y, z = cell
+        feet = (x + 0.5, feet_y, z + 0.5) if eye is None else (eye[0], feet_y, eye[2])
+        return self.clearance(feet, self.point), matches
 
 
 class Movement:
@@ -1877,7 +1890,8 @@ class Movement:
         self._follow_target_id = runtime_id
 
     async def follow_entity(self, entities, runtime_id: int, *, ticks: int = 80,
-                            stop_distance: float = 1.5, _resolve=None) -> int:
+                            stop_distance: float = 1.5, _resolve=None,
+                            _clearance: Callable[[Point, Point], bool | None] | None = None) -> int:
         """Track an observed actor for up to ticks frames, releasing input on exit.
 
         Return submitted moving frames, not a server-confirmed arrival.
@@ -1889,6 +1903,12 @@ class Movement:
 
         def check_target() -> None:
             if resolve(self._follow_target_id) is None:
+                raise _FollowTargetLost
+
+        def validate_step(start: Point, end: Point) -> None:
+            feet = (start[0], start[1] - 1.62, start[2])
+            next_feet = (end[0], end[1] - 1.62, end[2])
+            if _clearance(feet, next_feet) is not True:
                 raise _FollowTargetLost
 
         async with self._action_lock:
@@ -1920,7 +1940,10 @@ class Movement:
                         if _resolve is None:
                             await self._send_input(forward)
                         else:
-                            await self._send_input(forward, before_send=check_target)
+                            await self._send_input(
+                                forward, before_send=check_target,
+                                validate_step=None if _clearance is None else validate_step,
+                            )
                     except _FollowTargetLost:
                         break
                     submitted += forward
@@ -2057,6 +2080,85 @@ class Movement:
                 and self._input_position == self.position
                 and blocks._flat_stance(cell, allow_vegetation=True) is True)
 
+    async def _acquire_recovery_stance(self, blocks, mining_epoch: int) -> bool:
+        """Acquire the action lock at a standing pose after a storage pickup."""
+        after_tick = None
+        move_landing = None
+
+        def world_is_current():
+            if self._closing:
+                raise ConnectionError("movement is closed")
+            return blocks._mining_epoch == mining_epoch and not self._changing_dimension
+
+        def landed_by_move():
+            return (move_landing is not None and move_landing[0] == self.position
+                    and move_landing[1] is self._server_grounding)
+
+        def ready():
+            self._require_ground_input()
+            position = self._input_position
+            if (position is None or not self._can_send_input or not self._ray_pose_current
+                    or self._observed_ground is False or not all(map(math.isfinite, position))):
+                return False
+            cell = self._foot_cell(position)
+            if blocks._flat_stance(cell, allow_vegetation=True) is not True:
+                return False
+            if after_tick is None:
+                return self._navigation_start_is_standing(blocks, cell)
+            if self.position != position or self.observed_feet_position is None:
+                return False
+            if landed_by_move():
+                return abs(position[1] - (cell[1] + 1.62)) <= 0.05
+            # A position-only packet can move the pose onto the floor without
+            # establishing that the server says it landed there.
+            grounding = self._server_grounding
+            return (grounding is not None and grounding[0] > after_tick and grounding[1]
+                    and grounding[2] == position and self._navigation_start_is_standing(blocks, cell))
+
+        b = self.packets.protocol.binding
+
+        def observe(raw):
+            nonlocal move_landing
+            if not world_is_current():
+                return True
+            if raw.packet_id == b.MovePlayerPacket.ID:
+                packet = self.packets.protocol.decode(raw)
+                if int(packet.player_id) == self.player_id:
+                    tick = int(packet.tick)
+                    landed = (int(packet.reset_position) == 0 and not packet.riding_id and packet.on_ground
+                              and (tick == 0 or max(after_tick, self._last_correction_tick) < tick < self._tick))
+                    move_landing = (self.position, self._server_grounding) if landed else None
+            return ready()
+
+        observed = (
+            b.CorrectPlayerMovePredictionPacket.ID, b.MovePlayerPacket.ID,
+            b.ServerPlayerPostMovePositionPacket.ID, b.UpdateBlockPacket.ID,
+            b.UpdateSubChunkBlocksPacket.ID, b.LevelChunkPacket.ID, b.SubChunkPacket.ID,
+            b.SetActorLinkPacket.ID, b.ChangeDimensionPacket.ID, b.RespawnPacket.ID, b.DisconnectPacket.ID,
+        )
+        while world_is_current():
+            if ready():
+                await self._action_lock.acquire()
+                acquired = False
+                try:
+                    acquired = world_is_current() and ready()
+                    if acquired:
+                        if landed_by_move():
+                            # The newer normal MovePlayer pose supersedes an older airborne prediction.
+                            self._server_grounding = None
+                            self._finish_jump()
+                            self._pending_landing = None
+                            self._sprint_jump_extra = (0.0, 0.0)
+                        return True
+                finally:
+                    if not acquired:
+                        self._action_lock.release()
+            else:
+                if after_tick is None:
+                    after_tick = self._last_correction_tick
+                await self.packets.wait_for_packet(observed, timeout=None, match=observe)
+        return False
+
     def _navigation_visibility_standing(self) -> bool:
         flags = self.packets.protocol.binding.ActorFlags
         return not (self._observed_ground is False or self._sneaking or self._actor_flag(flags.SNEAKING)
@@ -2183,13 +2285,21 @@ class Movement:
 
     async def _navigate_goal(self, blocks, goal, rules, ticks, *, deadline=None, legacy=False, preferred_goal=None,
                              on_plan: Callable[[NavigationPlan], None] | None = None,
-                             emit_event: Callable[[NavigationEvent], None] | None = None):
+                             emit_event: Callable[[NavigationEvent], None] | None = None,
+                             near_anchor: Callable[[], Point | None] | None = None,
+                             near_clearance: Callable[[Point, Point], bool | None] | None = None,
+                             settle_epoch: int | None = None):
         loop = asyncio.get_running_loop()
+        if near_anchor is not None:
+            assert isinstance(goal, EntityNearGoal) and preferred_goal is None and not legacy and near_clearance is not None
         instances = self._navigation_instances(goal, preferred_goal)
 
         try:
             async with asyncio.timeout_at(deadline):
-                await self._action_lock.acquire()
+                if settle_epoch is None:
+                    await self._action_lock.acquire()
+                elif not await self._acquire_recovery_stance(blocks, settle_epoch):
+                    return NavigationResult("unknown", 0)
         except TimeoutError:
             return NavigationResult("budget", 0)
         try:
@@ -2235,6 +2345,7 @@ class Movement:
                 return await self._navigate_from(
                     blocks, goal, rules, ticks, start, dimension, epoch, deadline, legacy,
                     instances=instances, preferred_goal=preferred_goal, on_plan=on_plan, emit_event=emit_event,
+                    near_anchor=near_anchor, near_clearance=near_clearance,
                 )
             finally:
                 self._active_done = None
@@ -2244,7 +2355,8 @@ class Movement:
 
     async def _navigate_from(self, blocks, goal, rules, ticks, start, dimension, epoch, deadline, legacy, *,
                              instances, preferred_goal=None, on_plan: Callable[[NavigationPlan], None] | None = None,
-                             emit_event: Callable[[NavigationEvent], None] | None = None):
+                             emit_event: Callable[[NavigationEvent], None] | None = None,
+                             near_anchor=None, near_clearance=None):
         calibrated = not legacy and self._standard_ground_motion(blocks)
         graph = _StandingGraph(blocks, start, rules, allow_vertical=not (self._sprint_key or self._sneaking),
                                allow_gap=calibrated, allow_drop_two=calibrated, allow_ladder=calibrated,
@@ -2313,6 +2425,8 @@ class Movement:
                 return abandon("unknown", "dimension_changed")
             if self._stop_requested:
                 return outcome("stopped")
+            if near_anchor is not None and near_anchor() is None:
+                return abandon("unknown", "goal_unmatched")
             self._require_ground_input()
             if expired():
                 return outcome("budget")
@@ -3294,8 +3408,12 @@ class Movement:
                             return abandon("unreachable", "position_changed")
 
                         requested_goal = goal if preferred_goal is None else preferred_goal
-                        current_goal = self._navigation_goal(blocks, requested_goal, instances,
-                                                             visibility_budget=visibility_budget)
+                        if near_anchor is None:
+                            current_goal = self._navigation_goal(blocks, requested_goal, instances,
+                                                                 visibility_budget=visibility_budget)
+                        else:
+                            current_goal = _StandingNearState(requested_goal, point=near_anchor(),
+                                                              clearance=near_clearance)
                         target = current_goal.block_exists if legacy else True
                         status = stance_failure(blocks._flat_stance(current, allow_vegetation=True), target)
                         if status is not None:

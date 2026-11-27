@@ -4,7 +4,10 @@ import math
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from endpilot import BlockCollectionBatch, Bot, CountedBlockCollection, DropCollection, MixedCollectionBatch, NavigationRules
+from endpilot import (
+    BlockCollectionBatch, Bot, CollectionStorage, CountedBlockCollection, DropCollection,
+    MixedCollectionBatch, NavigationRules,
+)
 from endpilot.block_data import _catalog
 from endpilot.block_raycast import trace_blocks
 from endpilot.blocks import HASHED_AIR_RUNTIME_ID, Blocks
@@ -106,11 +109,11 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             pos=self.b.BlockPos(x=x, y=y, z=z), runtime_id=runtime_id, layer=layer,
         )
 
-    def pose(self, eye=(-2.5, 101.62, 3.5)):
+    def pose(self, eye=(-2.5, 101.62, 3.5), *, on_ground=True):
         b = self.b
         return b.MovePlayerPacket(
             player_id=PLAYER, pos=b.Vec3(x=eye[0], y=eye[1], z=eye[2]),
-            rot=b.Vec2(x=0, y=0), on_ground=True, reset_position=0,
+            rot=b.Vec2(x=0, y=0), on_ground=on_ground, reset_position=0,
         )
 
     def item(self, item_id=0, count=0):
@@ -769,14 +772,14 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         await self.finish_batch_break(TARGET, runtime_id=101, total=1, item_id=OAK_LOG_ITEM, net_id=15)
         return batch
 
-    def refill_window(self, *, position=REFILL_CHEST, iron_slot=4, item_id=445, container_id=2):
+    def refill_window(self, *, position=REFILL_CHEST, iron_slot=4, item_id=445, count=1, container_id=2):
         b = self.b
         x, y, z = position
         open_packet = b.ContainerOpenPacket(
             container_id=container_id, type=b.ContainerType.CONTAINER,
             pos=b.BlockPos(x=x, y=y, z=z), entity_unique_id=-1,
         )
-        stacks = {iron_slot: stack_descriptor(b, item_id, 1, 14)}
+        stacks = {iron_slot: stack_descriptor(b, item_id, count, 14)} if count else {}
         contents = b.InventoryContentPacket(
             inventory_id=container_id, slots=[stacks.get(index, self.item()) for index in range(27)],
             full_container_name=b.FullContainerName(name=b.ContainerEnumName.LEVEL_ENTITY_CONTAINER),
@@ -784,9 +787,9 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         )
         return open_packet, contents
 
-    async def refill_click(self, *, position=REFILL_CHEST):
+    async def refill_click(self, *, position=REFILL_CHEST, timeout=1):
         b = self.b
-        async with asyncio.timeout(1):
+        async with asyncio.timeout(timeout):
             click = await self.wire.outgoing.get()
             while isinstance(click, b.PlayerAuthInputPacket):
                 self.assertFalse(click.player_block_actions)
@@ -811,6 +814,12 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         action, = request.actions
         self.assertIsInstance(action, b.ItemStackRequestCereal.TakeActionData)
         self.assertEqual((action.source.slot, action.destination.slot, action.amount), (4, 3, 1))
+        return self.stack_response(request, (
+            ("LEVEL_ENTITY_CONTAINER", 4, 0, None), ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 3, 1, 20),
+        ))
+
+    def stack_response(self, request, slots):
+        b = self.b
         return b.ItemStackResponsePacket(responses=[b.ItemStackResponseInfo(
             client_request_id=request.client_request_id, result=b.ItemStackNetResult.SUCCESS,
             containers=[b.ItemStackResponseContainerInfo(
@@ -821,9 +830,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
                     custom_name=b.RedactableString(unredacted_string="", redacted_string=None),
                     durability_correction=0,
                 )],
-            ) for group, slot, count, net_id in (
-                ("LEVEL_ENTITY_CONTAINER", 4, 0, None), ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 3, 1, 20),
-            )],
+            ) for group, slot, count, net_id in slots],
         )])
 
     async def refill_close(self, *, confirm=True):
@@ -839,6 +846,438 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(row.status, row.tool_acquisition) for row in result.results],
                          [("collected", None), ("tool_unavailable", None)])
         self.assertTrue(self.wire.outgoing.empty())
+
+    async def start_storage_collection(
+        self, positions=(TARGET, SECOND_TARGET), *, dirt_count=64, slots=36, empty_slot=False, vein=False,
+        chest=REFILL_CHEST, terrain=(), ticks=0, search_radius=0, timeout=1,
+    ):
+        bot = await self.refill_bot(chest=chest)
+        inventory = [stack_descriptor(self.b, OAK_LOG_ITEM, 64, 100 + index) for index in range(slots)]
+        inventory[0] = stack_descriptor(self.b, 445, 1, 10)
+        inventory[2] = stack_descriptor(self.b, DIRT, dirt_count, 15)
+        inventory[12] = stack_descriptor(self.b, DIRT, 64, 112)
+        if empty_slot:
+            inventory[-1] = self.item()
+        await self.emit(
+            self.block(ORE), self.content(*inventory),
+            *(self.block(HASHED_AIR_RUNTIME_ID, position=(x, y, 3), layer=1)
+              for x in (-3, -2) for y in (99, 100, 101)),
+            *terrain,
+        )
+        storage = CollectionStorage(chest, "minecraft:dirt", inventory_slots=range(2, 3),
+                                    chest_slots=range(4, 5))
+        options = dict(storage=storage, ticks=ticks, search_radius=search_radius, timeout=timeout)
+        action = (bot.collect_vein_by_count(TARGET, item_id=DIRT, count=2, **options) if vein
+                  else bot.collect_targets(positions, **options))
+        task = asyncio.create_task(action)
+
+        async def settle_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        self.addAsyncCleanup(settle_task)
+        await self.expect_batch_start(TARGET)
+        await self.finish_batch_break(TARGET, runtime_id=101)
+        return bot, task
+
+    async def assert_storage_deposit(self, amount, *, chest_count=0, chest=REFILL_CHEST, click_timeout=1):
+        b = self.b
+        await self.refill_click(position=chest, timeout=click_timeout)
+        await self.emit(*self.refill_window(position=chest, item_id=DIRT, count=chest_count))
+        packet = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+        self.assertIsInstance(packet, b.ItemStackRequestPacket)
+        request, = packet.requests
+        action, = request.actions
+        self.assertIsInstance(action, b.ItemStackRequestCereal.PlaceActionData)
+        self.assertEqual((action.source.full_container_name.name.name, action.source.slot,
+                          action.destination.full_container_name.name.name, action.destination.slot, action.amount),
+                         ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 2, "LEVEL_ENTITY_CONTAINER", 4, amount))
+        return request
+
+    def storage_receipt(self, request, *, player_count, chest_count=None):
+        slots = [("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 2, player_count, 15 if player_count else None)]
+        if chest_count is not None:
+            slots.append(("LEVEL_ENTITY_CONTAINER", 4, chest_count, 21))
+        return self.stack_response(request, slots)
+
+    def assert_no_storage_followup(self):
+        b = self.b
+        while not self.wire.outgoing.empty():
+            packet = self.wire.outgoing.get_nowait()
+            self.assertIsInstance(packet, b.PlayerAuthInputPacket)
+            self.assertFalse(packet.player_block_actions)
+            self.assertNotIn(b.PlayerAuthInputPacket.InputData.UP, packet.input_data)
+
+    async def test_storage_does_not_open_when_the_same_item_has_stack_space(self):
+        bot, task = await self.start_storage_collection((TARGET,), dirt_count=63)
+        frame = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+        self.assertIsInstance(frame, self.b.PlayerAuthInputPacket)
+        self.assertIn(self.b.PlayerAuthInputPacket.InputData.UP, frame.input_data)
+        await self.emit(self.take(), self.slot(2, DIRT, 64, net_id=15))
+        first, = (await task).results
+        self.assertEqual((first.status, first.inventory_delta, first.storage_attempt), ("collected", 1, None))
+        self.assertIsNone(bot.open_window)
+        self.assert_no_storage_followup()
+
+    async def check_storage_requires_a_known_full_inventory(self, **inventory):
+        bot, task = await self.start_storage_collection(timeout=0.2, **inventory)
+        attempt, = (await task).results
+        self.assertEqual((attempt.status, attempt.storage_attempt), ("pickup_unconfirmed", None))
+        while not self.wire.outgoing.empty():
+            packet = self.wire.outgoing.get_nowait()
+            self.assertIsInstance(packet, self.b.PlayerAuthInputPacket)
+            self.assertFalse(packet.player_block_actions)
+        self.assertEqual(bot.observed_block(SECOND_TARGET).runtime_id, ORE)
+
+    async def test_storage_does_not_open_with_a_known_empty_slot(self):
+        await self.check_storage_requires_a_known_full_inventory(empty_slot=True)
+
+    async def test_storage_does_not_open_with_a_missing_slot_observation(self):
+        await self.check_storage_requires_a_known_full_inventory(slots=35)
+
+    async def test_storage_confirms_same_item_pickup_after_matching_close_before_counted_vein_resumes(self):
+        bot, task = await self.start_storage_collection(vein=True)
+        request = await self.assert_storage_deposit(64)
+        await self.emit(self.storage_receipt(request, player_count=0, chest_count=64))
+        close = await self.refill_close(confirm=False)
+        await self.emit(self.b.ContainerClosePacket(container_id=9))
+        self.assertFalse(task.done())
+        self.assertTrue(self.wire.outgoing.empty())
+        self.assertEqual(bot.open_window.container_id, close.container_id)
+
+        await self.emit(close)
+        await self.next_mixed_move()
+        self.assertEqual(bot.inventory_count(DIRT), 64)
+        await self.emit(self.take(), self.slot(2, DIRT, 1, net_id=25))
+        await self.expect_batch_start(SECOND_TARGET)
+        await self.finish_batch_break(SECOND_TARGET, runtime_id=102, total=2, net_id=25)
+
+        result = await task
+        first, second = result.results
+        self.assertEqual(result.collected_count, 2)
+        self.assertEqual((first.status, first.inventory_delta, first.collector_id), ("collected", 1, PLAYER))
+        self.assertEqual((first.drops[0].entity_id, first.drops[0].runtime_id), (1101, 101))
+        self.assertEqual((first.storage_attempt.stop_reason, first.storage_attempt.transfer.confirmed_count),
+                         ("complete", 64))
+        self.assertEqual((second.status, second.inventory_delta, second.storage_attempt), ("collected", 1, None))
+        self.assertIsNone(bot.open_window)
+        self.assert_no_storage_followup()
+
+    async def test_storage_retains_a_partial_receipt_without_mining_the_next_block(self):
+        bot, task = await self.start_storage_collection()
+        request = await self.assert_storage_deposit(1, chest_count=63)
+        await self.emit(self.storage_receipt(request, player_count=63, chest_count=64))
+        await self.refill_close()
+
+        attempt, = (await task).results
+        self.assertFalse(attempt.pickup_confirmed)
+        self.assertEqual((attempt.storage_attempt.stop_reason, attempt.storage_attempt.transfer.confirmed_count),
+                         ("destination_full", 1))
+        self.assertEqual(bot.observed_block(SECOND_TARGET).runtime_id, ORE)
+        self.assertIsNone(bot.open_window)
+        self.assert_no_storage_followup()
+
+    async def test_storage_routes_around_the_unmined_target_to_recover_the_original_drop(self):
+        chest = (-4, 100, 5)
+        columns = ((-3, 3), (-2, 3), (-3, 4), (-2, 4), (-3, 5), (-2, 5))
+        terrain = (
+            *(self.block(0x80310E21, position=(x, 99, z)) for x, z in columns),
+            *(self.block(HASHED_AIR_RUNTIME_ID, position=(x, y, z), layer=1)
+              for x, z in columns for y in (99, 100, 101)),
+            self.block(0x80310E21, position=(-3, 101, 4)),
+        )
+        bot, task = await self.start_storage_collection(chest=chest, terrain=terrain, ticks=120,
+                                                        search_radius=3, timeout=10)
+        request = await self.assert_storage_deposit(64, chest=chest, click_timeout=5)
+        await self.emit(self.storage_receipt(request, player_count=0, chest_count=64))
+        close = await self.refill_close(confirm=False)
+        with self.assertRaises(TimeoutError):
+            await asyncio.wait_for(self.wire.outgoing.get(), 0.05)
+        await self.emit(close)
+
+        async with asyncio.timeout(5):
+            while True:
+                frame = await self.wire.outgoing.get()
+                self.assertIsInstance(frame, self.b.PlayerAuthInputPacket)
+                self.assertFalse(frame.player_block_actions)
+                x, z = frame.pos.x, frame.pos.z
+                self.assertNotEqual((math.floor(x), math.floor(z)), (-3, 4),
+                                    "return movement crossed the still-solid mining target")
+                if math.hypot(x + 1.5, z - 3.5) <= 1.05:
+                    break
+        self.assertEqual(bot.observed_block(SECOND_TARGET).runtime_id, ORE)
+        await self.emit(self.take(101))
+        with self.assertRaises(TimeoutError):
+            await self.expect_batch_start(SECOND_TARGET, timeout=0.05)
+        self.assertFalse(task.done())
+        await self.emit(self.slot(2, DIRT, 1, net_id=25))
+        await self.expect_batch_start(SECOND_TARGET)
+        await self.finish_batch_break(SECOND_TARGET, runtime_id=102, total=2, net_id=25)
+
+        first, second = (await task).results
+        self.assertEqual((first.status, first.inventory_delta, first.collector_id), ("collected", 1, PLAYER))
+        self.assertEqual((first.drops[0].entity_id, first.drops[0].runtime_id), (1101, 101))
+        self.assertEqual((first.storage_attempt.stop_reason, first.storage_attempt.transfer.confirmed_count),
+                         ("complete", 64))
+        self.assertEqual((second.position, second.status), (SECOND_TARGET, "collected"))
+        self.assert_no_storage_followup()
+
+    async def test_storage_final_step_does_not_clip_a_solid_block_with_the_standing_body(self):
+        b = self.b
+        terrain = (
+            *(self.block(0x80310E21, position=(x, 99, z)) for x, z in ((-3, 4), (-2, 3), (-2, 4))),
+            *(self.block(HASHED_AIR_RUNTIME_ID, position=(x, y, 4), layer=1)
+              for x in (-3, -2) for y in (99, 100, 101)),
+        )
+        bot, task = await self.start_storage_collection(terrain=terrain, ticks=80, search_radius=1, timeout=4)
+        request = await self.assert_storage_deposit(64)
+        # The center line stays north of the solid block at z=4.
+        await self.emit(
+            b.MoveActorDeltaPacket(move_data=b.MoveActorDeltaData(
+                runtime_id=101, new_position_x=-1.48, new_position_y=100.05,
+                new_position_z=3.99, is_on_ground=True,
+            )),
+            self.storage_receipt(request, player_count=0, chest_count=64),
+        )
+        await self.refill_close()
+
+        def overlap_times(start, end, lower, upper):
+            if start == end:
+                return (0, 1) if lower < start < upper else (1, 0)
+            return sorted(((lower - start) / (end - start), (upper - start) / (end - start)))
+
+        previous_x, previous_z = -2.5, 3.5
+        async with asyncio.timeout(3):
+            while True:
+                frame = await self.wire.outgoing.get()
+                self.assertIsInstance(frame, b.PlayerAuthInputPacket)
+                self.assertFalse(frame.player_block_actions)
+                self.assertAlmostEqual(frame.pos.y, 101.62, places=3)
+                # Expand the known cube by the player's 0.3-block half-width.
+                x_enter, x_leave = overlap_times(previous_x, frame.pos.x, -3.3, -1.7)
+                z_enter, z_leave = overlap_times(previous_z, frame.pos.z, 3.7, 5.3)
+                self.assertGreaterEqual(max(0, x_enter, z_enter), min(1, x_leave, z_leave),
+                                        f"standing body clipped the intact target at {frame.pos}")
+                previous_x, previous_z = frame.pos.x, frame.pos.z
+                if math.hypot(frame.pos.x + 1.48, frame.pos.z - 3.99) <= 0.4:
+                    break
+
+        self.assertEqual(bot.observed_block(SECOND_TARGET).runtime_id, ORE)
+        await self.emit(self.take(101), self.slot(2, DIRT, 1, net_id=25))
+        await self.expect_batch_start(SECOND_TARGET, timeout=2)
+        await self.finish_batch_break(SECOND_TARGET, runtime_id=102, total=2, net_id=25)
+
+        first, second = (await task).results
+        self.assertEqual((first.status, first.collector_id, first.inventory_delta), ("collected", PLAYER, 1))
+        self.assertEqual((first.drops[0].entity_id, first.drops[0].runtime_id), (1101, 101))
+        self.assertEqual((first.storage_attempt.stop_reason, second.status), ("complete", "collected"))
+
+    async def start_storage_pickup_airborne(self, *, timeout):
+        bot, task = await self.start_storage_collection(timeout=timeout)
+        request = await self.assert_storage_deposit(64)
+        await self.emit(self.storage_receipt(request, player_count=0, chest_count=64))
+        await self.refill_close()
+        on_block = await self.next_mixed_move()
+        off_block = await self.next_mixed_move()
+        b = self.b
+        await self.emit(
+            b.CorrectPlayerMovePredictionPacket(
+                pos=b.Vec3(x=-2.5, y=102.62, z=4.41), pos_delta=b.Vec3(x=0, y=0, z=0),
+                on_ground=True, tick=on_block.client_tick,
+            ),
+            b.CorrectPlayerMovePredictionPacket(
+                pos=b.Vec3(x=-2.27, y=102.3157, z=3.42), pos_delta=b.Vec3(x=0, y=-0.08, z=0),
+                on_ground=False, tick=off_block.client_tick,
+            ),
+            self.take(101), self.slot(2, DIRT, 1, net_id=25),
+        )
+        self.assertIs(bot.movement_state.on_ground, False)
+        self.assertGreater(bot.movement_state.feet_position[1], SECOND_TARGET[1] + 0.5)
+        self.assertEqual(bot.inventory_count(DIRT), 65)
+        return bot, task, off_block.client_tick
+
+    async def test_storage_handoff_waits_for_a_fresh_grounded_pose_before_mining(self):
+        bot, task, airborne_tick = await self.start_storage_pickup_airborne(timeout=2)
+        b = self.b
+        landing = self.pose()
+
+        async def assert_waiting_to_land():
+            with self.assertRaises(TimeoutError):
+                await self.expect_batch_start(SECOND_TARGET, timeout=0.1)
+            self.assertFalse(task.done(), task.result() if task.done() else None)
+
+        await assert_waiting_to_land()
+        await self.emit(b.CorrectPlayerMovePredictionPacket(
+            pos=landing.pos, pos_delta=b.Vec3(x=0, y=0, z=0), on_ground=True, tick=airborne_tick - 1,
+        ))
+        await assert_waiting_to_land()
+        await self.emit(b.ServerPlayerPostMovePositionPacket(pos=landing.pos))
+        self.assertIs(bot.movement_state.on_ground, False)
+        self.assertAlmostEqual(bot.movement_state.feet_position[1], 100, places=3)
+        await assert_waiting_to_land()
+        await self.emit(self.pose(on_ground=False))
+        await assert_waiting_to_land()
+
+        await self.emit(b.CorrectPlayerMovePredictionPacket(
+            pos=landing.pos, pos_delta=b.Vec3(x=0, y=0, z=0), on_ground=True, tick=airborne_tick + 1,
+        ))
+        self.assertIs(bot.movement_state.on_ground, True)
+        await self.expect_batch_start(SECOND_TARGET)
+        await self.finish_batch_break(SECOND_TARGET, runtime_id=102, total=2, net_id=25)
+
+        first, second = (await task).results
+        self.assertEqual((first.status, first.collector_id, first.inventory_delta), ("collected", PLAYER, 1))
+        self.assertEqual((first.storage_attempt.stop_reason, first.storage_attempt.transfer.confirmed_count),
+                         ("complete", 64))
+        self.assertEqual((second.position, second.status), (SECOND_TARGET, "collected"))
+
+    async def test_storage_handoff_waits_after_position_only_update_over_known_air(self):
+        bot, task = await self.start_storage_collection(timeout=2)
+        request = await self.assert_storage_deposit(64)
+        await self.emit(self.storage_receipt(request, player_count=0, chest_count=64))
+        await self.refill_close()
+        frame = await self.next_mixed_move()
+        b = self.b
+        await self.emit(
+            self.take(101), self.slot(2, DIRT, 1, net_id=25),
+            b.ServerPlayerPostMovePositionPacket(pos=b.Vec3(x=-1.5, y=101.62, z=3.5)),
+        )
+        self.assertEqual(bot.inventory_count(DIRT), 65)
+        self.assertIs(bot.movement_state.on_ground, True)
+        x, y, z = bot.movement_state.feet_position
+        self.assertEqual((x, z), (-1.5, 3.5))
+        self.assertAlmostEqual(y, 100, places=3)
+        self.assertTrue(bot.observed_block((-2, 99, 3)).is_air)
+        with self.assertRaises(TimeoutError):
+            await self.expect_batch_start(SECOND_TARGET, timeout=0.15)
+        self.assertFalse(task.done(), task.result() if task.done() else None)
+
+        await self.emit(b.CorrectPlayerMovePredictionPacket(
+            pos=self.pose().pos, pos_delta=b.Vec3(x=0, y=0, z=0), on_ground=True, tick=frame.client_tick + 1,
+        ))
+        await self.expect_batch_start(SECOND_TARGET)
+        await self.finish_batch_break(SECOND_TARGET, runtime_id=102, total=2, net_id=25)
+
+        first, second = (await task).results
+        self.assertEqual((first.status, first.collector_id, first.inventory_delta), ("collected", PLAYER, 1))
+        self.assertEqual((first.storage_attempt.stop_reason, second.status), ("complete", "collected"))
+
+    async def test_storage_handoff_without_landing_preserves_the_confirmed_pickup(self):
+        bot, task, _ = await self.start_storage_pickup_airborne(timeout=0.5)
+        with self.assertRaises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(task), 0.15)
+        first = (await asyncio.wait_for(task, 2)).results[0]
+        self.assertEqual((first.status, first.collector_id, first.inventory_delta), ("collected", PLAYER, 1))
+        self.assertEqual((first.storage_attempt.stop_reason, first.storage_attempt.transfer.confirmed_count),
+                         ("complete", 64))
+        self.assertEqual(bot.observed_block(SECOND_TARGET).runtime_id, ORE)
+        self.assert_no_storage_followup()
+
+    async def test_storage_records_an_early_pickup_and_resumes_only_after_the_owned_close(self):
+        await self.check_storage_pickup_before_close(gain_before_close=True)
+
+    async def test_storage_waits_for_delayed_inventory_gain_after_the_owned_close(self):
+        await self.check_storage_pickup_before_close(gain_before_close=False)
+
+    async def check_storage_pickup_before_close(self, *, gain_before_close):
+        bot, task = await self.start_storage_collection()
+        request = await self.assert_storage_deposit(64)
+        await self.emit(self.storage_receipt(request, player_count=0, chest_count=64))
+        close = await self.refill_close(confirm=False)
+
+        async def assert_waiting_without_input():
+            with self.assertRaises(TimeoutError):
+                await asyncio.wait_for(self.wire.outgoing.get(), 0.05)
+            self.assertFalse(task.done())
+
+        gain = self.slot(2, DIRT, 1, net_id=25)
+        pickup = [self.take(101)]
+        if gain_before_close:
+            pickup.append(gain)
+        await self.emit(*pickup, self.b.ContainerClosePacket(container_id=9))
+        self.assertEqual(bot.inventory_count(DIRT), 65 if gain_before_close else 64)
+        self.assertEqual(bot.open_window.container_id, close.container_id)
+        await assert_waiting_without_input()
+
+        await self.emit(close)
+        if not gain_before_close:
+            self.assertIsNone(bot.open_window)
+            await assert_waiting_without_input()
+            await self.emit(gain)
+
+        async with asyncio.timeout(1):
+            frame = await self.wire.outgoing.get()
+            while isinstance(frame, self.b.MobEquipmentPacket):
+                frame = await self.wire.outgoing.get()
+        self.assertIsInstance(frame, self.b.PlayerAuthInputPacket)
+        self.assertNotIn(self.b.PlayerAuthInputPacket.InputData.UP, frame.input_data)
+        action, = frame.player_block_actions
+        self.assertEqual(action.player_action_type.name, "START_DESTROY_BLOCK")
+        self.assertEqual((action.pos.x, action.pos.y, action.pos.z), SECOND_TARGET)
+        await self.finish_batch_break(SECOND_TARGET, runtime_id=102, total=2, net_id=25)
+
+        first, second = (await task).results
+        self.assertEqual((first.status, first.collector_id, first.inventory_delta), ("collected", PLAYER, 1))
+        self.assertEqual((first.drops[0].entity_id, first.drops[0].runtime_id), (1101, 101))
+        self.assertEqual((first.storage_attempt.stop_reason, first.storage_attempt.transfer.confirmed_count),
+                         ("complete", 64))
+        self.assertEqual((second.status, second.inventory_delta), ("collected", 1))
+        self.assertIsNone(bot.open_window)
+        self.assert_no_storage_followup()
+
+    async def test_storage_does_not_resume_with_a_one_sided_deposit_receipt(self):
+        bot, task = await self.start_storage_collection()
+        request = await self.assert_storage_deposit(64)
+        await self.emit(self.storage_receipt(request, player_count=0))
+        close = await self.refill_close(confirm=False)
+        await self.emit(self.take(), self.slot(2, DIRT, 1, net_id=25), close)
+
+        attempt, = (await task).results
+        self.assertEqual((attempt.collector_id, attempt.inventory_delta, attempt.pickup_confirmed), (PLAYER, None, False))
+        self.assertEqual(attempt.storage_attempt.stop_reason, "unconfirmed")
+        step, = attempt.storage_attempt.transfer.steps
+        self.assertEqual((step.request_id, step.confirmed), (request.client_request_id.raw_id, None))
+        self.assertEqual(bot.observed_block(SECOND_TARGET).runtime_id, ORE)
+        self.assertIsNone(bot.open_window)
+        self.assert_no_storage_followup()
+
+    async def test_cancelled_storage_waits_for_close_and_keeps_the_late_receipt_unconfirmed(self):
+        bot, task = await self.start_storage_collection()
+        request = await self.assert_storage_deposit(64)
+        task.cancel("deposit pending")
+        close = await self.refill_close(confirm=False)
+        await self.emit(self.storage_receipt(request, player_count=0, chest_count=64),
+                        self.take(), self.slot(2, DIRT, 1, net_id=25))
+        self.assertEqual(bot.inventory_count(DIRT), 65)
+        self.assertFalse(task.done())
+        await self.emit(close)
+
+        with self.assertRaisesRegex(asyncio.CancelledError, "deposit pending") as caught:
+            await task
+        progress = caught.exception.collection_progress
+        self.assertEqual(progress.results, ())
+        self.assertFalse(progress.active.pickup_confirmed)
+        self.assertEqual(progress.active.storage_attempt.stop_reason, "cancelled")
+        step, = progress.active.storage_attempt.transfer.steps
+        self.assertEqual((step.request_id, step.confirmed), (request.client_request_id.raw_id, None))
+        self.assertEqual(bot.observed_block(SECOND_TARGET).runtime_id, ORE)
+        self.assertIsNone(bot.open_window)
+        self.assert_no_storage_followup()
+
+    async def test_storage_closes_without_depositing_after_reused_actor_ids(self):
+        bot, task = await self.start_storage_collection()
+        await self.refill_click()
+        opened, contents = self.refill_window(count=0)
+        await self.emit(opened, self.b.RemoveActorPacket(entity_id=1101),
+                        self.drop(position=(-1.5, 100.5, 3.5)), contents)
+        await self.refill_close()
+
+        attempt, = (await task).results
+        self.assertFalse(attempt.pickup_confirmed)
+        self.assertEqual(bot.inventory_count(DIRT), 128)
+        self.assertEqual(bot.observed_block(SECOND_TARGET).runtime_id, ORE)
+        self.assertIsNone(bot.open_window)
+        self.assert_no_storage_followup()
 
     async def test_batch_refills_between_confirmed_pickups_and_waits_for_owned_close(self):
         await self.check_batch_refill(await self.refill_bot(), REFILL_CHEST)

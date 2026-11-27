@@ -127,6 +127,45 @@ attempt ended before an outcome was observed. The exception's
 `collection_progress` includes known refill evidence in the attempted
 results and the active target.
 
+## Free inventory space during collection
+
+Pass a `CollectionStorage` to `collect_targets`, `collect_by_count`, or
+`collect_vein_by_count` to authorize a chest trip during a target attempt.
+
+```python
+from endpilot import CollectionStorage
+
+storage = CollectionStorage(
+    chest_position,
+    "minecraft:cobblestone",
+    inventory_slots=range(4, 5),
+    chest_slots=range(0, 1),
+)
+batch = await bot.collect_targets(positions, storage=storage)
+```
+
+The item must be an exact registered name or its transferable network ID.
+The bot considers storage after observing the break and a single new drop
+that is still present. It checks all 36 main inventory slots for a settled
+server snapshot with no available space for that drop. An empty slot or a
+same-item stack with possible spare capacity keeps collection on its usual
+pickup path. The trip uses the remaining break and pickup timeout and the
+target's movement and search budgets.
+
+The bot chooses the first eligible stack of the configured item in
+`inventory_slots` and attempts to store that entire stack in `chest_slots`.
+After confirming the whole transfer and receiving the chest's matching
+close, it continues with the original drop. The batch advances only after
+the bot confirms its own pickup of that instance and the matching inventory
+gain. Counted collection continues to count confirmed pickups even when the
+same item was stored during the detour.
+
+Read `BlockCollection.storage_attempt` for the trip's stop reason and
+confirmed transfer steps. When storage stops short, the batch ends with
+`pickup_unconfirmed`, or with `storage_incomplete` if the original pickup
+was already confirmed. The exception's `collection_progress` includes
+known storage and pickup evidence for the interrupted target.
+
 ## Collect blocks and existing drops together
 
 Pass block coordinates and current item snapshots from `bot.observed_drops`

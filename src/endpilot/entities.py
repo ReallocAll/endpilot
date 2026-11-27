@@ -1084,6 +1084,11 @@ class Entities:
             return state.position
         return None
 
+    def _item_navigation_anchor(self, state: EntityState) -> tuple[float, float, float] | None:
+        if state.entity_id not in self._rides:
+            return self._non_player_feet(state)
+        return None
+
     def _navigation_target(self, entity_id: int) -> tuple[object, tuple[float, float, float] | None] | None:
         """Resolve a visible instance and its feet when the position reference is known."""
         self._sync_reader_end()
@@ -1728,6 +1733,7 @@ class Entities:
             if getattr(self.packets.protocol, "number", None) == 2225:
                 body = _cursor_body(packet.data.data, b)
                 if not _player_flag(body.flags, b.ActorFlags.RIDING):
+                    self._actor_instances[state.runtime_id].feet_known = True
                     self._cursor_bodies[state.runtime_id] = body
         elif packet_id == b.AddPaintingPacket.ID:
             painting = _painting_snapshot(self.packets.protocol.decode(raw))
@@ -1832,7 +1838,8 @@ class Entities:
             state = self._by_runtime.get(runtime_id)
             if state is None:
                 return
-            instance = self._actor_instances.get(runtime_id) if state.actor_type in _ACTOR_SPAWN_FEET_TYPES else None
+            item = state.actor_type == "minecraft:item" and getattr(self.packets.protocol, "number", None) == 2225
+            instance = self._actor_instances.get(runtime_id) if item or state.actor_type in _ACTOR_SPAWN_FEET_TYPES else None
             if packet_id == b.MoveActorAbsolutePacket.ID:
                 position = (float(move.pos.x), float(move.pos.y), float(move.pos.z))
                 if instance is not None:
@@ -1848,7 +1855,7 @@ class Entities:
                 )
                 # A delta with omitted axes can only keep a previously verified feet position.
                 if instance is not None:
-                    if state.actor_type in _ACTOR_DELTA_FEET_TYPES and all(value is not None for value in axes):
+                    if (item or state.actor_type in _ACTOR_DELTA_FEET_TYPES) and all(value is not None for value in axes):
                         instance.feet_known = state.entity_id not in self._rides
                     elif state.actor_type == _SHEEP and any(value is not None for value in axes):
                         instance.feet_known = False
