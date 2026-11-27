@@ -173,9 +173,10 @@ from `bot.observed_drops` and returns the original snapshot when the server
 confirms this player's pickup of that instance. If the nearby direct path is
 blocked by observed terrain and the drop has a known ground anchor, the bot
 uses bounded ground navigation to reach a clear approach. A clear path or
-insufficient terrain observations keep the direct approach. The route and
-final approach share the call's movement and timeout budgets. Pass `ticks=0`
-to wait for the pickup without walking.
+insufficient terrain observations keep the direct approach. The bot also
+checks the path as the drop moves. Direct movement, routing, and the final
+approach share the call's movement and timeout budgets. Pass `ticks=0` to wait
+for the pickup without walking.
 
 ## Collect blocks and existing drops together
 

@@ -2003,9 +2003,10 @@ class Movement:
         runtime_id = target.runtime_id
         loop = asyncio.get_running_loop()
         blocked = False
+        direct_start_tick = None
 
         def resolve_in_time(selected: int) -> EntityState | None:
-            if deadline is None or loop.time() < deadline:
+            if not self._stop_requested and (deadline is None or loop.time() < deadline):
                 return resolve(selected)
             return None
 
@@ -2025,45 +2026,61 @@ class Movement:
             cell = self._foot_cell(origin)
             return cell if self._navigation_start_is_standing(blocks, cell) else None
 
-        def start_direct() -> bool:
-            nonlocal blocked
+        def direct_is_blocked(step: tuple[Point, Point] | None = None) -> bool:
             if not target.entity_id or (cell := standing_cell()) is None:
-                return True
+                return False
             anchor = supported_anchor(resolve_in_time(runtime_id))
             if anchor is None:
-                return True
+                return False
             x, _, z = self.input_position
             # The swept-cell scan is local even when the caller sets a larger route radius.
             if max(abs(math.floor(anchor[0]) - cell[0]),
                    abs(math.floor(anchor[2]) - cell[2])) > _DROP_DIRECT_PROBE_RADIUS:
-                return True
+                return False
             feet_y = cell[1]
-            blocked = blocks._flight_clearance((x, feet_y, z), (anchor[0], feet_y, anchor[2])) is False
+            return (blocks._flight_clearance((x, feet_y, z), (anchor[0], feet_y, anchor[2])) is False
+                    or (step is not None and step[0] != step[1] and blocks._flight_clearance(*step) is False))
+
+        def start_direct() -> bool:
+            nonlocal blocked, direct_start_tick
+            direct_start_tick = self._tick
+            blocked = direct_is_blocked()
             return not blocked
 
+        def direct_clearance(start: Point, end: Point) -> bool:
+            nonlocal blocked
+            # The same drop can move behind a wall after the initial clearance check.
+            blocked = direct_is_blocked((start, end))
+            return not blocked and (deadline is None or loop.time() < deadline)
+
         await self.follow_entity(entities, runtime_id, ticks=ticks, stop_distance=0.0,
-                                 _resolve=resolve_in_time, _start=start_direct)
-        if not blocked:
+                                 _resolve=resolve_in_time, _clearance=direct_clearance, _start=start_direct)
+        if not blocked or resolve_in_time(runtime_id) is None:
+            return
+        assert direct_start_tick is not None
+        remaining = ticks - (self._tick - direct_start_tick)
+        if remaining <= 0:
             return
 
         if on_route is not None:
             on_route()
         rules = NavigationRules() if search_radius is None else NavigationRules(search_radius=int(search_radius))
-        start_tick = None
+        route_start_tick = None
 
         def record_start(_plan: NavigationPlan) -> None:
-            nonlocal start_tick
-            if start_tick is None:
-                start_tick = self._tick
+            nonlocal route_start_tick
+            if route_start_tick is None:
+                route_start_tick = self._tick
 
         route = await self._navigate_drop(
-            blocks, target.entity_id, lambda: supported_anchor(resolve_in_time(runtime_id)), rules, ticks,
+            blocks, target.entity_id, lambda: supported_anchor(resolve_in_time(runtime_id)), rules, remaining,
             deadline=deadline, on_plan=record_start,
         )
         if route.status != "reached":
             return
-        remaining = ticks if start_tick is None else ticks - (self._tick - start_tick)
-        if remaining <= 0 or (deadline is not None and loop.time() >= deadline):
+        if route_start_tick is not None:
+            remaining -= self._tick - route_start_tick
+        if remaining <= 0 or resolve_in_time(runtime_id) is None:
             return
 
         def resolve_near(selected: int) -> EntityState | None:

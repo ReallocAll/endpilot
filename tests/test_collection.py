@@ -1960,9 +1960,12 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(packet.player_block_actions)
                 self.assertNotIn(self.b.PlayerAuthInputPacket.InputData.UP, packet.input_data)
 
-    async def check_drop_approaches_around_an_observed_wall(self, *, mixed):
+    async def check_drop_approaches_around_an_observed_wall(self, *, mixed, moving=False):
         bot = await self.public_bot()
+        b = self.b
         next_block = (-1, 100, 4)
+        far_side = (-0.5, 100.125, 3.5)
+        spawn = (-2.5, 100.125, 2.5) if moving else far_side
         columns = ((-3, 3), (-3, 2), (-2, 2), (-1, 2), (-1, 3), (-2, 3))
         await self.emit(
             self.block(ORE, position=next_block),
@@ -1970,7 +1973,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             *(self.block(0x80310E21, position=(x, 99, z)) for x, z in columns),
             *(self.block(HASHED_AIR_RUNTIME_ID, position=(x, y, z), layer=1)
               for x, z in columns for y in (99, 100, 101)),
-            self.drop(191, entity_id=5191, position=(-0.5, 100.125, 3.5)),
+            self.drop(191, entity_id=5191, position=spawn),
             self.slot(3),
         )
         drop = next(actor for actor in bot.observed_entities if actor.runtime_id == 191)
@@ -1983,6 +1986,17 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(task, return_exceptions=True)
 
         self.addAsyncCleanup(settle_task)
+        if moving:
+            first = await self.next_mixed_move()
+            self.assertAlmostEqual(first.pos.x, -2.5, places=5)
+            self.assertLess(first.pos.z, 3.5)
+            await self.emit(b.MoveActorDeltaPacket(move_data=b.MoveActorDeltaData(
+                runtime_id=drop.runtime_id, new_position_x=far_side[0], new_position_y=far_side[1],
+                new_position_z=far_side[2], is_on_ground=True,
+            )))
+            observed, = (actor for actor in bot.observed_entities if actor.runtime_id == drop.runtime_id)
+            self.assertEqual((observed.entity_id, observed.position), (drop.entity_id, far_side))
+
         async with asyncio.timeout(5):
             while True:
                 frame = await self.wire.outgoing.get()
@@ -2016,6 +2030,9 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_collect_drop_approaches_around_an_observed_wall(self):
         await self.check_drop_approaches_around_an_observed_wall(mixed=False)
+
+    async def test_collect_drop_replans_when_the_same_drop_moves_behind_a_wall(self):
+        await self.check_drop_approaches_around_an_observed_wall(mixed=False, moving=True)
 
     async def test_mixed_approaches_around_an_observed_wall_before_starting_the_next_block(self):
         await self.check_drop_approaches_around_an_observed_wall(mixed=True)
