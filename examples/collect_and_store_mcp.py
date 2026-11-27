@@ -92,8 +92,8 @@ class _CollectAndStoreTools:
             raise ToolError(str(error)) from error
 
     async def find_observed_blocks(self, name: str) -> _ObservedBlocks:
-        """Find up to 16 cached blocks by name within 8 blocks without loading terrain."""
-        result = self._connected_bot().find_blocks(name, radius=8, limit=16)
+        """Find up to 16 cached blocks by name within a 16-block radius without loading terrain."""
+        result = self._connected_bot().find_blocks(name, limit=16)
         return {"positions": [match.position for match in result.matches], "complete": result.complete}
 
     async def start_collect_and_store(
