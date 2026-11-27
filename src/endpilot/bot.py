@@ -56,6 +56,7 @@ from .movement import BlockApproach, FlightResult, ForwardInput, Movement, Movem
 from .navigation import NavigationEvent, NavigationGoal, NavigationPlan, NavigationResult, NavigationRules
 from .placement import (
     BoatPlacementResult, EntityPlacementResult, PlacementResult, observe_entity_placement, observe_placement,
+    WaterBucketFillResult, observe_water_bucket_fill,
 )
 from .player_state import DeathEvent, GlideBoostEvent, PlayerAbilities, PlayerEffect, PlayerState, PlayerVitals
 from .qa import PacketTimeline
@@ -2027,6 +2028,25 @@ class Bot:
             face=face, expected_runtime_id=expected_runtime_id, expected_block_name=expected_block_name,
             replace=replace, click_pos=click_pos, timeout=timeout,
         )
+
+    async def fill_water_bucket(
+        self, position: tuple[int, int, int], *, timeout: float = 15,
+    ) -> WaterBucketFillResult:
+        """Click an observed main-layer water source once with a selected empty bucket in Survival.
+
+        Aim at the source before calling. With stacked buckets, an observed empty
+        main inventory slot is required and the server chooses the destination.
+        The result preserves independent observations of source removal, the
+        selected slot's change, and the water bucket's destination. Those server
+        effects carry no request ID linking them to the click. On cancellation,
+        the exception's ``placement_progress`` holds the observations so far.
+        """
+        session = self._session
+        containers, blocks, creative = self._containers, self._blocks, self._creative
+        if session is None or containers is None or blocks is None or creative is None:
+            raise RuntimeError("player has not joined")
+        return await observe_water_bucket_fill(containers, blocks, creative, lambda: session.item_registry,
+                                               position, timeout=timeout)
 
     async def place_entity(
         self, position: tuple[int, int, int], *, timeout: float = 15,

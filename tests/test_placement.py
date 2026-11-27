@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 from endpilot import (
     BoatPlacementResult, Bot, EntityPlacementResult, ItemRegistrySnapshot, PlacementInventoryChange, PlacementResult,
+    WaterBucketFillResult,
 )
 from endpilot.blocks import Blocks, HASHED_AIR_RUNTIME_ID
 from endpilot.compression import PacketConnection
@@ -414,6 +415,163 @@ class PlacementTests(_PlacementHarness):
 WATER, FLOWING_WATER = 0x483B8B2A, 1334811448
 BOAT_ITEM, BOAT_SLOT = 496, 8
 BOAT_POSITION = (4.5, 90.875, 7.5)
+
+
+class WaterBucketFillTests(_PlacementHarness):
+    EMPTY_BUCKET, WATER_BUCKET = 320, 321
+    SOURCE_SLOT, OLD_PRODUCT = 2, 12
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        b = self.b
+        session = self.bot._session = JoinSession(self.packets, None, "bucket fill fixture")
+        self.stop_registry = self.packets.subscribe_raw(session._on_item_registry)
+        self.addCleanup(self.stop_registry)
+        await self.deliver(
+            b.ItemRegistryPacket(items=[
+                b.ItemData(id=self.EMPTY_BUCKET, name="minecraft:bucket"),
+                b.ItemData(id=self.WATER_BUCKET, name="minecraft:water_bucket"),
+            ]),
+            b.PlayerHotbarPacket(selected_slot=self.SOURCE_SLOT, container_id=b.ContainerID.INVENTORY,
+                                 should_select_slot=True),
+            self.block(SUPPORT, WATER), self.bucket(1), self.wet_bucket(self.OLD_PRODUCT),
+        )
+
+    def bucket(self, count, *, slot=SOURCE_SLOT):
+        return self.slot(count, slot=slot, item_id=self.EMPTY_BUCKET, block_runtime_id=0)
+
+    def wet_bucket(self, slot, *, net_id=22):
+        return self.slot(1, slot=slot, item_id=self.WATER_BUCKET, block_runtime_id=0, net_id=net_id)
+
+    def fill(self, timeout=0.6):
+        return self.bot.fill_water_bucket(SUPPORT, timeout=timeout)
+
+    async def test_one_bucket_reports_same_slot_and_world_in_either_order(self):
+        for world_first in (True, False):
+            with self.subTest(world_first=world_first):
+                await self.deliver(self.block(SUPPORT, WATER), self.bucket(1))
+                self.wire.sent.clear()
+                pending = await self.arm_click(self.fill())
+                sent, = self.wire.sent
+                tx = sent.variant_transaction
+                self.assertEqual((tx.pos.x, tx.pos.y, tx.pos.z), SUPPORT)
+                self.assertEqual((tx.face, tx.slot, tx.target_block_id), (1, self.SOURCE_SLOT, WATER))
+                self.assertEqual((tx.item.id, tx.item.stack_size), (self.EMPTY_BUCKET, 1))
+                self.assertEqual((tx.click_pos.x, tx.click_pos.y, tx.click_pos.z), (0.5, 1, 0.5))
+                await self.deliver(self.wet_bucket(self.OLD_PRODUCT, net_id=23), self.block(TARGET),
+                                   self.block(SUPPORT, layer=1))
+                world, inventory = self.block(SUPPORT), self.wet_bucket(self.SOURCE_SLOT)
+                first, second = (world, inventory) if world_first else (inventory, world)
+                await self.deliver(first)
+                self.assertFalse(pending.done())
+                await self.deliver(second)
+                result = await pending
+                self.assertIsInstance(result, WaterBucketFillResult)
+                self.assertEqual((result.submitted, result.reason, result.position), (True, "observations_complete", SUPPORT))
+                self.assertEqual((result.source_slot, result.water_bucket_slot), (self.SOURCE_SLOT, self.SOURCE_SLOT))
+                self.assertEqual(result.world_change.before.runtime_id, WATER)
+                self.assertTrue(result.world_change.after.is_air)
+                self.assertIs(result.selected_slot_change, result.water_bucket_change)
+                self.assertEqual((result.water_bucket_change.before.item_id, result.water_bucket_change.after.item_id),
+                                 (self.EMPTY_BUCKET, self.WATER_BUCKET))
+                self.assertFalse(self.inventory._slot_observers)
+                self.assertFalse(self.blocks._block_observers)
+                self.assertEqual(len(self.wire.sent), 1)
+
+    async def test_stack_observes_debit_and_discovers_actual_destination(self):
+        await self.deliver(self.bucket(5), self.bucket(0, slot=1), self.bucket(0, slot=10))
+        pending = await self.arm_click(self.fill())
+        await self.deliver(self.block(SUPPORT), self.wet_bucket(self.OLD_PRODUCT, net_id=23), self.wet_bucket(11))
+        await self.deliver(self.wet_bucket(10), self.wet_bucket(10))
+        self.assertFalse(pending.done())
+        await self.deliver(self.bucket(4))
+        result = await pending
+        self.assertEqual((result.submitted, result.reason, result.source_slot, result.water_bucket_slot),
+                         (True, "observations_complete", self.SOURCE_SLOT, 10))
+        self.assertEqual((result.selected_slot_change.before.count, result.selected_slot_change.after.count), (5, 4))
+        self.assertEqual((result.water_bucket_change.before.item_id, result.water_bucket_change.after.item_id),
+                         (0, self.WATER_BUCKET))
+        self.assertTrue(result.world_change.after.is_air)
+        self.assertEqual(len(self.wire.sent), 1)
+
+    async def test_two_new_product_slots_in_one_inventory_report_are_ambiguous(self):
+        b = self.b
+        def content(*updates):
+            items = [self.bucket(0).item for _ in range(36)]
+            for update in updates:
+                items[update.slot] = update.item
+            return b.InventoryContentPacket(inventory_id=b.ContainerID.INVENTORY, slots=items)
+
+        await self.deliver(content(self.bucket(5), self.wet_bucket(self.OLD_PRODUCT)))
+        pending = await self.arm_click(self.fill(timeout=0.1))
+        await self.deliver(self.block(SUPPORT), self.bucket(4))
+        await self.deliver(content(self.bucket(4), self.wet_bucket(1), self.wet_bucket(10),
+                                   self.wet_bucket(self.OLD_PRODUCT)))
+        result = await pending
+        self.assertEqual((result.submitted, result.reason, result.water_bucket_slot), (True, "timed_out", None))
+        self.assertIsNone(result.water_bucket_change)
+        self.assertEqual(result.selected_slot_change.after.count, 4)
+        self.assertTrue(result.world_change.after.is_air)
+
+    async def test_non_source_and_unconfirmed_space_reject_without_a_click(self):
+        for runtime_id in (FLOWING_WATER, STONE, HASHED_AIR_RUNTIME_ID):
+            await self.deliver(self.block(SUPPORT, runtime_id), self.block(SUPPORT, WATER, layer=1))
+            result = await self.fill()
+            self.assertEqual((result.submitted, result.reason), (False, "precondition_failed"))
+        await self.deliver(self.block(SUPPORT, WATER), self.bucket(5))
+        result = await self.fill()
+        self.assertEqual((result.submitted, result.reason), (False, "precondition_failed"))
+        await self.deliver(self.bucket(0, slot=1))
+        self.inventory._unconfirmed_transfer_slots.add(1)
+        result = await self.fill()
+        self.assertEqual((result.submitted, result.reason), (False, "precondition_failed"))
+        await self.deliver(self.bucket(1))
+        self.bot._creative.game_mode = self.b.GameType.CREATIVE
+        result = await self.fill()
+        self.assertEqual((result.submitted, result.reason), (False, "precondition_failed"))
+        self.assertEqual(self.wire.sent, [])
+
+    async def test_only_empty_destination_lost_before_write_rejects_without_a_click(self):
+        await self.deliver(self.bucket(5), self.bucket(0, slot=1))
+
+        async def sync(*, timeout):
+            await self.deliver(self.slot(3, slot=1))
+
+        self.movement.wait_for_position_sync.side_effect = sync
+        result = await self.fill()
+        self.assertEqual((result.submitted, result.reason), (False, "precondition_failed"))
+        self.assertEqual(self.wire.sent, [])
+
+    async def test_wrong_stack_debit_preserves_only_world_and_product_at_timeout(self):
+        await self.deliver(self.bucket(5), self.bucket(0, slot=1))
+        pending = await self.arm_click(self.fill(timeout=0.1))
+        await self.deliver(self.bucket(3), self.wet_bucket(1), self.block(SUPPORT))
+        result = await pending
+        self.assertEqual((result.submitted, result.reason, result.water_bucket_slot), (True, "timed_out", 1))
+        self.assertIsNone(result.selected_slot_change)
+        self.assertTrue(result.world_change.after.is_air)
+
+    async def test_dimension_change_preserves_inventory_and_excludes_later_world_evidence(self):
+        pending = await self.arm_click(self.fill())
+        await self.deliver(self.wet_bucket(self.SOURCE_SLOT), self.b.ChangeDimensionPacket(dimension_id=1),
+                           self.block(SUPPORT))
+        result = await pending
+        self.assertEqual((result.dimension_id, result.submitted, result.reason), (0, True, "dimension_changed"))
+        self.assertEqual(result.water_bucket_slot, self.SOURCE_SLOT)
+        self.assertIsNone(result.world_change)
+
+    async def test_failed_transport_does_not_claim_early_packet_evidence(self):
+        async def fail():
+            await self.deliver(self.wet_bucket(self.SOURCE_SLOT), self.block(SUPPORT))
+            raise OSError("transport failed while writing")
+
+        self.wire.before_send = fail
+        result = await self.fill()
+        self.assertEqual((result.submitted, result.reason), (None, "send_failed"))
+        self.assertIsNone(result.world_change)
+        self.assertIsNone(result.water_bucket_slot)
+        self.assertFalse(self.inventory._slot_observers)
+        self.assertFalse(self.blocks._block_observers)
 
 
 class _EntityPlacementHarness(_PlacementHarness):

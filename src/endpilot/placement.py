@@ -6,11 +6,11 @@ from dataclasses import dataclass
 from math import isfinite
 from typing import Literal
 
-from .blocks import FACE_OFFSETS, BlockChange, Blocks
+from .blocks import FACE_OFFSETS, BlockChange, BlockStateObservation, Blocks
 from .containers import Containers
 from .creative_inventory import CreativeInventory
 from .entities import Entities, EntitySpawn
-from .inventory import HeldItemStack, InventorySlotChange
+from .inventory import HeldItemStack, InventorySlotChange, _MAIN_INVENTORY_SIZE
 from .item_registry import ItemRegistrySnapshot
 from .protocol import RawPacket
 
@@ -61,6 +61,25 @@ class PlacementResult:
 
 
 @dataclass(frozen=True, slots=True)
+class WaterBucketFillResult:
+    """The click's submission state and independently observed water and inventory changes."""
+
+    dimension_id: int
+    position: tuple[int, int, int]
+    source_slot: int
+    submitted: bool | None
+    reason: _PlacementReason
+    world_change: BlockChange | None
+    selected_slot_change: InventorySlotChange | None
+    water_bucket_change: InventorySlotChange | None
+
+    @property
+    def water_bucket_slot(self) -> int | None:
+        """The observed destination when a single slot can be identified."""
+        return None if self.water_bucket_change is None else self.water_bucket_change.slot
+
+
+@dataclass(frozen=True, slots=True)
 class EntityPlacementResult:
     """Local submission and independent server observations for an entity placement click."""
 
@@ -89,6 +108,13 @@ def _item_identity(stack: HeldItemStack) -> tuple[int, int, int, bytes]:
 def _one_item_decrease(before: HeldItemStack, after: HeldItemStack | None) -> bool:
     return (after is not None and after.count == before.count - 1
             and (after.item_id == 0 if before.count == 1 else _item_identity(after) == _item_identity(before)))
+
+
+def _is_water_source(state: BlockStateObservation | None) -> bool:
+    if state is None or state.name != "minecraft:water":
+        return False
+    depth = state.properties.get("liquid_depth")
+    return type(depth) is int and depth == 0
 
 
 async def _wait_for_placement[Result](
@@ -282,6 +308,167 @@ async def observe_placement(
     )
 
 
+async def observe_water_bucket_fill(
+    containers: Containers,
+    blocks: Blocks,
+    creative: CreativeInventory,
+    get_item_registry: Callable[[], ItemRegistrySnapshot | None],
+    position: tuple[int, int, int],
+    *,
+    timeout: float = 15,
+) -> WaterBucketFillResult:
+    """Click one main-layer source and observe its removal and the inventory exchange."""
+    if not isfinite(timeout) or timeout < 0:
+        raise ValueError("water bucket fill timeout must be a finite nonnegative number")
+
+    inventory, movement, packets = containers.inventory, containers.movement, containers.packets
+    binding = packets.protocol.binding
+    x, y, z = position
+    position = (x, y, z)
+    dimension = blocks.dimension_id
+    slot = inventory.selected_slot
+    selection_revision = inventory.selection_revision
+    clicked = blocks.observed_block(position)
+    submitted = False
+    world_change = selected_change = None
+    products: dict[int, InventorySlotChange] = {}
+
+    def result(reason: _PlacementReason) -> WaterBucketFillResult:
+        product = next(iter(products.values())) if len(products) == 1 else None
+        return WaterBucketFillResult(dimension, position, slot, submitted, reason, world_change, selected_change, product)
+
+    def name_for(stack: HeldItemStack) -> str | None:
+        registry = get_item_registry()
+        return None if registry is None or stack.item_id == 0 else registry.name_for_id(stack.item_id)
+
+    def confirmed_stack(index: int) -> HeldItemStack | None:
+        if (index in inventory._drop_key_counts or index in inventory._unconfirmed_transfer_slots
+                or inventory._requests_for_endpoints(((None, index),))):
+            return None
+        return inventory._observed_stack(index)
+
+    def is_empty(stack: HeldItemStack | None) -> bool:
+        return stack is not None and not (stack.item_id or stack.count or stack.net_id)
+
+    def empty_destinations() -> set[int]:
+        return {index for index in range(_MAIN_INVENTORY_SIZE) if index != slot and is_empty(confirmed_stack(index))}
+
+    if blocks._closed or inventory._request_stream_ended or packets._reader_end_result()[0]:
+        return result("disconnected")
+    if movement._changing_dimension:
+        return result("dimension_changed")
+    before = confirmed_stack(slot)
+    if (creative.game_mode != binding.GameType.SURVIVAL or before is None or before.count <= 0 or clicked is None
+            or name_for(before) != "minecraft:bucket" or not _is_water_source(blocks.observed_block_state(position))):
+        return result("precondition_failed")
+    stacked = before.count > 1
+    if stacked and not empty_destinations():
+        return result("precondition_failed")
+    if timeout == 0:
+        return result("timed_out")
+
+    loop = asyncio.get_running_loop()
+    finished = loop.create_future()
+    empty_slots: set[int] = set()
+    selected_baseline = None
+
+    def finish(reason: _PlacementReason) -> None:
+        if not finished.done():
+            finished.set_result(reason)
+
+    def complete_if_observed() -> None:
+        if world_change is not None and selected_change is not None and len(products) == 1:
+            finish("observations_complete")
+
+    def on_block(change: BlockChange) -> None:
+        nonlocal world_change
+        if (submitted is True and not finished.done() and world_change is None
+                and change.before == clicked and change.after.is_air is True):
+            world_change = change
+            loop.call_soon(complete_if_observed)
+
+    def on_inventory(change: InventorySlotChange) -> None:
+        nonlocal selected_change
+        if submitted is not True or finished.done():
+            return
+        index, previous, after = change.slot, change.before, change.after
+        if index != slot and index not in empty_slots:
+            return
+        if after is None or confirmed_stack(index) != after:
+            empty_slots.discard(index)
+            return
+        water_bucket = after.count == 1 and name_for(after) == "minecraft:water_bucket"
+        if index == slot:
+            if (selected_change is not None or selected_baseline is None or previous is None
+                    or previous.count != selected_baseline.count
+                    or _item_identity(previous) != _item_identity(selected_baseline)):
+                return
+            exchanged = _one_item_decrease(previous, after) if stacked else water_bucket
+            if exchanged:
+                selected_change = change
+                if not stacked:
+                    products[index] = change
+        elif not is_empty(after):
+            empty_slots.remove(index)
+            if water_bucket and is_empty(previous):
+                products[index] = change
+        # A complete inventory packet can publish several slot changes in one dispatch.
+        loop.call_soon(complete_if_observed)
+
+    def on_packet(raw: RawPacket) -> None:
+        if raw.packet_id == binding.ChangeDimensionPacket.ID:
+            finish("dimension_changed")
+        elif raw.packet_id == binding.DisconnectPacket.ID:
+            finish("disconnected")
+
+    def before_send() -> None:
+        nonlocal submitted, empty_slots
+        if movement._changing_dimension or blocks.dimension_id != dimension:
+            finish("dimension_changed")
+        if blocks._closed:
+            finish("disconnected")
+        if (finished.done() or creative.game_mode != binding.GameType.SURVIVAL
+                or inventory.selection_revision != selection_revision or confirmed_stack(slot) != before
+                or name_for(before) != "minecraft:bucket" or blocks.observed_block(position) != clicked):
+            raise _PreconditionChanged
+        if stacked:
+            empty_slots = empty_destinations()
+            if not empty_slots:
+                raise _PreconditionChanged
+        submitted = None
+
+    async def submit() -> _PlacementReason | None:
+        nonlocal submitted, selected_baseline, empty_slots
+        try:
+            await movement.wait_for_position_sync(timeout=None)
+        except ConnectionError:
+            return "disconnected"
+        if movement.input_position is None:
+            return "precondition_failed"
+        try:
+            await containers.click_block(position, blocks, face=1, _before_send=before_send)
+        except _PreconditionChanged:
+            return "precondition_failed"
+        except Exception:
+            if submitted is False:
+                raise
+            return "send_failed"
+        if confirmed_stack(slot) == before:
+            selected_baseline = before
+        empty_slots = {index for index in empty_slots if is_empty(confirmed_stack(index))}
+        submitted = True
+        return None
+
+    unsubscribe_block = blocks.subscribe_block_changes(on_block, dimension_id=dimension, position=position, layer=0)
+    unsubscribe_inventory = inventory.subscribe_inventory_changes(on_inventory)
+    unsubscribe_packet = packets.subscribe_raw(on_packet)
+    unsubscribe_end = packets.subscribe_reader_end(lambda _cause: finish("disconnected"))
+    return await _wait_for_placement(
+        submit(), finished, timeout, result, unsubscribe_block, unsubscribe_inventory, unsubscribe_packet,
+        unsubscribe_end,
+    )
+
+
 async def observe_entity_placement[Result: EntityPlacementResult](
     containers: Containers,
     blocks: Blocks,
@@ -338,8 +525,7 @@ async def observe_entity_placement[Result: EntityPlacementResult](
     clearance = ()
     match item_name:
         case _ if item_name in _WATERCRAFT:
-            depth = clicked.properties.get("liquid_depth")
-            if clicked.name != "minecraft:water" or type(depth) is not int or depth != 0:
+            if not _is_water_source(clicked):
                 return result("precondition_failed")
             actor_type, hull_variant = _WATERCRAFT[item_name]
             if not legacy_oak_boat:
