@@ -34,9 +34,10 @@ from .creative_inventory import CreativeCatalog, CreativeClearResult, CreativeEn
 from .dimension_transition import DimensionTransition
 from .enchanting import Enchanting, EnchantOption
 from .entities import (
-    Entities, EntityActorEvent, EntityAttributeUpdate, EntityCursorResult, EntityEffectUpdate, EntityHealthEvent,
-    EntityHealthEventKind, EntityMovement, EntitySpawn, EntityState, EntitySwing, ItemPickup, PlayerEquipmentSnapshot,
-    PlayerListChange, PlayerListEntry, VehicleLink, VehicleLinkChange,
+    Entities, EntityActorEvent, EntityAttributeUpdate, EntityCriticalEffect, EntityCriticalEffectKind,
+    EntityCursorResult, EntityEffectUpdate, EntityHealthEvent, EntityHealthEventKind, EntityMovement, EntitySpawn,
+    EntityState, EntitySwing, ItemPickup, PlayerEquipmentSnapshot, PlayerListChange, PlayerListEntry, VehicleLink,
+    VehicleLinkChange,
 )
 from .expression import skin_packet
 from .fishing import Fishing, FishingResult
@@ -2968,6 +2969,33 @@ class Bot:
         if self._entities is None:
             raise RuntimeError("player has not joined")
         return self._entities.subscribe_entity_swings(callback, runtime_id=runtime_id)
+
+    async def wait_for_entity_critical_effect(
+        self, *, kind: EntityCriticalEffectKind | None = None, runtime_id: int | None = None,
+        timeout: float | None = 15,
+    ) -> EntityCriticalEffect:
+        """Wait for the next matching server critical-hit visual in the current dimension.
+
+        A runtime filter binds the current entity instance or the local player.
+        Without that filter, the visual can refer to an unobserved actor.
+        """
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return await self._entities.wait_for_entity_critical_effect(kind=kind, runtime_id=runtime_id, timeout=timeout)
+
+    def subscribe_entity_critical_effects(
+        self, callback: Callable[[EntityCriticalEffect], None], *,
+        kind: EntityCriticalEffectKind | None = None, runtime_id: int | None = None,
+    ) -> Callable[[], None]:
+        """Deliver critical-hit visuals to a synchronous callback and return an idempotent unsubscribe function.
+
+        A runtime-filtered subscription ends when the actor leaves view, its
+        identity changes, or the dimension changes. Other subscriptions last
+        until the session ends or they are unsubscribed.
+        """
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return self._entities.subscribe_entity_critical_effects(callback, kind=kind, runtime_id=runtime_id)
 
     async def wait_for_entity_health_event(
         self, *, kind: EntityHealthEventKind | None = None, runtime_id: int | None = None, timeout: float | None = 15,

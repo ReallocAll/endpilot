@@ -1,4 +1,4 @@
-"""Exercise incoming swings through the public SDK and the native packet codec."""
+"""Exercise incoming animations through the public SDK and the native packet codec."""
 
 import asyncio
 from dataclasses import FrozenInstanceError
@@ -8,7 +8,7 @@ from uuid import UUID
 
 from bedrock_protocol import ActorSwingSource, DecodeError, HandSlot
 
-from endpilot import Bot, EntitySwing
+from endpilot import Bot, EntityCriticalEffect, EntityHealthEvent, EntitySwing
 from endpilot.compression import PacketConnection
 from endpilot.entities import Entities
 from endpilot.protocol import Protocol, RawPacket, _write_uint, write_batch
@@ -56,6 +56,16 @@ class EntityAnimationTests(unittest.IsolatedAsyncioTestCase):
 
     async def arm(self, runtime_id=None):
         task = asyncio.create_task(self.bot.wait_for_entity_swing(runtime_id=runtime_id, timeout=1))
+        self.addAsyncCleanup(self.cancel, task)
+        await asyncio.sleep(0)
+        return task
+
+    def critical(self, runtime_id=8, *, action="CRITICAL_HIT", data=55.0):
+        packet = self.b.AnimatePacket
+        return packet(action=packet.Action[action], runtime_id=runtime_id, data=data)
+
+    async def arm_critical(self, **filters):
+        task = asyncio.create_task(self.bot.wait_for_entity_critical_effect(timeout=1, **filters))
         self.addAsyncCleanup(self.cancel, task)
         await asyncio.sleep(0)
         return task
@@ -324,3 +334,136 @@ class EntityAnimationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(caught.exception.__cause__, error)
         with self.assertRaises(OSError):
             await self.bot.close()
+
+    async def test_critical_effects_preserve_order_data_and_packet_time_entity(self):
+        b = self.b
+        await self.deliver(self.spawn())
+        original, = self.bot.observed_entities
+        seen, filtered, swings, health = [], [], [], []
+        self.bot.subscribe_entity_critical_effects(seen.append)
+        self.bot.subscribe_entity_critical_effects(filtered.append, kind="magic_critical", runtime_id=8)
+        self.bot.subscribe_entity_swings(swings.append)
+        self.bot.subscribe_entity_health_events(health.append)
+        waiting = await self.arm_critical(kind="magic_critical", runtime_id=8)
+
+        hurt = b.ActorEventPacket(runtime_id=8, event_id=b.ActorEvent.HURT)
+        swing = self.swing(source=ActorSwingSource.ATTACK)
+        await self.deliver(swing, hurt, self.swing(action="WAKE_UP"))
+        self.assertEqual(seen, [])
+        self.assertEqual(swings, [EntitySwing(8, 108, original, ActorSwingSource.ATTACK, HandSlot.MAINHAND)])
+        self.assertEqual(health, [EntityHealthEvent("hurt", original)])
+
+        unknown = self.critical(99, action="MAGIC_CRITICAL_HIT", data=3.25)
+        wrong_kind = self.critical(data=-2.5)
+        await self.deliver(unknown, wrong_kind)
+        self.assertFalse(waiting.done())
+        self.assertEqual(filtered, [])
+
+        raw = []
+        self.bot.packets.subscribe_raw(raw.append)
+        magic = self.critical(action="MAGIC_CRITICAL_HIT", data=15.0)
+        move = b.MoveActorAbsolutePacket(move_data=b.MoveActorAbsoluteData(
+            runtime_id=8, pos=b.Vec3(x=3.5, y=100, z=1.5),
+        ))
+        critical = self.critical()
+        await self.deliver(magic, magic, hurt, move, critical)
+
+        current, = self.bot.observed_entities
+        self.assertEqual(current.position, (3.5, 100.0, 1.5))
+        first_magic = EntityCriticalEffect("magic_critical", 8, 108, original, 15.0)
+        self.assertEqual(seen, [
+            EntityCriticalEffect("magic_critical", 99, None, None, 3.25),
+            EntityCriticalEffect("critical", 8, 108, original, -2.5),
+            first_magic,
+            first_magic,
+            EntityCriticalEffect("critical", 8, 108, current, 55.0),
+        ])
+        self.assertEqual(filtered, [first_magic, first_magic])
+        self.assertEqual(await waiting, first_magic)
+        self.assertEqual(seen[2].entity.position, (1.5, 100.0, 1.5))
+        with self.assertRaises(FrozenInstanceError):
+            seen[2].data = 0.0
+        self.assertEqual(len(swings), 1)
+        self.assertEqual(health, [EntityHealthEvent("hurt", original)] * 2)
+        self.assertEqual(
+            [packet for packet in raw if packet.packet_id == b.AnimatePacket.ID],
+            [self.bot.protocol.encode(packet) for packet in (magic, magic, critical)],
+        )
+
+    async def test_critical_effects_allow_self_and_reject_invalid_filters(self):
+        subscribe = self.bot.subscribe_entity_critical_effects
+        wait = self.bot.wait_for_entity_critical_effect
+        for filters, error in (({"kind": "hurt"}, ValueError), ({"runtime_id": 99}, LookupError)):
+            with self.subTest(filters=filters):
+                with self.assertRaises(error):
+                    subscribe(self.fail, **filters)
+                with self.assertRaises(error):
+                    await wait(timeout=0, **filters)
+
+        seen = []
+        subscribe(seen.append, runtime_id=7)
+        waiting = await self.arm_critical(runtime_id=7)
+        effect = self.critical(7)
+        await self.bot.packets.send(effect)
+        await self.deliver()
+        self.assertEqual(self.wire.sent[-1].action, effect.action)
+        self.assertEqual(seen, [])
+        self.assertFalse(waiting.done())
+        await self.deliver(effect)
+        expected = EntityCriticalEffect("critical", 7, 17, None, 55.0)
+        self.assertEqual(seen, [expected])
+        self.assertEqual(await waiting, expected)
+
+    async def test_critical_effect_scopes_end_on_removal_or_instance_replacement(self):
+        await self.deliver(self.spawn())
+        old, seen = [], []
+        subscribe = self.bot.subscribe_entity_critical_effects
+        subscribe(old.append, runtime_id=8)
+        subscribe(seen.append, kind="critical")
+        removed = await self.arm_critical(runtime_id=8)
+        await self.deliver(self.b.RemoveActorPacket(entity_id=108), self.critical(),
+                           self.spawn(entity_id=109), self.critical())
+        with self.assertRaisesRegex(LookupError, "no longer observed"):
+            await removed
+
+        subscribe(old.append, runtime_id=8)
+        replaced = await self.arm_critical(runtime_id=8)
+        await self.deliver(self.spawn(entity_id=110), self.critical())
+        with self.assertRaisesRegex(LookupError, "no longer observed"):
+            await replaced
+        self.assertEqual(old, [])
+        self.assertEqual([event.entity_id for event in seen], [None, 109, 110])
+
+        fresh = await self.arm_critical(runtime_id=8)
+        await self.deliver(self.critical())
+        self.assertEqual(await fresh, seen[-1])
+        self.assertEqual(seen[-1].entity_id, 110)
+
+    async def test_critical_effect_waits_end_on_dimension_change_and_close(self):
+        await self.deliver(self.spawn())
+        seen, scoped = [], []
+        subscribe = self.bot.subscribe_entity_critical_effects
+        stop = subscribe(seen.append, kind="critical")
+        subscribe(scoped.append, runtime_id=8)
+        cancelled = await self.arm_critical()
+        cancelled.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled
+
+        waits = (await self.arm_critical(), await self.arm_critical(runtime_id=8))
+        await self.deliver(self.b.ChangeDimensionPacket(dimension_id=1), self.critical(),
+                           self.spawn(entity_id=109), self.critical())
+        for waiting in waits:
+            with self.assertRaisesRegex(RuntimeError, "dimension changed"):
+                await waiting
+        self.assertEqual(scoped, [])
+        self.assertEqual([event.entity_id for event in seen], [None, 109])
+
+        stop()
+        stop()
+        await self.deliver(self.critical())
+        self.assertEqual(len(seen), 2)
+        closing = await self.arm_critical()
+        await self.bot.close()
+        with self.assertRaises(ConnectionError):
+            await closing

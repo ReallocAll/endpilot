@@ -216,6 +216,36 @@ an unsubscribe function. A filtered subscription ends when its actor leaves
 view or the dimension changes. An observed swing reports the animation.
 Use separate observations to confirm a hit or damage.
 
+## Observe critical-hit visuals
+
+`await bot.wait_for_entity_critical_effect(kind="critical", runtime_id=runtime_id)`
+waits for the next matching server animation on the target actor. Use
+`kind="magic_critical"` for the magic critical visual, or omit `kind` to accept
+both. These correspond to `CRITICAL_HIT` and `MAGIC_CRITICAL_HIT` in
+`AnimatePacket`. Each matching packet produces one `EntityCriticalEffect`.
+Subscriptions preserve duplicates and arrival order. Use hurt events and
+health updates to observe damage separately.
+
+An `EntityCriticalEffect` is immutable and contains the visual `kind`, the
+target `runtime_id`, its unique `entity_id` when known, an optional packet-time
+`entity` snapshot, and the decoded `data` float. For the local player, the
+effect carries the bot's IDs and `entity=None`. For an unobserved actor, it
+carries the packet's runtime ID with `entity_id=None` and `entity=None`.
+
+`bot.subscribe_entity_critical_effects(callback, kind=..., runtime_id=...)`
+uses the same filters, delivers events to a synchronous callback, and returns
+an idempotent unsubscribe function. Both methods send no packets. A runtime
+filter binds the local player or the currently observed actor instance.
+Omit it to include unobserved actors and to keep a subscription active across
+dimension changes.
+
+An unsupported `kind` raises `ValueError`. A runtime filter for an unobserved
+actor raises `LookupError`. If a filtered actor leaves view or is replaced,
+its subscription ends and its wait raises `LookupError`. A dimension change
+ends runtime-filtered subscriptions and all pending waits, which raise
+`RuntimeError`. A deadline raises `TimeoutError`. Connection end closes all
+subscriptions and raises `ConnectionError` in pending waits.
+
 ## Observe entity hurt and death
 
 `await bot.wait_for_entity_health_event(kind="hurt", runtime_id=runtime_id)`

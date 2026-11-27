@@ -23,9 +23,9 @@ from .creative_inventory import (
 from .dimension_transition import DimensionTransition
 from .enchanting import EnchantOption, Enchantment
 from .entities import (
-    EntityActorEvent, EntityAttribute, EntityAttributeModifier, EntityAttributeUpdate, EntityCursorResult,
-    EntityEffectUpdate, EntityHealthEvent, EntitySwing, ItemPickup, PaintingSnapshot, PlayerEquipmentSnapshot,
-    PlayerListChange, PlayerListEntry, VehicleLink, VehicleLinkChange,
+    EntityActorEvent, EntityAttribute, EntityAttributeModifier, EntityAttributeUpdate, EntityCriticalEffect,
+    EntityCursorResult, EntityEffectUpdate, EntityHealthEvent, EntitySwing, ItemPickup, PaintingSnapshot,
+    PlayerEquipmentSnapshot, PlayerListChange, PlayerListEntry, VehicleLink, VehicleLinkChange,
 )
 from .fishing import FishingResult
 from .inventory import HeldItemSnapshot, HeldItemStack, InventorySlotChange
@@ -112,6 +112,7 @@ __all__ = [
     "EntityAttribute",
     "EntityAttributeModifier",
     "EntityAttributeUpdate",
+    "EntityCriticalEffect",
     "EntityCursorResult",
     "EntityEffectUpdate",
     "EntityHealthEvent",
