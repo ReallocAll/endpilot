@@ -31,7 +31,12 @@ _WEB_DROP_TOOLS = {
     }),
     "minecraft:web": frozenset({"minecraft:shears"}),
 }
-_DIAMOND_ORES = frozenset({"minecraft:diamond_ore", "minecraft:deepslate_diamond_ore"})
+_SILK_TOUCH_ORE_DROPS = {
+    "minecraft:diamond_ore": "minecraft:diamond",
+    "minecraft:deepslate_diamond_ore": "minecraft:diamond",
+    "minecraft:iron_ore": "minecraft:raw_iron",
+    "minecraft:deepslate_iron_ore": "minecraft:raw_iron",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,7 +190,8 @@ class HarvestTools:
         requested = self._item_names.get(requested_drop_id)
         if state.name == "minecraft:web" and (required := _WEB_DROP_TOOLS.get(requested)) is not None:
             return replace(rule, required=required if rule.required is None else rule.required & required)
-        if state.name in _DIAMOND_ORES and requested in ("minecraft:diamond", state.name):
+        ordinary_drop = _SILK_TOUCH_ORE_DROPS.get(state.name)
+        if ordinary_drop is not None and requested in (ordinary_drop, state.name):
             return _SilkTouchRule(rule.required, rule.speeds, silk_touch=requested == state.name)
         return None
 
