@@ -2387,32 +2387,39 @@ class Bot:
             targets, count=count, ticks=ticks, search_radius=search_radius, timeout=timeout,
         )
 
-    def best_harvest_tool(self, position: tuple[int, int, int]) -> HarvestTool | None:
-        """Rank eligible vanilla tools by base speed and applicable Efficiency I–V.
+    def best_harvest_tool(
+        self, position: tuple[int, int, int], *, require_harvest: bool = True,
+    ) -> HarvestTool | None:
+        """Rank vanilla tools for the observed block without sending packets.
 
-        Pickaxes, axes, shovels, hoes and shears receive the bonus where their
-        base speed exceeds bare hands. The returned speed_multiplier is the base speed.
+        By default only tools that can harvest the block are eligible. Pass
+        require_harvest=False to rank ordinary breaking progress, including
+        choices that yield no drop. Pickaxes, axes, shovels, hoes and shears
+        receive the Efficiency I–V bonus where their base speed exceeds bare
+        hands. The returned speed_multiplier is the base speed.
         Bare hands have item_name=None. An absent candidate, unknown block or
         protocol other than 2225 returns None.
         """
         if self._harvest_tools is None:
             raise RuntimeError("player has not joined")
-        return self._harvest_tools.best(position)
+        return self._harvest_tools.best(position, require_harvest=require_harvest)
 
     async def equip_harvest_tool(
-        self, position: tuple[int, int, int], *, timeout: float = 15
+        self, position: tuple[int, int, int], *, timeout: float = 15, require_harvest: bool = True,
     ) -> HarvestTool | None:
         """Select the best tool or an empty hand for the observed block.
 
-        Await inventory transfers if needed and close any inventory screen opened
-        for the transfer. The returned slot is the requested hotbar slot.
+        Pass require_harvest=False to use the breaking-progress ranking from
+        best_harvest_tool. Await inventory transfers if needed and close any
+        inventory screen opened for the transfer. The returned slot is the
+        requested hotbar slot.
         Return None when no candidate or usable slot is known. A changed stack
         or a rejected or unconfirmed transfer raises RuntimeError. Each server
         wait uses timeout.
         """
         if self._harvest_tools is None:
             raise RuntimeError("player has not joined")
-        return await self._harvest_tools.equip(position, timeout=timeout)
+        return await self._harvest_tools.equip(position, timeout=timeout, require_harvest=require_harvest)
 
     async def place_against(
         self, against: BlockUpdate | BlockObservation, *, face: int = 1,

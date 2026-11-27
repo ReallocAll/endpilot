@@ -166,14 +166,15 @@ class HarvestTools:
         self._item_names = item_names
         self._equip_lock = asyncio.Lock()
 
-    def best(self, position: tuple[int, int, int]) -> HarvestTool | None:
-        return self._best(position, self._inventory.slots)
+    def best(self, position: tuple[int, int, int], *, require_harvest: bool = True) -> HarvestTool | None:
+        return self._best(position, self._inventory.slots, require_harvest=require_harvest)
 
     def _best(
         self, position: tuple[int, int, int], slots: dict[int, object], *, requested_drop_id: int | None = None,
+        require_harvest: bool = True,
     ) -> HarvestTool | None:
         rule = self._mining_rule(self._blocks.observed_block(position), requested_drop_id=requested_drop_id)
-        return None if rule is None else self._best_in_inventory(rule, slots)
+        return None if rule is None else self._best_in_inventory(rule, slots, require_harvest=require_harvest)
 
     def _mining_rule(
         self, block: BlockObservation | None, *, requested_drop_id: int | None = None,
@@ -220,25 +221,32 @@ class HarvestTools:
         return (equipment.item_id == int(held.id) and equipment.count > 0
                 and self._matches_drop_enchantment(rule, equipment.user_data_buffer))
 
-    def _best_in_inventory(self, rule: MiningRule, slots: dict[int, object]) -> HarvestTool | None:
+    def _best_in_inventory(
+        self, rule: MiningRule, slots: dict[int, object], *, require_harvest: bool = True,
+    ) -> HarvestTool | None:
         return self._best_in_slots(
             rule, {slot: item for slot, item in slots.items() if 0 <= slot < _MAIN_INVENTORY_SIZE},
-            selected=self._inventory.selected_slot,
+            selected=self._inventory.selected_slot, require_harvest=require_harvest,
         )
 
     def _best_in_slots(
         self, rule: MiningRule, slots: dict[int, object], *, selected: int | None = None,
+        require_harvest: bool = True,
     ) -> HarvestTool | None:
-        best = HarvestTool(None, None, 1.0) if rule.required is None else None
-        best_speed = 1.0
+        required = rule.required
+        best = HarvestTool(None, None, 1.0) if required is None or not require_harvest else None
+        best_score = 1.0 if require_harvest else (10 if required is None else 3)
         efficiency_id = int(self._inventory.packets.protocol.binding.Enchant.Type.EFFICIENCY)
-        # Equal speeds favor the selected player slot, then the lowest index.
+        # Ties favor bare hands when available, then the selected slot, then the lowest index.
         for slot in sorted(slots, key=lambda index: (index != selected, index)):
             item = slots[slot]
             if int(item.id) == 0 or int(item.stack_size) <= 0:
                 continue
             name = self._item_names.get(int(item.id))
-            if name is None or (rule.required is not None and name not in rule.required):
+            if name is None:
+                continue
+            harvestable = required is None or name in required
+            if require_harvest and not harvestable:
                 continue
             if isinstance(rule, _SilkTouchRule) and not self._matches_drop_enchantment(rule, item.user_data_buffer):
                 continue
@@ -247,9 +255,11 @@ class HarvestTools:
             if (base_speed > 1 and (name == "minecraft:shears" or name.endswith(("_pickaxe", "_axe", "_shovel", "_hoe")))
                     and item.user_data_buffer):
                 speed += _efficiency_bonus(bytes(item.user_data_buffer), efficiency_id)
-            if best is None or speed > best_speed:
+            # For the same block, harvestable and non-harvestable breaks use divisors 30 and 100.
+            score = speed if require_harvest else speed * (10 if harvestable else 3)
+            if best is None or score > best_score:
                 best = HarvestTool(slot, name, base_speed)
-                best_speed = speed
+                best_score = score
         return best
 
     def _known_item_slots(self, slots, indices: range) -> bool:
@@ -513,15 +523,19 @@ class HarvestTools:
 
     async def equip(
         self, position: tuple[int, int, int], *, timeout: float, requested_drop_id: int | None = None,
+        require_harvest: bool = True,
     ) -> HarvestTool | None:
         async with self._equip_lock:
-            return await self._equip(position, timeout=timeout, requested_drop_id=requested_drop_id)
+            return await self._equip(
+                position, timeout=timeout, requested_drop_id=requested_drop_id, require_harvest=require_harvest,
+            )
 
     async def _equip(
         self, position: tuple[int, int, int], *, timeout: float, requested_drop_id: int | None = None,
+        require_harvest: bool = True,
     ) -> HarvestTool | None:
         slots = self._inventory.slots
-        tool = self._best(position, slots, requested_drop_id=requested_drop_id)
+        tool = self._best(position, slots, requested_drop_id=requested_drop_id, require_harvest=require_harvest)
         if tool is None:
             return None
         return await self._equip_tool(tool, slots, timeout=timeout)

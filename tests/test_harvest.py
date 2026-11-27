@@ -12,6 +12,7 @@ from test_blocks import PacketStream
 
 POSITION = (4, 99, -9)
 DIAMOND_ORE = 0x54A1D0FD
+IRON_ORE = 0x79275ADE
 DIRT = 0x824EEF86
 OAK_LOG = 0xF253CAD8
 NETHER_WART_BLOCK = 0x22A97687
@@ -49,6 +50,7 @@ class HarvestTests(unittest.IsolatedAsyncioTestCase):
             1209: "minecraft:iron_hoe",
             1210: "minecraft:diamond_hoe",
             1211: "minecraft:iron_sword",
+            1212: "minecraft:copper_pickaxe",
             299: "test:iron_pickaxe",
         }
         self.stream.close = self.close_stream
@@ -147,6 +149,68 @@ class HarvestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.best_harvest_tool(POSITION), HarvestTool(12, "minecraft:iron_pickaxe", 6))
         self.block(0x80310E21)  # Stone admits the faster gold tool.
         self.assertEqual(bot.best_harvest_tool(POSITION), HarvestTool(0, "minecraft:golden_pickaxe", 12))
+
+    async def test_clear_tool_compares_progress_with_and_without_a_drop(self):
+        bot = await self.connect()
+        self.block(IRON_ORE)
+        gold = HarvestTool(1, "minecraft:golden_pickaxe", 12)
+        copper = HarvestTool(2, "minecraft:copper_pickaxe", 5)
+        self.inventory_slot(1, 1200)
+        self.assertIsNone(bot.best_harvest_tool(POSITION))
+        self.assertIsNone(await bot.equip_harvest_tool(POSITION, require_harvest=True))
+        self.assertEqual(bot.best_harvest_tool(POSITION, require_harvest=False), gold)
+
+        self.inventory_slot(2, 1212)
+        self.assertEqual(bot.best_harvest_tool(POSITION, require_harvest=False), copper)
+        self.inventory_slot(1, 1200, user_data=enchantment_data(self.binding, 2))
+        self.assertEqual(bot.best_harvest_tool(POSITION), copper)
+        self.assertEqual(bot.best_harvest_tool(POSITION, require_harvest=True), copper)
+        self.assertEqual(bot.best_harvest_tool(POSITION, require_harvest=False), gold)
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_clear_tool_ties_favor_empty_hands_then_selected_slot_then_index(self):
+        bot = await self.connect()
+        self.block(IRON_ORE)
+        self.inventory_slot(0, 1206, user_data=enchantment_data(self.binding, 5))
+        self.inventory_slot(1, 0)
+        self.assertIsNone(bot.best_harvest_tool(POSITION))
+        self.assertEqual(bot.best_harvest_tool(POSITION, require_harvest=False), HarvestTool(None, None, 1))
+        self.assertEqual(await bot.equip_harvest_tool(POSITION, require_harvest=False), HarvestTool(1, None, 1))
+        self.assertEqual(bot.held_item.slot, 1)
+        self.assertEqual(bot.inventory_slots[1].id, 0)
+
+        self.inventory_slot(4, 1200)
+        self.inventory_slot(2, 1200)
+        self.assertEqual(bot.best_harvest_tool(POSITION, require_harvest=False),
+                         HarvestTool(2, "minecraft:golden_pickaxe", 12))
+        await bot.select_hotbar(4)
+        self.assertEqual(bot.best_harvest_tool(POSITION, require_harvest=False),
+                         HarvestTool(4, "minecraft:golden_pickaxe", 12))
+
+    async def test_clear_tool_with_a_full_inventory_can_swap_but_cannot_select_bare_hands(self):
+        bot = await self.connect()
+        self.block(IRON_ORE)
+        for slot in range(36):
+            self.inventory_slot(slot, 299)
+        self.assertEqual(bot.best_harvest_tool(POSITION, require_harvest=False), HarvestTool(None, None, 1))
+        self.assertIsNone(await bot.equip_harvest_tool(POSITION, require_harvest=False))
+        self.assertEqual(self.stream.sent, [])
+
+        self.inventory_slot(0, 1212)
+        enchanted = enchantment_data(self.binding, 2)
+        self.inventory_slot(12, 1200, user_data=enchanted)
+        self.reply_to_transfers(bot, "SUCCESS")
+        self.assertEqual(await bot.equip_harvest_tool(POSITION, require_harvest=False),
+                         HarvestTool(0, "minecraft:golden_pickaxe", 12))
+        self.assertEqual([type(packet) for packet in self.stream.sent], [
+            self.binding.InteractPacket, self.binding.ItemStackRequestPacket,
+            self.binding.ContainerClosePacket, self.binding.MobEquipmentPacket,
+        ])
+        self.assertEqual(bot.inventory_slots[0].id, 1200)
+        self.assertEqual(bot.inventory_slots[0].user_data_buffer, enchanted)
+        self.assertEqual(bot.inventory_slots[12].id, 1212)
+        self.assertTrue(all(bot.inventory_slots[slot].id == 299 for slot in range(36) if slot not in (0, 12)))
+        self.assertIsNone(bot.open_window)
 
     async def test_efficiency_preserves_eligibility_ties_and_base_speed(self):
         bot = await self.connect()
@@ -617,6 +681,8 @@ class HarvestTests(unittest.IsolatedAsyncioTestCase):
                 self.block(runtime_id)
                 self.assertIsNone(bot.best_harvest_tool(POSITION))
                 self.assertIsNone(await bot.equip_harvest_tool(POSITION))
+                self.assertIsNone(bot.best_harvest_tool(POSITION, require_harvest=False))
+                self.assertIsNone(await bot.equip_harvest_tool(POSITION, require_harvest=False))
         self.assertEqual(self.stream.sent, [])
 
     async def test_vanilla_palette_rejects_unknown_and_custom_registries(self):
