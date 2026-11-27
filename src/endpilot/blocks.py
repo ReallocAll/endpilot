@@ -1387,6 +1387,20 @@ class Blocks:
             return False
         return True if standing is True and overhead is True else None
 
+    def _dry_grass_path_stance(self, position: tuple[int, int, int]) -> bool | None:
+        x, y, z = position
+        floor = (x, y - 1, z)
+        block = self.observed_block(floor)
+        state = None if block is None else self._vanilla_state(block.runtime_id)
+        if (state is None or state.name != "minecraft:grass_path"
+                or state.outline != (0, 0, 0, 1, 15 / 16, 1)):
+            return False
+        clearance = (self._stance_air(self.observed_block(floor, layer=1)),
+                     self._stance_clearance(position), self._stance_clearance((x, y + 1, z)))
+        if False in clearance:
+            return False
+        return True if all(clearance) else None
+
     def _ascent_step(
         self, source: tuple[int, int, int], landing: tuple[int, int, int],
     ) -> bool | None:

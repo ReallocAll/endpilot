@@ -593,7 +593,8 @@ def _block_face_cells(position: Cell):
 class _StandingGraph:
     def __init__(self, blocks, start: Cell, rules: NavigationRules, *, allow_vertical: bool,
                  allow_gap: bool = False, allow_stone_ledge_drop: bool = False, allow_ladder: bool = False,
-                 allow_water: bool = False, allow_lower_slab_lane: bool = False):
+                 allow_water: bool = False, allow_lower_slab_lane: bool = False,
+                 grass_path_walking: Callable[[], bool] | None = None):
         self.blocks = blocks
         self.origin = start
         self.rules = rules
@@ -603,6 +604,13 @@ class _StandingGraph:
         self.allow_ladder = allow_ladder
         self.allow_water = allow_water
         self.allow_lower_slab_lane = allow_lower_slab_lane
+        self.grass_path_walking = grass_path_walking
+
+    def walk_stance(self, cell: Cell) -> bool | None:
+        stance = self.blocks._flat_stance(cell, allow_vegetation=True)
+        if stance is False and self.grass_path_walking is not None and self.grass_path_walking():
+            return self.blocks._dry_grass_path_stance(cell)
+        return stance
 
     def in_bounds(self, cell: Cell) -> bool:
         return (abs(cell[0] - self.origin[0]) <= self.rules.search_radius
@@ -629,7 +637,7 @@ class _StandingGraph:
         if _is_gap_jump(source, destination):
             return self.blocks._gap_jump(source, destination) if self.allow_gap else False
         if source[1] == destination[1]:
-            return self.blocks._flat_stance(destination, allow_vegetation=True)
+            return self.walk_stance(destination)
         if not self.allow_vertical:
             return False
         if destination[1] > source[1]:
@@ -727,7 +735,7 @@ class _StandingGraph:
         args = goal.goal, self.rules, self.blocks.dimension_id, start
         if not self.in_bounds(start):
             return NavigationPlan(*args, "unreachable")
-        stance = self.blocks._flat_stance(start, allow_vegetation=True)
+        stance = self.walk_stance(start)
         if stance is False:
             return NavigationPlan(*args, "unreachable")
 

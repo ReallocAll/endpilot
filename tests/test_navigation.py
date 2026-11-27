@@ -440,6 +440,88 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                     self.assertGreater(self.moving_input()[-1].pos.x, 2.0)
                     self.assert_released()
 
+    async def test_foot_goal_walks_dry_grass_path_at_either_reported_height(self):
+        self.prepare_vegetation_corridor(hashed=True)
+        self.blocks._player_game_type = "SURVIVAL"
+        self.movement._gap_jump_allowed = lambda: True
+        path = ((0, 100, 0), (1, 100, 0), (2, 100, 0))
+        for x in range(3):
+            self.set_block((x, 99, 0), 0x73C709FB)
+        rules = NavigationRules(search_radius=2, vertical_radius=0)
+        goal = FootGoal(path[-1])
+        for y in (101.62, 101.62 - 1 / 16):
+            with self.subTest(y=y):
+                self.set_position(0.5, 0.5, y=y, on_ground=True)
+                self.stream.sent.clear()
+                plan = self.bot.plan_navigation(goal, rules=rules)
+                self.assertEqual((plan.status, plan.nodes), ("found", path))
+                result = await self.bot.navigate(goal, rules=rules)
+                self.assertEqual((result.status, result.stand_position), ("reached", path[-1]))
+                self.assertTrue(self.moving_input())
+                self.assertTrue(all(abs(frame.pos.y - y) < 0.001 for frame in self.stream.sent))
+                self.assert_released()
+
+    async def test_foot_goal_rebases_grass_path_walk_from_real_ground_correction(self):
+        self.prepare_vegetation_corridor(hashed=True)
+        self.blocks._player_game_type = "SURVIVAL"
+        self.movement._gap_jump_allowed = lambda: True
+        self.set_block((1, 99, 0), 0x73C709FB)
+        self.set_position(0.5, 0.5, on_ground=True)
+        requested = FootGoal((1, 100, 0))
+        corrected = None
+
+        def report_landing():
+            nonlocal corrected
+            frame = self.stream.sent[-1]
+            if corrected is None and frame.pos.x >= 1.15:
+                corrected = len(self.stream.sent)
+                self.correct_position(frame.pos.x, 101.62 - 1 / 16, 0.5, on_ground=True,
+                                      tick=frame.client_tick)
+
+        self.stream.on_send = report_landing
+        result = await self.bot.navigate(requested, rules=NavigationRules(search_radius=1, vertical_radius=0))
+        self.assertEqual((result.status, result.stand_position), ("reached", requested.position))
+        self.assertIsNotNone(corrected)
+        self.assertGreater(len(self.stream.sent), corrected)
+        for frame in self.stream.sent[:corrected]:
+            self.assertAlmostEqual(frame.pos.y, 101.62, places=4)
+        for frame in self.stream.sent[corrected:]:
+            self.assertAlmostEqual(frame.pos.y, 101.62 - 1 / 16, places=4)
+        self.assertFalse(self.jump_input())
+
+    async def test_grass_path_walking_does_not_widen_pose_geometry_or_goal_contracts(self):
+        ids = self.prepare_vegetation_corridor(hashed=True)
+        self.blocks._player_game_type = "SURVIVAL"
+        self.movement._gap_jump_allowed = lambda: True
+        floor, feet, head = (1, 99, 0), (1, 100, 0), (1, 101, 0)
+        path_id = 0x73C709FB
+        goal = FootGoal(feet)
+        rules = NavigationRules(search_radius=1, vertical_radius=0)
+        self.set_position(0.5, 0.5, on_ground=True)
+        self.set_block(floor, path_id)
+        for position, layer, value, restore, status in (
+            (floor, 0, 360492383, path_id, "unreachable"),  # Same-height farmland is not a path.
+            (floor, 1, ids["water"], self.AIR, "unreachable"),
+            (floor, 1, ids["unknown"], self.AIR, "unknown"),
+            (feet, 1, ids["unknown"], self.AIR, "unknown"),
+            (head, 0, self.STONE, self.AIR, "unreachable"),
+        ):
+            with self.subTest(position=position, layer=layer, value=value):
+                self.set_block(position, value, layer=layer)
+                self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, status)
+                result = await self.bot.navigate(goal, rules=rules)
+                self.assertEqual((result.status, result.frames), (status, 0))
+                self.set_block(position, restore, layer=layer)
+        self.assertEqual(self.bot.plan_navigation(XZGoal((1, 0)), rules=rules).status, "unreachable")
+        wet_rules = NavigationRules(search_radius=1, vertical_radius=0, allow_swimming=True)
+        self.assertEqual(self.bot.plan_navigation(goal, rules=wet_rules).status, "unreachable")
+        self.set_position(0.5, 0.5, y=101.62 - 1 / 16, on_ground=True)
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unreachable")
+        self.set_block((0, 99, 0), path_id)
+        self.set_position(0.5, 0.5, y=101.59, on_ground=True)
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unreachable")
+        self.assertEqual(self.stream.sent, [])
+
     async def test_flat_navigation_requires_clear_layers_and_support_around_vegetation(self):
         plant, head, support = (1, 100, 0), (1, 101, 0), (1, 99, 0)
         goal = FootGoal((2, 100, 0))
