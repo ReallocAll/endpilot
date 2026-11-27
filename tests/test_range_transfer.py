@@ -779,6 +779,23 @@ class RangeTransferTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(progress.confirmed_count, 1)
                 self.assertEqual(len(self.outgoing()), 2)
 
+    async def test_disconnect_preserves_submitted_range_step_without_confirming_it(self):
+        self.open_chest(self.stack(PAPER, 1, 17), self.stack(PAPER, 2, 18))
+        self.player_slot(9, self.stack())
+        pending = self.hold_requests()
+        transfer = self.start(self.transfer(3, player=range(9, 10)))
+        first = await asyncio.wait_for(pending.get(), 1)
+        self.reply(first, [(CHEST, 0, 0, None), (PLAYER, 9, 1, 31)])
+        second = await asyncio.wait_for(pending.get(), 1)
+        self.bot._inventory._end_requests()
+        with self.assertRaises(ConnectionError) as error:
+            await asyncio.wait_for(transfer, 1)
+        progress = error.exception.transfer_progress
+        self.assertEqual((progress.stop_reason, progress.confirmed_count), ("unconfirmed", 1))
+        self.assertEqual(progress.steps[-1],
+                         RangeTransferStep(1, 9, 2, None, int(second.client_request_id.raw_id), None))
+        self.assertEqual(self.outgoing(), [first, second])
+
     async def test_overlapping_ranges_do_not_confirm_two_moves_against_the_same_baseline(self):
         self.open_chest(self.stack(SNOWBALL, 9, 17))
         self.player_slot(9, self.stack(SNOWBALL, 14, 31))

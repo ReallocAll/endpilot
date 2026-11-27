@@ -626,6 +626,10 @@ class Inventory:
                     # A write may have started or still be queued.
                     error._item_stack_request_id = request_id
             raise
+        except ConnectionError as error:
+            if _range_step and pending.submitted:
+                error._item_stack_request_id = request_id
+            raise
 
     def _qa_response(self, request_id: int):
         reply = self._qa_requests.get(request_id)

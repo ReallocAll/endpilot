@@ -73,8 +73,9 @@ next join attempt. Confirm a server crash from BDS process status or logs.
 
 When the packet reader ends or `bot.close()` completes, the old session cannot
 apply another transfer verdict. An unresolved request may already have moved
-items; reconnect and observe the affected slots before deciding whether to
-retry. In an active session, a matching late verdict settles its pending
+items. A possibly submitted range step retains its old-session request ID, not
+a verdict. Reconnect with the same player identity and observe the affected
+slots before deciding whether to retry. In an active session, a matching late verdict settles its pending
 request; fresh slot observations can make a slot usable after incomplete
 corrections, but they neither settle an outstanding request nor change an earlier
 [`transfer_progress` snapshot](../tutorials/containers.md#choose-ranges-and-interpret-partial-results).

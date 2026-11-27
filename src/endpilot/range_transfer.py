@@ -419,7 +419,7 @@ async def _transfer_range(
             except _InventoryMoveNotSubmitted as stopped:
                 steps.pop()
                 return result(str(stopped))
-            except (TimeoutError, asyncio.CancelledError) as error:
+            except (TimeoutError, asyncio.CancelledError, ConnectionError) as error:
                 receipt = getattr(error, "_item_stack_response", None)
                 if receipt is not None:
                     record_reply(receipt)
@@ -559,7 +559,7 @@ async def transfer_inventory_range(
             except _InventoryMoveNotSubmitted as stopped:
                 steps.pop()
                 return result(str(stopped))
-            except (TimeoutError, asyncio.CancelledError) as error:
+            except (TimeoutError, asyncio.CancelledError, ConnectionError) as error:
                 receipt = getattr(error, "_item_stack_response", None)
                 if receipt is not None:
                     record_reply(receipt)

@@ -312,6 +312,9 @@ result with `complete: false` does not rule out more ore. Pass the returned
 Call `observe_collect_and_store` to read the current phase and confirmed
 counts. `stop_collect_and_store` cancels the task and waits for it to settle,
 returning any confirmed partial counts. A transfer step with `confirmed: null`
-has insufficient evidence to determine the quantity moved. The same bot
-stays online and can run another task or use the built-in tools before
-`disconnect`. [MCP server example](../../examples/collect_and_store_mcp.py)
+has insufficient evidence to determine the quantity moved, even if
+`stored_count` is zero. If the server drops the connection, save the task report
+before calling `disconnect` and reconnecting: this example clears the old task
+on disconnect and does not retry it. Reconnect with the same player identity
+and inspect both affected slots before retrying.
+[MCP server example](../../examples/collect_and_store_mcp.py)
