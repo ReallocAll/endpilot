@@ -1667,10 +1667,10 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
                         *(self.block(OAK_LOG_BLOCK, position=position) for position in positions))
         return bot
 
-    def collect_logs(self, bot, *, count, radius=2, ticks=0, search_radius=0, timeout=1):
+    def collect_logs(self, bot, *, count, radius=2, ticks=0, search_radius=0, timeout=1, refresh_candidates=False):
         return asyncio.create_task(bot.collect_by_count(
             "oak_log", item_id=OAK_LOG_ITEM, count=count, radius=radius, ticks=ticks,
-            search_radius=search_radius, timeout=timeout,
+            search_radius=search_radius, timeout=timeout, refresh_candidates=refresh_candidates,
         ))
 
     async def web_bot(self, *, sword):
@@ -2058,6 +2058,216 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.collected_count, 0)
         self.assert_no_more_collection_inputs()
 
+    async def test_counted_candidate_refresh_keeps_the_original_sphere_and_selector(self):
+        outside = (-4, 100, 5)
+        bot = await self.log_bot(TARGET, outside)
+        await self.emit(
+            self.block(0x80310E21, position=(-4, 99, 4)),
+            *(self.block(HASHED_AIR_RUNTIME_ID, position=(-4, y, 4), layer=1) for y in (100, 101)),
+        )
+        for selector in ("oak_log", OAK_LOG_BLOCK):
+            with self.subTest(selector=selector):
+                await self.emit(
+                    self.pose(), self.slot(2), self.block(OAK_LOG_BLOCK),
+                    self.block(HASHED_AIR_RUNTIME_ID, position=SECOND_TARGET),
+                    self.block(HASHED_AIR_RUNTIME_ID, position=THIRD_TARGET),
+                )
+                task = asyncio.create_task(bot.collect_by_count(
+                    (value for value in (selector, selector)), item_id=OAK_LOG_ITEM, count=4, radius=2,
+                    refresh_candidates=True, ticks=0, search_radius=0, timeout=1,
+                ))
+                await self.expect_batch_start(TARGET)
+                await self.emit(
+                    self.block(OAK_LOG_BLOCK, position=SECOND_TARGET),
+                    self.block(OAK_LOG_BLOCK, position=THIRD_TARGET),
+                    self.pose((-3.5, 101.62, 4.5)),
+                )
+                self.assertIn(outside, [match.position for match in bot.find_blocks(selector, radius=2).matches])
+                self.assertFalse(task.done())
+                self.assert_no_more_collection_inputs()
+                await self.finish_batch_break(TARGET, runtime_id=101, total=1, item_id=OAK_LOG_ITEM)
+                await self.expect_batch_start(THIRD_TARGET)
+                await self.emit(self.block(OAK_LOG_BLOCK))
+                await self.finish_batch_break(THIRD_TARGET, runtime_id=102, total=2, item_id=OAK_LOG_ITEM)
+                await self.expect_batch_start(SECOND_TARGET)
+                await self.finish_batch_break(SECOND_TARGET, runtime_id=103, total=3, item_id=OAK_LOG_ITEM)
+
+                result = await asyncio.wait_for(task, 1)
+                positions = (TARGET, THIRD_TARGET, SECOND_TARGET)
+                self.assertEqual((result.positions, result.collected_count, result.search_complete, result.active),
+                                 (positions, 3, None, None))
+                self.assertEqual([(row.position, row.status, row.inventory_delta) for row in result.results],
+                                 [(position, "collected", 1) for position in positions])
+                self.assertEqual(bot.observed_block(TARGET).runtime_id, OAK_LOG_BLOCK)
+                self.assertEqual(bot.observed_block(outside).runtime_id, OAK_LOG_BLOCK)
+                self.assert_no_more_collection_inputs()
+
+    async def test_counted_candidate_refresh_can_continue_after_the_last_target_changes(self):
+        bot = await self.log_bot(TARGET)
+        async with bot._blocks._mining_lock:
+            task = self.collect_logs(bot, count=2, refresh_candidates=True)
+            equipped = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+            self.assertIsInstance(equipped, self.b.MobEquipmentPacket)
+            await self.emit(self.block(HASHED_AIR_RUNTIME_ID), self.block(OAK_LOG_BLOCK, position=SECOND_TARGET))
+        await self.expect_batch_start(SECOND_TARGET)
+        await self.emit(self.block(OAK_LOG_BLOCK), self.block(OAK_LOG_BLOCK, position=THIRD_TARGET))
+        await self.finish_batch_break(SECOND_TARGET, runtime_id=101, total=1, item_id=OAK_LOG_ITEM)
+        await self.expect_batch_start(THIRD_TARGET)
+        await self.finish_batch_break(THIRD_TARGET, runtime_id=102, total=2, item_id=OAK_LOG_ITEM)
+
+        result = await asyncio.wait_for(task, 1)
+        self.assertEqual((result.positions, result.collected_count), ((TARGET, SECOND_TARGET, THIRD_TARGET), 2))
+        self.assertEqual([row.status for row in result.results], ["target_changed", "collected", "collected"])
+        self.assertEqual(bot.observed_block(TARGET).runtime_id, OAK_LOG_BLOCK)
+        self.assert_no_more_collection_inputs()
+
+    async def test_counted_candidate_refresh_cancellation_keeps_the_lock_and_second_attempt_evidence(self):
+        bot = await self.log_bot(TARGET)
+        task = self.collect_logs(bot, count=2, refresh_candidates=True)
+        await self.expect_batch_start(TARGET)
+        competitor = asyncio.create_task(bot.collect_block(THIRD_TARGET, timeout=1))
+        await self.emit(self.block(OAK_LOG_BLOCK, position=SECOND_TARGET))
+        await self.finish_batch_break(TARGET, runtime_id=101, total=1, item_id=OAK_LOG_ITEM)
+        await self.expect_batch_start(SECOND_TARGET)
+        self.assertFalse(competitor.done())
+        await self.finish_batch_break(SECOND_TARGET, runtime_id=102, item_id=OAK_LOG_ITEM)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError) as interruption:
+            await asyncio.wait_for(task, 1)
+        progress = interruption.exception.collection_progress
+        self.assertEqual((progress.positions, progress.collected_count, progress.search_complete),
+                         ((TARGET, SECOND_TARGET), 1, None))
+        first, = progress.results
+        self.assertEqual((first.position, first.status, first.inventory_delta), (TARGET, "collected", 1))
+        self.assertEqual((progress.active.position, progress.active.status, progress.active.drops[0].runtime_id),
+                         (SECOND_TARGET, "pickup_unconfirmed", 102))
+        self.assertEqual((await asyncio.wait_for(competitor, 1)).status, "target_air")
+        self.assertFalse(bot._block_collector._lock.locked())
+        while not self.wire.outgoing.empty():
+            self.assertFalse(getattr(self.wire.outgoing.get_nowait(), "player_block_actions", None))
+
+    async def test_counted_candidate_refresh_does_not_continue_after_unconfirmed_pickup(self):
+        bot = await self.log_bot(TARGET)
+        task = self.collect_logs(bot, count=2, timeout=0.2, refresh_candidates=True)
+        await self.expect_batch_start(TARGET)
+        await self.emit(self.block(OAK_LOG_BLOCK, position=SECOND_TARGET))
+        await self.finish_batch_break(TARGET, runtime_id=101, item_id=OAK_LOG_ITEM)
+
+        result = await asyncio.wait_for(task, 1)
+        self.assertEqual((result.positions, result.collected_count), ((TARGET,), 0))
+        attempt, = result.results
+        self.assertEqual((attempt.status, attempt.timed_out), ("pickup_unconfirmed", True))
+        while not self.wire.outgoing.empty():
+            self.assertFalse(getattr(self.wire.outgoing.get_nowait(), "player_block_actions", None))
+
+    async def test_counted_candidate_refresh_does_not_continue_after_unsettled_refill(self):
+        bot = await self.refill_bot()
+        chest = HarvestToolChest(REFILL_CHEST, range(4, 5), range(3, 4))
+        for options in ({"tool_chest": chest}, {"tool_chests": (chest,)}):
+            with self.subTest(options=options):
+                await self.emit(self.block(OAK_LOG_BLOCK), self.block(ORE, position=SECOND_TARGET), self.slot(3))
+                task = asyncio.create_task(bot.collect_by_count(
+                    ORE, item_id=DIRT, count=2, radius=2, refresh_candidates=True,
+                    ticks=0, search_radius=0, timeout=1, **options,
+                ))
+                await self.emit(
+                    await self.refill_request(), self.block(OAK_LOG_BLOCK, position=SECOND_TARGET), self.block(ORE),
+                )
+                await self.refill_close()
+
+                result = await asyncio.wait_for(task, 1)
+                self.assertEqual((result.positions, result.collected_count), ((SECOND_TARGET,), 0))
+                attempt, = result.results
+                self.assertEqual(attempt.status, "target_changed")
+                acquisition = attempt.tool_acquisition
+                self.assertEqual((acquisition.status, acquisition.transfer.confirmed_count), ("unobserved", 1))
+                self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_counted_candidate_refresh_stops_at_a_return_approach_budget_after_refill(self):
+        bot = await self.refill_bot()
+        chest = HarvestToolChest(REFILL_CHEST, range(4, 5), range(3, 4))
+        action_lock = bot._movement._action_lock
+        acquire = action_lock.acquire
+        for refresh in (False, True):
+            with self.subTest(refresh=refresh):
+                await self.emit(self.block(OAK_LOG_BLOCK), self.block(ORE, position=SECOND_TARGET), self.slot(3))
+                task = asyncio.create_task(bot.collect_by_count(
+                    ORE, item_id=DIRT, count=2, radius=2, refresh_candidates=refresh,
+                    ticks=0, search_radius=0, timeout=0.3, tool_chests=(chest,),
+                ))
+                await self.emit(await self.refill_request())
+                equipped = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+                self.assertIsInstance(equipped, self.b.MobEquipmentPacket)
+                self.assertEqual((equipped.item.id, equipped.item.net_id_variant), (445, 20))
+                close = await self.refill_close(confirm=False)
+                waiting = asyncio.Event()
+                expired = asyncio.Event()
+
+                async def watch_return_acquire():
+                    waiting.set()
+                    try:
+                        return await acquire()
+                    except asyncio.CancelledError:
+                        expired.set()
+                        raise
+
+                async with action_lock:
+                    with patch.object(action_lock, "acquire", watch_return_acquire):
+                        await self.emit(close)
+                        await asyncio.wait_for(waiting.wait(), 1)
+                        self.assertIsNone(bot.open_window)
+                        await self.emit(self.block(HASHED_AIR_RUNTIME_ID, position=SECOND_TARGET), self.block(ORE))
+                        await asyncio.wait_for(expired.wait(), 1)
+
+                result = await asyncio.wait_for(task, 2)
+                self.assertEqual((result.positions, result.collected_count), ((SECOND_TARGET,), 0), result)
+                attempt, = result.results
+                self.assertEqual((attempt.status, attempt.approach.status),
+                                 ("budget_exhausted" if refresh else "target_changed", "budget_exhausted"))
+                (refill_chest, acquisition), = attempt.tool_refill_attempts
+                self.assertEqual(refill_chest, chest)
+                self.assertIs(attempt.tool_acquisition, acquisition)
+                self.assertEqual((acquisition.status, acquisition.tool.item_name, acquisition.transfer.confirmed_count),
+                                 ("equipped", "minecraft:iron_pickaxe", 1))
+                self.assertEqual(bot.observed_block(TARGET).runtime_id, ORE)
+                self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_counted_candidate_refresh_stops_when_the_refill_approach_is_stopped(self):
+        chest_position, late = (4, 100, 3), (-4, 100, 3)
+        bot = await self.refill_bot(chest=chest_position)
+        await self.emit(
+            *(self.block(0x80310E21, position=(x, 99, z)) for x in range(-4, 6) for z in range(2, 5)),
+            *(self.block(HASHED_AIR_RUNTIME_ID, position=(x, y, z))
+              for x in range(-4, 6) for y in range(100, 103) for z in range(2, 5)
+              if (x, y, z) not in (SECOND_TARGET, chest_position)),
+            *(self.block(HASHED_AIR_RUNTIME_ID, position=(x, y, z), layer=1)
+              for x in range(-4, 6) for y in range(100, 103) for z in range(2, 5)),
+        )
+        chest = HarvestToolChest(chest_position, range(4, 5), range(3, 4))
+        task = asyncio.create_task(bot.collect_by_count(
+            ORE, item_id=DIRT, count=2, radius=2, refresh_candidates=True,
+            ticks=160, search_radius=8, timeout=2, tool_chests=(chest,),
+        ))
+        frame = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+        self.assertIsInstance(frame, self.b.PlayerAuthInputPacket)
+        self.assertIn(self.b.PlayerAuthInputPacket.InputData.UP, frame.input_data)
+        self.assertFalse(frame.player_block_actions)
+        await self.emit(self.block(HASHED_AIR_RUNTIME_ID, position=SECOND_TARGET), self.block(ORE, position=late))
+        await asyncio.wait_for(bot.stop_moving(), 1)
+        result = await asyncio.wait_for(task, 1)
+
+        self.assertEqual((result.positions, result.collected_count), ((SECOND_TARGET,), 0), result)
+        attempt, = result.results
+        self.assertEqual(attempt.approach.status, "reached")
+        self.assertEqual(attempt.tool_acquisition.status, "chest_approach_stopped")
+        self.assertIsNone(attempt.tool_acquisition.transfer)
+        self.assertIsNone(bot.open_window)
+        self.assertEqual(bot.observed_block(late).runtime_id, ORE)
+        while not self.wire.outgoing.empty():
+            packet = self.wire.outgoing.get_nowait()
+            self.assertIsInstance(packet, self.b.PlayerAuthInputPacket)
+            self.assertFalse(packet.player_block_actions)
+
     async def test_counted_collection_keeps_partial_gain_and_stops_on_another_players_pickup(self):
         first, second, third = THIRD_TARGET, SECOND_TARGET, TARGET
         bot = await self.log_bot(first, second, third)
@@ -2077,11 +2287,13 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assert_no_more_collection_inputs()
 
     async def test_counted_collection_stops_when_confirmed_pickup_has_a_different_item_id(self):
-        bot = await self.log_bot(SECOND_TARGET, TARGET)
-        task = self.collect_logs(bot, count=1, timeout=0.5)
+        bot = await self.log_bot(SECOND_TARGET)
+        task = self.collect_logs(bot, count=1, timeout=0.5, refresh_candidates=True)
         await self.expect_batch_start(SECOND_TARGET)
+        await self.emit(self.block(OAK_LOG_BLOCK))
         await self.finish_batch_break(SECOND_TARGET, runtime_id=101, total=1)
         result = await asyncio.wait_for(task, 1)
+        self.assertEqual(result.positions, (SECOND_TARGET,))
         attempt, = result.results
         self.assertEqual((attempt.status, attempt.drops[0].item_network_id), ("collected", DIRT))
         self.assertEqual(attempt.pickup_drop, attempt.drops[0])
@@ -2212,11 +2424,12 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assert_no_more_collection_inputs()
 
     async def test_counted_collection_stops_after_subchunk_break_wait_times_out(self):
-        bot = await self.log_bot(SECOND_TARGET, TARGET)
+        bot = await self.log_bot(SECOND_TARGET)
         events = []
         self.addCleanup(bot.subscribe_mining_events(events.append))
-        task = self.collect_logs(bot, count=2, timeout=0.2)
+        task = self.collect_logs(bot, count=2, timeout=0.2, refresh_candidates=True)
         await self.expect_batch_start(SECOND_TARGET)
+        await self.emit(self.block(OAK_LOG_BLOCK))
         b = self.b
         x, y, z = SECOND_TARGET
         pos = b.BlockPos(x=x, y=y, z=z)
@@ -2233,7 +2446,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.next_actions(), ["STOP_DESTROY_BLOCK"])
 
         result = await asyncio.wait_for(task, 1)
-        self.assertEqual(result.positions, (SECOND_TARGET, TARGET))
+        self.assertEqual(result.positions, (SECOND_TARGET,))
         attempt, = result.results
         self.assertEqual((attempt.position, attempt.status, attempt.timed_out, attempt.inventory_delta),
                          (SECOND_TARGET, "collected", True, 1))

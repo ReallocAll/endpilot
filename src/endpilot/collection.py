@@ -1,7 +1,7 @@
 """Collect supplied blocks and drops using their observed world and pickup evidence."""
 
 import asyncio
-from collections.abc import Awaitable, Callable, Coroutine, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from functools import partial
 import math
@@ -71,7 +71,7 @@ _StoreForDrop = Callable[
 
 @dataclass(frozen=True, slots=True)
 class BlockCollectionBatch:
-    """Ordered target snapshot and evidence collected before the batch ended.
+    """Ordered admitted positions and evidence collected before the batch ended.
 
     Results are the attempted prefix. An exception's collection_progress can
     also carry evidence from the interrupted target in active.
@@ -85,9 +85,10 @@ class BlockCollectionBatch:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CountedBlockCollection(BlockCollectionBatch):
-    """Candidate snapshot and confirmed main-inventory gains for one item ID.
+    """Admitted candidates and confirmed main-inventory gains for one item ID.
 
     search_complete records the admission-time completeness of a vein search.
+    Radius candidates are ordered by admission round, then by search order.
     """
 
     item_id: int
@@ -259,7 +260,8 @@ class _BlockCollector:
             epoch = self.blocks._mining_epoch
             before = tuple(self.blocks.observed_block(position) for position in positions)
             await self._run(self._collect_batch(
-                bot, progress, before, epoch, ticks=ticks, search_radius=search_radius, timeout=timeout,
+                bot, progress, zip(positions, before, strict=True), epoch,
+                ticks=ticks, search_radius=search_radius, timeout=timeout,
                 tool_chest=tool_chest, tool_chests=tool_chests, storage=storage, storage_item_id=storage_item_id,
                 requested_drop_id=requested_drop_id,
             ))
@@ -270,12 +272,22 @@ class _BlockCollector:
 
     async def collect_by_count(
         self, bot: "Bot", names: str | int | Iterable[str] | Iterable[int], *, item_id: int, count: int,
-        radius: int = 16, ticks: int = 160, search_radius: int = 8, timeout: float = 15,
+        radius: int = 16, refresh_candidates: bool = False, ticks: int = 160, search_radius: int = 8, timeout: float = 15,
         tool_chest: HarvestToolChest | None = None, tool_chests: Sequence[HarvestToolChest] | None = None,
         storage: CollectionStorage | None = None,
     ) -> CountedBlockCollection:
+        center = None
+
+        def find_candidates() -> BlockSearchResult:
+            nonlocal center, names
+            if refresh_candidates and names is not None and not isinstance(names, (str, int, tuple)):
+                names = tuple(names)
+            search = self.blocks.find_blocks(names, radius=radius, limit=None, center=center)
+            center = search.center
+            return search
+
         return await self._collect_counted(
-            bot, partial(self.blocks.find_blocks, names, radius=radius, limit=None),
+            bot, find_candidates, refresh_candidates=refresh_candidates,
             item_id=item_id, count=count, ticks=ticks, search_radius=search_radius, timeout=timeout,
             tool_chest=tool_chest, tool_chests=tool_chests, storage=storage,
         )
@@ -297,7 +309,7 @@ class _BlockCollector:
         self, bot: "Bot", find_candidates: Callable[[], BlockSearchResult], *, item_id: int, count: int,
         ticks: int, search_radius: int, timeout: float, tool_chest: HarvestToolChest | None,
         tool_chests: Sequence[HarvestToolChest] | None, storage: CollectionStorage | None,
-        report_completeness: bool = False,
+        report_completeness: bool = False, refresh_candidates: bool = False,
     ) -> CountedBlockCollection:
         if not isinstance(item_id, int) or isinstance(item_id, bool) or item_id == 0:
             raise ValueError("collection item ID must be a nonzero integer")
@@ -306,22 +318,45 @@ class _BlockCollector:
         tool_chests = _snapshot_tool_chests(tool_chest, tool_chests)
         storage_item_id = _storage_item_id(bot, storage, timeout)
         progress = _CountedProgress(self.blocks.dimension_id, item_id, count)
+        seen: set[tuple[int, int, int]] = set()
+
+        def admit(search: BlockSearchResult) -> list[BlockObservation]:
+            observations = []
+            for match in search.matches:
+                if match.position in seen:
+                    continue
+                before = self.blocks.observed_block(match.position)
+                if before is not None and before.is_air is False:
+                    seen.add(match.position)
+                    observations.append(before)
+            progress.positions += tuple(before.position for before in observations)
+            return observations
+
         try:
             self._check_connection()
             epoch = self.blocks._mining_epoch
             search = find_candidates()
             if report_completeness:
                 progress.search_complete = search.complete
-            observations = tuple(
-                before for match in search.matches if (before := self.blocks.observed_block(match.position)) is not None
-                and before.is_air is False
-            )
-            progress.positions = tuple(before.position for before in observations)
+            observations = admit(search)
             if observations:
+                def targets() -> Iterator[tuple[tuple[int, int, int], BlockObservation]]:
+                    batch = observations
+                    while batch:
+                        for before in batch:
+                            yield before.position, before
+                        if not refresh_candidates:
+                            return
+                        # The batch loop requests another target only after normal exhaustion.
+                        self._check_connection()
+                        self.blocks._check_mining_epoch(epoch)
+                        batch = admit(find_candidates())
+
                 await self._run(self._collect_batch(
-                    bot, progress, observations, epoch, ticks=ticks, search_radius=search_radius,
+                    bot, progress, targets(), epoch, ticks=ticks, search_radius=search_radius,
                     timeout=timeout, tool_chest=tool_chest, tool_chests=tool_chests,
                     storage=storage, storage_item_id=storage_item_id, requested_drop_id=item_id,
+                    refresh_candidates=refresh_candidates,
                 ))
         except (Exception, asyncio.CancelledError) as error:
             error.collection_progress = progress.snapshot()
@@ -398,10 +433,11 @@ class _BlockCollector:
             )
 
     async def _collect_batch(
-        self, bot: "Bot", progress: _BatchProgress, observations: tuple[BlockObservation | None, ...], epoch: int, *,
+        self, bot: "Bot", progress: _BatchProgress,
+        targets: Iterable[tuple[tuple[int, int, int], BlockObservation | None]], epoch: int, *,
         ticks: int, search_radius: int, timeout: float, tool_chest: HarvestToolChest | None,
         tool_chests: tuple[HarvestToolChest, ...] | None, storage: CollectionStorage | None,
-        storage_item_id: int | None, requested_drop_id: int | None,
+        storage_item_id: int | None, requested_drop_id: int | None, refresh_candidates: bool = False,
     ) -> None:
         counted = progress if isinstance(progress, _CountedProgress) else None
         ordered_refill = tool_chests is not None
@@ -409,7 +445,7 @@ class _BlockCollector:
         refill = None if not chests else partial(
             self._refill_tool, bot, dimension=progress.dimension_id, epoch=epoch,
             ticks=ticks, search_radius=search_radius, timeout=timeout, ordered=ordered_refill,
-            requested_drop_id=requested_drop_id,
+            requested_drop_id=requested_drop_id, refresh_candidates=refresh_candidates,
         )
         store = None if storage is None else partial(
             self._store_for_drop, bot, storage, storage_item_id,
@@ -417,14 +453,14 @@ class _BlockCollector:
         )
         async with self._lock:
             settle_before_approach = False
-            for position, before in zip(progress.positions, observations, strict=True):
+            for position, before in targets:
                 self._check_connection()
                 self.blocks._check_mining_epoch(epoch)
                 result = await self._collect_one(
                     position, before, progress.dimension_id, ticks=ticks, search_radius=search_radius,
                     timeout=timeout, epoch=epoch, progress=progress, refill=refill, refill_chests=chests,
                     ordered_refill=ordered_refill, store=store, settle_before_approach=settle_before_approach,
-                    requested_drop_id=requested_drop_id,
+                    requested_drop_id=requested_drop_id, refresh_candidates=refresh_candidates,
                 )
                 progress.results.append(result)
                 progress.active = None
@@ -439,7 +475,8 @@ class _BlockCollector:
                 counted.collected_count += received
                 if result.status == "target_changed":
                     acquisition = result.tool_acquisition
-                    if result.tool_refill_attempts and not (
+                    refill_attempted = result.tool_refill_attempts or (refresh_candidates and acquisition is not None)
+                    if refill_attempted and not (
                         _settled_refill_miss(acquisition) or (acquisition is not None and acquisition.status == "equipped")
                     ):
                         break
@@ -549,6 +586,7 @@ class _BlockCollector:
     async def _refill_tool(
         self, bot: "Bot", chest: HarvestToolChest, target: BlockObservation, *, dimension: int, epoch: int,
         ticks: int, search_radius: int, timeout: float, ordered: bool, requested_drop_id: int | None = None,
+        refresh_candidates: bool = False,
     ) -> HarvestToolAcquisition | None:
         chest_block = self.harvest._refill_chest(target, chest.position, requested_drop_id=requested_drop_id)
         if chest_block is None:
@@ -563,6 +601,9 @@ class _BlockCollector:
         if self.blocks.dimension_id != dimension:
             return None
         self.blocks._check_mining_epoch(epoch)
+        status = {"unknown": "unobserved", "budget": "budget_exhausted"}.get(route.status, route.status)
+        if refresh_candidates and route.status not in ("reached", "unreachable"):
+            return HarvestToolAcquisition(f"chest_approach_{status}")
         if self.blocks.observed_block(target.position) != target:
             return None
         if (busy := self.harvest._window_busy()) is not None:
@@ -573,7 +614,6 @@ class _BlockCollector:
                         target, chest.position, requested_drop_id=requested_drop_id,
                     ) != chest_block):
                 return None
-            status = {"unknown": "unobserved", "budget": "budget_exhausted"}.get(route.status, route.status)
             return HarvestToolAcquisition(f"chest_approach_{status}")
         match, = route.matches
         assert isinstance(match, BlockInteractionMatch) and match.position == chest.position
@@ -704,6 +744,7 @@ class _BlockCollector:
         progress: _BatchProgress | _MixedProgress | None = None, refill: _ToolRefill | None = None,
         refill_chests: tuple[HarvestToolChest, ...] = (), ordered_refill: bool = False,
         store: _StoreForDrop | None = None, settle_before_approach: bool = False, requested_drop_id: int | None = None,
+        refresh_candidates: bool = False,
     ) -> BlockCollection:
         if before is None or before.is_air is None:
             return BlockCollection(position, "target_unobserved", before)
@@ -746,7 +787,7 @@ class _BlockCollector:
             remember(replace(evidence, approach=approach))
             # A changed target can itself make a route unreachable or unobserved.
             status = check_target(check_observation=(
-                approach.status == "reached" or evidence.tool_acquisition is not None
+                approach.status == "reached" or (not refresh_candidates and evidence.tool_acquisition is not None)
                 or (counted is not None and approach.status in ("unreachable", "unobserved"))
             ))
             if status is not None or approach.status != "reached":

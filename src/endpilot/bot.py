@@ -2450,14 +2450,17 @@ class Bot:
 
     async def collect_by_count(
         self, names: str | int | Iterable[str] | Iterable[int], *, item_id: int, count: int,
-        radius: int = 16, ticks: int = 160, search_radius: int = 8, timeout: float = 15,
+        radius: int = 16, refresh_candidates: bool = False, ticks: int = 160, search_radius: int = 8, timeout: float = 15,
         tool_chest: HarvestToolChest | None = None, tool_chests: Sequence[HarvestToolChest] | None = None,
         storage: CollectionStorage | None = None,
     ) -> CountedBlockCollection:
         """Collect a positive count of one item from nearby observed matching blocks.
 
-        Snapshot candidates in distance order. Skip a changed block only
-        before START in the same world generation. Stop on other failures.
+        Snapshot candidates in distance order. Pass refresh_candidates=True
+        to check the same starting sphere for new coordinates after each
+        exhausted batch. The check uses cached observations and ends when
+        there are no new candidates. Skip a changed block only before START
+        in the same world generation. Stop on other failures.
         The result counts confirmed main-inventory gains for item_id and can
         exceed count. Exceptions carry known collection_progress.
 
@@ -2468,7 +2471,7 @@ class Bot:
         if self._block_collector is None:
             raise RuntimeError("player has not joined")
         return await self._block_collector.collect_by_count(
-            self, names, item_id=item_id, count=count, radius=radius, ticks=ticks,
+            self, names, item_id=item_id, count=count, radius=radius, refresh_candidates=refresh_candidates, ticks=ticks,
             search_radius=search_radius, timeout=timeout, tool_chest=tool_chest, tool_chests=tool_chests,
             storage=storage,
         )

@@ -79,6 +79,18 @@ the same world generation. It stops at the requested count, when it runs out
 of candidates, or at any other failure. `ticks`, `search_radius`, and `timeout`
 apply to each attempt as in `collect_block`.
 
+Pass `refresh_candidates=True` to check the cache again when the bot has
+tried the last candidate and still needs more items. Each check uses the
+initial search center, radius and block selectors. It sends no packets and
+ends the collection if there are no new matching coordinates. A coordinate
+admitted in an earlier round cannot be admitted again. `positions` lists
+all admitted coordinates in round order, with distance order within each
+round. `results` lists attempted and skipped coordinates in that same
+order. A failure or a timeout still ends the collection, even on the last
+candidate of a round. With refresh enabled, an unconfirmed tool refill
+or an approach that was stopped or exhausted its budget ends collection
+even if the target also changed.
+
 For `minecraft:web` targets, both counted methods use the requested item to
 choose the tool. Request `minecraft:string` to use a wooden, stone, golden,
 copper, iron, diamond, or netherite sword. Request `minecraft:web` to use
