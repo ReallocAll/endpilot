@@ -3,6 +3,8 @@
 import asyncio
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
+from functools import partial
+from inspect import isasyncgenfunction, isawaitable, iscoroutinefunction
 from math import inf
 from re import Pattern, fullmatch
 from typing import Any, Literal
@@ -81,6 +83,20 @@ def _client_option(enum_type, name):
     return enum_type[name]
 
 
+def _validate_plugin(plugin: object) -> None:
+    if not callable(plugin):
+        raise TypeError("plugin must be callable")
+    while isinstance(plugin, partial):
+        call = type(plugin).__call__
+        if call is not partial.__call__:
+            plugin = call
+            break
+        plugin = plugin.func
+    call = getattr(type(plugin), "__call__", None)
+    if any(iscoroutinefunction(target) or isasyncgenfunction(target) for target in (plugin, call)):
+        raise TypeError("plugin must be synchronous")
+
+
 class Bot:
     def __init__(self, name: str = "EndPilot", protocol: int = DEFAULT_PROTOCOL, *,
                  input_source: Callable[[], ForwardInput] | None = None,
@@ -101,6 +117,7 @@ class Bot:
         self._offline_identity = OfflineIdentity(name)
         self.protocol = Protocol(protocol)
         self._auto_respawn = auto_respawn
+        self._plugins: dict[int, Callable[["Bot"], object]] = {}
         self._spawn_observers: dict[object, Callable[[Literal["initial", "respawn"]], None]] = {}
         self._input_source = input_source
         self._on_input_sent = on_input_sent
@@ -137,6 +154,45 @@ class Bot:
         self._scoreboard: Scoreboard | None = None
         self._environment: WorldEnvironment | None = None
         self._feedback: WorldFeedback | None = None
+
+    def load_plugin(self, plugin: Callable[["Bot"], object]) -> None:
+        """Run a synchronous plugin on this Bot once, including before joining.
+
+        Registration follows the callable's identity and survives reconnects.
+        An exception or awaitable result removes the registration so the caller
+        can retry. The plugin is responsible for cleanup of its own side effects.
+        A returned awaitable stays under its creator's management.
+        """
+        _validate_plugin(plugin)
+        self._load_plugin(plugin)
+
+    def load_plugins(self, plugins: Iterable[Callable[["Bot"], object]]) -> None:
+        """Validate the entire iterable, then load each plugin in iteration order.
+
+        If installation fails, earlier successful registrations remain installed.
+        """
+        plugins = tuple(plugins)
+        for plugin in plugins:
+            _validate_plugin(plugin)
+        for plugin in plugins:
+            self._load_plugin(plugin)
+
+    def has_plugin(self, plugin: object) -> bool:
+        """Check whether this exact callable is installing or already installed."""
+        registered = self._plugins.get(id(plugin))
+        return registered is not None and registered is plugin
+
+    def _load_plugin(self, plugin: Callable[["Bot"], object]) -> None:
+        if self.has_plugin(plugin):
+            return
+        key = id(plugin)
+        self._plugins[key] = plugin
+        try:
+            if isawaitable(plugin(self)):
+                raise TypeError("plugin returned an awaitable")
+        except BaseException:
+            del self._plugins[key]
+            raise
 
     @property
     def identity(self) -> OfflineIdentity | _OnlineIdentity:

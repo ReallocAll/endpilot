@@ -68,6 +68,18 @@ joining to receive `"initial"` once the session is ready. The callback receives
 the returned unsubscribe function to remove this registration. The subscription
 follows the same `Bot` across joins.
 
+Load a reusable observer with `bot.load_plugin(plugin)` or pass several to
+`bot.load_plugins(plugins)`. Each plugin is a synchronous callable that receives
+the `Bot` immediately, so it can register with `subscribe_spawns` before the
+first join. Each Bot retains the exact callable across reconnects.
+`bot.has_plugin(plugin)` is true during installation and after success, so
+plugins can load each other without installing twice. A batch validates its
+members before installing them in order. If a plugin raises or returns an
+awaitable, its registration is removed and earlier successes stay installed.
+An awaitable result raises `TypeError` and remains under its creator's
+management. The caller can retry after the plugin cleans up its own side
+effects.
+
 ## Observe the server player list
 
 `bot.observed_players` is an immutable snapshot of the player list the server

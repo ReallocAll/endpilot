@@ -262,6 +262,23 @@ class SpawnEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first.closed)
         self.assertFalse(replacement.closed)
 
+    async def test_plugin_installs_one_spawn_subscription_across_rejoins(self):
+        installations = []
+        events = []
+
+        def observe_spawns(bot):
+            installations.append(bot)
+            bot.subscribe_spawns(events.append)
+
+        self.bot.load_plugin(observe_spawns)
+        self.bot.load_plugins([observe_spawns])
+        for expected in (["initial"], ["initial", "initial"]):
+            await self.connect(self.wire())
+            self.assertTrue(self.bot.has_plugin(observe_spawns))
+            self.assertEqual(installations, [self.bot])
+            self.assertEqual(events, expected)
+            await self.bot.close()
+
     async def test_failed_or_refused_joins_do_not_publish_and_subscription_survives(self):
         b = self.b
         events = []
