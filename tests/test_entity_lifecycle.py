@@ -70,6 +70,56 @@ class EntityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         return b.AddItemActorPacket(id=109, runtime_id=9, pos=b.Vec3(x=2, y=3, z=4),
                                     item=b.SerializedNetworkItemStackDescriptor(id=5, stack_size=2))
 
+    def owner_metadata(self, owner, *, tamed=True, owner_type=None):
+        b = self.b
+        flags = (1 << int(b.ActorFlags.TAMED)) if tamed else 0
+        fields = [b.DataItemEntry(id=int(b.ActorDataIDs.RESERVED_0),
+                                  payload=b.DataItemInt64Payload(value=flags))]
+        if owner is not None:
+            payload = owner_type or b.DataItemInt64Payload
+            fields.append(b.DataItemEntry(id=int(b.ActorDataIDs.OWNER), payload=payload(value=owner)))
+        return b.SynchedActorData.CopyableDataList(data=fields)
+
+    async def test_wolf_owner_updates_only_from_typed_owner_metadata(self):
+        b = self.b
+        owner_id = -4294967295
+        wolf = self.actor(actor_type="minecraft:wolf")
+        wolf.data = self.owner_metadata(-1, tamed=False)
+        await self.join()
+        await self.deliver(wolf)
+        untamed, = self.bot.observed_entities
+        self.assertIsNone(untamed.owner_entity_id)
+
+        async def update(owner, *, owner_type=None):
+            await self.deliver(b.SetActorDataPacket(id=wolf.runtime_id,
+                                                   packed_items=self.owner_metadata(owner, owner_type=owner_type)))
+            current, = self.bot.observed_entities
+            return current.owner_entity_id
+
+        self.assertIsNone(await update(None))
+        self.assertIsNone(await update(17, owner_type=b.DataItemIntPayload))
+        self.assertEqual(await update(owner_id), owner_id)
+        self.assertEqual(await update(None), owner_id)
+        self.assertEqual(await update(17, owner_type=b.DataItemIntPayload), owner_id)
+        self.assertIsNone(await update(-1))
+        self.assertIsNone(untamed.owner_entity_id)
+
+    async def test_wolf_owner_is_available_on_spawn_and_cleared_by_actor_replacement(self):
+        b = self.b
+        owner_id = -4294967295
+        wolf = self.actor(actor_type="minecraft:wolf")
+        wolf.data = self.owner_metadata(owner_id)
+        await self.join(wolf)
+        initial, = self.bot.observed_entities
+        self.assertEqual(initial.owner_entity_id, owner_id)
+        self.assertEqual(self.bot.observed_players, ())
+
+        replacement = self.actor(entity_id=109, actor_type="minecraft:wolf")
+        await self.deliver(b.RemoveActorPacket(entity_id=wolf.entity_id), replacement)
+        current, = self.bot.observed_entities
+        self.assertEqual((current.entity_id, current.owner_entity_id), (replacement.entity_id, None))
+        self.assertEqual(initial.owner_entity_id, owner_id)
+
     async def test_all_add_families_publish_immutable_physical_snapshots(self):
         await self.join()
         b = self.b

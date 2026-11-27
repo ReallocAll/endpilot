@@ -86,6 +86,10 @@ class EntityState:
     reports for these flags on this visible remote player instance. ``None``
     means the flag is unknown or does not apply.
 
+    ``owner_entity_id`` holds the latest unique entity ID reported for a wolf's
+    owner or the ID reported at a fishing hook's spawn. The owner can be outside
+    the observed actors or player list. ``None`` means absent or unknown.
+
     ``firework_attached_entity_id`` is the unique ID reported in the spawn
     metadata of a firework rocket, when the packet identifies an attachment.
 
@@ -383,6 +387,7 @@ _COW = "minecraft:cow"
 _SHEEP = "minecraft:sheep"
 _VILLAGER = "minecraft:villager_v2"
 _FIREWORK = "minecraft:fireworks_rocket"
+_WOLF = "minecraft:wolf"
 _ACTOR_DELTA_FEET_TYPES = frozenset((_COW, _VILLAGER))
 _ACTOR_SPAWN_FEET_TYPES = _ACTOR_DELTA_FEET_TYPES | {_SHEEP}
 _CURSOR_BODY_TYPES = frozenset((_COW, _SHEEP))
@@ -469,6 +474,14 @@ def _visible_effects_value(metadata, binding) -> int | None:
     return next((int(entry.payload.value) for entry in reversed(metadata)
                  if entry.id == binding.ActorDataIDs.VISIBLE_MOB_EFFECTS
                  and isinstance(entry.payload, binding.DataItemInt64Payload)), None)
+
+
+def _owner_entity_id(metadata, binding, previous: int | None = None) -> int | None:
+    for entry in metadata:
+        if entry.id == binding.ActorDataIDs.OWNER and isinstance(entry.payload, binding.DataItemInt64Payload):
+            owner = int(entry.payload.value)
+            return None if owner == -1 else owner
+    return previous
 
 
 def _unsupported_view_pose(words: _PlayerFlagWords, binding) -> bool:
@@ -1796,6 +1809,11 @@ class Entities:
                 shield_observers = tuple(self._shield_block_observers)
                 shield_block = ShieldBlockEvent(runtime_id, self._animation_entity_id(runtime_id), int(packet.tick))
             state = self._by_runtime.get(runtime_id)
+            if state is not None and state.actor_type == _WOLF:
+                owner = _owner_entity_id(metadata, b, state.owner_entity_id)
+                if owner != state.owner_entity_id:
+                    state = replace(state, owner_entity_id=owner)
+                    self._by_runtime[runtime_id] = state
             visible_observers = ()
             if state is not None and self._visible_effect_target(runtime_id):
                 visible_effects = _visible_effects_value(metadata, b)
@@ -1885,10 +1903,8 @@ class Entities:
             actor = self.packets.protocol.decode(raw)
             runtime_id = int(actor.runtime_id)
             owner = None
-            if actor.actor_type == "minecraft:fishing_hook":
-                owner = next((int(entry.payload.value) for entry in actor.data.data
-                              if int(entry.id) == int(b.ActorDataIDs.OWNER)
-                              and isinstance(entry.payload, b.DataItemInt64Payload)), None)
+            if actor.actor_type in (_WOLF, "minecraft:fishing_hook"):
+                owner = _owner_entity_id(actor.data.data, b)
             attachment = None
             if actor.actor_type == _FIREWORK:
                 # Fireworks use this metadata for the attached actor's unique ID.
@@ -1906,7 +1922,7 @@ class Entities:
             state = EntityState(
                 int(actor.entity_id), runtime_id, actor.actor_type,
                 (float(actor.pos.x), float(actor.pos.y), float(actor.pos.z)),
-                owner_entity_id=None if owner == -1 else owner,
+                owner_entity_id=owner,
                 boat_rotation=(float(actor.rot.x), float(actor.rot.y)) if is_boat else None,
                 boat_velocity=(float(actor.velocity.x), float(actor.velocity.y), float(actor.velocity.z))
                 if is_boat else (0.0, 0.0, 0.0),
