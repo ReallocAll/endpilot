@@ -2933,11 +2933,11 @@ class Bot:
     async def collect_drop(
         self, runtime_id: int, *, ticks: int = 120, timeout: float = 15
     ) -> EntityState:
-        """Approach an observed dropped item; confirm this player picked it up."""
+        """Approach the observed drop, routing around known obstacles when possible, and confirm pickup."""
         if self._entities is None or self._movement is None:
             raise RuntimeError("player has not joined")
         return await self._entities.collect_drop(
-            self._movement, runtime_id, self.player_id, ticks=ticks, timeout=timeout
+            self._movement, runtime_id, self.player_id, ticks=ticks, timeout=timeout, blocks=self._blocks,
         )
 
     async def wait_for_item_drop(self, timeout: float = 15) -> EntityState:

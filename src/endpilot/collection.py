@@ -17,14 +17,13 @@ from .harvest import HarvestTool, HarvestToolAcquisition, HarvestToolChest, Harv
 from .inventory import _InventoryMoveNotSubmitted, _MAIN_INVENTORY_SIZE, _stack_snapshot
 from .inventory_observation import _InventoryObservation
 from .movement import BlockApproach, Movement, _PLAYER_HALF_WIDTH
-from .navigation import AllGoal, BlockFaceGoal, BlockInteractionGoal, BlockInteractionMatch, EntityNearGoal, NavigationRules
+from .navigation import AllGoal, BlockFaceGoal, BlockInteractionGoal, BlockInteractionMatch, NavigationRules
 
 if TYPE_CHECKING:
     from .bot import Bot
 
 
 _ToolRefill = Callable[[HarvestToolChest, BlockObservation], Awaitable[HarvestToolAcquisition | None]]
-_STORAGE_PICKUP_RADIUS = 1.2
 
 
 @dataclass(frozen=True, slots=True)
@@ -406,20 +405,20 @@ class _BlockCollector:
             dimension=progress.dimension_id, ticks=ticks, search_radius=search_radius,
         )
         async with self._lock:
-            settle_after_storage = False
+            settle_before_approach = False
             for position, before in zip(progress.positions, observations, strict=True):
                 self._check_connection()
                 self.blocks._check_mining_epoch(epoch)
                 result = await self._collect_one(
                     position, before, progress.dimension_id, ticks=ticks, search_radius=search_radius,
                     timeout=timeout, epoch=epoch, progress=progress, refill=refill, refill_chests=chests,
-                    ordered_refill=ordered_refill, store=store, settle_after_storage=settle_after_storage,
+                    ordered_refill=ordered_refill, store=store, settle_before_approach=settle_before_approach,
                 )
                 progress.results.append(result)
                 progress.active = None
                 if result.approach is not None or result.status != "target_changed":
-                    settle_after_storage = (result.status == "collected" and result.storage_attempt is not None
-                                            and result.storage_attempt.stop_reason == "complete")
+                    settle_before_approach = (result.status == "collected" and result.storage_attempt is not None
+                                              and result.storage_attempt.stop_reason == "complete")
                 if counted is None:
                     if result.status != "collected":
                         break
@@ -446,18 +445,28 @@ class _BlockCollector:
             self.blocks._check_mining_epoch(epoch)
             drops = _SelectedDrops(self.blocks, self.entities, selected, epoch, self.movement.player_id)
             unsubscribe = self.blocks.packets.subscribe_raw(drops.observe) if selected else None
+            routed_pickup = False
+
+            def mark_routed():
+                nonlocal routed_pickup
+                routed_pickup = True
+
             try:
                 for target in progress.targets:
                     self._check_connection()
                     self.blocks._check_mining_epoch(epoch)
                     if isinstance(target, EntityState):
-                        result = await self._collect_selected_drop(target, drops, progress, ticks=ticks, timeout=timeout)
+                        result = await self._collect_selected_drop(
+                            target, drops, progress, ticks=ticks, search_radius=search_radius, timeout=timeout,
+                            on_route=mark_routed,
+                        )
                         success = result.status == "picked_up"
                     else:
                         result = await self._collect_one(
                             target, before[target], progress.dimension_id, ticks=ticks, search_radius=search_radius,
-                            timeout=timeout, epoch=epoch, progress=progress,
+                            timeout=timeout, epoch=epoch, progress=progress, settle_before_approach=routed_pickup,
                         )
+                        routed_pickup = False
                         success = result.status == "collected"
                     progress.results.append(result)
                     progress.active = None
@@ -469,7 +478,8 @@ class _BlockCollector:
                     unsubscribe()
 
     async def _collect_selected_drop(
-        self, target: EntityState, drops: "_SelectedDrops", progress: _MixedProgress, *, ticks: int, timeout: float,
+        self, target: EntityState, drops: "_SelectedDrops", progress: _MixedProgress, *, ticks: int,
+        search_radius: int, timeout: float, on_route: Callable[[], None],
     ) -> DropCollection:
         result = drops.result(target)
         if result is not None:
@@ -483,8 +493,9 @@ class _BlockCollector:
             return None
 
         deadline = asyncio.timeout(timeout)
-        follow = asyncio.create_task(self.movement.follow_entity(
-            self.entities, target.runtime_id, ticks=ticks, stop_distance=0.0, _resolve=resolve,
+        follow = asyncio.create_task(self.movement._approach_drop(
+            self.blocks, self.entities, target, resolve, ticks=ticks, search_radius=search_radius,
+            deadline=deadline.when(), on_route=on_route,
         ))
         follow.add_done_callback(lambda _: drops.changed.set())
         try:
@@ -674,7 +685,7 @@ class _BlockCollector:
         ticks: int, search_radius: int, timeout: float, epoch: int | None = None,
         progress: _BatchProgress | _MixedProgress | None = None, refill: _ToolRefill | None = None,
         refill_chests: tuple[HarvestToolChest, ...] = (), ordered_refill: bool = False,
-        store: _StoreForDrop | None = None, settle_after_storage: bool = False,
+        store: _StoreForDrop | None = None, settle_before_approach: bool = False,
     ) -> BlockCollection:
         if before is None or before.is_air is None:
             return BlockCollection(position, "target_unobserved", before)
@@ -711,9 +722,9 @@ class _BlockCollector:
         while True:
             approach, match = await self._approach(
                 position, ticks=ticks, search_radius=search_radius, timeout=timeout,
-                settle_epoch=epoch if settle_after_storage else None,
+                settle_epoch=epoch if settle_before_approach else None,
             )
-            settle_after_storage = False
+            settle_before_approach = False
             remember(replace(evidence, approach=approach))
             # A changed target can itself make a route unreachable or unobserved.
             status = check_target(check_observation=(
@@ -980,32 +991,12 @@ class _CollectionObservation:
         current = self.live_drop(drop)
         return None if current is None else self.entities._item_navigation_anchor(current)
 
-    def pickup_clearance(self, feet, anchor) -> bool | None:
-        # A horizontal approach must reach an item at the standing body's height.
-        if anchor[1] < feet[1]:
-            return False
-        dx, dz = anchor[0] - feet[0], anchor[2] - feet[2]
-        distance = math.hypot(dx, dz)
-        # Stop when the anchor is inside the standing player's horizontal footprint.
-        scale = 0.0 if distance <= _PLAYER_HALF_WIDTH else 1.0 - _PLAYER_HALF_WIDTH / distance
-        return self.blocks._flight_clearance(feet, (feet[0] + dx * scale, feet[1], feet[2] + dz * scale))
-
-    def pickup_stance(self, anchor: tuple[float, float, float] | None) -> tuple[float, float, float] | None:
-        movement = self.blocks.movement
-        origin = movement.input_position
-        if anchor is None or origin is None:
-            return None
-        cell_x, feet_y, cell_z = movement._foot_cell(origin)
-        if (not movement._at_standing_height(feet_y)
-                or math.dist((cell_x + 0.5, feet_y, cell_z + 0.5), anchor) > _STORAGE_PICKUP_RADIUS):
-            return None
-        return origin[0], feet_y, origin[2]
-
     def nearby_drop(self, drop: EntityState) -> EntityState | None:
         current = self.live_drop(drop)
         anchor = None if current is None else self.entities._item_navigation_anchor(current)
-        feet = self.pickup_stance(anchor)
-        return current if feet is not None and self.pickup_clearance(feet, anchor) is True else None
+        movement = self.blocks.movement
+        feet = movement._drop_pickup_stance(anchor)
+        return current if feet is not None and movement._drop_pickup_clearance(self.blocks, feet, anchor) is True else None
 
     def _pickup_delta(self, item_id: int) -> int | None:
         delta = self.inventory_feedback.delta(item_id)
@@ -1128,19 +1119,17 @@ async def _observe_mined_block(
                             or (result.status != "inventory_unconfirmed" and observation.live_drop(drop) is None)):
                         return result
                     if result.status == "pickup_unconfirmed" and follow_ticks:
-                        goal = EntityNearGoal(drop.entity_id, _STORAGE_PICKUP_RADIUS)
                         movement = blocks.movement
                         start_tick = movement._tick
-                        route = await movement._navigate_goal(
-                            blocks, goal, NavigationRules(search_radius=int(search_radius)), follow_ticks,
-                            deadline=deadline.when(), near_anchor=lambda: observation.drop_anchor(drop),
-                            near_clearance=observation.pickup_clearance,
+                        route = await movement._navigate_drop(
+                            blocks, drop.entity_id, lambda: observation.drop_anchor(drop),
+                            NavigationRules(search_radius=int(search_radius)), follow_ticks, deadline=deadline.when(),
                         )
                         result = observation.result()
                         reached = route.status == "reached"
                         if result.status != "inventory_unconfirmed" and (
                             result.status != "pickup_unconfirmed"
-                            or (not reached and observation.pickup_stance(observation.drop_anchor(drop)) is None)
+                            or (not reached and movement._drop_pickup_stance(observation.drop_anchor(drop)) is None)
                         ):
                             timed_out = asyncio.get_running_loop().time() >= deadline.when()
                             return replace(result, timed_out=timed_out)

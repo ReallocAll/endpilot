@@ -6,6 +6,7 @@ from collections import deque
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from functools import partial
 from time import perf_counter_ns
 from typing import Literal
 
@@ -28,6 +29,8 @@ _GROUND_FRICTION = 0.546
 _GROUND_ACCELERATION = 0.16277136 / _GROUND_FRICTION**3
 _REST_SPEED = 0.003
 _PLAYER_HALF_WIDTH = 0.30
+_DROP_PICKUP_RADIUS = 1.2
+_DROP_DIRECT_PROBE_RADIUS = NavigationRules().search_radius
 _FLIGHT_HORIZONTAL_ACCELERATION = 0.049
 _FLIGHT_AIR_DRAG = 0.91
 _FLIGHT_IDLE_DAMPING = 0.375
@@ -1891,7 +1894,8 @@ class Movement:
 
     async def follow_entity(self, entities, runtime_id: int, *, ticks: int = 80,
                             stop_distance: float = 1.5, _resolve=None,
-                            _clearance: Callable[[Point, Point], bool | None] | None = None) -> int:
+                            _clearance: Callable[[Point, Point], bool | None] | None = None,
+                            _start: Callable[[], bool] | None = None) -> int:
         """Track an observed actor for up to ticks frames, releasing input on exit.
 
         Return submitted moving frames, not a server-confirmed arrival.
@@ -1920,9 +1924,15 @@ class Movement:
             self._follow_target_id = runtime_id
             done = self._active_done = asyncio.Event()
             submitted = 0
+            release = _resolve is None or ticks != 0
             try:
+                if not release:
+                    return 0
                 if self._input_position is None:
                     await self.wait_for_position_sync()
+                if _start is not None and (self._stop_requested or not _start()):
+                    release = False
+                    return 0
                 for _ in range(ticks):
                     if self._server_disconnected:
                         raise ConnectionError("server disconnected during movement")
@@ -1952,10 +1962,123 @@ class Movement:
             finally:
                 self._follow_target_id = None
                 try:
-                    await self._release_input()
+                    if release:
+                        await self._release_input()
                 finally:
                     self._active_done = None
                     done.set()
+
+    @staticmethod
+    def _drop_pickup_clearance(blocks, feet: Point, anchor: Point) -> bool | None:
+        if anchor[1] < feet[1]:
+            return False
+        dx, dz = anchor[0] - feet[0], anchor[2] - feet[2]
+        distance = math.hypot(dx, dz)
+        # Stop when the anchor is inside the standing player's horizontal footprint.
+        scale = 0.0 if distance <= _PLAYER_HALF_WIDTH else 1.0 - _PLAYER_HALF_WIDTH / distance
+        return blocks._flight_clearance(feet, (feet[0] + dx * scale, feet[1], feet[2] + dz * scale))
+
+    def _drop_pickup_stance(self, anchor: Point | None) -> Point | None:
+        origin = self.input_position
+        if anchor is None or origin is None:
+            return None
+        cell_x, feet_y, cell_z = self._foot_cell(origin)
+        if (not self._at_standing_height(feet_y)
+                or math.dist((cell_x + 0.5, feet_y, cell_z + 0.5), anchor) > _DROP_PICKUP_RADIUS):
+            return None
+        return origin[0], feet_y, origin[2]
+
+    async def _navigate_drop(self, blocks, entity_id: int, near_anchor: Callable[[], Point | None],
+                             rules: NavigationRules, ticks: int, *, deadline: float | None,
+                             on_plan: Callable[[NavigationPlan], None] | None = None) -> NavigationResult:
+        return await self._navigate_goal(
+            blocks, EntityNearGoal(entity_id, _DROP_PICKUP_RADIUS), rules, ticks, deadline=deadline,
+            near_anchor=near_anchor, near_clearance=partial(self._drop_pickup_clearance, blocks), on_plan=on_plan,
+        )
+
+    async def _approach_drop(self, blocks, entities: Entities, target: EntityState,
+                             resolve: Callable[[int], EntityState | None], *, ticks: int,
+                             deadline: float | None, search_radius: int | None = None,
+                             on_route: Callable[[], None] | None = None) -> None:
+        runtime_id = target.runtime_id
+        loop = asyncio.get_running_loop()
+        blocked = False
+
+        def resolve_in_time(selected: int) -> EntityState | None:
+            if deadline is None or loop.time() < deadline:
+                return resolve(selected)
+            return None
+
+        def supported_anchor(actor: EntityState | None) -> Point | None:
+            anchor = None if actor is None else entities._item_navigation_anchor(actor)
+            if anchor is not None:
+                x, y, z = map(math.floor, anchor)
+                if blocks._stance_support((x, y - 1, z)) is True:
+                    return anchor
+            return None
+
+        def standing_cell() -> Cell | None:
+            origin = self.input_position
+            if (origin is None or not all(map(math.isfinite, origin)) or not self._ray_pose_current
+                    or not self._navigation_visibility_standing()):
+                return None
+            cell = self._foot_cell(origin)
+            return cell if self._navigation_start_is_standing(blocks, cell) else None
+
+        def start_direct() -> bool:
+            nonlocal blocked
+            if not target.entity_id or (cell := standing_cell()) is None:
+                return True
+            anchor = supported_anchor(resolve_in_time(runtime_id))
+            if anchor is None:
+                return True
+            x, _, z = self.input_position
+            # The swept-cell scan is local even when the caller sets a larger route radius.
+            if max(abs(math.floor(anchor[0]) - cell[0]),
+                   abs(math.floor(anchor[2]) - cell[2])) > _DROP_DIRECT_PROBE_RADIUS:
+                return True
+            feet_y = cell[1]
+            blocked = blocks._flight_clearance((x, feet_y, z), (anchor[0], feet_y, anchor[2])) is False
+            return not blocked
+
+        await self.follow_entity(entities, runtime_id, ticks=ticks, stop_distance=0.0,
+                                 _resolve=resolve_in_time, _start=start_direct)
+        if not blocked:
+            return
+
+        if on_route is not None:
+            on_route()
+        rules = NavigationRules() if search_radius is None else NavigationRules(search_radius=int(search_radius))
+        start_tick = None
+
+        def record_start(_plan: NavigationPlan) -> None:
+            nonlocal start_tick
+            if start_tick is None:
+                start_tick = self._tick
+
+        route = await self._navigate_drop(
+            blocks, target.entity_id, lambda: supported_anchor(resolve_in_time(runtime_id)), rules, ticks,
+            deadline=deadline, on_plan=record_start,
+        )
+        if route.status != "reached":
+            return
+        remaining = ticks if start_tick is None else ticks - (self._tick - start_tick)
+        if remaining <= 0 or (deadline is not None and loop.time() >= deadline):
+            return
+
+        def resolve_near(selected: int) -> EntityState | None:
+            actor = resolve_in_time(selected)
+            if actor is None:
+                return None
+            cell = standing_cell()
+            if cell is None or blocks._flat_stance(cell, allow_vegetation=True) is not True:
+                return None
+            anchor = supported_anchor(actor)
+            feet = self._drop_pickup_stance(anchor)
+            return actor if feet is not None and self._drop_pickup_clearance(blocks, feet, anchor) is True else None
+
+        await self.follow_entity(entities, runtime_id, ticks=remaining, stop_distance=_PLAYER_HALF_WIDTH,
+                                 _resolve=resolve_near, _clearance=blocks._flight_clearance)
 
 
     @classmethod
@@ -2081,7 +2204,7 @@ class Movement:
                 and blocks._flat_stance(cell, allow_vegetation=True) is True)
 
     async def _acquire_recovery_stance(self, blocks, mining_epoch: int) -> bool:
-        """Acquire the action lock at a standing pose after a storage pickup."""
+        """Acquire the action lock at a standing pose after a routed pickup."""
         after_tick = None
         move_landing = None
 
@@ -2432,6 +2555,12 @@ class Movement:
                 return outcome("budget")
             return None
 
+        def check_near_anchor():
+            if near_anchor() is None:
+                raise _FollowTargetLost
+
+        send_input = self._send_input if near_anchor is None else partial(self._send_input, before_send=check_near_anchor)
+
         def can_release_input() -> bool:
             return (self._can_send_input and dimension_is_current() and not self._awaiting_dismount_pose
                     and self._boat_input is None
@@ -2538,7 +2667,7 @@ class Movement:
                 if forward:
                     await self.look_at((landing[0] + 0.5, y, landing[2] + 0.5))
                 first_step = forward and step_tick is None
-                tick = await self._send_input(
+                tick = await send_input(
                     forward, landing_target=(landing[1], lower_columns) if first_step else None,
                 )
                 remaining -= 1
@@ -2616,7 +2745,7 @@ class Movement:
                 # From rest, gain the ledge's height before applying forward input.
                 forward = (jump_tick is not None and not jump and not braking_at_edge
                            and (advancing or y >= upper_eye))
-                tick = await self._send_input(
+                tick = await send_input(
                     forward, jump_pressed=jump, jump_surface=raised_surface if jump else None,
                     landing_target=(ly, frozenset({(lx, lz)})) if jump else None,
                 )
@@ -2711,14 +2840,14 @@ class Movement:
                                 or (self._ground_correction_tick is None and abs(y - wire_eye) > wire_step)):
                             return abandon("unknown", "edge_unavailable")
                         if self._teleport_pending is not None or self._jump_was_pressed:
-                            await self._send_input(False, move_vector=(0.0, 0.0))
+                            await send_input(False, move_vector=(0.0, 0.0))
                             remaining -= 1
                             await asyncio.sleep(0.05)
                             continue
                         self._rotation = (self._rotation[0], yaw)
                         # Accept corrections during the write, and consume them only after it succeeds.
                         step_tick = self._tick
-                        step_tick = await self._send_input(True, landing_target=(ly, low_columns))
+                        step_tick = await send_input(True, landing_target=(ly, low_columns))
                         use_ground_velocity = False
                         release_input = True
                         forward_frames = 1
@@ -2752,7 +2881,7 @@ class Movement:
                                and y >= upper_eye - 0.05)
                     if forward:
                         self._rotation = (self._rotation[0], yaw)
-                    await self._send_input(forward)
+                    await send_input(forward)
                     remaining -= 1
                     if forward:
                         forward_frames += 1
@@ -2874,7 +3003,7 @@ class Movement:
                                 or (self._ground_correction_tick is None and abs(y - wire_eye) > wire_step)):
                             return abandon("unknown", "edge_unavailable")
                         if self._teleport_pending is not None or self._jump_was_pressed:
-                            await self._send_input(False)
+                            await send_input(False)
                             remaining -= 1
                             await asyncio.sleep(0.05)
                             continue
@@ -2905,7 +3034,7 @@ class Movement:
                         self._rotation = (0.0, heading)
                     elif brake_tick is None:
                         brake_tick = self._tick
-                    await self._send_input(forward, landing_target=(ly, deck) if forward_frames == 0 else None)
+                    await send_input(forward, landing_target=(ly, deck) if forward_frames == 0 else None)
                     remaining -= 1
                     if forward:
                         forward_frames += 1
@@ -3066,7 +3195,7 @@ class Movement:
                     self._rotation = (0.0, heading)
                     moving = max(map(abs, directions)) > 0.01
                     release_input |= moving
-                    await self._send_input(
+                    await send_input(
                         False, move_vector=directions, sneak_changed=sneak_changed,
                         landing_target=(ly, rung_columns) if phase == "approach" and frames == 0 else None,
                     )
@@ -3188,7 +3317,7 @@ class Movement:
                                 or (self._ground_correction_tick is None and abs(y - wire_eye) > height_step)):
                             return abandon("unknown", "edge_unavailable")
                         if self._teleport_pending is not None or self._jump_was_pressed:
-                            await self._send_input(False, move_vector=(0.0, 0.0))
+                            await send_input(False, move_vector=(0.0, 0.0))
                             remaining -= 1
                             await asyncio.sleep(0.05)
                             continue
@@ -3250,7 +3379,7 @@ class Movement:
                         self._water_swim_tick = self._tick
                         swim_tick = last_sent = await self._submit_swim(True, (0.0, forward))
                     else:
-                        last_sent = await self._send_input(False, move_vector=(0.0, forward),
+                        last_sent = await send_input(False, move_vector=(0.0, forward),
                                                           landing_target=(sy, deck) if last_sent is None else None)
                     remaining -= 1
                     submitted += int(forward > 0)
@@ -3325,7 +3454,7 @@ class Movement:
                             return abandon("unreachable", "edge_unavailable")
                         if any(directions) or self._velocity[0] or self._velocity[2]:
                             before_alignment = self.position
-                        await self._send_input(False, move_vector=directions)
+                        await send_input(False, move_vector=directions)
                         remaining -= 1
                         moving = max(map(abs, directions)) > 0.01
                         submitted += int(moving)
@@ -3343,7 +3472,7 @@ class Movement:
                     if y != observed[1] or (self._ground_correction_tick is None
                                            and abs(y - wire_eye_y) > wire_height_step):
                         return abandon("unknown", "edge_unavailable")
-                    jump_tick = await self._send_input(
+                    jump_tick = await send_input(
                         True, jump_pressed=True, landing_target=(sy, landing_columns),
                     )
                     use_ground_velocity = False
@@ -3378,7 +3507,7 @@ class Movement:
                 forward = forward_frames < _GAP_FORWARD_FRAMES
                 if forward:
                     self._rotation = (self._rotation[0], heading)
-                await self._send_input(forward)
+                await send_input(forward)
                 remaining -= 1
                 if forward:
                     forward_frames += 1
@@ -3564,7 +3693,7 @@ class Movement:
                             directions = self._ground_target_directions(dx, dz, yaw)
                             if directions is None:
                                 return abandon("unreachable", "edge_unavailable")
-                            await self._send_input(False, move_vector=directions)
+                            await send_input(False, move_vector=directions)
                             submitted += int(max(map(abs, directions)) > 0.01)
                         else:
                             previous_yaw = self._rotation[1]
@@ -3575,12 +3704,14 @@ class Movement:
                                     return outcome("budget")
                                 release_input = False
                                 continue
-                            await self._send_input(True)
+                            await send_input(True)
                             submitted += 1
                         release_input = True
                         remaining -= 1
                         aimed_cell = None
                         await asyncio.sleep(0.05)
+            except _FollowTargetLost:
+                return abandon("unknown", "goal_unmatched")
             except _VisibilityBudgetExhausted as error:
                 if pending_error is error:
                     raise

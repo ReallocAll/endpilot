@@ -166,12 +166,24 @@ confirmed transfer steps. When storage stops short, the batch ends with
 was already confirmed. The exception's `collection_progress` includes
 known storage and pickup evidence for the interrupted target.
 
+## Collect an observed drop
+
+`await bot.collect_drop(runtime_id, ticks=120, timeout=15)` approaches an item
+from `bot.observed_drops` and returns the original snapshot when the server
+confirms this player's pickup of that instance. If the nearby direct path is
+blocked by observed terrain and the drop has a known ground anchor, the bot
+uses bounded ground navigation to reach a clear approach. A clear path or
+insufficient terrain observations keep the direct approach. The route and
+final approach share the call's movement and timeout budgets. Pass `ticks=0`
+to wait for the pickup without walking.
+
 ## Collect blocks and existing drops together
 
 Pass block coordinates and current item snapshots from `bot.observed_drops`
 to `bot.collect_mixed_targets()`. Targets are deduplicated before the optional
 `count` limit. A drop is bound to its observed instance by its runtime and
-unique IDs. The returned `MixedCollectionBatch.results` contains the attempted
+unique IDs. Each item leg uses the same ground approach with the supplied
+`search_radius`. The returned `MixedCollectionBatch.results` contains the attempted
 prefix, ending at the first target whose result differs from `"collected"` for
 a block or `"picked_up"` for a drop. Inspect `collection_progress` if the batch
 raises.

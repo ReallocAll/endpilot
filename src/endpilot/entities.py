@@ -2034,37 +2034,40 @@ class Entities:
 
     async def collect_drop(
         self, movement, runtime_id: int, player_id: int, *,
-        ticks: int = 120, timeout: float = 15
+        ticks: int = 120, timeout: float = 15, blocks=None,
     ) -> EntityState:
-        """Approach an observed drop; return only after BDS confirms our pickup.
-
-        Movement uses a straight path on level terrain; the item may be taken by
-        another actor, despawn, or remain unreachable. Those do not imply success.
-        """
+        """Approach an observed drop and return only after this player's pickup."""
         drop = self.get(runtime_id)
         instance = self._actor_instance(runtime_id)
         if drop is None or drop.actor_type != "minecraft:item" or instance is None:
             raise ValueError("item actor is not currently observed")
+        deadline = asyncio.timeout(timeout)
         pickup = asyncio.create_task(self.wait_for_item_pickup(
             item_runtime_id=runtime_id, collector_runtime_id=player_id,
             item_entity_id=drop.entity_id or None, timeout=timeout,
             _item_instance=instance,
         ))
         follow = None
+
+        def resolve(selected):
+            return self._bound_item(drop, instance) if selected == runtime_id else None
+
         try:
-            # Register the packet waiter before sending any movement input.
-            await asyncio.sleep(0)
-            follow = asyncio.create_task(movement.follow_entity(
-                self, runtime_id, ticks=ticks, stop_distance=0.0,
-                _resolve=lambda selected: self._bound_item(drop, instance) if selected == runtime_id else None,
-            ))
-            done, _ = await asyncio.wait(
-                (pickup, follow), return_when=asyncio.FIRST_COMPLETED
-            )
-            if follow in done:
-                await follow
-            await pickup
-            return drop
+            async with deadline:
+                # Register the packet waiter before sending any movement input.
+                await asyncio.sleep(0)
+                if blocks is None:
+                    approach = movement.follow_entity(self, runtime_id, ticks=ticks, stop_distance=0.0, _resolve=resolve)
+                else:
+                    approach = movement._approach_drop(
+                        blocks, self, drop, resolve, ticks=ticks, deadline=deadline.when(),
+                    )
+                follow = asyncio.create_task(approach)
+                done, _ = await asyncio.wait((pickup, follow), return_when=asyncio.FIRST_COMPLETED)
+                if follow in done:
+                    await follow
+                await pickup
+                return drop
         finally:
             tasks = (pickup, follow) if follow is not None else (pickup,)
             for task in tasks:

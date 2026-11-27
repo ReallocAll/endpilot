@@ -1960,6 +1960,66 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(packet.player_block_actions)
                 self.assertNotIn(self.b.PlayerAuthInputPacket.InputData.UP, packet.input_data)
 
+    async def check_drop_approaches_around_an_observed_wall(self, *, mixed):
+        bot = await self.public_bot()
+        next_block = (-1, 100, 4)
+        columns = ((-3, 3), (-3, 2), (-2, 2), (-1, 2), (-1, 3), (-2, 3))
+        await self.emit(
+            self.block(ORE, position=next_block),
+            self.block(0x80310E21, position=(-2, 101, 3)),
+            *(self.block(0x80310E21, position=(x, 99, z)) for x, z in columns),
+            *(self.block(HASHED_AIR_RUNTIME_ID, position=(x, y, z), layer=1)
+              for x, z in columns for y in (99, 100, 101)),
+            self.drop(191, entity_id=5191, position=(-0.5, 100.125, 3.5)),
+            self.slot(3),
+        )
+        drop = next(actor for actor in bot.observed_entities if actor.runtime_id == 191)
+        collect = (bot.collect_mixed_targets([drop, next_block], timeout=6) if mixed
+                   else bot.collect_drop(drop.runtime_id, timeout=6))
+        task = asyncio.create_task(collect)
+
+        async def settle_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        self.addAsyncCleanup(settle_task)
+        async with asyncio.timeout(5):
+            while True:
+                frame = await self.wire.outgoing.get()
+                self.assertIsInstance(frame, self.b.PlayerAuthInputPacket)
+                self.assertFalse(frame.player_block_actions)
+                x, z = frame.pos.x, frame.pos.z
+                self.assertFalse(-2.3 < x < -0.7 and 2.7 < z < 4.3,
+                                 f"drop approach clipped the observed wall at {frame.pos}")
+                if math.hypot(x + 0.5, z - 3.5) <= 0.5:
+                    break
+
+        if mixed:
+            with self.assertRaises(TimeoutError):
+                await self.expect_batch_start(next_block, timeout=0.1)
+        self.assertFalse(task.done())
+        self.assertEqual(bot.observed_block(next_block).runtime_id, ORE)
+        await self.emit(self.take(191), self.slot(3, DIRT, 1, net_id=15))
+        self.assertEqual(bot.inventory_count(DIRT), 1)
+        if mixed:
+            await self.expect_batch_start(next_block, timeout=2)
+            await self.finish_batch_break(next_block, runtime_id=101, total=1, net_id=16)
+            pickup, mined = (await task).results
+            self.assertEqual((pickup.target, pickup.status, pickup.pickup.collector_runtime_id),
+                             (drop, "picked_up", PLAYER))
+            self.assertEqual(pickup.pickup.item, drop)
+            self.assertEqual((mined.position, mined.status), (next_block, "collected"))
+        else:
+            self.assertEqual(await task, drop)
+        self.assertEqual(bot.observed_block(TARGET).runtime_id, ORE)
+        self.assert_no_more_collection_inputs()
+
+    async def test_collect_drop_approaches_around_an_observed_wall(self):
+        await self.check_drop_approaches_around_an_observed_wall(mixed=False)
+
+    async def test_mixed_approaches_around_an_observed_wall_before_starting_the_next_block(self):
+        await self.check_drop_approaches_around_an_observed_wall(mixed=True)
+
     async def test_mixed_counts_distinct_inputs_and_accepts_a_snapshot_from_before_motion(self):
         bot = await self.batch_bot()
         drop = await self.mixed_drop(bot)
