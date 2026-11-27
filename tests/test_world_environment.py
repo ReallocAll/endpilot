@@ -2,10 +2,11 @@ import asyncio
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
+from weakref import ref
 
 from endpilot import Bot, SessionEnd, Weather, WorldClock, WorldSpawn, WorldTime
-from endpilot.protocol import write_batch
+from endpilot.protocol import RawPacket, write_batch
 
 
 class WorldEnvironmentTests(unittest.IsolatedAsyncioTestCase):
@@ -38,7 +39,9 @@ class WorldEnvironmentTests(unittest.IsolatedAsyncioTestCase):
         return self.binding.LevelEventPacket(event_id=event_id, data=data)
 
     def deliver(self, *packets, framed=True):
-        batch = write_batch([self.bot.protocol.encode(packet) for packet in packets])
+        batch = write_batch(
+            packet if isinstance(packet, RawPacket) else self.bot.protocol.encode(packet) for packet in packets
+        )
         self.incoming.put_nowait((b"\xff" if framed else b"") + batch)
 
     async def join(self, *, rain=0, thunder=0, before_start=(), before_spawn=(), initial_difficulty=0, initial_hardcore=False,
@@ -125,7 +128,13 @@ class WorldEnvironmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.transport.send.await_count, sends)
         with self.assertRaises(FrozenInstanceError):
             spawn.position = (0, 10, 0)
+        callback = Mock()
+        unsubscribe = self.bot.subscribe_world_spawn_changes(callback)
+        retained = ref(callback)
+        del callback
         await self.bot.close()
+        self.assertIsNone(retained())
+        unsubscribe()
         self.assertIsNone(self.bot.world_difficulty)
         self.assertIsNone(self.bot.world_spawn)
         self.assertEqual(spawn.position, (-14, None, 8))
@@ -194,10 +203,89 @@ class WorldEnvironmentTests(unittest.IsolatedAsyncioTestCase):
         await self.apply(b.DisconnectPacket(), late)
         self.assertIsNone(self.bot.advertised_world_generator)
 
+    async def test_world_spawn_changes_replay_through_both_native_protocols(self):
+        for protocol in (2193, 2225):
+            with self.subTest(protocol=protocol):
+                self.bot = Bot("WorldObserver", protocol=protocol)
+                self.addAsyncCleanup(self.bot.close)
+                self.binding = self.bot.protocol.binding
+                with self.assertRaisesRegex(RuntimeError, "player has not joined"):
+                    self.bot.subscribe_world_spawn_changes(lambda _: None)
+                await self.join(default_spawn=(8, 32767, 8))
+                changes = []
+
+                def observe(value):
+                    changes.append((value, self.bot.world_spawn))
+
+                sends = self.transport.send.await_count
+                self.bot.subscribe_world_spawn_changes(observe)
+                self.assertEqual(changes, [])
+                self.assertEqual(self.transport.send.await_count, sends)
+
+                # The packet bodies are from the stock 1.26.66.1 world and personal spawn capture.
+                packet_id = self.binding.SetSpawnPositionPacket.ID
+                public = RawPacket(packet_id, bytes.fromhex("021090031000ffffffff0fffffffff0fffffffff0f"))
+                personal = RawPacket(packet_id, bytes.fromhex("001e90031a00ffffffff0fffffffff0fffffffff0f"))
+                await self.apply(self.spawn((8, 32767, 8)), public, public, personal,
+                                 self.spawn((8, 200, 8), dimension=1),
+                                 self.spawn((8, 32767, 8), dimension=1))
+                self.assertEqual([value for value, _ in changes], [
+                    WorldSpawn((8, 200, 8), 0), WorldSpawn((8, 200, 8), 1), WorldSpawn((8, None, 8), 1),
+                ])
+                for value, cache in changes:
+                    self.assertIs(value, cache)
+                with self.assertRaises(FrozenInstanceError):
+                    changes[0][0].position = (0, 0, 0)
+                self.assertEqual(self.bot.player_respawn_point.position, (15, 200, 13))
+
+                # A StartGame update can seed the cache without publishing a WORLD_SPAWN event.
+                late = self.binding.StartGamePacket(
+                    settings=self.binding.LevelSettings(default_spawn=self.block_pos((7, 200, 7))),
+                )
+                await self.apply(late, self.spawn((7, 200, 7)))
+                self.assertEqual(self.bot.world_spawn, WorldSpawn((7, 200, 7), 0))
+                self.assertEqual(len(changes), 3)
+                await self.bot.close()
+
+    async def test_world_spawn_subscriptions_are_independent_and_isolate_callback_failures(self):
+        await self.join()
+        loop = asyncio.get_running_loop()
+        self.addCleanup(loop.set_exception_handler, loop.get_exception_handler())
+        errors = []
+        loop.set_exception_handler(lambda _, context: errors.append(context["exception"]))
+        failure = RuntimeError("spawn observer failed")
+        cancellation = asyncio.CancelledError("spawn observer cancelled")
+
+        def fail(_):
+            raise failure
+
+        def cancel(_):
+            raise cancellation
+
+        self.bot.subscribe_world_spawn_changes(fail)
+        self.bot.subscribe_world_spawn_changes(cancel)
+        changes = []
+        callback = changes.append
+        first = self.bot.subscribe_world_spawn_changes(callback)
+        second = self.bot.subscribe_world_spawn_changes(callback)
+
+        first()
+        first()
+        await self.apply(self.spawn((7, 20, 7)))
+        self.assertEqual(errors, [failure, cancellation])
+        self.assertEqual(changes, [WorldSpawn((7, 20, 7), 0)])
+        second()
+        second()
+        await self.apply(self.spawn((8, 20, 8)))
+        self.assertEqual(self.bot.world_spawn, WorldSpawn((8, 20, 8), 0))
+        self.assertEqual(changes, [WorldSpawn((7, 20, 7), 0)])
+
     async def test_live_updates_leave_public_spawn_unchanged_during_personal_change_and_dimension_switch(self):
         b = self.binding
         await self.join(initial_difficulty=1, initial_hardcore=True, default_spawn=(8, 200, 8))
         initial = self.bot.world_spawn
+        changes = []
+        self.bot.subscribe_world_spawn_changes(changes.append)
         await self.apply(self.spawn((15, 200, 13), personal=True),
                          b.ChangeDimensionPacket(dimension_id=1, loading_screen_id=0),
                          b.PlayerActionPacket(runtime_id=10, action=b.PlayerActionType.CHANGE_DIMENSION_ACK),
@@ -210,7 +298,9 @@ class WorldEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                          b.PlayerActionPacket(runtime_id=10, action=b.PlayerActionType.CHANGE_DIMENSION_ACK))
         self.assertIs(self.bot.world_hardcore, True)
         self.assertEqual(self.bot.world_spawn, initial)
+        self.assertEqual(changes, [])
         await self.apply(self.spawn((-20, 0, 55)))
+        self.assertEqual(changes, [WorldSpawn((-20, 0, 55), dimension_id=0)])
         self.assertEqual(initial, WorldSpawn((8, 200, 8), dimension_id=0))
         self.assertEqual(self.bot.world_spawn, WorldSpawn((-20, 0, 55), dimension_id=0))
         self.assertEqual(self.bot.player_respawn_point.position, (15, 200, 13))
@@ -218,21 +308,39 @@ class WorldEnvironmentTests(unittest.IsolatedAsyncioTestCase):
     async def test_disconnect_invalidates_observations_before_reader_ends_and_rejoin_rebuilds(self):
         b = self.binding
         await self.join(initial_difficulty=2, initial_hardcore=True, default_spawn=(17, 200, 6))
+        old_changes = []
+        callback = old_changes.append
+        retained = ref(callback)
+        unsubscribe_old = self.bot.subscribe_world_spawn_changes(callback)
+        del callback
         late = b.StartGamePacket(settings=b.LevelSettings(is_hardcore=True))
         await self.apply(b.DisconnectPacket(), late, self.difficulty(0), self.spawn((8, 200, 8)))
         self.assertIsNone(self.bot.world_difficulty)
         self.assertIsNone(self.bot.world_hardcore)
         self.assertIsNone(self.bot.world_spawn)
         self.assertEqual(self.bot.world_time.daylight_ticks, 31)
+        self.assertIsNone(retained())
+        with self.assertRaisesRegex(ConnectionError, "stream is closed"):
+            self.bot.subscribe_world_spawn_changes(old_changes.append)
         await self.bot.close()
         await self.join(initial_difficulty=0, default_spawn=(0, 32767, 0))
         self.assertEqual(self.bot.world_difficulty, 0)
         self.assertIs(self.bot.world_hardcore, False)
         self.assertEqual(self.bot.world_spawn, WorldSpawn((0, None, 0), dimension_id=0))
+        new_changes = []
+        self.bot.subscribe_world_spawn_changes(new_changes.append)
+        unsubscribe_old()
+        await self.apply(self.spawn((8, 200, 8)))
+        self.assertEqual(old_changes, [])
+        self.assertEqual(new_changes, [WorldSpawn((8, 200, 8), 0)])
 
     async def test_reader_end_invalidates_advertised_world_settings(self):
         await self.join(initial_hardcore=True, generator=self.binding.GeneratorType.FLAT)
         self.assertIs(self.bot.advertised_world_generator, self.binding.GeneratorType.FLAT)
+        callback = Mock()
+        retained = ref(callback)
+        unsubscribe = self.bot.subscribe_world_spawn_changes(callback)
+        del callback
         ended = asyncio.Event()
         self.bot.packets.subscribe_reader_end(lambda _cause: ended.set())
         self.incoming.put_nowait(ConnectionError("test connection lost"))
@@ -241,6 +349,10 @@ class WorldEnvironmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.bot.world_hardcore)
         self.assertIsNone(self.bot.advertised_world_generator)
         self.assertIsNone(self.bot.world_spawn)
+        self.assertIsNone(retained())
+        unsubscribe()
+        with self.assertRaisesRegex(ConnectionError, "stream is closed"):
+            self.bot.subscribe_world_spawn_changes(lambda _: None)
         with self.assertRaisesRegex(ConnectionError, "test connection lost"):
             await self.bot.close()
 

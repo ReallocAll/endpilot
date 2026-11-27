@@ -1,8 +1,11 @@
 """World settings, time and weather observed on the server stream."""
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from bedrock_protocol import GeneratorType
+
+from .compression import PacketConnection
 
 
 _TICKS_PER_DAY = 24_000
@@ -108,6 +111,7 @@ class WorldEnvironment:
         self.hardcore: bool | None = None
         self.advertised_generator: GeneratorType | int | None = None
         self.world_spawn: WorldSpawn | None = None
+        self._world_spawn_observers: dict[object, Callable[[WorldSpawn], None]] = {}
         self.limited_crafting: bool | None = None
         self._clocks: dict[int, WorldClock] = {}
         self._rules: dict[str, WorldRule] = {}
@@ -131,6 +135,17 @@ class WorldEnvironment:
         self.hardcore = None
         self.advertised_generator = None
         self.world_spawn = None
+        self._world_spawn_observers.clear()
+
+    def subscribe_world_spawn_changes(self, callback: Callable[[WorldSpawn], None]) -> Callable[[], None]:
+        observers = self._world_spawn_observers
+        token = object()
+        observers[token] = callback
+
+        def unsubscribe() -> None:
+            observers.pop(token, None)
+
+        return unsubscribe
 
     def time(self) -> WorldTime:
         return WorldTime(self._daylight_ticks, self._game_ticks_at_join,
@@ -175,11 +190,15 @@ class WorldEnvironment:
                 self.difficulty = int(packet.difficulty)
             elif (isinstance(packet, b.SetSpawnPositionPacket)
                   and packet.spawn_pos_type == b.SpawnPositionType.WORLD_SPAWN):
-                self._set_world_spawn(packet.pos, int(packet.dimension_type))
+                self._set_world_spawn(packet.pos, int(packet.dimension_type), notify=not at_join)
 
-    def _set_world_spawn(self, pos, dimension_id: int) -> None:
+    def _set_world_spawn(self, pos, dimension_id: int, *, notify: bool = False) -> None:
         y = None if pos.y == _UNFIXED_SPAWN_HEIGHT else int(pos.y)
-        self.world_spawn = WorldSpawn((int(pos.x), y, int(pos.z)), dimension_id)
+        spawn = WorldSpawn((int(pos.x), y, int(pos.z)), dimension_id)
+        if spawn != self.world_spawn:
+            self.world_spawn = spawn
+            if notify:
+                PacketConnection._notify(self._world_spawn_observers.values(), spawn)
 
     def _apply_rules(self, rules) -> None:
         for rule in rules:

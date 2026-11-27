@@ -589,6 +589,21 @@ class Bot:
         environment = self._environment
         return None if environment is None else environment.world_spawn
 
+    def subscribe_world_spawn_changes(self, callback: Callable[[WorldSpawn], None]) -> Callable[[], None]:
+        """Observe public spawn changes advertised to the currently joined session.
+
+        A synchronous callback receives the new immutable WorldSpawn after world_spawn
+        is updated by a WORLD_SPAWN packet. The initial value is available in world_spawn.
+        The returned function unsubscribes and can be called repeatedly.
+        """
+        environment = self._environment
+        state = self._get_session_end_state()
+        if environment is None or state is None:
+            raise RuntimeError("player has not joined")
+        if state.result is not None:
+            raise ConnectionError("world spawn subscription stream is closed")
+        return environment.subscribe_world_spawn_changes(callback)
+
     async def wait_for_world_time_update(self, *, timeout: float = 15) -> WorldTime:
         """Wait for the next packet that changes the observed time snapshot."""
         if self._environment is None:
