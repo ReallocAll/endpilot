@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from functools import partial
-from typing import Literal
+from typing import Callable, Literal
 from uuid import UUID
 
 from bedrock_protocol import DecodeError
@@ -193,6 +193,7 @@ class JoinSession:
         self._item_registry_subscriptions = ()
         self._end_state = _SessionEndState()
         self._end_subscriptions = ()
+        self._end_observer: Callable[[SessionEnd], None] | None = None
         self.movement_speed: float | None = None
         self.bed_packets = []
         self.boss_bar_packets = []
@@ -677,9 +678,20 @@ class JoinSession:
         for unsubscribe in subscriptions:
             unsubscribe()
 
+    def _set_session_end_observer(self, callback: Callable[[SessionEnd], None]) -> None:
+        # The Bot hands off the observer only after it publishes the joined session.
+        result = self._end_state.result
+        if result is None:
+            self._end_observer = callback
+        else:
+            callback(result)
+
     def _finish_session_end(self, result: SessionEnd) -> None:
         if self._end_state.finish(result):
             self._stop_observing_session_end()
+            observer, self._end_observer = self._end_observer, None
+            if observer is not None:
+                observer(result)
 
     def _on_end_packet(self, raw: RawPacket) -> None:
         protocol = self.packets.protocol
@@ -712,12 +724,13 @@ class JoinSession:
             if ended:
                 self._on_reader_end(cause)
 
-    def _on_local_close(self) -> None:
+    def _on_local_close(self, reason: str | None) -> None:
         self._sync_session_end()
-        self._finish_session_end(SessionEnd("local_close"))
+        self._finish_session_end(SessionEnd("local_close", message=reason))
 
     async def close(self) -> None:
         self._stop_observing_session_end()
+        self._end_observer = None
         if isinstance(self.identity, _OnlineIdentity):
             self.identity = None
         self._clear_item_registry()

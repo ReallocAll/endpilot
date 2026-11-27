@@ -106,6 +106,7 @@ class Bot:
         self._online_join: _PendingOnlineJoin | None = None
         self._session: JoinSession | None = None
         self._session_end_state: _SessionEndState | None = None
+        self._session_end_observers: dict[object, Callable[[SessionEnd], None]] = {}
         self._movement: Movement | None = None
         self._inventory: Inventory | None = None
         self._books: Books | None = None
@@ -265,9 +266,11 @@ class Bot:
                 raise ConnectionError("player closed while joining")
 
         def finish_join() -> None:
-            self._session_end_state = self._session._end_state
-            if self._session.spawned:
+            session = self._session
+            self._session_end_state = session._end_state
+            if session.spawned:
                 self._player_state._start_spawn_observation(self._publish_spawn)
+            session._set_session_end_observer(self._publish_session_end)
             start_complete.set()
 
         try:
@@ -3325,6 +3328,30 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._session.wait_for_server_disconnect(timeout)
 
+    def subscribe_session_end(self, callback: Callable[[SessionEnd], None]) -> Callable[[], None]:
+        """Call back synchronously with the first end of each joined session.
+
+        Register before or after joining. The subscription persists across
+        joins and only observes future ends. The returned function unsubscribes.
+        """
+        observers = self._session_end_observers
+        token = object()
+        observers[token] = callback
+
+        def unsubscribe() -> None:
+            observers.pop(token, None)
+
+        return unsubscribe
+
+    def _publish_session_end(self, result: SessionEnd) -> None:
+        for callback in tuple(self._session_end_observers.values()):
+            try:
+                callback(result)
+            except (Exception, asyncio.CancelledError) as error:
+                asyncio.get_running_loop().call_exception_handler({
+                    "message": "session end observer failed", "exception": error, "callback": callback,
+                })
+
     def _get_session_end_state(self) -> _SessionEndState | None:
         state = self._session_end_state
         session = self._session
@@ -3381,11 +3408,12 @@ class Bot:
             raise RuntimeError("player has not joined")
         return self._session.packets
 
-    async def close(self) -> None:
+    async def close(self, *, reason: str | None = None) -> None:
+        """Close the connection, using reason as the message if local close ends the session."""
         session = self._session
         state = self._session_end_state
         if state is not None and state.result is None and session is not None:
-            session._on_local_close()
+            session._on_local_close(reason)
         component_errors: list[BaseException] = []
 
         @contextmanager

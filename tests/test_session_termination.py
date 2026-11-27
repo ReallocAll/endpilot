@@ -610,10 +610,16 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(waiting, return_exceptions=True)
 
     async def test_disconnect_after_spawn_in_the_same_batch_survives_later_reader_failure(self):
+        observed = []
+        self.bot.subscribe_spawns(observed.append)
+        self.bot.subscribe_session_end(lambda result: observed.append((result, self.bot.session_end)))
         wire = self.wire(self.disconnect("First reason", filtered=""), self.disconnect("Later reason"))
         await self.connect(wire)
         result = await self.bot.wait_for_session_end(timeout=1)
         self.assertEqual(result, SessionEnd("server_disconnect", 55, "KICKED", "First reason", ""))
+        self.assertEqual(observed, ["initial", (result, result)])
+        self.assertIs(observed[1][0], result)
+        self.assertIs(observed[1][1], result)
         self.assertIs(self.bot.session_end, result)
         self.assertFalse(wire.closed)
         with self.assertRaises(FrozenInstanceError):
@@ -635,10 +641,11 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(raised.exception, failure)
         self.assertIs(self.bot.session_end, result)
         with self.assertRaises(OSError) as raised:
-            await self.bot.close()
+            await self.bot.close(reason="Do not replace the first kick")
         self.assertIs(raised.exception, failure)
         self.assertTrue(wire.closed)
         self.assertIs(await self.bot.wait_for_session_end(timeout=0), result)
+        self.assertEqual(len(observed), 2)
 
     async def test_independent_waiter_timeout_and_cancellation_keep_another_waiter_live(self):
         wire = self.wire()
@@ -675,6 +682,8 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
     async def test_reader_failure_reports_only_the_error_type_and_preserves_close_error(self):
         wire = self.wire()
         await self.connect(wire)
+        observed = []
+        self.bot.subscribe_session_end(observed.append)
         failure = EOFError("details from the transport")
         wire.incoming.put_nowait(failure)
         result = await self.bot.wait_for_session_end(timeout=1)
@@ -682,10 +691,12 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(str(failure), repr(result))
         self.assertFalse(wire.closed)
         with self.assertRaises(EOFError) as raised:
-            await self.bot.close()
+            await self.bot.close(reason="Do not replace reader EOF")
         self.assertIs(raised.exception, failure)
         self.assertTrue(wire.closed)
         self.assertIs(self.bot.session_end, result)
+        self.assertEqual(len(observed), 1)
+        self.assertIs(observed[0], result)
 
     async def test_zero_timeout_wait_and_close_see_reader_completion_before_its_callback(self):
         for wait_first in (False, True):
@@ -703,7 +714,7 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
                     if wait_first:
                         result = await self.bot.wait_for_session_end(timeout=0)
                         self.assertEqual(result, SessionEnd("reader_end"))
-                    await self.bot.close()
+                    await self.bot.close(reason="Reader already completed")
 
                 async def recv():
                     nonlocal close_task
@@ -725,7 +736,67 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(wire.closed)
                 self.assertEqual(self.bot.session_end, SessionEnd("reader_end"))
 
+    async def test_session_end_observers_can_unsubscribe_and_schedule_close(self):
+        events, late, duplicates = [], [], []
+        scheduled_close = None
+        duplicate = duplicates.append
+
+        def first(result):
+            nonlocal scheduled_close
+            events.append((result, self.bot.session_end, self.bot._session._end_subscriptions))
+            remove_first()
+            remove_first()
+            self.bot.subscribe_session_end(late.append)
+            scheduled_close = asyncio.create_task(self.bot.close(reason="Second close"))
+
+        def fails(result):
+            if result.message == "First close":
+                raise ValueError("broken session end observer")
+            raise asyncio.CancelledError("cancelled session end observer")
+
+        remove_first = self.bot.subscribe_session_end(first)
+        self.bot.subscribe_session_end(fails)
+        remove_duplicate = self.bot.subscribe_session_end(duplicate)
+        self.bot.subscribe_session_end(duplicate)
+        await self.bot.close()
+        self.assertEqual(events, [])
+        self.assertEqual(duplicates, [])
+
+        wire = self.wire()
+        await self.connect(wire)
+        with patch.object(asyncio.get_running_loop(), "call_exception_handler") as report:
+            await self.bot.close(reason="First close")
+            self.assertIsNotNone(scheduled_close)
+            await scheduled_close
+            first_end = self.bot.session_end
+            self.assertEqual(first_end, SessionEnd("local_close", message="First close"))
+            self.assertEqual(events, [(first_end, first_end, ())])
+            self.assertIs(events[0][0], first_end)
+            self.assertIs(events[0][1], first_end)
+            self.assertEqual(duplicates, [first_end, first_end])
+            self.assertEqual(late, [])
+            self.assertTrue(wire.closed)
+            self.assertFalse(any(isinstance(packet, self.b.DisconnectPacket) for packet in wire.sent))
+
+            remove_duplicate()
+            remove_duplicate()
+            await self.connect(self.wire(player_id=42))
+            await self.bot.close()
+            second_end = self.bot.session_end
+            self.assertEqual(second_end, SessionEnd("local_close"))
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(duplicates, [first_end, first_end, second_end])
+        self.assertEqual(late, [second_end])
+        self.assertIs(late[0], second_end)
+        self.assertEqual(
+            [type(call.args[0]["exception"]) for call in report.call_args_list],
+            [ValueError, asyncio.CancelledError],
+        )
+
     async def test_local_close_binds_waiters_and_old_reader_packets_cannot_replace_a_rejoin(self):
+        observed, late = [], []
+        self.bot.subscribe_session_end(observed.append)
         first = self.wire()
         await self.connect(first)
         old_packets = self.bot.packets
@@ -741,18 +812,22 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
             await drain()
 
         with patch.object(state, "aclose", new=drain_old_state):
-            closing = asyncio.create_task(self.bot.close())
+            closing = asyncio.create_task(self.bot.close(reason="Closing the first session"))
             try:
                 await asyncio.wait_for(detached.wait(), 1)
                 old_result = await old_wait
-                self.assertEqual(old_result, SessionEnd("local_close"))
+                self.assertEqual(old_result, SessionEnd("local_close", message="Closing the first session"))
                 self.assertIs(self.bot.session_end, old_result)
+                self.assertIs(observed[0], old_result)
                 self.assertFalse(first.closed)
+                self.bot.subscribe_session_end(late.append)
+                self.assertEqual(late, [])
 
                 replacement = self.wire(player_id=42)
                 await self.connect(replacement)
                 self.assertIsNone(self.bot.session_end)
                 first.push(self.disconnect("Old session ended"))
+                first.incoming.put_nowait(EOFError("Late EOF after local close"))
                 self.assertEqual(old_packets.protocol.decode(await late_wire).messages.message, "Old session ended")
                 self.assertIsNone(self.bot.session_end)
                 replacement.push(self.disconnect("New session ended", filtered="New filtered"))
@@ -761,16 +836,22 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
                                                         "New session ended", "New filtered"))
             finally:
                 release.set()
-                await closing
+                with self.assertRaisesRegex(EOFError, "Late EOF after local close"):
+                    await closing
                 for task in (old_wait, late_wire):
                     task.cancel()
                 await asyncio.gather(old_wait, late_wire, return_exceptions=True)
         self.assertTrue(first.closed)
         self.assertFalse(replacement.closed)
         self.assertIs(self.bot.session_end, new_result)
-        self.assertEqual(old_result, SessionEnd("local_close"))
+        self.assertEqual(old_result, SessionEnd("local_close", message="Closing the first session"))
+        self.assertEqual(observed, [old_result, new_result])
+        self.assertEqual(late, [new_result])
+        self.assertIs(late[0], new_result)
 
     async def test_pre_spawn_refusal_does_not_publish_a_result_and_invalid_join_retains_the_last_one(self):
+        observed = []
+        self.bot.subscribe_session_end(observed.append)
         self.assertIsNone(self.bot.session_end)
         with self.assertRaisesRegex(RuntimeError, "player has not joined"):
             await self.bot.wait_for_session_end(timeout=0)
@@ -788,8 +869,12 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
             await self.connect(refused)
         self.assertTrue(refused.closed)
         self.assertIsNone(self.bot.session_end)
+        self.assertEqual(observed, [saved])
+        self.assertIs(observed[0], saved)
 
     async def test_cancelled_authorization_and_failed_assembly_never_publish_a_session(self):
+        observed = []
+        self.bot.subscribe_session_end(observed.append)
         entered = asyncio.Event()
 
         async def authorize(_public_key):
@@ -827,8 +912,11 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.bot.session_end)
         with self.assertRaisesRegex(RuntimeError, "player has not joined"):
             await self.bot.wait_for_session_end(timeout=0)
+        self.assertEqual(observed, [])
 
     async def test_cancelled_online_join_after_assembly_keeps_the_end_private(self):
+        observed = []
+        self.bot.subscribe_session_end(observed.append)
         wire = self.wire(self.disconnect("queued just after spawn"))
         start = self.bot._start_session
 
@@ -850,3 +938,4 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.bot.session_end)
         with self.assertRaisesRegex(RuntimeError, "player has not joined"):
             await self.bot.wait_for_session_end(timeout=0)
+        self.assertEqual(observed, [])
