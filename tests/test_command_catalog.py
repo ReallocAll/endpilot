@@ -189,6 +189,80 @@ class CommandCatalogTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertEqual(self.bot.complete_command("configure "), ("high-value",))
 
+    async def test_scoreboard_completes_live_objectives_after_a_literal_player(self):
+        packet = self.b.AvailableCommandsPacket
+        players, set_action, reset_action = 0x00300000, 0x00300001, 0x00300002
+        target, objectives, count = 0x0010000A, 0x04100000, 0x00100001
+        await self.join(packet(
+            enum_values=("players", "set", "add", "remove", "reset", "list"),
+            enums=[
+                packet.EnumData(name="ScoreboardPlayersCategory", values=(0,)),
+                packet.EnumData(name="ScoreboardPlayersNumAction", values=(1, 2, 3)),
+                packet.EnumData(name="ScoreboardResetAction", values=(4,)),
+                packet.EnumData(name="ScoreboardListAction", values=(5,)),
+            ],
+            soft_enums=[packet.SoftEnumData(name="ScoreboardObjectives", values=("ep_alpha",))],
+            commands=[packet.CommandData(name="scoreboard", alias_enum=-1, overloads=[
+                self.overload(players, set_action, target, objectives, count),
+                self.overload(players, reset_action, target, objectives, optional_from=3),
+                self.overload(players, 0x00300003, target, optional_from=2),
+            ])],
+        ))
+        sent = list(self.wire.sent)
+        set_query = "/scoreboard players set Pilot_1 ep_"
+        reset_query = "/scoreboard players reset Pilot_1 ep_"
+        for query in (set_query, reset_query):
+            self.assertEqual(self.bot.complete_command(query), ("ep_alpha",))
+
+        update = self.b.SoftEnumUpdateType
+        for operation, value, expected in (
+            (update.ADD, "ep_beta", ("ep_alpha", "ep_beta")),
+            (update.REMOVE, "ep_alpha", ("ep_beta",)),
+        ):
+            await self.deliver(self.b.UpdateSoftEnumPacket(
+                enum_name="ScoreboardObjectives", type=operation, values=(value,),
+            ))
+            for query in (set_query, reset_query):
+                self.assertEqual(self.bot.complete_command(query), expected)
+
+        self.assertEqual(self.bot.complete_command("/scoreboard players set Pilot_1 "), ("ep_beta",))
+        self.assertEqual(self.bot.complete_command("/scoreboard players reset Pilot_1 ep_a"), ())
+        self.assertEqual(self.bot.complete_command("/scoreboard players reset Pilot_1 EP_"), ())
+        self.assertEqual(self.bot.complete_command("/scoreboard players set "), ())
+        self.assertEqual(self.bot.complete_command("/scoreboard players set ep_"), ())
+        self.assertEqual(self.bot.complete_command("/scoreboard players set Pilot_1 ep_beta "), ())
+        self.assertEqual(self.bot.complete_command("/scoreboard players Set Pilot_1 ep_"), ())
+        self.assertEqual(self.bot.complete_command("/scoreboard players list Pilot_1 ep_"), ())
+        for target_token in ("@s", "@a[tag=probe]", '*', '"Pilot_1"', '"Pilot 1"', "Pilot[one]"):
+            with self.subTest(target=target_token):
+                self.assertEqual(self.bot.complete_command(f"/scoreboard players set {target_token} ep_"), ())
+        self.assertEqual(self.wire.sent, sent)
+
+    async def test_literal_target_keeps_overlapping_enum_overloads_independent(self):
+        packet = self.b.AvailableCommandsPacket
+        choose, named_target, fixed_choice, hidden_choice = (0x00300000 + i for i in range(4))
+        target, objectives = 0x0010000A, 0x04100000
+        await self.join(packet(
+            enum_values=("choose", "Named", "shared", "fixed", "hidden"),
+            enums=[
+                packet.EnumData(name="Action", values=(0,)),
+                packet.EnumData(name="Named", values=(1,)),
+                packet.EnumData(name="Fixed", values=(2, 3)),
+                packet.EnumData(name="Hidden", values=(4,)),
+            ],
+            soft_enums=[packet.SoftEnumData(name="Live", values=("live", "shared"))],
+            commands=[packet.CommandData(name="configure", alias_enum=-1, overloads=[
+                self.overload(choose, named_target, fixed_choice),
+                self.overload(choose, target, objectives),
+                self.overload(choose, 0x00100001, hidden_choice),
+                self.overload(choose, target, hidden_choice, chaining=True),
+            ])],
+        ))
+        self.assertEqual(self.bot.complete_command("/configure choose "), ("Named",))
+        self.assertEqual(self.bot.complete_command("/configure choose Named "), ("shared", "fixed", "live"))
+        self.assertEqual(self.bot.complete_command("/configure choose Another "), ("live", "shared"))
+        self.assertEqual(self.bot.complete_command("/configure choose @s "), ())
+
     async def test_soft_enum_updates_follow_catalog_and_spawn_in_wire_order(self):
         packet = self.b.AvailableCommandsPacket
         enum_name = "ScoreboardObjectives"

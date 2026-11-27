@@ -39,15 +39,25 @@ class CommandCatalog:
     commands: tuple[CommandCatalogEntry, ...]
 
 
-# A parameter holds hard enum values or an index into the live soft enums.
-type _EnumOverload = tuple[tuple[str, ...] | int, ...]
+# A parameter holds hard enum values, an index into the live soft enums, or
+# None for a player target that can be crossed using a plain literal name.
+type _EnumRef = tuple[str, ...] | int
+type _CompletionPrefix = tuple[_EnumRef | None, ...]
 
 
 @dataclass(slots=True)
 class _CommandAdvertisement:
     catalog: CommandCatalog
-    overloads: dict[str, tuple[_EnumOverload, ...]]
+    overloads: dict[str, tuple[_CompletionPrefix, ...]]
     soft_enums: list[tuple[str, tuple[str, ...]]]
+
+    def enum_values(self, ref: _EnumRef) -> tuple[str, ...]:
+        return self.soft_enums[ref][1] if isinstance(ref, int) else ref
+
+    def matches_argument(self, ref: _EnumRef | None, argument: str) -> bool:
+        if ref is None:
+            return all(character.isalnum() or character == "_" for character in argument)
+        return argument in self.enum_values(ref)
 
     def update_soft_enum(self, packet, update_type) -> None:
         name, operation = packet.enum_name, packet.type
@@ -67,7 +77,7 @@ class _CommandAdvertisement:
             self.soft_enums[index] = (name, updated)
 
 
-def _enum_prefix(params, hard_enums: tuple[tuple[str, ...], ...], soft_enum_count: int) -> _EnumOverload:
+def _completion_prefix(params, hard_enums: tuple[tuple[str, ...], ...], soft_enum_count: int) -> _CompletionPrefix:
     result = []
     for param in params:
         symbol = param.parse_symbol
@@ -77,6 +87,9 @@ def _enum_prefix(params, hard_enums: tuple[tuple[str, ...], ...], soft_enum_coun
             result.append(hard_enums[index])
         elif kind == 0x04100000 and index < soft_enum_count:
             result.append(index)
+        elif symbol == 0x0010000A and not param.optional:
+            # The Target grammar also accepts selectors and quoted names.
+            result.append(None)
         else:
             # Later parameters cannot be reached through an unsupported parameter.
             break
@@ -98,7 +111,8 @@ def _command_advertisement(packet) -> _CommandAdvertisement:
         commands.append(CommandCatalogEntry(record.name, aliases))
         prefixes = tuple(
             prefix for overload in record.overloads
-            if not overload.is_chaining and (prefix := _enum_prefix(overload.params, hard_enums, len(soft_enums)))
+            if not overload.is_chaining
+            and (prefix := _completion_prefix(overload.params, hard_enums, len(soft_enums)))
         )
         if prefixes:
             for name in dict.fromkeys((record.name, *aliases)):
@@ -238,12 +252,12 @@ class Commands:
         for overload in advertisement.overloads.get(command.removeprefix("/"), ()):
             if position >= len(overload):
                 continue
-            choices = tuple(
-                advertisement.soft_enums[ref][1] if isinstance(ref, int) else ref
-                for ref in overload[:position + 1]
-            )
-            if all(argument in values for argument, values in zip(arguments, choices)):
-                matches.extend(value for value in choices[-1] if value.startswith(prefix))
+            ref = overload[position]
+            if ref is not None and all(
+                advertisement.matches_argument(previous, argument)
+                for previous, argument in zip(overload, arguments)
+            ):
+                matches.extend(value for value in advertisement.enum_values(ref) if value.startswith(prefix))
         return tuple(dict.fromkeys(matches))
 
     def _on_packet(self, raw: RawPacket) -> None:
