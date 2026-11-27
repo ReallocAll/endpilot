@@ -113,8 +113,8 @@ class OffhandEquipmentTests(unittest.IsolatedAsyncioTestCase):
     def close_packet(self):
         return self.b.ContainerClosePacket(container_id=4, container_type=self.b.ContainerType.INVENTORY)
 
-    def player(self, item_id=0, count=0, net_id=None):
-        return self.b.InventorySlotPacket(inventory_id=self.b.ContainerID.INVENTORY, slot=3,
+    def player(self, item_id=0, count=0, net_id=None, *, slot=3):
+        return self.b.InventorySlotPacket(inventory_id=self.b.ContainerID.INVENTORY, slot=slot,
                                           item=item(self.b, item_id, count, net_id))
 
     def offhand(self, item_id=0, count=0, net_id=None):
@@ -201,6 +201,133 @@ class OffhandEquipmentTests(unittest.IsolatedAsyncioTestCase):
         hand, player = self.bot.offhand_item, self.bot.inventory_slots[3]
         self.assertEqual((hand.id, hand.stack_size, hand.net_id_variant), (17, 14, 22))
         self.assertEqual((player.id, player.stack_size, player.net_id_variant), (17, 64, 20))
+
+    async def test_automatic_unequip_takes_the_whole_stack_into_the_first_confirmed_empty_slot(self):
+        b = self.b
+        await self.deliver(self.window(), self.player(slot=25), self.player(4, 64, 72),
+                           self.player(slot=22), self.offhand(17, 16, 71))
+        taking = asyncio.create_task(self.bot.unequip_offhand())
+        request = await self.sent_request()
+        action, = request.actions
+        self.assertIsInstance(action, b.ItemStackRequestCereal.TakeActionData)
+        self.assertEqual(action.amount, 16)
+        self.assertEqual(action.source.full_container_name.name, b.ContainerEnumName.OFFHAND_CONTAINER)
+        self.assertEqual((action.source.slot, action.source.net_id_variant), (1, 71))
+        self.assertEqual(action.destination.full_container_name.name,
+                         b.ContainerEnumName.COMBINED_HOTBAR_AND_INVENTORY_CONTAINER)
+        self.assertEqual((action.destination.slot, action.destination.net_id_variant), (22, 0))
+        self.assertEqual(self.bot.offhand_item.stack_size, 16)
+        self.assertEqual(self.bot.inventory_slots[22].stack_size, 0)
+        await self.deliver(self.response(request, "SUCCESS", ("OFFHAND_CONTAINER", 1, 0, None),
+                                         ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 22, 16, 71)))
+        reply = await taking
+        self.assertEqual(reply.client_request_id.raw_id, request.client_request_id.raw_id)
+        self.assertEqual(reply.result.name, "SUCCESS")
+        self.assertEqual(self.bot.offhand_item.stack_size, 0)
+        stored = self.bot.inventory_slots[22]
+        self.assertEqual((stored.id, stored.stack_size, stored.net_id_variant), (17, 16, 71))
+        self.assertEqual(self.bot.inventory_slots[25].stack_size, 0)
+        self.assertEqual(self.wire.sent, [])
+
+    async def test_automatic_unequip_does_not_send_without_the_required_observations(self):
+        b = self.b
+        with self.assertRaisesRegex(RuntimeError, "open the player inventory"):
+            await self.bot.unequip_offhand()
+        await self.deliver(self.window(), self.offhand(17, 16, 71), self.player(17, 48, 72))
+        with self.assertRaisesRegex(RuntimeError, "no empty main inventory slot is confirmed"):
+            await self.bot.unequip_offhand()
+        await self.deliver(b.InventoryContentPacket(
+            inventory_id=b.ContainerID.INVENTORY, slots=[item(b, 17, 48, slot + 100) for slot in range(36)],
+        ))
+        with self.assertRaisesRegex(RuntimeError, "the main inventory is full"):
+            await self.bot.unequip_offhand()
+        await self.deliver(self.player(), b.InventoryContentPacket(inventory_id=b.ContainerID.OFFHAND, slots=[]))
+        with self.assertRaisesRegex(RuntimeError, "offhand slot is unobserved"):
+            await self.bot.unequip_offhand()
+        await self.deliver(self.offhand())
+        with self.assertRaisesRegex(ValueError, "source slot is empty"):
+            await self.bot.unequip_offhand()
+        await self.deliver(self.offhand(17, 16))
+        with self.assertRaisesRegex(RuntimeError, "no observed identity or amount"):
+            await self.bot.unequip_offhand()
+        await self.deliver(self.offhand(17, 16, 71))
+        with self.assertRaisesRegex(ValueError, "explicit amount requires a destination"):
+            await self.bot.unequip_offhand(amount=2)
+        self.assertEqual(self.wire.sent, [])
+
+    async def test_automatic_unequip_distinguishes_repeated_observations_from_restored_slots(self):
+        b = self.b
+        for restored in (None, "destination", "offhand"):
+            with self.subTest(restored=restored):
+                await self.deliver(self.window(), self.player(slot=22), self.offhand(17, 16, 71))
+                taking = asyncio.create_task(self.bot.unequip_offhand())
+                request = await self.sent_request()
+                self.assertEqual(request.actions[0].destination.slot, 22)
+                if restored == "destination":
+                    await self.deliver(self.player(4, 64, 72, slot=22))
+                elif restored == "offhand":
+                    await self.deliver(b.InventorySlotPacket(
+                        inventory_id=b.ContainerID.OFFHAND, slot=0, item=item(b, 17, 16, 73),
+                    ))
+                await self.deliver(self.player(slot=22), self.offhand(17, 16, 71))
+                await self.deliver(self.response(request, "SUCCESS", ("OFFHAND_CONTAINER", 1, 0, None),
+                                                 ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 22, 16, 71)))
+
+                reply = await taking
+                self.assertEqual(reply.client_request_id.raw_id, request.client_request_id.raw_id)
+                self.assertEqual(reply.result.name, "SUCCESS")
+                destination = self.bot.inventory_slots[22]
+                offhand = self.bot.offhand_item
+                self.assertEqual((destination.id, destination.stack_size, destination.net_id_variant),
+                                 (0, 0, None) if restored == "destination" else (17, 16, 71))
+                self.assertEqual((offhand.id, offhand.stack_size, offhand.net_id_variant),
+                                 (17, 16, 71) if restored == "offhand" else (0, 0, None))
+
+    async def test_automatic_unequip_skips_an_empty_slot_with_a_pending_request(self):
+        await self.deliver(self.window(), self.player(), self.player(slot=22),
+                           self.player(4, 64, 72, slot=2), self.offhand(17, 16, 71))
+        move = asyncio.create_task(self.inventory.move_item(2, 3))
+        first = await self.sent_request()
+        taking = asyncio.create_task(self.bot.unequip_offhand())
+        second = await self.sent_request()
+        self.assertEqual(second.actions[0].destination.slot, 22)
+        with self.assertRaisesRegex(RuntimeError, "item-stack request in flight"):
+            await self.bot.unequip_offhand(3)
+        self.assertEqual(self.wire.sent, [])
+        await self.deliver(self.response(first, "ERROR"), self.response(second, "ERROR"))
+        self.assertEqual((await move).result.name, "ERROR")
+        self.assertEqual((await taking).result.name, "ERROR")
+
+    async def test_automatic_unequip_checks_the_window_and_both_slots_at_write(self):
+        send = self.packets.send
+        for changed, updates in (
+            ("window", (self.close_packet(), self.window())),
+            ("destination", (self.player(4, 64, 72),)),
+            ("source", (self.offhand(17, 16, 73),)),
+        ):
+            with self.subTest(changed=changed):
+                await self.deliver(self.window(), self.player(), self.offhand(17, 16, 71))
+                ready, release = asyncio.Event(), asyncio.Event()
+
+                async def delayed_send(packet, **options):
+                    ready.set()
+                    await release.wait()
+                    await send(packet, **options)
+
+                self.packets.send = delayed_send
+                task = asyncio.create_task(self.bot.unequip_offhand())
+                try:
+                    async with asyncio.timeout(1):
+                        await ready.wait()
+                    await self.deliver(*updates)
+                    release.set()
+                    with self.assertRaisesRegex(RuntimeError, "changed before submission"):
+                        await task
+                    self.assertEqual(self.wire.sent, [])
+                finally:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    self.packets.send = send
 
     async def test_explicit_unequip_respects_another_request_already_owning_offhand(self):
         b = self.b
@@ -293,23 +420,25 @@ class OffhandEquipmentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_late_unequip_verdict_preserves_independent_update_after_same_id_reopen(self):
         b = self.b
-        await self.deliver(self.window(), self.player(), self.offhand(17, 16, 71))
-        window = self.containers.window
-        task = asyncio.create_task(self.bot.unequip_offhand(3))
-        request = await self.sent_request()
-        await self.deliver(self.close_packet(), self.window(), self.player(578, 1, 83))
-        self.assertIsNot(self.containers.window, window)
-        self.assertEqual(self.containers.window.container_id, window.container_id)
-        player = self.bot.inventory_slots[3]
-        corrections = (("OFFHAND_CONTAINER", 1, 0, None), ("HOTBAR_CONTAINER", 3, 16, 71))
-        unrelated = SimpleNamespace(client_request_id=b.ItemStackRequestId(raw_id=-99))
-        await self.deliver(self.response(unrelated, "SUCCESS", *corrections))
-        self.assertFalse(task.done())
-        self.assertEqual(self.bot.offhand_item.stack_size, 16)
-        await self.deliver(self.response(request, "SUCCESS", *corrections))
-        self.assertEqual((await task).result.name, "SUCCESS")
-        self.assertEqual((self.bot.offhand_item.id, self.bot.offhand_item.stack_size), (0, 0))
-        self.assertIs(self.bot.inventory_slots[3], player)
+        for args in ((3,), ()):
+            with self.subTest(explicit=bool(args)):
+                await self.deliver(self.window(), self.player(), self.offhand(17, 16, 71))
+                window = self.containers.window
+                task = asyncio.create_task(self.bot.unequip_offhand(*args))
+                request = await self.sent_request()
+                await self.deliver(self.close_packet(), self.window(), self.player(578, 1, 83))
+                self.assertIsNot(self.containers.window, window)
+                self.assertEqual(self.containers.window.container_id, window.container_id)
+                player = self.bot.inventory_slots[3]
+                corrections = (("OFFHAND_CONTAINER", 1, 0, None), ("HOTBAR_CONTAINER", 3, 16, 71))
+                unrelated = SimpleNamespace(client_request_id=b.ItemStackRequestId(raw_id=-99))
+                await self.deliver(self.response(unrelated, "SUCCESS", *corrections))
+                self.assertFalse(task.done())
+                self.assertEqual(self.bot.offhand_item.stack_size, 16)
+                await self.deliver(self.response(request, "SUCCESS", *corrections))
+                self.assertEqual((await task).result.name, "SUCCESS")
+                self.assertEqual((self.bot.offhand_item.id, self.bot.offhand_item.stack_size), (0, 0))
+                self.assertIs(self.bot.inventory_slots[3], player)
 
     async def test_rejects_unobserved_empty_or_wrong_window_before_send(self):
         equip, unequip = self.inventory.equip_offhand, self.inventory.unequip_offhand

@@ -193,6 +193,8 @@ class Inventory:
     def _set_offhand_slot(self, item, *, received=False):
         self._offhand_slot = item
         self._record_damage_descriptor(_DAMAGE_OFFHAND_SLOT, item, received=received)
+        if received:
+            self._observe_transfer_slot(_DAMAGE_OFFHAND_SLOT, item)
 
     def _set_slot(self, slot, item, *, drop_origin=None, received=False):
         slot = int(slot)
@@ -853,7 +855,7 @@ class Inventory:
 
         return await self._request_item_stack(request, apply, timeout=timeout, _on_slot_observed=observe)
 
-    def _empty_armor_destination(self) -> int:
+    def _empty_main_inventory_destination(self) -> int:
         complete = True
         for index in range(_MAIN_INVENTORY_SIZE):
             item = self._slots.get(index)
@@ -898,7 +900,7 @@ class Inventory:
                 raise RuntimeError("the armor stack has no confirmed identity or single-item amount")
             if self._requests_for_endpoints((armor_endpoint,)):
                 raise RuntimeError("the armor slot has an item-stack request in flight")
-            destination_slot = self._empty_armor_destination()
+            destination_slot = self._empty_main_inventory_destination()
         else:
             self._require_no_automatic_unequip(armor_slot, destination_slot)
         destination_observed = self._slots.get(destination_slot)
@@ -1004,22 +1006,27 @@ class Inventory:
         """Move an observed inventory stack to the offhand and return the BDS verdict."""
         return await self._offhand_exchange(source_slot, containers, into_offhand=True, timeout=timeout)
 
-    async def unequip_offhand(self, destination_slot: int, *, containers, amount: int | None = None,
+    async def unequip_offhand(self, destination_slot: int | None = None, *, containers, amount: int | None = None,
                               timeout: float = 15):
         """Move the observed offhand stack to inventory and return the BDS verdict."""
         if amount is not None and (type(amount) is not int or not 1 <= amount <= 255):
             raise ValueError("amount must be between 1 and 255")
+        if amount is not None and destination_slot is None:
+            raise ValueError("an explicit amount requires a destination slot")
         return await self._offhand_exchange(
             destination_slot, containers, into_offhand=False, timeout=timeout, take_amount=amount,
         )
 
-    async def _offhand_exchange(self, index: int, containers, *, into_offhand: bool, timeout: float,
+    async def _offhand_exchange(self, index: int | None, containers, *, into_offhand: bool, timeout: float,
                                 take_amount: int | None = None):
-        if type(index) is not int or not 0 <= index < 36:
+        automatic = index is None and not into_offhand
+        if not automatic and (type(index) is not int or not 0 <= index < _MAIN_INVENTORY_SIZE):
             raise ValueError("inventory slot must be between 0 and 35")
         window = containers.window
         if window is None or window.container_type != "INVENTORY":
             raise RuntimeError("open the player inventory screen before changing the offhand")
+        if automatic:
+            index = self._empty_main_inventory_destination()
 
         player_item = self._slots.get(index)
         offhand_item = self._offhand_slot
@@ -1063,25 +1070,47 @@ class Inventory:
             actions=[action], strings_to_filter=[], strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
         )
 
-        expected = (_stack_snapshot(player_item), _stack_snapshot(offhand_item)) if exact_take else None
+        checked_take = automatic or exact_take
+        player_endpoint = (None, index)
+        if checked_take:
+            expected = {
+                player_endpoint: _stack_snapshot(player_item),
+                _DAMAGE_OFFHAND_SLOT: _stack_snapshot(offhand_item),
+            }
+        changed = set()
 
         def before_send():
             nonlocal player_item, offhand_item
             if containers.window is not window:
                 raise RuntimeError("the player inventory window changed before submission")
             current_player, current_offhand = self._slots.get(index), self._offhand_slot
-            if exact_take:
+            if checked_take:
                 pending = self._pending_requests[request_id]
                 if any(other is not pending for other in self._requests_for_endpoints(pending.endpoints)):
                     raise RuntimeError("an offhand transfer slot has an item-stack request in flight")
-                if (_stack_snapshot(current_player), _stack_snapshot(current_offhand)) != expected:
+                if (_stack_snapshot(current_player) != expected[player_endpoint]
+                        or _stack_snapshot(current_offhand) != expected[_DAMAGE_OFFHAND_SLOT]
+                        or automatic and (index in self._unconfirmed_transfer_slots or index in self._drop_key_counts)):
                     raise RuntimeError("an offhand transfer slot changed before submission")
                 player_item, offhand_item = current_player, current_offhand
             elif current_player is not player_item or current_offhand is not offhand_item:
                 raise RuntimeError("an offhand transfer slot changed before submission")
-            elif any(pending.submitted and pending.exact_offhand_take
-                     for pending in self._requests_for_endpoints({_DAMAGE_OFFHAND_SLOT})):
-                raise RuntimeError("an exact offhand take still has an item-stack request in flight")
+            else:
+                for pending in self._requests_for_endpoints((_DAMAGE_OFFHAND_SLOT,)):
+                    if pending.submitted and pending.exact_offhand_take:
+                        raise RuntimeError("an exact offhand take still has an item-stack request in flight")
+                    if pending.submitted and pending.automatic_unequip:
+                        raise RuntimeError("an automatic offhand unequip has an item-stack request in flight")
+
+        def observe(endpoint, item):
+            # Retain changes even if a later observation restores the original value.
+            if _stack_snapshot(item) != expected[endpoint]:
+                changed.add(endpoint)
+
+        def slot_unchanged(endpoint, current, original):
+            if automatic:
+                return endpoint not in changed and _stack_snapshot(current) == expected[endpoint]
+            return current is original
 
         def apply(response):
             # The matching verdict still belongs to the player's slots after the screen closes.
@@ -1100,17 +1129,19 @@ class Inventory:
                 name = container.full_container_name.name.name
                 for slot in container.slots:
                     # Preserve typed observations received before the matching verdict.
-                    if name == "OFFHAND_CONTAINER" and slot.slot == 1 and self._offhand_slot is offhand_item:
+                    if (name == "OFFHAND_CONTAINER" and slot.slot == 1
+                            and slot_unchanged(_DAMAGE_OFFHAND_SLOT, self._offhand_slot, offhand_item)):
                         self._set_offhand_slot(corrected(offhand_item, offhand_after, slot))
                     elif (name in (
                         "HOTBAR_CONTAINER", "INVENTORY_CONTAINER", "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER",
-                    ) and slot.slot == index and self._slots.get(index) is player_item):
+                    ) and slot.slot == index and slot_unchanged(player_endpoint, self._slots.get(index), player_item)):
                         self._set_slot(index, corrected(player_item, player_after, slot))
 
         return await self._request_item_stack(
             request, apply, timeout=timeout,
-            before_send=None if exact_take else before_send, _at_write=before_send if exact_take else None,
-            _exact_offhand_take=exact_take,
+            before_send=None if checked_take else before_send, _at_write=before_send if checked_take else None,
+            _on_slot_observed=observe if automatic else None,
+            _automatic_unequip=automatic, _exact_offhand_take=exact_take,
         )
 
     async def move_item(
