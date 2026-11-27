@@ -31,7 +31,7 @@ from .entities import (
     PlayerListChange, PlayerListEntry, ShieldBlockEvent, VehicleLink, VehicleLinkChange,
 )
 from .fishing import FishingResult
-from .inventory import HeldItemSnapshot, HeldItemStack, InventorySlotChange
+from .inventory import CursorObservation, HeldItemSnapshot, HeldItemStack, InventorySlotChange
 from .item_registry import ItemRegistrySnapshot
 from .item_use import ItemCooldownEvent
 from .login import LoginRefused, SessionEnd
@@ -133,6 +133,7 @@ __all__ = [
     "ForwardInput",
     "FurnaceProgress",
     "GlideBoostEvent",
+    "CursorObservation",
     "HeldItemSnapshot",
     "HeldItemStack",
     "InventorySlotChange",

@@ -46,7 +46,7 @@ from .fishing import Fishing, FishingResult
 from .forms import Forms
 from .game_hp_estimate import _estimate_sourceless_explosion_damage
 from .harvest import HarvestTool, HarvestToolChest, HarvestTools
-from .inventory import HeldItemSnapshot, Inventory, InventorySlotChange
+from .inventory import CursorObservation, HeldItemSnapshot, Inventory, InventorySlotChange
 from .item_registry import ItemRegistrySnapshot
 from .item_use import ItemConsumption, ItemCooldownEvent, ItemUse
 from .item_user_data import read_item_user_data
@@ -1570,6 +1570,21 @@ class Bot:
         if self._inventory is None:
             raise RuntimeError("player has not joined")
         await self._inventory.select_hotbar(slot)
+
+    @property
+    def last_cursor_observation(self) -> CursorObservation | None:
+        """Read the last server report for the active connection's inventory UI cursor.
+
+        Return None until a report arrives and after the connection ends. The
+        cursor may have changed since the report. A stack response can report
+        count and stack network ID, while item details require a full descriptor.
+        """
+        inventory = self._inventory
+        state = self._session_end_state
+        if (inventory is None or (state is not None and state.result is not None)
+                or inventory.packets._reader_end_result()[0]):
+            return None
+        return inventory._last_cursor_observation
 
     @property
     def held_item(self) -> HeldItemSnapshot:

@@ -30,6 +30,16 @@ class HeldItemSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class CursorObservation:
+    """One server report for the inventory UI cursor. Count zero reports an empty cursor."""
+
+    source: Literal["inventory_content", "inventory_slot", "item_stack_response"]
+    count: int
+    stack_net_id: int | None
+    observed_item: HeldItemStack | None  # Present only for a full nonempty descriptor in this report.
+
+
+@dataclass(frozen=True, slots=True)
 class InventorySlotChange:
     """A main inventory slot's before and after descriptions at a server update boundary."""
 
@@ -146,6 +156,7 @@ class Inventory:
         self._drop_key_lock = asyncio.Lock()
         self._armor_slots = {}
         self._offhand_slot = None  # None means the server has not described this slot.
+        self._last_cursor_observation: CursorObservation | None = None
         self._damage_descriptors = {}
         self._next_request_id = -1
         self._selected_slot = 0
@@ -218,6 +229,30 @@ class Inventory:
             event.set()
         self._changed.set()
 
+    def _observe_cursor_item(self, source: Literal["inventory_content", "inventory_slot"], item) -> None:
+        if self._request_stream_ended or item is None:
+            return
+        count = int(item.stack_size)
+        if int(item.id) == 0:
+            if count == 0:
+                self._last_cursor_observation = CursorObservation(source, 0, None, None)
+        elif count > 0:
+            observed = _stack_snapshot(item)
+            self._last_cursor_observation = CursorObservation(source, count, observed.net_id, observed)
+
+    def _observe_cursor_response(self, response, binding) -> None:
+        if self._request_stream_ended or getattr(response, "result", None) != binding.ItemStackNetResult.SUCCESS:
+            return
+        for container in response.containers or ():
+            if container.full_container_name.name != binding.ContainerEnumName.CURSOR_CONTAINER:
+                continue
+            for slot in container.slots:
+                if int(slot.slot) == 0:
+                    net_id = slot.item_stack_net_id
+                    self._last_cursor_observation = CursorObservation(
+                        "item_stack_response", int(slot.amount), None if net_id is None else int(net_id.raw_id), None,
+                    )
+
     def _on_packet(self, raw):
         b = self.packets.protocol.binding
         if raw.packet_id == b.ItemStackResponsePacket.ID:
@@ -228,6 +263,7 @@ class Inventory:
                 self._fail_pending_requests(ValueError, "could not decode item-stack response", error)
                 return
             for response in responses:
+                self._observe_cursor_response(response, b)
                 request_id = int(response.client_request_id.raw_id)
                 pending = self._pending_requests.get(request_id)
                 if pending is None or (pending.checked_at_write and not pending.submitted):
@@ -254,6 +290,11 @@ class Inventory:
         elif raw.packet_id == b.InventoryContentPacket.ID:
             packet = self.packets.protocol.decode(raw)
             inventory_id = int(packet.inventory_id)
+            if inventory_id == int(b.ContainerID.PLAYER_ONLY_UI):
+                slots = packet.slots
+                if slots:
+                    self._observe_cursor_item("inventory_content", slots[0])
+                return
             if inventory_id == int(b.ContainerID.ARMOR):
                 previous = self._armor_slots
                 self._armor_slots = dict(enumerate(packet.slots))
@@ -283,7 +324,10 @@ class Inventory:
             self._notify_inventory_changes(before, complete=True)
         elif raw.packet_id == b.InventorySlotPacket.ID:
             packet = self.packets.protocol.decode(raw)
-            if int(packet.inventory_id) == int(b.ContainerID.INVENTORY):
+            inventory_id = int(packet.inventory_id)
+            if inventory_id == int(b.ContainerID.PLAYER_ONLY_UI) and int(packet.slot) == 0:
+                self._observe_cursor_item("inventory_slot", packet.item)
+            elif inventory_id == int(b.ContainerID.INVENTORY):
                 slot = int(packet.slot)
                 before = {slot: self._slots.get(slot)} if self._observes_inventory_slot(slot) else None
                 self._unconfirmed_transfer_slots.discard(slot)
@@ -297,11 +341,11 @@ class Inventory:
                 if slot == self._selected_slot:
                     self._notify_held_item()
                 self._notify_inventory_changes(before)
-            elif int(packet.inventory_id) == int(b.ContainerID.ARMOR):
+            elif inventory_id == int(b.ContainerID.ARMOR):
                 slot = int(packet.slot)
                 self._set_armor_slot(slot, packet.item, received=True)
                 self._observe_transfer_slot(("ARMOR_CONTAINER", slot), packet.item)
-            elif int(packet.inventory_id) == int(b.ContainerID.OFFHAND) and int(packet.slot) == 0:
+            elif inventory_id == int(b.ContainerID.OFFHAND) and int(packet.slot) == 0:
                 self._set_offhand_slot(packet.item, received=True)
         elif raw.packet_id == b.MobEquipmentPacket.ID:
             packet = self.packets.protocol.decode(raw)
@@ -490,6 +534,7 @@ class Inventory:
 
     def _end_requests(self, cause=None):
         self._request_stream_ended = True
+        self._last_cursor_observation = None
         self._slot_observers.clear()
         self._fail_pending_requests(ConnectionError, "connection ended before an item-stack verdict", cause)
         for waiter in self._held_item_waiters:
