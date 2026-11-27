@@ -330,6 +330,29 @@ terrain, or actor geometry could affect the result. Both queries send no packets
 `attack_entity` and `interact_entity` submit input; a normal return does not
 confirm a hit, damage, or another server-side effect.
 
+## Observe shield blocks
+
+`bot.subscribe_shield_blocks(callback, runtime_id=...)` calls a synchronous
+callback when the server asserts the `BLOCKED_USING_SHIELD` actor flag.
+`await bot.wait_for_shield_block(runtime_id=..., timeout=15)` returns the next
+matching event. Both methods send zero packets. The immutable
+`ShieldBlockEvent` holds the defender's runtime ID, its unique ID when
+known, and the tick reported in the metadata packet.
+
+Repeated assertions count once until a typed report clears the flag. Login
+metadata and remote spawn packets can establish that initial state silently.
+The event reports the impact flag separately from shield posture. The
+attacker, health, and shield wear require their own observations.
+
+Omit `runtime_id` to observe the local player and visible remote players. An
+explicit remote filter binds to the current player instance. An unknown ID
+raises `LookupError`, and a filtered wait raises `LookupError` if its actor
+leaves view or is replaced. A dimension change ends filtered subscriptions
+and raises `RuntimeError` in pending waits. Unfiltered subscriptions continue
+across dimensions. The unsubscribe function is idempotent. A wait raises
+`TimeoutError` at its deadline or `ConnectionError` when the connection
+ends. Use `timeout=None` to wait without a deadline.
+
 ## Observe entity swings
 
 `await bot.wait_for_entity_swing(runtime_id=runtime_id)` waits for the next

@@ -129,6 +129,15 @@ class EntityMovementUpdate:
     on_ground: bool
 
 
+@dataclass(frozen=True, slots=True)
+class ShieldBlockEvent:
+    """A server-reported shield block and the originating metadata tick."""
+
+    runtime_id: int
+    entity_id: int | None
+    tick: int
+
+
 _EntityLifecycleReason = Literal[
     "spawn_packet", "remove_actor", "pickup", "replaced", "roster_removed", "identity_invalidated",
     "dimension_changed",
@@ -516,6 +525,8 @@ class Entities:
         self._crouch_observers: list[_EntityObserver[EntityState]] = []
         self._sleep_observers: list[_EntityObserver[EntityState]] = []
         self._attached_firework_observers: list[_EntityObserver[EntityState]] = []
+        self._shield_block_observers: list[_EntityObserver[ShieldBlockEvent]] = []
+        self._shield_block_asserted: set[int] = set()
         self._unidentified_equipment_since: dict[int, int] = {}
         # AddPlayer can identify an instance before its unique ID appears in EntityState.
         self._unlisted_player_runtime_by_id: dict[int, int] = {}
@@ -559,8 +570,10 @@ class Entities:
         self._clear_player_equipment(ConnectionError, "entity session is closed", _cause)
         for observers in (self._swing_observers, self._critical_effect_observers, self._health_observers,
                           self._actor_event_observers, self._attribute_observers, self._effect_observers,
-                          self._crouch_observers, self._sleep_observers, self._attached_firework_observers):
+                          self._crouch_observers, self._sleep_observers, self._attached_firework_observers,
+                          self._shield_block_observers):
             self._end_entity_observers(observers, lambda _: True, ConnectionError, "entity session is closed", _cause)
+        self._shield_block_asserted.clear()
         self._glide_observers.clear()
         self._actor_instances.clear()
         self._cursor_bodies.clear()
@@ -716,28 +729,40 @@ class Entities:
         self._require_live()
         return await self._wait_for_entity_event(self._attached_firework_observers, None, timeout)
 
-    def _require_animation_target(self, runtime_id: int | None) -> None:
+    def _require_known_actor_target(self, runtime_id: int | None) -> None:
         self._require_live()
         if runtime_id is not None and runtime_id != self._own_runtime_id and runtime_id not in self._actor_instances:
             raise LookupError("entity is not currently observed")
 
+    def subscribe_shield_blocks(
+        self, callback: Callable[[ShieldBlockEvent], None], *, runtime_id: int | None = None,
+    ) -> Callable[[], None]:
+        self._require_remote_player_target(None if runtime_id == self._own_runtime_id else runtime_id)
+        return self.packets._subscribe(self._shield_block_observers, _EntityObserver(runtime_id, callback))
+
+    async def wait_for_shield_block(
+        self, *, runtime_id: int | None = None, timeout: float | None = 15,
+    ) -> ShieldBlockEvent:
+        self._require_remote_player_target(None if runtime_id == self._own_runtime_id else runtime_id)
+        return await self._wait_for_entity_event(self._shield_block_observers, runtime_id, timeout)
+
     def subscribe_entity_swings(
         self, callback: Callable[[EntitySwing], None], *, runtime_id: int | None = None,
     ) -> Callable[[], None]:
-        self._require_animation_target(runtime_id)
+        self._require_known_actor_target(runtime_id)
         observer = _EntityObserver(runtime_id, callback)
         return self.packets._subscribe(self._swing_observers, observer)
 
     async def wait_for_entity_swing(
         self, *, runtime_id: int | None = None, timeout: float | None = 15,
     ) -> EntitySwing:
-        self._require_animation_target(runtime_id)
+        self._require_known_actor_target(runtime_id)
         return await self._wait_for_entity_event(self._swing_observers, runtime_id, timeout)
 
     def _require_critical_effect_target(self, kind: EntityCriticalEffectKind | None, runtime_id: int | None) -> None:
         if kind not in (None, "critical", "magic_critical"):
             raise ValueError("kind must be 'critical' or 'magic_critical'")
-        self._require_animation_target(runtime_id)
+        self._require_known_actor_target(runtime_id)
 
     def subscribe_entity_critical_effects(
         self, callback: Callable[[EntityCriticalEffect], None], *,
@@ -858,6 +883,21 @@ class Entities:
     def _forget_entity_observers(self, observers, runtime_id: int) -> None:
         self._end_entity_observers(observers, lambda observer: observer.runtime_id == runtime_id,
                                    LookupError, "entity is no longer observed")
+
+    def _shield_block_edge(self, runtime_id: int, metadata, binding) -> bool:
+        if runtime_id != self._own_runtime_id and runtime_id not in self._player_views:
+            return False
+        word = next((int(entry.payload.value) for entry in reversed(metadata)
+                     if entry.id == 92 and isinstance(entry.payload, binding.DataItemInt64Payload)), None)
+        if word is None:
+            return False
+        if not _player_flag((None, word), binding.ActorFlags.BLOCKED_USING_SHIELD):
+            self._shield_block_asserted.discard(runtime_id)
+            return False
+        if runtime_id in self._shield_block_asserted:
+            return False
+        self._shield_block_asserted.add(runtime_id)
+        return True
 
     def _observe_animation(self, raw: RawPacket) -> None:
         if not self._swing_observers and not self._critical_effect_observers:
@@ -1472,6 +1512,8 @@ class Entities:
             self._forget_entity_observers(self._effect_observers, runtime_id)
             self._forget_entity_observers(self._crouch_observers, runtime_id)
             self._forget_entity_observers(self._sleep_observers, runtime_id)
+            self._forget_entity_observers(self._shield_block_observers, runtime_id)
+            self._shield_block_asserted.discard(runtime_id)
             if not new_instance and (state.attributes or state.status_effects):
                 # A conflicting roster identity must not inherit the previous actor's reports.
                 state = replace(state, attributes=(), status_effects=())
@@ -1511,6 +1553,8 @@ class Entities:
         self._forget_entity_observers(self._effect_observers, runtime_id)
         self._forget_entity_observers(self._crouch_observers, runtime_id)
         self._forget_entity_observers(self._sleep_observers, runtime_id)
+        self._forget_entity_observers(self._shield_block_observers, runtime_id)
+        self._shield_block_asserted.discard(runtime_id)
         self._forget_player_equipment(runtime_id)
         state = self._by_runtime.pop(runtime_id, None)
         if lifecycle_events is not None and state is not None:
@@ -1677,12 +1721,19 @@ class Entities:
                     ordinary_move=feet is not None and getattr(player, "player_game_type", None) != b.GameType.SPECTATOR,
                     riding_block=riding_block,
                 )
+                if _player_flag(words, b.ActorFlags.BLOCKED_USING_SHIELD):
+                    self._shield_block_asserted.add(runtime_id)
         elif packet_id == b.SetActorDataPacket.ID:
             packet = self.packets.protocol.decode(raw)
             runtime_id = int(packet.id)
+            metadata = packet.packed_items.data
+            shield_observers = ()
+            if self._shield_block_edge(runtime_id, metadata, b) and not startup and self._shield_block_observers:
+                shield_observers = tuple(self._shield_block_observers)
+                shield_block = ShieldBlockEvent(runtime_id, self._animation_entity_id(runtime_id), int(packet.tick))
             body = self._cursor_bodies.get(runtime_id)
             if body is not None:
-                body = _cursor_body(packet.packed_items.data, b, body)
+                body = _cursor_body(metadata, b, body)
                 if (self._by_runtime[runtime_id].actor_type == "minecraft:item"
                         and _player_flag(body.flags, b.ActorFlags.RIDING)):
                     # Metadata can report a ride without a link; its end does not supply a new anchor.
@@ -1691,7 +1742,6 @@ class Entities:
                     self._cursor_bodies[runtime_id] = body
             view = self._player_views.get(runtime_id)
             if view is not None:
-                metadata = packet.packed_items.data
                 words = _player_flag_words(metadata, b, view.flags)
                 # Pose metadata invalidates the anchor but cannot establish a new one.
                 unsupported = _unsupported_view_pose(words, b)
@@ -1730,6 +1780,8 @@ class Entities:
                         self._notify_entity_observers(
                             sleep_observers, state, runtime_id, "entity sleep observer failed",
                         )
+            if shield_observers and not self._closed:
+                self._notify_entity_observers(shield_observers, shield_block, runtime_id, "shield block observer failed")
         elif packet_id == b.MobEquipmentPacket.ID:
             packet = self.packets.protocol.decode(raw)
             runtime_id = int(packet.runtime_id)
@@ -1857,6 +1909,9 @@ class Entities:
                                        RuntimeError, "dimension changed while waiting for an entity sleep change")
             self._end_entity_observers(self._attached_firework_observers, dimension_bound,
                                        RuntimeError, "dimension changed while waiting for an attached firework")
+            self._end_entity_observers(self._shield_block_observers, dimension_bound,
+                                       RuntimeError, "dimension changed while waiting for a shield block")
+            self._shield_block_asserted.clear()
             if lifecycle_events is not None:
                 lifecycle_events.extend(
                     EntityLifecycleEvent("left", state, "dimension_changed") for state in self._by_runtime.values()
@@ -1871,6 +1926,11 @@ class Entities:
             self._player_feet_by_runtime.clear()
             self._player_views.clear()
             self._unresolved_ride_changes.clear()
+        elif packet_id == b.RespawnPacket.ID and self._own_runtime_id in self._shield_block_asserted:
+            packet = self.packets.protocol.decode(raw)
+            if (packet.runtime_id in (0, self._own_runtime_id)
+                    and packet.state == b.PlayerRespawnState.READY_TO_SPAWN):
+                self._shield_block_asserted.discard(self._own_runtime_id)
         elif packet_id == b.RemoveActorPacket.ID:
             entity_id = int(self.packets.protocol.decode(raw).entity_id)
             self._forget_links(entity_id)

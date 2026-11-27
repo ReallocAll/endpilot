@@ -27,7 +27,7 @@ from .entities import (
     EntityActorEvent, EntityAttribute, EntityAttributeModifier, EntityAttributeUpdate, EntityCriticalEffect,
     EntityCursorResult, EntityEffectUpdate, EntityHealthEvent, EntityLifecycleEvent, EntityMovementUpdate,
     EntitySwing, ItemPickup, PaintingSnapshot, PlayerEquipmentSnapshot, PlayerListChange, PlayerListEntry,
-    VehicleLink, VehicleLinkChange,
+    ShieldBlockEvent, VehicleLink, VehicleLinkChange,
 )
 from .fishing import FishingResult
 from .inventory import HeldItemSnapshot, HeldItemStack, InventorySlotChange
@@ -175,6 +175,7 @@ __all__ = [
     "SignEditor",
     "SignObservation",
     "SignSide",
+    "ShieldBlockEvent",
     "Skin",
     "SleepRejected",
     "SoundEvent",

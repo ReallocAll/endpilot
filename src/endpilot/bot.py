@@ -38,7 +38,7 @@ from .entities import (
     Entities, EntityActorEvent, EntityAttributeUpdate, EntityCriticalEffect, EntityCriticalEffectKind,
     EntityCursorResult, EntityEffectUpdate, EntityHealthEvent, EntityHealthEventKind, EntityLifecycleEvent,
     EntityMovement, EntityMovementUpdate, EntitySpawn, EntityState, EntitySwing, ItemPickup,
-    PlayerEquipmentSnapshot, PlayerListChange, PlayerListEntry, VehicleLink, VehicleLinkChange,
+    PlayerEquipmentSnapshot, PlayerListChange, PlayerListEntry, ShieldBlockEvent, VehicleLink, VehicleLinkChange,
 )
 from .expression import skin_packet
 from .fishing import Fishing, FishingResult
@@ -3047,6 +3047,22 @@ class Bot:
         if self._entities is None:
             raise RuntimeError("player has not joined")
         return await self._entities.wait_for_entity_swing(runtime_id=runtime_id, timeout=timeout)
+
+    def subscribe_shield_blocks(
+        self, callback: Callable[[ShieldBlockEvent], None], *, runtime_id: int | None = None,
+    ) -> Callable[[], None]:
+        """Observe server-reported shield blocks by the local player or a tracked remote player."""
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return self._entities.subscribe_shield_blocks(callback, runtime_id=runtime_id)
+
+    async def wait_for_shield_block(
+        self, *, runtime_id: int | None = None, timeout: float | None = 15,
+    ) -> ShieldBlockEvent:
+        """Wait for the next shield block by the local player or a tracked remote player."""
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return await self._entities.wait_for_shield_block(runtime_id=runtime_id, timeout=timeout)
 
     def subscribe_entity_swings(
         self, callback: Callable[[EntitySwing], None], *, runtime_id: int | None = None,

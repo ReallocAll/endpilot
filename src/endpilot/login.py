@@ -484,15 +484,16 @@ class JoinSession:
                 ):
                     self.player_state_packets.append(raw)
                     self.movement_packets.append(raw)
+                    if packet.state == binding.PlayerRespawnState.READY_TO_SPAWN:
+                        self.entity_packets.append(raw)
             elif raw.packet_id == binding.SetActorDataPacket.ID:
                 packet = protocol.decode(raw)
+                self.entity_packets.append(raw)
                 if packet.id == self.player_id:
                     self.bed_packets.append(raw)
                     if air_metadata(packet, binding) or swimming_metadata(packet, binding) is not None:
                         self.player_state_packets.append(raw)
                     self.movement_packets.append(raw)
-                else:
-                    self.entity_packets.append(raw)
             elif raw.packet_id == binding.MobEffectPacket.ID:
                 if self.player_id is not None and protocol.decode(raw).runtime_id == self.player_id:
                     self.player_state_packets.append(raw)
