@@ -31,6 +31,7 @@ from .entities import (
     EntitySwing, EntityVisibleEffectUpdate, ItemPickup, PaintingSnapshot, PlayerEquipmentSnapshot,
     PlayerListChange, PlayerListEntry, ShieldBlockEvent, VehicleLink, VehicleLinkChange,
 )
+from .entity_registry import EntityRegistryEntry, EntityRegistrySnapshot
 from .fishing import FishingResult
 from .inventory import CursorObservation, HeldItemSnapshot, HeldItemStack, InventorySlotChange
 from .item_registry import ItemRegistrySnapshot
@@ -129,6 +130,8 @@ __all__ = [
     "EntityMovementUpdate",
     "EntityNearGoal",
     "EntityPlacementResult",
+    "EntityRegistryEntry",
+    "EntityRegistrySnapshot",
     "EntitySwing",
     "EntityVisibilityGoal",
     "EntityVisibleEffectUpdate",

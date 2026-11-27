@@ -22,6 +22,7 @@ from .client_clock import ClientClock
 from .compression import PacketConnection
 from .creative_inventory import creative_packet_ids
 from .dimension_transition import _DimensionTransitions
+from .entity_registry import EntityRegistrySnapshot, _read_entity_registry
 from .forms import FORM_PACKET_IDS
 from .item_registry import ItemRegistrySnapshot
 from .player_state import VITAL_ATTRIBUTES, air_metadata, movement_speed_attribute, swimming_metadata
@@ -192,6 +193,8 @@ class JoinSession:
         self.item_names: dict[int, str] = {}
         self.item_registry: ItemRegistrySnapshot | None = None
         self._item_registry_subscriptions = ()
+        self.entity_registry: EntityRegistrySnapshot | None = None
+        self._entity_registry_subscriptions = ()
         self._end_state = _SessionEndState()
         self._end_subscriptions = ()
         self._end_observer: Callable[[SessionEnd], None] | None = None
@@ -362,6 +365,10 @@ class JoinSession:
             session._item_registry_subscriptions = (
                 packets.subscribe_raw(session._on_item_registry),
                 packets.subscribe_reader_end(session._clear_item_registry),
+            )
+            session._entity_registry_subscriptions = (
+                packets.subscribe_raw(session._on_entity_registry),
+                packets.subscribe_reader_end(session._clear_entity_registry),
             )
             return session
         except BaseException as error:
@@ -564,6 +571,8 @@ class JoinSession:
                 self._replace_item_registry(protocol.decode(raw))
                 # Replay each registry at the point where startup drops saw it.
                 self.entity_packets.append(raw)
+            elif raw.packet_id == binding.AvailableActorIdentifiersPacket.ID:
+                self._replace_entity_registry(raw)
             elif raw.packet_id == binding.ChunkRadiusUpdatedPacket.ID:
                 self._on_chunk_radius(raw)
                 self.chunk_radius = self.accepted_chunk_radius
@@ -637,6 +646,28 @@ class JoinSession:
         self._item_registry_subscriptions = ()
         self.item_registry = None
         self.item_names.clear()
+
+    def _replace_entity_registry(self, raw: RawPacket) -> None:
+        try:
+            packet = self.packets.protocol.decode(raw)
+        except DecodeError:
+            return
+        snapshot = _read_entity_registry(packet.identifier_list)
+        if snapshot is not None:
+            self.entity_registry = snapshot
+
+    def _on_entity_registry(self, raw: RawPacket) -> None:
+        binding = self.packets.protocol.binding
+        if raw.packet_id == binding.AvailableActorIdentifiersPacket.ID:
+            self._replace_entity_registry(raw)
+        elif raw.packet_id == binding.DisconnectPacket.ID:
+            self._clear_entity_registry()
+
+    def _clear_entity_registry(self, _cause=None) -> None:
+        for unsubscribe in self._entity_registry_subscriptions:
+            unsubscribe()
+        self._entity_registry_subscriptions = ()
+        self.entity_registry = None
 
     def _on_chunk_radius(self, raw):
         protocol = self.packets.protocol
@@ -736,6 +767,7 @@ class JoinSession:
         if isinstance(self.identity, _OnlineIdentity):
             self.identity = None
         self._clear_item_registry()
+        self._clear_entity_registry()
         if self._unsubscribe_chunk_radius is not None:
             self._unsubscribe_chunk_radius()
             self._unsubscribe_chunk_radius = None

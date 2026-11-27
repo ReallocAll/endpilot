@@ -80,6 +80,31 @@ An awaitable result raises `TypeError` and remains under its creator's
 management. The caller can retry after the plugin cleans up its own side
 effects.
 
+## Observe advertised entity types
+
+`bot.entity_registry` is an immutable snapshot of the entity types advertised
+by the current server. It is `None` until this connection receives a valid
+advertisement and after disconnection. An explicitly empty advertisement
+produces a snapshot with `entries == ()`. A later advertisement replaces the
+snapshot. Snapshots you already hold remain available after replacement or
+disconnection.
+
+```python
+registry = bot.entity_registry
+if registry is not None:
+    dragon = registry.entry_for_name("minecraft:ender_dragon")
+    if dragon is not None:
+        print(dragon.type_id, dragon.summonable)
+```
+
+Each `EntityRegistryEntry` retains the server's full `name` and the `type_id`
+from the announcement's `rid` field. The `bid` string and the `has_spawn_egg`
+and `summonable` flags are `None` when omitted by the server. Lookups by exact
+name or `entry_for_type_id(type_id)` return the first match in `entries`, which
+preserves announcement order, including duplicate entries. The type ID
+identifies a kind of entity. `bot.observed_entities` reports visible instances
+with their own `runtime_id` values.
+
 ## Observe the server player list
 
 `bot.observed_players` is an immutable snapshot of the player list the server

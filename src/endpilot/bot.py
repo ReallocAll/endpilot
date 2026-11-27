@@ -37,6 +37,7 @@ from .containers import BrewingProgress, Containers, ContainerSlotChange, Contai
 from .creative_inventory import CreativeCatalog, CreativeClearResult, CreativeEntry, CreativeInventory
 from .dimension_transition import DimensionTransition
 from .enchanting import Enchanting, EnchantOption
+from .entity_registry import EntityRegistrySnapshot
 from .entities import (
     Entities, EntityActorEvent, EntityAttributeUpdate, EntityCriticalEffect, EntityCriticalEffectKind,
     EntityCursorResult, EntityEffectUpdate, EntityHealthEvent, EntityHealthEventKind, EntityLifecycleEvent,
@@ -299,6 +300,12 @@ class Bot:
         """Return the active session's observed item registry, or None when unavailable."""
         session = self._session
         return None if session is None else session.item_registry
+
+    @property
+    def entity_registry(self) -> EntityRegistrySnapshot | None:
+        """Return the active session's latest entity type advertisement, if received."""
+        session = self._session
+        return None if session is None or self.session_end is not None else session.entity_registry
 
     async def _join_session(
         self, connect, *endpoint, timeout: float, credential_provider: BedrockCredentialProvider | None,
