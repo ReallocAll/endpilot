@@ -31,7 +31,7 @@ from .chat import Chat, ChatMatch, ChatMessage, ChatPatterns, DisplayMatch, Text
 from .client_clock import ClientClock
 from .collection import BlockCollection, BlockCollectionBatch, CountedBlockCollection, MixedCollectionBatch, _BlockCollector
 from .collection_storage import CollectionStorage
-from .commands import CommandCatalog, Commands
+from .commands import CommandCatalog, CommandCompletion, Commands
 from .compression import PacketConnection
 from .containers import BrewingProgress, Containers, ContainerSlotChange, ContainerWindow, FurnaceProgress
 from .creative_inventory import CreativeCatalog, CreativeClearResult, CreativeEntry, CreativeInventory
@@ -2720,12 +2720,25 @@ class Bot:
         return None if commands is None else commands.complete_name(prefix)
 
     def complete_command(self, text: str) -> tuple[str, ...] | None:
-        """Suggest advertised names, aliases, and positional hard or soft enum tokens.
+        """Suggest advertised command names, enum tokens, and literal tell targets.
 
         Return None when no catalog is available. This method sends no packets.
         """
+        completion = self.complete_command_with_span(text)
+        return None if completion is None else completion.tokens
+
+    def complete_command_with_span(self, text: str) -> CommandCompletion | None:
+        """Return completion tokens and their replacement span at the end of text.
+
+        Start and end are Python string indices. Return None when no catalog is
+        available, or an empty tokens tuple when no candidate matches.
+        This method sends no packets.
+        """
         commands = self._commands
-        return None if commands is None else commands.complete_command(text)
+        if commands is None:
+            return None
+        players = () if self._entities is None else self._entities.player_list()
+        return commands.complete_command_with_span(text, (player.name for player in players))
 
     async def send_command(self, command: str) -> None:
         """Submit a player command, accepting an optional leading slash."""

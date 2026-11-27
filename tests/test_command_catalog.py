@@ -2,9 +2,10 @@ import asyncio
 from dataclasses import FrozenInstanceError
 import unittest
 from unittest.mock import patch
+from uuid import UUID
 
 from endpilot import Bot
-from endpilot.commands import CommandCatalog, CommandCatalogEntry
+from endpilot.commands import CommandCatalog, CommandCatalogEntry, CommandCompletion
 from endpilot.protocol import write_batch
 from endpilot.qa import PacketTimeline
 
@@ -172,6 +173,7 @@ class CommandCatalogTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(text=text):
                 self.assertEqual(self.bot.complete_command(text), expected)
         self.assertEqual(self.bot.complete_command_name("/c"), ("configure", "cfg"))
+        self.assertEqual(self.bot._commands.complete_command("cfg Start s"), ("shared", "slow"))
         with self.assertRaisesRegex(ValueError, "whitespace"):
             self.bot.complete_command_name("cfg Start ")
         self.assertEqual(self.wire.sent, sent)
@@ -188,6 +190,94 @@ class CommandCatalogTests(unittest.IsolatedAsyncioTestCase):
             )],
         ))
         self.assertEqual(self.bot.complete_command("configure "), ("high-value",))
+
+    async def test_completes_live_literal_tell_targets_and_replacement_spans(self):
+        b = self.b
+        packet = b.AvailableCommandsPacket
+        target, message = 0x00100008, 0x00100044
+
+        def advertisement(*aliases):
+            return packet(
+                enum_values=aliases,
+                enums=[packet.EnumData(name="TellAliases", values=tuple(range(len(aliases))))],
+                commands=[
+                    packet.CommandData(name="tell", alias_enum=0, overloads=[self.overload(target, message)]),
+                    packet.CommandData(name="other", alias_enum=-1, overloads=[self.overload(target, message)]),
+                ],
+            )
+
+        def roster(*names):
+            return b.PlayerListPacket(entries=[
+                b.PlayerListPacket.AddEntry(action=b.PlayerListPacketType.ADD, uuid=UUID(int=index), name=name)
+                for index, name in enumerate(names, start=1)
+            ])
+
+        await self.join()
+        self.assertIsNone(self.bot.complete_command("/tell Dm"))
+        self.assertIsNone(self.bot.complete_command_with_span("/tell Dm"))
+        await self.deliver(advertisement("tell", "w", "msg"))
+        self.assertEqual(self.bot.complete_command_with_span("/tell Dm"), CommandCompletion(6, 8, ()))
+        await self.deliver(roster("Dm Peer", "DmSender_1", "Dm Peer", 'Bad"Name', "Bad\\Name", "Bad\tName",
+                                  "Bad\x00Name", "Bad\nName", "@a", "Bad[Name]", "Bad'Name", " Bad Name"))
+
+        sent = list(self.wire.sent)
+        for query, start, expected in (
+            ("/tell Dm", 6, ('"Dm Peer"', "DmSender_1")),
+            ('/tell "Dm P', 6, ('"Dm Peer"',)),
+            ('/tell "Dm ', 6, ('"Dm Peer"',)),
+            ('/tell "DmS', 6, ("DmSender_1",)),
+            ("/w DmS", 3, ("DmSender_1",)),
+            ("msg\tDm", 4, ('"Dm Peer"', "DmSender_1")),
+            (" \t/tell  ", 9, ('"Dm Peer"', "DmSender_1")),
+            ("/tel", 1, ("tell",)),
+        ):
+            with self.subTest(query=query):
+                result = self.bot.complete_command_with_span(query)
+                self.assertEqual(result, CommandCompletion(start, len(query), expected))
+                self.assertEqual(self.bot.complete_command(query), expected)
+
+        result = self.bot.complete_command_with_span('/tell "Dm P')
+        self.assertEqual('/tell "Dm P'[:result.start] + result.tokens[0] + '/tell "Dm P'[result.end:], '/tell "Dm Peer"')
+        with self.assertRaises(FrozenInstanceError):
+            result.start = 0
+
+        for query in (
+            "/tell dm", "/tell @", '/tell "@', "/tell Bad", '/tell "Bad', "/other Dm",
+            "/unadvertised Dm", '/tell "Dm Peer" ', '/tell "Dm Peer" Dm', "/tell DmSender_1 Dm",
+            "/tell Dm P", "/tell\nDm",
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(self.bot.complete_command(query), ())
+        self.assertEqual(self.wire.sent, sent)
+
+        await self.deliver(b.PlayerListPacket(entries=[
+            b.PlayerListPacket.RemoveEntry(action=b.PlayerListPacketType.REMOVE, uuid=UUID(int=index))
+            for index in (1, 3)
+        ]))
+        self.assertEqual(self.bot.complete_command('/tell "Dm P'), ())
+        self.assertEqual(self.bot.complete_command("/tell Dm"), ("DmSender_1",))
+
+        await self.deliver(advertisement("msg"))
+        self.assertEqual(self.bot.complete_command("/w Dm"), ())
+        self.assertEqual(self.bot.complete_command("/msg Dm"), ("DmSender_1",))
+        await self.deliver(self.catalog())
+        self.assertEqual(self.bot.complete_command("/msg Dm"), ())
+        await self.deliver(b.DisconnectPacket())
+        self.assertIsNone(self.bot.complete_command_with_span("/msg Dm"))
+
+    async def test_tell_requires_an_advertised_required_first_target(self):
+        b = self.b
+        packet = b.AvailableCommandsPacket
+        await self.join(packet(commands=[packet.CommandData(name="tell", alias_enum=-1, overloads=[
+            self.overload(0x0010000A),
+            self.overload(0x00100008, optional_from=0),
+            self.overload(0x00100008, chaining=True),
+            self.overload(0x00100001, 0x00100008),
+        ])]), b.PlayerListPacket(entries=[b.PlayerListPacket.AddEntry(
+            action=b.PlayerListPacketType.ADD, uuid=UUID(int=1), name="Dm Peer",
+        )]))
+        self.assertEqual(self.bot.observed_players[0].name, "Dm Peer")
+        self.assertEqual(self.bot.complete_command("/tell Dm"), ())
 
     async def test_scoreboard_completes_live_objectives_after_a_literal_player(self):
         packet = self.b.AvailableCommandsPacket
@@ -213,6 +303,8 @@ class CommandCatalogTests(unittest.IsolatedAsyncioTestCase):
         reset_query = "/scoreboard players reset Pilot_1 ep_"
         for query in (set_query, reset_query):
             self.assertEqual(self.bot.complete_command(query), ("ep_alpha",))
+            self.assertEqual(self.bot.complete_command_with_span(query),
+                             CommandCompletion(len(query) - 3, len(query), ("ep_alpha",)))
 
         update = self.b.SoftEnumUpdateType
         for operation, value, expected in (

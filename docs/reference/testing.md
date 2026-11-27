@@ -53,17 +53,33 @@ Verify the intended effect of either command call from a separate world,
 inventory, or server observation.
 
 The synchronous `bot.complete_command(text)` reads the current command
-advertisement and live soft-enum updates without sending packets or executing
-a command. Pass the text with an optional leading slash. Completion matches
-the current token by case-sensitive prefix. Trailing whitespace starts a new
-token.
+advertisement, live soft enums and player list. It sends no packets. Pass
+the text with an optional leading slash. Completion matches the current
+token by case-sensitive prefix.
 
 The result is a tuple of advertised command names or aliases for the first
 token. For arguments, completion covers unquoted, whitespace-separated values
-from positional hard or soft enums, including optional enum parameters. Every
-earlier position in the same overload must contain a matching enum value. The
-method returns `None` before the first advertisement and an empty tuple when
-there are no supported matches.
+from positional hard or soft enums, including optional enum parameters. Earlier
+positions must match their advertised parameter in the same overload. Trailing
+whitespace starts a new token outside an open player target quote.
+
+When the catalog advertises the standard `/tell` target, the first argument
+also completes ordinary names from the current server player list. The same
+applies to `/w` and `/msg` when they are advertised as aliases of `/tell`.
+Names made of ASCII letters, digits and underscores are returned literally.
+Names with internal spaces return one double-quoted token. An open double
+quote lets the prefix include spaces, as in `/tell "Dm P`. Player suggestions
+end when the target is closed or the input moves to the message.
+
+`bot.complete_command_with_span(text)` returns an immutable
+`endpilot.commands.CommandCompletion` with `start`, `end`, and `tokens`.
+Use `text[:result.start] + token + text[result.end:]` to apply a candidate.
+The indices are Python string indices and preserve any leading slash on a
+command name. For `/tell Dm` and `/tell "Dm P`, the spans are `[6, 8)` and
+`[6, 11)`, and both can return the token `"Dm Peer"`.
+
+Both methods return `None` when the catalog is unavailable. An empty tuple
+of tokens means the catalog is known and there are no supported matches.
 Use `bot.complete_command_name(prefix)` to complete just the first command word.
 
 ```python

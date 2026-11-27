@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from math import isfinite
+import re
 import uuid
 
 from bedrock_protocol import CommandBlockMode, TextPacketType, nbt
@@ -22,6 +23,7 @@ _COMMAND_BLOCK_TYPES = {
     "chain": ("minecraft:chain_command_block", CommandBlockMode.CHAIN),
 }
 _COMMAND_BLOCK_MODES = dict(_COMMAND_BLOCK_TYPES.values())
+_LITERAL_PLAYER_NAME = re.compile(r"[A-Za-z0-9_]+(?: +[A-Za-z0-9_]+)*")
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +41,15 @@ class CommandCatalog:
     commands: tuple[CommandCatalogEntry, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class CommandCompletion:
+    """Candidate tokens and the half-open Python string span they replace."""
+
+    start: int
+    end: int
+    tokens: tuple[str, ...]
+
+
 # A parameter holds hard enum values, an index into the live soft enums, or
 # None for a player target that can be crossed using a plain literal name.
 type _EnumRef = tuple[str, ...] | int
@@ -50,6 +61,7 @@ class _CommandAdvertisement:
     catalog: CommandCatalog
     overloads: dict[str, tuple[_CompletionPrefix, ...]]
     soft_enums: list[tuple[str, tuple[str, ...]]]
+    player_target_commands: set[str]
 
     def enum_values(self, ref: _EnumRef) -> tuple[str, ...]:
         return self.soft_enums[ref][1] if isinstance(ref, int) else ref
@@ -105,10 +117,18 @@ def _command_advertisement(packet) -> _CommandAdvertisement:
     soft_enums = [(enum.name, tuple(dict.fromkeys(enum.values))) for enum in packet.soft_enums]
     commands = []
     overloads = {}
+    player_target_commands = set()
     for record in packet.commands:
         alias_enum = record.alias_enum
         aliases = hard_enums[alias_enum] if 0 <= alias_enum < len(hard_enums) else ()
         commands.append(CommandCatalogEntry(record.name, aliases))
+        # Protocol 2225's native tell uses this required first target parameter.
+        if record.name == "tell" and any(
+            not overload.is_chaining and overload.params
+            and overload.params[0].parse_symbol == 0x00100008 and not overload.params[0].optional
+            for overload in record.overloads
+        ):
+            player_target_commands.update({"tell", *aliases} & {"tell", "w", "msg"})
         prefixes = tuple(
             prefix for overload in record.overloads
             if not overload.is_chaining
@@ -120,7 +140,22 @@ def _command_advertisement(packet) -> _CommandAdvertisement:
                     overloads.setdefault(name, []).extend(prefixes)
     return _CommandAdvertisement(
         CommandCatalog(tuple(commands)), {name: tuple(items) for name, items in overloads.items()}, soft_enums,
+        player_target_commands,
     )
+
+
+def _player_tokens(prefix: str, names: Iterable[str]) -> Iterable[str]:
+    for name in names:
+        if name.startswith(prefix) and _LITERAL_PLAYER_NAME.fullmatch(name):
+            yield f'"{name}"' if " " in name else name
+
+
+def _command_names(catalog: CommandCatalog, token: str) -> tuple[str, ...]:
+    prefix = token.removeprefix("/")
+    return tuple(dict.fromkeys(
+        name for entry in catalog.commands for name in (entry.name, *entry.aliases)
+        if name and name.startswith(prefix)
+    ))
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,30 +261,36 @@ class Commands:
             return None
         if any(character.isspace() for character in prefix):
             raise ValueError("command-name prefix must not contain whitespace")
-        token = prefix.removeprefix("/")
-        return tuple(dict.fromkeys(
-            name for entry in catalog.commands for name in (entry.name, *entry.aliases)
-            if name and name.startswith(token)
-        ))
+        return _command_names(catalog, prefix)
 
     def complete_command(self, text: str) -> tuple[str, ...] | None:
         """Match the current name or advertised enum argument at the end of text."""
+        completion = self.complete_command_with_span(text)
+        return None if completion is None else completion.tokens
+
+    def complete_command_with_span(self, text: str, player_names: Iterable[str] = ()) -> CommandCompletion | None:
+        """Match at the end of text using the current advertisement and player names."""
         advertisement = self._advertisement
         if advertisement is None:
             return None
+        end = len(text)
         tokens = text.split()
         if not tokens:
-            return self.complete_name("")
+            return CommandCompletion(end, end, _command_names(advertisement.catalog, ""))
         if not text[-1].isspace():
             if len(tokens) == 1:
-                return self.complete_name(tokens[0])
+                token = tokens[0]
+                start = end - len(token.removeprefix("/"))
+                return CommandCompletion(start, end, _command_names(advertisement.catalog, token))
             prefix = tokens.pop()
         else:
             prefix = ""
         command, *arguments = tokens
+        name = command.removeprefix("/")
+        start = end - len(prefix)
         position = len(arguments)
         matches = []
-        for overload in advertisement.overloads.get(command.removeprefix("/"), ()):
+        for overload in advertisement.overloads.get(name, ()):
             if position >= len(overload):
                 continue
             ref = overload[position]
@@ -258,7 +299,16 @@ class Commands:
                 for previous, argument in zip(overload, arguments)
             ):
                 matches.extend(value for value in advertisement.enum_values(ref) if value.startswith(prefix))
-        return tuple(dict.fromkeys(matches))
+        if name in advertisement.player_target_commands:
+            target = text.lstrip()[len(command):].lstrip(" \t")
+            if target.startswith('"') and '"' not in target[1:]:
+                target_start = end - len(target)
+                if not matches or target_start == start:
+                    start = target_start
+                    matches.extend(_player_tokens(target[1:], player_names))
+            elif position == 0 and target == prefix:
+                matches.extend(_player_tokens(prefix, player_names))
+        return CommandCompletion(start, end, tuple(dict.fromkeys(matches)))
 
     def _on_packet(self, raw: RawPacket) -> None:
         protocol = self.packets.protocol
