@@ -50,7 +50,7 @@ class CurrentTradeOffersTests(unittest.IsolatedAsyncioTestCase):
         self.wire.incoming.put_nowait(write_batch(self.protocol.encode(packet) for packet in (*packets, marker)))
         await handled
 
-    def quote(self, count=9, uses=0, *, invalid=False):
+    def quote(self, count=9, uses=0, *, invalid=False, tier=None):
         from bedrock_protocol import nbt
 
         amount = nbt.StringTag("unknown") if invalid else nbt.ByteTag(count)
@@ -59,6 +59,8 @@ class CurrentTradeOffersTests(unittest.IsolatedAsyncioTestCase):
             "buyA": nbt.CompoundTag({"Name": nbt.StringTag("minecraft:emerald"), "Count": amount}),
             "sell": nbt.CompoundTag({"Name": nbt.StringTag("minecraft:book"), "Count": nbt.ByteTag(1)}),
         })
+        if tier is not None:
+            recipe["tier"] = tier
         data = nbt.CompoundTag({"Recipes": nbt.ListTag([recipe], int(nbt.Type.COMPOUND))})
         return self.b.UpdateTradePacket(
             container_id=7, type=self.b.ContainerType.TRADE, size=1, trader_tier=0,
@@ -71,27 +73,36 @@ class CurrentTradeOffersTests(unittest.IsolatedAsyncioTestCase):
                                           pos=self.b.BlockPos(x=0, y=0, z=0), entity_unique_id=42)
 
     async def test_latest_server_quote_replaces_same_window_and_keeps_old_values_frozen(self):
+        from bedrock_protocol import nbt
+
         self.assertIsNone(self.trading.current_offers)
-        await self.deliver(self.quote())
+        await self.deliver(self.quote(tier=nbt.IntTag(0)))
         original = self.trading.current_offers
         window = self.containers.window
-        await self.deliver(self.quote(18, uses=3))
+        await self.deliver(self.quote(18, uses=3, tier=nbt.IntTag(2)))
         latest = self.trading.current_offers
         self.assertIs(self.containers.window, window)
         self.assertEqual((latest.offers[0].buy_a.count, latest.offers[0].uses), (18, 3))
         self.assertEqual((original.offers[0].buy_a.count, original.offers[0].uses), (9, 0))
+        self.assertEqual((original.offers[0].tier, latest.offers[0].tier), (0, 2))
         with self.assertRaises(FrozenInstanceError):
             original.offers[0].buy_a.count = 1
+        with self.assertRaises(FrozenInstanceError):
+            original.offers[0].tier = 1
 
-        await self.deliver(self.quote(invalid=True, uses=4))
+        await self.deliver(self.quote(invalid=True, uses=4, tier=nbt.StringTag("2")))
         invalid = self.trading.current_offers
         self.assertIs(self.containers.window, window)
         self.assertIsNone(invalid.offers[0].buy_a)
+        self.assertIsNone(invalid.offers[0].tier)
         self.assertEqual(invalid.offers[0].uses, 4)
         self.assertEqual(latest.offers[0].buy_a.count, 18)
+        self.assertEqual(self.wire.sent, [])
 
     async def test_close_and_same_number_reopen_require_a_quote_for_the_new_window(self):
-        await self.deliver(self.quote())
+        from bedrock_protocol import nbt
+
+        await self.deliver(self.quote(tier=nbt.IntTag(1)))
         old = self.trading.current_offers
         window = self.containers.window
         await self.deliver(self.b.ContainerClosePacket(container_id=7, container_type=self.b.ContainerType.TRADE))
@@ -102,6 +113,8 @@ class CurrentTradeOffersTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.trading.current_offers)
         await self.deliver(self.quote(10))
         self.assertEqual(self.trading.current_offers.offers[0].buy_a.count, 10)
+        self.assertIsNone(self.trading.current_offers.offers[0].tier)
+        self.assertEqual(old.offers[0].tier, 1)
         await self.deliver(self.open_packet("CONTAINER"))
         self.assertIsNone(self.trading.current_offers)
 
@@ -130,6 +143,10 @@ class CurrentTradeOffersTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TradingTests(unittest.IsolatedAsyncioTestCase):
+    def test_quote_constructor_keeps_tier_optional(self):
+        self.assertIsNone(TradeOffer(17, TradeItem("minecraft:wheat", 20), None,
+                                     TradeItem("minecraft:emerald", 1), 2, 16).tier)
+
     async def test_quotes_match_unique_actor_and_preserve_server_recipe(self):
         b = Protocol(2193).binding
         wrong = RawPacket(b.UpdateTradePacket.ID, b"wrong")

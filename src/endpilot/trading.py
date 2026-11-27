@@ -27,12 +27,15 @@ class TradeItem:
 
 @dataclass(frozen=True, slots=True)
 class TradeOffer:
+    """A server quote whose announced tier can be compared with TradeOffers.trader_tier."""
+
     recipe_net_id: int | None
     buy_a: TradeItem | None
     buy_b: TradeItem | None
     sell: TradeItem | None
     uses: int | None
     max_uses: int | None
+    tier: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +154,7 @@ def _read_offers(packet) -> TradeOffers:
             _item(recipe, "sell"),
             _number(recipe, "uses"),
             _number(recipe, "maxUses"),
+            tier=_number(recipe, "tier"),
         )
         for recipe in (() if recipes is None else recipes)
     )
