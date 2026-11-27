@@ -101,6 +101,7 @@ class _PendingStackRequest:
     checked_at_write: bool = False
     submitted: bool = False
     automatic_unequip: bool = False
+    exact_offhand_take: bool = False
 
 
 class _InventoryMoveNotSubmitted(RuntimeError):
@@ -526,12 +527,14 @@ class Inventory:
                     endpoints.add((None, int(part.slot)))
                 elif container.name.name == "ARMOR_CONTAINER":
                     endpoints.add(("ARMOR_CONTAINER", int(part.slot)))
+                elif container.name.name == "OFFHAND_CONTAINER":
+                    endpoints.add(_DAMAGE_OFFHAND_SLOT)
         return frozenset(endpoints)
 
     async def _request_item_stack(self, request, apply, *, timeout, queued=False, before_send=None,
                                   after_send=None, _endpoints=None, _range_step=False,
                                   _wait_for=(), _on_unconfirmed=None, _on_slot_observed=None,
-                                  _at_write=None, _automatic_unequip=False):
+                                  _at_write=None, _automatic_unequip=False, _exact_offhand_take=False):
         if self._request_stream_ended:
             raise ConnectionError("item-stack request stream is closed")
         request_id = int(request.client_request_id.raw_id)
@@ -540,6 +543,7 @@ class Inventory:
         pending = _PendingStackRequest(
             reply, apply, endpoints, _range_step, _on_unconfirmed, _on_slot_observed,
             checked_at_write=_at_write is not None, automatic_unequip=_automatic_unequip,
+            exact_offhand_take=_exact_offhand_take,
         )
         self._pending_requests[request_id] = pending
         if queued:
@@ -959,11 +963,17 @@ class Inventory:
         """Move an observed inventory stack to the offhand and return the BDS verdict."""
         return await self._offhand_exchange(source_slot, containers, into_offhand=True, timeout=timeout)
 
-    async def unequip_offhand(self, destination_slot: int, *, containers, timeout: float = 15):
+    async def unequip_offhand(self, destination_slot: int, *, containers, amount: int | None = None,
+                              timeout: float = 15):
         """Move the observed offhand stack to inventory and return the BDS verdict."""
-        return await self._offhand_exchange(destination_slot, containers, into_offhand=False, timeout=timeout)
+        if amount is not None and (type(amount) is not int or not 1 <= amount <= 255):
+            raise ValueError("amount must be between 1 and 255")
+        return await self._offhand_exchange(
+            destination_slot, containers, into_offhand=False, timeout=timeout, take_amount=amount,
+        )
 
-    async def _offhand_exchange(self, index: int, containers, *, into_offhand: bool, timeout: float):
+    async def _offhand_exchange(self, index: int, containers, *, into_offhand: bool, timeout: float,
+                                take_amount: int | None = None):
         if type(index) is not int or not 0 <= index < 36:
             raise ValueError("inventory slot must be between 0 and 35")
         window = containers.window
@@ -994,29 +1004,49 @@ class Inventory:
         source_item, destination_item = (player_item, offhand_item) if into_offhand else (offhand_item, player_item)
         if not source_item.id:
             raise ValueError("the source slot is empty")
-        if destination_item.id:
+        exact_take = take_amount is not None
+        if destination_item.id and not exact_take:
             action = cereal.SwapActionData(source=source, destination=destination)
         else:
-            amount = int(source_item.stack_size)
+            amount = int(source_item.stack_size) if take_amount is None else take_amount
+            if exact_take and amount > source_item.stack_size:
+                raise ValueError("amount exceeds the observed offhand stack")
             if not 1 <= amount <= 255:
                 raise ValueError("stack amount must be between 1 and 255 for an offhand transfer")
             transfer = cereal.PlaceActionData if into_offhand else cereal.TakeActionData
             action = transfer(amount=amount, source=source, destination=destination)
 
+        request_id = self._allocate_request_id()
         request = b.ItemStackRequestPacketData.RequestData(
-            client_request_id=b.ItemStackRequestId(raw_id=self._allocate_request_id()),
+            client_request_id=b.ItemStackRequestId(raw_id=request_id),
             actions=[action], strings_to_filter=[], strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
         )
 
+        expected = (_stack_snapshot(player_item), _stack_snapshot(offhand_item)) if exact_take else None
+
         def before_send():
+            nonlocal player_item, offhand_item
             if containers.window is not window:
                 raise RuntimeError("the player inventory window changed before submission")
-            if self._slots.get(index) is not player_item or self._offhand_slot is not offhand_item:
+            current_player, current_offhand = self._slots.get(index), self._offhand_slot
+            if exact_take:
+                pending = self._pending_requests[request_id]
+                if any(other is not pending for other in self._requests_for_endpoints(pending.endpoints)):
+                    raise RuntimeError("an offhand transfer slot has an item-stack request in flight")
+                if (_stack_snapshot(current_player), _stack_snapshot(current_offhand)) != expected:
+                    raise RuntimeError("an offhand transfer slot changed before submission")
+                player_item, offhand_item = current_player, current_offhand
+            elif current_player is not player_item or current_offhand is not offhand_item:
                 raise RuntimeError("an offhand transfer slot changed before submission")
+            elif any(pending.submitted and pending.exact_offhand_take
+                     for pending in self._requests_for_endpoints({_DAMAGE_OFFHAND_SLOT})):
+                raise RuntimeError("an exact offhand take still has an item-stack request in flight")
 
         def apply(response):
             # The matching verdict still belongs to the player's slots after the screen closes.
             success = response.result.name == "SUCCESS"
+            offhand_after = offhand_item if exact_take else player_item
+            player_after = player_item if exact_take and player_item.id else offhand_item
 
             def corrected(original, replacement, slot):
                 if not success:
@@ -1030,13 +1060,17 @@ class Inventory:
                 for slot in container.slots:
                     # Preserve typed observations received before the matching verdict.
                     if name == "OFFHAND_CONTAINER" and slot.slot == 1 and self._offhand_slot is offhand_item:
-                        self._set_offhand_slot(corrected(offhand_item, player_item, slot))
+                        self._set_offhand_slot(corrected(offhand_item, offhand_after, slot))
                     elif (name in (
                         "HOTBAR_CONTAINER", "INVENTORY_CONTAINER", "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER",
                     ) and slot.slot == index and self._slots.get(index) is player_item):
-                        self._set_slot(index, corrected(player_item, offhand_item, slot))
+                        self._set_slot(index, corrected(player_item, player_after, slot))
 
-        return await self._request_item_stack(request, apply, timeout=timeout, before_send=before_send)
+        return await self._request_item_stack(
+            request, apply, timeout=timeout,
+            before_send=None if exact_take else before_send, _at_write=before_send if exact_take else None,
+            _exact_offhand_take=exact_take,
+        )
 
     async def move_item(
         self, source_slot: int, destination_slot: int, amount: int = 1, *, timeout: float = 15, _queued: bool = False,

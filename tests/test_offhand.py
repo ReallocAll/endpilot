@@ -185,6 +185,65 @@ class OffhandEquipmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.inventory.slots[3].id, self.inventory.slots[3].stack_size,
                           self.inventory.slots[3].net_id_variant), (17, 16, 76))
 
+    async def test_explicit_unequip_amount_takes_without_swapping(self):
+        b = self.b
+        await self.deliver(self.window(), self.player(17, 62, 20), self.offhand(17, 16, 22))
+        taking = asyncio.create_task(self.bot.unequip_offhand(3, amount=2))
+        request = await self.sent_request()
+        action, = request.actions
+        self.assertIsInstance(action, b.ItemStackRequestCereal.TakeActionData)
+        self.assertEqual((action.amount, action.source.slot, action.source.net_id_variant,
+                          action.destination.slot, action.destination.net_id_variant),
+                         (2, 1, 22, 3, 20))
+        await self.deliver(self.response(request, "SUCCESS", ("OFFHAND_CONTAINER", 1, 14, 22),
+                                         ("HOTBAR_CONTAINER", 3, 64, None)))
+        self.assertEqual((await taking).result.name, "SUCCESS")
+        hand, player = self.bot.offhand_item, self.bot.inventory_slots[3]
+        self.assertEqual((hand.id, hand.stack_size, hand.net_id_variant), (17, 14, 22))
+        self.assertEqual((player.id, player.stack_size, player.net_id_variant), (17, 64, 20))
+
+    async def test_explicit_unequip_respects_another_request_already_owning_offhand(self):
+        b = self.b
+        await self.deliver(self.window(), self.player(17, 48, 20), self.offhand(17, 16, 22),
+                           b.InventorySlotPacket(inventory_id=b.ContainerID.INVENTORY, slot=2, item=item(b, 0, 0, None)))
+        swapping = asyncio.create_task(self.bot.unequip_offhand(3))
+        request = await self.sent_request()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "item-stack request in flight"):
+                await self.bot.unequip_offhand(2, amount=2, timeout=1)
+            self.assertEqual(self.wire.sent, [])
+            await self.deliver(self.response(request, "SUCCESS", ("OFFHAND_CONTAINER", 1, 48, 20),
+                                             ("HOTBAR_CONTAINER", 3, 16, 22)))
+            self.assertEqual((await swapping).result.name, "SUCCESS")
+        finally:
+            swapping.cancel()
+            await asyncio.gather(swapping, return_exceptions=True)
+
+    async def test_legacy_unequip_does_not_send_during_an_already_sent_exact_take(self):
+        await self.deliver(self.window(), self.player(17, 40, 20), self.offhand(17, 16, 22))
+        taking = asyncio.create_task(self.bot.unequip_offhand(3, amount=2))
+        request = await self.sent_request()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "exact offhand take .* in flight"):
+                await self.bot.unequip_offhand(3, timeout=1)
+            self.assertEqual(self.wire.sent, [])
+            await self.deliver(self.response(request, "SUCCESS", ("OFFHAND_CONTAINER", 1, 14, 22),
+                                             ("HOTBAR_CONTAINER", 3, 42, 20)))
+            self.assertEqual((await taking).result.name, "SUCCESS")
+        finally:
+            taking.cancel()
+            await asyncio.gather(taking, return_exceptions=True)
+
+        swapping = asyncio.create_task(self.bot.unequip_offhand(3))
+        swap = await self.sent_request()
+        self.assertIsInstance(swap.actions[0], self.b.ItemStackRequestCereal.SwapActionData)
+        await self.deliver(self.response(swap, "SUCCESS", ("OFFHAND_CONTAINER", 1, 42, 20),
+                                         ("HOTBAR_CONTAINER", 3, 14, 22)))
+        self.assertEqual((await swapping).result.name, "SUCCESS")
+        hand, player = self.bot.offhand_item, self.bot.inventory_slots[3]
+        self.assertEqual((hand.stack_size, hand.net_id_variant, player.stack_size, player.net_id_variant),
+                         (42, 20, 14, 22))
+
     async def test_swaps_or_preserves_real_updates_in_each_direction(self):
         b = self.b
         for into_offhand in (True, False):

@@ -1632,14 +1632,19 @@ class Bot:
             raise RuntimeError("bot is not joined")
         return await self._inventory.equip_offhand(source_slot, containers=self._containers, timeout=timeout)
 
-    async def unequip_offhand(self, destination_slot: int, *, timeout: float = 15):
-        """Move the full offhand stack to inventory and return the matching ItemStackResponse.
+    async def unequip_offhand(self, destination_slot: int, *, amount: int | None = None, timeout: float = 15):
+        """Move items from the offhand to inventory and return the matching ItemStackResponse.
 
-        Open the player inventory screen first. An occupied destination swaps stacks.
+        Open the player inventory screen first. Omit amount for the full stack,
+        swapping stacks if the destination is occupied. With an explicit amount,
+        take exactly that many without swapping. BDS decides if the target can
+        accept the move; the request is not retried or reduced.
         """
         if self._inventory is None or self._containers is None:
             raise RuntimeError("bot is not joined")
-        return await self._inventory.unequip_offhand(destination_slot, containers=self._containers, timeout=timeout)
+        return await self._inventory.unequip_offhand(
+            destination_slot, containers=self._containers, amount=amount, timeout=timeout,
+        )
 
 
     async def drop_inventory_item(self, slot: int, amount: int = 1, *, timeout: float = 15):
