@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, TypedDict
+from urllib.parse import urlsplit
 
 from ._join_address import _parse_join_address
 from .blocks import BlockChange, BlockUpdate
@@ -138,11 +139,23 @@ class MCPPlayer:
         async with self._lifecycle:
             if self.bot is not None:
                 raise RuntimeError("a player is already connected")
+            # urlsplit strips tabs and line breaks before exposing the hostname.
+            if any(ord(char) < 32 or ord(char) == 127 for char in url):
+                raise ValueError("invalid server address")
+            target = urlsplit(url)
+            if target.scheme == "raknet":
+                raknet_address = _parse_join_address(url)
+            elif target.scheme in ("http", "https"):
+                raknet_address = None
+                host = target.hostname
+                if not host or target.port == 0 or any(char.isspace() for char in host):
+                    raise ValueError("invalid server address")
+            else:
+                raise ValueError("use a NetherNet signaling URL or raknet://host:port")
             bot = Bot(name)
             try:
-                if url.startswith("raknet://"):
-                    target = _parse_join_address(url)
-                    await bot.join_raknet(target.host, target.port)
+                if raknet_address is not None:
+                    await bot.join_raknet(raknet_address.host, raknet_address.port)
                 else:
                     await bot.join_nethernet(url)
             except BaseException:

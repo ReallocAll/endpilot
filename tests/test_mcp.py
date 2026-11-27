@@ -153,6 +153,8 @@ class MCPPlayerTests(unittest.IsolatedAsyncioTestCase):
                 await player.place_against(2, 99, 0)
 
     async def test_connect_raknet_addresses_use_the_sdk_endpoint_rules(self):
+        authenticated_url = "https://fixture:secret@localhost:443/lobby/%2Fbedrock?profile=fixture#section"
+        ipv6_url = "http://[::1]:19132/signaling"
         with patch("endpilot.mcp_server.Bot", FakeBot):
             player = MCPPlayer()
             for address, endpoint in (
@@ -160,6 +162,8 @@ class MCPPlayerTests(unittest.IsolatedAsyncioTestCase):
                 ("raknet://[::1]:19140", ("::1", 19140)),
                 ("raknet://127.0.0.1", ("127.0.0.1", 19132)),
                 ("http://localhost:19132/signaling", "http://localhost:19132/signaling"),
+                (authenticated_url, authenticated_url),
+                (ipv6_url, ipv6_url),
             ):
                 with self.subTest(address=address):
                     await player.connect(address)
@@ -167,6 +171,27 @@ class MCPPlayerTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(player.bot.url, endpoint)
                     finally:
                         await player.disconnect()
+
+    async def test_connect_rejects_invalid_or_missing_explicit_address(self):
+        with patch("endpilot.mcp_server.Bot", wraps=FakeBot) as bot_factory:
+            for address in (
+                "http://:19132/signaling",
+                "http://bad host.invalid:19132/signaling",
+                "http://bad\x01host.invalid:19132/signaling",
+                "http://bad\thost.invalid:19132/signaling",
+                "http://bad\nhost.invalid:19132/signaling",
+                "http://bad\rhost.invalid:19132/signaling",
+                "https://localhost:65536/signaling",
+                "http://localhost:0/signaling",
+                "localhost:19132",
+                "ftp://localhost:19132",
+            ):
+                with self.subTest(address=address):
+                    player = MCPPlayer()
+                    with self.assertRaises(ValueError):
+                        await player.connect(address)
+                    self.assertIsNone(player.bot)
+            bot_factory.assert_not_called()
 
     async def test_disconnect_cancels_pending_block_wait(self):
         with patch("endpilot.mcp_server.Bot", FakeBot):
