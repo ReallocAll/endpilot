@@ -16,7 +16,8 @@ from .blocks import (
 from .compression import PacketConnection
 from .entities import Entities, EntityState
 from .inventory import (
-    HeldItemStack, _BlockTransferEndpoint, _InventoryMoveNotSubmitted, _PLAYER_CONTAINERS, _TransferEndpoint,
+    HeldItemStack, _BlockTransferEndpoint, _InventoryMoveNotSubmitted, _MAIN_INVENTORY_SIZE, _PLAYER_CONTAINERS,
+    _TransferEndpoint,
     _correct_observed_item, _response_item, _stack_snapshot,
 )
 
@@ -77,6 +78,10 @@ class _WindowChangedBeforeClose(RuntimeError):
 
 _CHEST_BOAT = "minecraft:chest_boat"
 _HORSE = "minecraft:horse"
+_HORSE_SLOT_COUNT = 2
+_HORSE_SADDLE_SLOT = 0
+_HORSE_EQUIP_CONTAINER = "HORSE_EQUIP_CONTAINER"
+_SADDLE = "minecraft:saddle"
 _ENTITY_CONTAINER_LAYOUTS = {
     "minecraft:chest_minecart": ("CONTAINER", 27),
     "minecraft:hopper_minecart": ("HOPPER", 5),
@@ -165,12 +170,13 @@ def _validate_anvil_name(new_name: str | None) -> None:
 
 class Containers:
     def __init__(self, packets, movement, inventory, *, entities: Entities | None = None,
-                 blocks: Blocks | None = None):
+                 blocks: Blocks | None = None, item_names: Mapping[int, str] | None = None):
         self.packets = packets
         self.movement = movement
         self.inventory = inventory
         self._entities = entities
         self._blocks = blocks
+        self._item_names = {} if item_names is None else item_names
         self.window: ContainerWindow | None = None
         self._dimension = None if blocks is None else blocks.dimension_id
         self._layout_token = object()
@@ -478,6 +484,10 @@ class Containers:
     def _observe_transfer_slot(self, index: int, item: object) -> None:
         entity = self._entity_container
         if entity is not None:
+            if entity.actor_type == _HORSE and (
+                self._window_slot_count != _HORSE_SLOT_COUNT or index != _HORSE_SADDLE_SLOT
+            ):
+                return
             if entity.actor_type == _CHEST_BOAT:
                 count = entity.slot_count(self.window)
                 if count is None or self._window_slot_count != count or not 0 <= index < count:
@@ -1013,7 +1023,8 @@ class Containers:
                 if opened is None or self.window is not opened:
                     raise RuntimeError("the entity container window closed or changed during open")
                 require_target()
-                return opened
+                if not horse:
+                    return opened
         finally:
             try:
                 for task in tasks:
@@ -1022,6 +1033,13 @@ class Containers:
                 await asyncio.gather(*tasks, return_exceptions=True)
             finally:
                 self._entity_opening = False
+        # An unsolicited announcement remains observable. Bind the horse only
+        # after the requested interaction and its matching open have completed.
+        if self.window is not opened:
+            raise RuntimeError("the entity container window closed or changed during open")
+        require_target()
+        self._entity_container = target
+        return opened
 
     async def open_inventory_screen(
         self, *, timeout: float = 15, _on_observed: Callable[[ContainerWindow], None] | None = None,
@@ -1343,15 +1361,20 @@ class Containers:
         _before_range_write: Callable[[int], None] | None = None,
     ):
         window = self.window
-        if window is not None and window.container_type == "HORSE":
-            raise RuntimeError("horse equipment windows are read-only")
+        horse = window is not None and window.container_type == "HORSE"
+        entity_container = self._entity_container
+        if horse and (
+            entity_container is None or entity_container.actor_type != _HORSE
+            or window.entity_unique_id != entity_container.entity_id or self.packets.protocol.number != 2225
+            or block_container is not None or _expected_slots is not None or _range_window_current is not None
+        ):
+            raise RuntimeError("this horse equipment window is read-only")
         if window is None or self._slots is None:
             raise RuntimeError("container window or its server-reported slots are unavailable")
         layout = self._layout_token
         observed_slot_count = self._observed_window_slot_count(window)
         if _expected_slot_count is not None and observed_slot_count != _expected_slot_count:
             raise RuntimeError("container slot count changed before transfer")
-        entity_container = self._entity_container
         strict_slot_count = None
         if entity_container is not None:
             entity_container.require_visible()
@@ -1366,6 +1389,11 @@ class Containers:
         if not 1 <= amount <= 255:
             raise ValueError("item-stack request amount must be between 1 and 255")
         chest_slot, player_slot = (destination_slot, source_slot) if into_container else (source_slot, destination_slot)
+        if horse:
+            if (type(chest_slot) is not int or chest_slot != _HORSE_SADDLE_SLOT or type(amount) is not int or amount != 1
+                    or type(player_slot) is not int or not 0 <= player_slot < _MAIN_INVENTORY_SIZE):
+                raise ValueError("horse transfers require one saddle in slot 0 and a main inventory slot")
+            strict_slot_count = _HORSE_SLOT_COUNT
         if strict_slot_count is not None:
             if not 0 <= chest_slot < strict_slot_count:
                 raise ValueError(f"the entity container slot must be in range({strict_slot_count})")
@@ -1399,7 +1427,9 @@ class Containers:
                 if observed_slot_count != 27:
                     raise RuntimeError("the active shulker box has an unsupported slot count")
 
-        if shulker:
+        if horse:
+            container_name = _HORSE_EQUIP_CONTAINER
+        elif shulker:
             container_name = "SHULKER_BOX_CONTAINER"
             strict_slot_count = 27
         else:
@@ -1439,6 +1469,8 @@ class Containers:
                         old.matches(block_endpoint, allow_possible=True) for old in self._unconfirmed_block_slots
                     )))
 
+        if horse and (pending or slots_unconfirmed()):
+            raise RuntimeError("horse transfer slots need a fresh server observation and no pending item request")
         if _expected_slots is not None and (pending or slots_unconfirmed()):
             return None
         blockers = tuple(request.reply for request in pending if request.range_step)
@@ -1468,6 +1500,20 @@ class Containers:
         )
         source = original_chest = original_player = None
 
+        def horse_layout_is_known():
+            return (self._window_slot_count == _HORSE_SLOT_COUNT and self._slots is not None
+                    and self._slots.keys() == {0, 1} and all(item is not None for item in self._slots.values()))
+
+        def is_saddle(item):
+            return (item is not None and int(item.id) != 0 and int(item.stack_size) == 1 and item.net_id_variant
+                    and self._item_names.get(int(item.id)) == _SADDLE)
+
+        def horse_player_slot_is_known(item, *, correction=None):
+            equipment = self.inventory._damage_descriptors.get(player_endpoint)
+            return (item is not None and player_slot not in self.inventory._count_observation_gaps
+                    and _same_slot(item, self.inventory.item_or_empty(player_slot))
+                    and (equipment is None or _same_slot(item, equipment) or _same_slot(correction, equipment)))
+
         def prepare_request():
             nonlocal source, original_chest, original_player
             original_chest = self._slots.get(chest_slot)
@@ -1482,6 +1528,15 @@ class Containers:
                 not _same_slot(source, _expected_slots[0]) or not _same_slot(destination, _expected_slots[1])
             ):
                 raise RuntimeError("container transfer slots changed before submission")
+            if horse:
+                observed_destination = original_chest if into_container else original_player
+                if not horse_layout_is_known() or not horse_player_slot_is_known(original_player):
+                    raise RuntimeError("horse transfer requires observed horse equipment and main inventory slots")
+                if not is_saddle(source):
+                    raise ValueError("horse transfer source must be one server-registered saddle")
+                if observed_destination is None or (observed_destination.id or observed_destination.stack_size
+                                                    or observed_destination.net_id_variant):
+                    raise ValueError("horse transfer destination must be an observed empty slot")
             if source is None or int(source.id) == 0:
                 raise ValueError("source slot has no observed item")
             request.actions = [action_type(
@@ -1499,10 +1554,22 @@ class Containers:
         entity_changes: dict[_TransferEndpoint, object] = {}
         entity_range = _range_window_current is not None and entity_container is not None
         brewing_slot_changed = False
+        horse_overlap = False
+
+        def mark_horse_overlap():
+            nonlocal horse_overlap
+            horse_overlap = True
 
         def observe_pending_slot(endpoint, current):
             nonlocal brewing_slot_changed
             original = original_player if endpoint == player_endpoint else original_chest
+            if horse:
+                if endpoint in entity_changes:
+                    if not _same_slot(entity_changes[endpoint], current):
+                        mark_horse_overlap()
+                elif not _same_slot(original, current):
+                    entity_changes[endpoint] = current
+                return
             if entity_range:
                 if endpoint != player_endpoint and not window_is_current():
                     return
@@ -1549,6 +1616,64 @@ class Containers:
             return (self.window is window and self._layout_token is layout
                     and (entity_container is None or
                          (self._entity_container is entity_container and entity_container.is_visible())))
+
+        def apply_horse(response):
+            if response.result.name != "SUCCESS":
+                return
+
+            current_player = self.inventory.slots.get(player_slot)
+            if not window_is_current() or not horse_layout_is_known():
+                # A submitted success can change the player slot even when the
+                # response omits that correction. Preserve any newer observation.
+                if current_player is original_player:
+                    self.inventory._unconfirmed_transfer_slots.add(player_slot)
+                return
+
+            wanted = {container_name: (chest_slot, int(into_container)),
+                      player_name: (player_slot, int(not into_container))}
+            receipts = {name: [] for name in wanted}
+            for container in response.containers or ():
+                address = container.full_container_name
+                name = address.name.name
+                if address.dynamic_id is None and name in wanted:
+                    index, _ = wanted[name]
+                    receipts[name].extend(slot for slot in container.slots if int(slot.slot) == index)
+
+            def receipt_matches(name):
+                index, count = wanted[name]
+                slots = receipts[name]
+                return (len(slots) == 1 and int(slots[0].requested_slot) == index
+                        and int(slots[0].amount) == count
+                        and (not count or (slots[0].item_stack_net_id is not None
+                                           and int(slots[0].item_stack_net_id.raw_id) != 0)))
+
+            known = (self._slots[chest_slot], current_player)
+            originals = (original_chest, original_player)
+            if all(map(receipt_matches, wanted)) and not horse_overlap and is_saddle(source):
+                corrected = tuple(
+                    _response_item(b, original, source, receipts[name][0])
+                    for name, original in zip(wanted, originals)
+                )
+                # BDS can send an authoritative slot echo before the response.
+                # Keep newer observations and apply only the two matched corrections.
+                endpoints_match = all(
+                    _same_slot(current, after) or (endpoint not in entity_changes and _same_slot(current, original))
+                    for endpoint, current, after, original in zip(
+                        (chest_endpoint, player_endpoint), known, corrected, originals, strict=True
+                    )
+                )
+                if endpoints_match and horse_player_slot_is_known(known[1], correction=corrected[1]):
+                    before = {} if self._slot_observers else None
+                    if not _same_slot(known[0], corrected[0]):
+                        self._record_slot_before(chest_slot, before)
+                        self._slots[chest_slot] = corrected[0]
+                        self._slots_updated.set()
+                    if not _same_slot(known[1], corrected[1]):
+                        self.inventory._set_slot(player_slot, corrected[1])
+                    self._notify_slot_changes(window, before)
+                    return
+            self._unconfirmed_transfer_slots.add(chest_slot)
+            self.inventory._unconfirmed_transfer_slots.add(player_slot)
 
         def apply(response):
             # A reply can correct other slots as well as the action's endpoints.
@@ -1681,6 +1806,17 @@ class Containers:
                         entity_container.require_visible()
                     if not window_is_current():
                         raise RuntimeError("container transfer endpoint changed before submission")
+                    if horse:
+                        own_request = self.inventory._pending_requests[request_id]
+                        current_player = self.inventory.slots.get(player_slot)
+                        if (not horse_layout_is_known() or slots_unconfirmed() or not is_saddle(source)
+                                or not _same_slot(original_chest, self._slots.get(chest_slot))
+                                or not _same_slot(original_player, current_player)
+                                or not horse_player_slot_is_known(current_player)
+                                or any(request is not own_request for request in
+                                       self.inventory._requests_for_endpoints(endpoints))):
+                            raise RuntimeError("horse transfer slots changed before submission")
+                        original_player = current_player
                     if exact_block:
                         name = self._current_window_block_name(window)
                         observe_target(name)
@@ -1723,10 +1859,10 @@ class Containers:
         check_at_write = stop_watching is not None or _range_window_current is not None or strict_slot_count is not None
         try:
             return await self.inventory._request_item_stack(
-                request, apply, timeout=timeout, queued=_queued, before_send=before_send,
+                request, apply_horse if horse else apply, timeout=timeout, queued=_queued, before_send=before_send,
                 _endpoints=endpoints, _range_step=_expected_slots is not None,
-                _wait_for=blockers, _on_unconfirmed=_on_unconfirmed,
-                _on_slot_observed=observe_pending_slot if brewing or _on_unconfirmed is not None else None,
+                _wait_for=blockers, _on_unconfirmed=mark_horse_overlap if horse else _on_unconfirmed,
+                _on_slot_observed=observe_pending_slot if horse or brewing or _on_unconfirmed is not None else None,
                 _at_write=before_write if check_at_write else None,
             )
         finally:

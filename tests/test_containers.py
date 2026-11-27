@@ -402,6 +402,8 @@ class ContainerTests(unittest.IsolatedAsyncioTestCase):
             containers.close()
 
 class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
+    SADDLE_ID = 1234
+
     async def asyncSetUp(self):
         self.enterContext(ManualClock().patch_scheduler())
         self.bot = Bot("CartPlayer", protocol=2225)
@@ -708,9 +710,9 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
         return b.AddActorPacket(runtime_id=34, entity_id=unique, actor_type="minecraft:chest_boat",
                                 pos=b.Vec3(x=1.5, y=100, z=0.5))
 
-    def horse(self, unique=-205):
+    def horse(self, unique=-205, *, runtime_id=35):
         b = self.b
-        return b.AddActorPacket(runtime_id=35, entity_id=unique, actor_type="minecraft:horse",
+        return b.AddActorPacket(runtime_id=runtime_id, entity_id=unique, actor_type="minecraft:horse",
                                 pos=b.Vec3(x=1.5, y=100, z=0.5))
 
     def horse_equipment(self, unique=-205, *, window_id=2):
@@ -723,8 +725,25 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
             })])}),
         )
 
+    def saddle(self, *, count=1, net=70, item_id=SADDLE_ID):
+        return self.b.SerializedNetworkItemStackDescriptor(id=item_id, stack_size=count, net_id_variant=net)
+
+    def horse_content(self, item=None, *, count=2):
+        slots = [self.b.SerializedNetworkItemStackDescriptor() for _ in range(count)]
+        if item is not None:
+            slots[0] = item
+        return self.b.InventoryContentPacket(inventory_id=2, slots=slots)
+
+    async def open_horse(self, inventory, *, runtime_id=35, unique=-205):
+        opening = await self.start_open(runtime_id)
+        await self.deliver(self.horse_equipment(unique), inventory)
+        return await opening
+
     async def prepare_horse(self, *, confirmed=True):
-        await self.deliver(self.horse(), self.position(), self.main_slot(), self.sneak_pose(False))
+        b = self.b
+        registry = b.ItemRegistryPacket(items=[b.ItemData(id=self.SADDLE_ID, name="minecraft:saddle")])
+        await self.deliver(registry, self.horse(), self.position(), self.main_slot(), self.main_slot(1),
+                           self.sneak_pose(False))
         await self.bot.set_sneaking(True)
         if confirmed:
             await self.deliver(self.sneak_pose(True))
@@ -753,10 +772,7 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
         opening = await self.start_open(35)
         click, = self.clicks()
         self.assertEqual((int(click.slot), int(click.item.id), click.item.stack_size), (0, 0, 0))
-        contents = b.InventoryContentPacket(inventory_id=2, slots=[
-            b.SerializedNetworkItemStackDescriptor(id=374, stack_size=1),
-            b.SerializedNetworkItemStackDescriptor(),
-        ])
+        contents = self.horse_content(self.saddle())
         await self.deliver(contents)
         self.assertIsNone(self.bot.open_window)
         self.assertFalse(opening.done())
@@ -773,7 +789,7 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(waiting.done())
         await self.deliver(contents)
         self.assertEqual([(i, item.id, item.stack_size) for i, item in (await waiting).items()],
-                         [(0, 374, 1), (1, 0, 0)])
+                         [(0, self.SADDLE_ID, 1), (1, 0, 0)])
         self.assertEqual([change.slot for change in changes], [0, 1])
         armor = b.SerializedNetworkItemStackDescriptor(id=386, stack_size=1)
         await self.deliver(b.InventorySlotPacket(inventory_id=3, slot=1, item=armor))
@@ -782,10 +798,35 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.container_slots[1].id, 386)
         self.assertEqual(changes[-1].after.item_id, 386)
 
+        def address(part):
+            group = part.full_container_name
+            return (group.name.name, group.dynamic_id, int(part.slot), int(part.net_id_variant))
+
+        horse_domain, player_domain = "HORSE_EQUIP_CONTAINER", "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER"
+        take, request = await self.submit_stack(self.bot.take_from_container(0, 1))
+        action, = request.actions
+        self.assertIsInstance(action, b.ItemStackRequestCereal.TakeActionData)
+        self.assertEqual((action.amount, address(action.source), address(action.destination)),
+                         (1, (horse_domain, None, 0, 70), (player_domain, None, 1, 0)))
+        await self.deliver(b.InventorySlotPacket(inventory_id=2, slot=0, item=contents.slots[1]))
+        await self.reply_stack(request, (horse_domain, 0, 0, 0), (player_domain, 1, 1, 71))
+        self.assertEqual((await take).result.name, "SUCCESS")
+        self.assertEqual((self.bot.container_slots[0].id, self.bot.inventory_slots[1].id,
+                          self.bot.inventory_slots[1].net_id_variant), (0, self.SADDLE_ID, 71))
+
+        put, request = await self.submit_stack(self.bot.put_into_container(1, 0))
+        action, = request.actions
+        self.assertIsInstance(action, b.ItemStackRequestCereal.PlaceActionData)
+        self.assertEqual((action.amount, address(action.source), address(action.destination)),
+                         (1, (player_domain, None, 1, 71), (horse_domain, None, 0, 0)))
+        await self.deliver(b.InventorySlotPacket(inventory_id=2, slot=0, item=self.saddle(net=72)))
+        await self.reply_stack(request, (horse_domain, 0, 1, 72), (player_domain, 1, 0, 0))
+        self.assertEqual((await put).result.name, "SUCCESS")
+        self.assertEqual((self.bot.container_slots[0].id, self.bot.container_slots[0].net_id_variant,
+                          self.bot.container_slots[1].id, self.bot.inventory_slots[1].id),
+                         (self.SADDLE_ID, 72, 386, 0))
+
         requests_before = list(self.wire.sent)
-        for operation in (self.bot.take_from_container(0, 0), self.bot.put_into_container(0, 0)):
-            with self.assertRaisesRegex(RuntimeError, "read-only"):
-                await operation
         for operation in (
             transfer_range(self.bot, direction="take", item="minecraft:saddle", count=1,
                            source_slots=range(1), destination_slots=range(1)),
@@ -808,6 +849,241 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.bot.container_slots)
         await self.deliver(contents)
         self.assertIsNone(self.bot.container_slots)
+
+    async def test_horse_take_rejects_unsupported_slots_and_unconfirmed_stacks_without_sending(self):
+        await self.prepare_horse()
+        await self.open_horse(self.horse_content(self.saddle()))
+        requests_before = list(self.wire.sent)
+        for slots in ((1, 1, 1), (0, 1, 2), (0, 36, 1)):
+            with self.assertRaisesRegex(ValueError, "one saddle in slot 0"):
+                await self.bot.take_from_container(*slots)
+        with self.assertRaisesRegex(RuntimeError, "observed horse equipment and main inventory"):
+            await self.bot.take_from_container(0, 2)
+        for item in (self.saddle(item_id=374), self.saddle(count=2), self.saddle(net=None)):
+            await self.deliver(self.horse_content(item))
+            with self.assertRaisesRegex(ValueError, "one server-registered saddle"):
+                await self.bot.take_from_container(0, 1)
+        await self.deliver(self.horse_content(self.saddle(), count=1))
+        with self.assertRaisesRegex(RuntimeError, "unsupported slot count"):
+            await self.bot.take_from_container(0, 1)
+        await self.deliver(self.horse_content(self.saddle()), self.main_slot(1, self.saddle(net=81)))
+        with self.assertRaisesRegex(ValueError, "an observed empty slot"):
+            await self.bot.take_from_container(0, 1)
+        with self.assertRaisesRegex(ValueError, "an observed empty slot"):
+            await self.bot.put_into_container(1, 0)
+        self.assertEqual(self.wire.sent, requests_before)
+
+    async def test_horse_native_replacement_does_not_inherit_transfer_ownership_or_late_verdict(self):
+        await self.prepare_horse()
+        original = await self.open_horse(self.horse_content(self.saddle()))
+        take, request = await self.submit_stack(self.bot.take_from_container(0, 1))
+        await self.deliver(self.horse_equipment(), self.horse_content(self.saddle(net=81)))
+        self.assertEqual(self.bot.open_window, original)
+        self.assertIsNot(self.bot.open_window, original)
+        await self.reply_stack(request, ("HORSE_EQUIP_CONTAINER", 0, 0, 0),
+                               ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 1, 1, 72))
+        self.assertEqual((await take).result.name, "SUCCESS")
+        self.assertEqual((self.bot.container_slots[0].net_id_variant, self.bot.inventory_slots[1].id), (81, 0))
+        requests_before = list(self.wire.sent)
+        with self.assertRaisesRegex(RuntimeError, "read-only"):
+            await self.bot.take_from_container(0, 1)
+        self.assertEqual(self.wire.sent, requests_before)
+
+    async def test_late_horse_take_requires_fresh_player_empty_slot_before_another_take(self):
+        await self.assert_late_horse_take_requires_fresh_player_slot(("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 1, 1, 71))
+
+    async def test_late_horse_take_without_player_correction_requires_fresh_player_slot(self):
+        await self.assert_late_horse_take_requires_fresh_player_slot()
+
+    async def test_late_horse_take_success_after_cancellation_still_requires_fresh_player_slot(self):
+        await self.assert_late_horse_take_requires_fresh_player_slot(cancel_wait=True)
+
+    async def assert_late_horse_take_requires_fresh_player_slot(self, *player_corrections, cancel_wait=False):
+        await self.prepare_horse()
+        original = await self.open_horse(self.horse_content(self.saddle()))
+        packet_send = self.bot.packets.send
+
+        async def refresh_before_write(packet, **kwargs):
+            if isinstance(packet, self.b.ItemStackRequestPacket):
+                await self.deliver(self.main_slot(1))
+            await packet_send(packet, **kwargs)
+
+        with patch.object(self.bot.packets, "send", refresh_before_write):
+            take, request = await self.submit_stack(self.bot.take_from_container(0, 1))
+        if cancel_wait:
+            take.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await take
+        await self.deliver(self.horse_closed(), self.horse(-206, runtime_id=36))
+        replacement = await self.open_horse(self.horse_content(self.saddle(net=81)), runtime_id=36, unique=-206)
+        self.assertEqual(replacement.container_id, original.container_id)
+        await self.reply_stack(request, ("HORSE_EQUIP_CONTAINER", 0, 0, 0), *player_corrections)
+        if not cancel_wait:
+            self.assertEqual((await take).result.name, "SUCCESS")
+        self.assertEqual((self.bot.container_slots[0].net_id_variant, self.bot.inventory_slots[1].id), (81, 0))
+        before = list(self.wire.sent)
+        with self.assertRaisesRegex(RuntimeError, "fresh server observation"):
+            await self.bot.take_from_container(0, 1, timeout=.1)
+        self.assertEqual(self.wire.sent, before)
+
+        await self.deliver(self.main_slot(1))
+        resumed, request = await self.submit_stack(self.bot.take_from_container(0, 1))
+        action, = request.actions
+        self.assertEqual((action.source.net_id_variant, action.destination.net_id_variant), (81, 0))
+        await self.reply_stack(request, ("HORSE_EQUIP_CONTAINER", 0, 0, 0),
+                               ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 1, 1, 82))
+        self.assertEqual((await resumed).result.name, "SUCCESS")
+
+    async def test_late_horse_put_requires_fresh_player_saddle_before_another_put(self):
+        await self.assert_late_horse_put_requires_fresh_player_slot(("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 1, 0, 0))
+
+    async def test_late_horse_put_without_player_correction_requires_fresh_player_slot(self):
+        await self.assert_late_horse_put_requires_fresh_player_slot()
+
+    async def assert_late_horse_put_requires_fresh_player_slot(self, *player_corrections):
+        await self.prepare_horse()
+        await self.deliver(self.main_slot(1, self.saddle(net=71)))
+        await self.open_horse(self.horse_content())
+        put, request = await self.submit_stack(self.bot.put_into_container(1, 0))
+        await self.deliver(self.horse_closed(), self.horse(-206, runtime_id=36))
+        await self.open_horse(self.horse_content(), runtime_id=36, unique=-206)
+        await self.reply_stack(request, ("HORSE_EQUIP_CONTAINER", 0, 1, 71), *player_corrections)
+        self.assertEqual((await put).result.name, "SUCCESS")
+        self.assertEqual((self.bot.container_slots[0].id, self.bot.inventory_slots[1].net_id_variant), (0, 71))
+        before = list(self.wire.sent)
+        with self.assertRaisesRegex(RuntimeError, "fresh server observation"):
+            await self.bot.put_into_container(1, 0, timeout=.1)
+        self.assertEqual(self.wire.sent, before)
+
+        await self.deliver(self.main_slot(1, self.saddle(net=72)))
+        resumed, request = await self.submit_stack(self.bot.put_into_container(1, 0))
+        action, = request.actions
+        self.assertEqual((action.source.net_id_variant, action.destination.net_id_variant), (72, 0))
+        await self.reply_stack(request, ("HORSE_EQUIP_CONTAINER", 0, 1, 72),
+                               ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 1, 0, 0))
+        self.assertEqual((await resumed).result.name, "SUCCESS")
+
+    async def test_late_horse_take_keeps_new_player_observation_of_the_same_empty_slot(self):
+        await self.prepare_horse()
+        await self.open_horse(self.horse_content(self.saddle()))
+        take, request = await self.submit_stack(self.bot.take_from_container(0, 1))
+        await self.deliver(self.horse_closed(), self.horse(-206, runtime_id=36))
+        await self.open_horse(self.horse_content(self.saddle(net=81)), runtime_id=36, unique=-206)
+        await self.deliver(self.main_slot(1, self.saddle(net=71)), self.main_slot(1))
+        await self.reply_stack(request, ("HORSE_EQUIP_CONTAINER", 0, 0, 0))
+        self.assertEqual((await take).result.name, "SUCCESS")
+        self.assertEqual((self.bot.container_slots[0].net_id_variant, self.bot.inventory_slots[1].id), (81, 0))
+        resumed, request = await self.submit_stack(self.bot.take_from_container(0, 1))
+        action, = request.actions
+        self.assertEqual((action.source.net_id_variant, action.destination.net_id_variant), (81, 0))
+        await self.reply_stack(request, ("HORSE_EQUIP_CONTAINER", 0, 0, 0),
+                               ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 1, 1, 82))
+        self.assertEqual((await resumed).result.name, "SUCCESS")
+
+    async def test_late_horse_rejection_keeps_player_slot_confirmed(self):
+        b = self.b
+        await self.prepare_horse()
+        await self.open_horse(self.horse_content(self.saddle()))
+        take, request = await self.submit_stack(self.bot.take_from_container(0, 1))
+        await self.deliver(self.horse_closed(), self.horse(-206, runtime_id=36))
+        await self.open_horse(self.horse_content(self.saddle(net=81)), runtime_id=36, unique=-206)
+        await self.deliver(b.ItemStackResponsePacket(responses=[b.ItemStackResponseInfo(
+            client_request_id=request.client_request_id, result=b.ItemStackNetResult.ERROR,
+        )]))
+        self.assertEqual((await take).result.name, "ERROR")
+        self.assertEqual((self.bot.container_slots[0].net_id_variant, self.bot.inventory_slots[1].id), (81, 0))
+        resumed, request = await self.submit_stack(self.bot.take_from_container(0, 1))
+        await self.reply_stack(request, ("HORSE_EQUIP_CONTAINER", 0, 0, 0),
+                               ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 1, 1, 82))
+        self.assertEqual((await resumed).result.name, "SUCCESS")
+
+    async def test_horse_take_cancelled_before_write_leaves_player_slot_confirmed(self):
+        await self.prepare_horse()
+        await self.open_horse(self.horse_content(self.saddle()))
+        original_send = self.bot.packets.send
+        writing = asyncio.Event()
+
+        async def pause_stack_request(packet, **kwargs):
+            if isinstance(packet, self.b.ItemStackRequestPacket):
+                writing.set()
+                await asyncio.Future()
+            await original_send(packet, **kwargs)
+
+        before = list(self.wire.sent)
+        with patch.object(self.bot.packets, "send", pause_stack_request):
+            take = self.start(self.bot.take_from_container(0, 1))
+            await asyncio.wait_for(writing.wait(), 1)
+            await self.cancel(take)
+        self.assertTrue(take.cancelled())
+        self.assertEqual(self.wire.sent, before)
+        resumed, request = await self.submit_stack(self.bot.take_from_container(0, 1))
+        await self.reply_stack(request, ("HORSE_EQUIP_CONTAINER", 0, 0, 0),
+                               ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 1, 1, 82))
+        self.assertEqual((await resumed).result.name, "SUCCESS")
+
+    async def test_horse_success_with_wrong_receipt_address_requires_fresh_observations(self):
+        b = self.b
+        await self.prepare_horse()
+        await self.open_horse(self.horse_content(self.saddle()))
+        take, request = await self.submit_stack(self.bot.take_from_container(0, 1))
+        await self.reply_stack(request, ("HORSE_EQUIP_CONTAINER", 1, 0, 0),
+                               ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 1, 1, 71))
+        self.assertEqual((await take).result.name, "SUCCESS")
+        self.assertEqual((self.bot.container_slots[0].id, self.bot.inventory_slots[1].id), (self.SADDLE_ID, 0))
+        requests_before = list(self.wire.sent)
+        with self.assertRaisesRegex(RuntimeError, "fresh server observation"):
+            await self.bot.take_from_container(0, 1)
+        self.assertEqual(self.wire.sent, requests_before)
+        await self.deliver(self.horse_content(self.saddle()), self.main_slot(1))
+        take, request = await self.submit_stack(self.bot.take_from_container(0, 1))
+        await self.deliver(b.ItemStackResponsePacket(responses=[b.ItemStackResponseInfo(
+            client_request_id=request.client_request_id, result=b.ItemStackNetResult.ERROR,
+        )]))
+        self.assertEqual((await take).result.name, "ERROR")
+        self.assertEqual((self.bot.container_slots[0].id, self.bot.inventory_slots[1].id), (self.SADDLE_ID, 0))
+
+    async def test_horse_success_does_not_replace_new_main_hand_equipment(self):
+        b = self.b
+        await self.prepare_horse()
+        await self.open_horse(self.horse_content(self.saddle()))
+        take, request = await self.submit_stack(self.bot.take_from_container(0, 1))
+        await self.deliver(b.MobEquipmentPacket(runtime_id=7, container_id=b.ContainerID.INVENTORY,
+                                                slot=1, selected_slot=1, item=self.storage_item(1, 80)))
+        await self.reply_stack(request, ("HORSE_EQUIP_CONTAINER", 0, 0, 0),
+                               ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 1, 1, 71))
+        self.assertEqual((await take).result.name, "SUCCESS")
+        self.assertEqual((self.bot.container_slots[0].id, self.bot.inventory_slots[1].id), (self.SADDLE_ID, 0))
+
+    async def test_horse_take_rechecks_window_actor_and_both_slots_at_the_write(self):
+        b = self.b
+        await self.prepare_horse()
+        changes = (
+            (self.main_slot(1, self.saddle(net=82)),),
+            (b.InventoryContentPacket(inventory_id=b.ContainerID.INVENTORY, slots=[self.main_slot().item]),),
+            (self.horse_content(self.saddle(net=83)),),
+            (self.horse_equipment(-206), self.horse_content(self.saddle())),
+            (self.horse_closed(), self.horse_equipment(), self.horse_content(self.saddle())),
+            (b.RemoveActorPacket(entity_id=-205), self.horse()),
+            (b.ItemRegistryPacket(items=[b.ItemData(id=self.SADDLE_ID, name="minecraft:stone")]),),
+        )
+        original_send = self.bot.packets.send
+        for packets in changes:
+            with self.subTest(changed=type(packets[0]).__name__):
+                if self.bot.open_window is not None:
+                    await self.deliver(self.horse_closed())
+                await self.prepare_horse()
+                await self.open_horse(self.horse_content(self.saddle()))
+
+                async def send(packet, **kwargs):
+                    if isinstance(packet, b.ItemStackRequestPacket):
+                        await self.deliver(*packets)
+                    await original_send(packet, **kwargs)
+
+                requests_before = list(self.wire.sent)
+                with patch.object(self.bot.packets, "send", send):
+                    with self.assertRaisesRegex(RuntimeError, "changed before submission|no longer observed"):
+                        await self.bot.take_from_container(0, 1)
+                self.assertEqual(self.wire.sent, requests_before)
 
     async def test_horse_open_rejects_wrong_window_and_tracks_actual_replacement(self):
         await self.prepare_horse()

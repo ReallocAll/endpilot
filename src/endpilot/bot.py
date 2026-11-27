@@ -439,6 +439,7 @@ class Bot:
         )
         self._containers = Containers(
             session.packets, self._movement, self._inventory, entities=self._entities, blocks=self._blocks,
+            item_names=session.item_names,
         )
         def observe_game_mode(mode):
             if player_state is not None:
@@ -2117,7 +2118,11 @@ class Bot:
     async def take_from_container(
         self, source_slot: int, destination_slot: int, amount: int = 1, *, timeout: float = 15
     ):
-        """Return the server's item-stack verdict; response slots update observed state."""
+        """Return the server's item-stack verdict; response slots update observed state.
+
+        For a horse opened with open_entity_container(), take one saddle from
+        slot 0 into a confirmed empty main inventory slot.
+        """
         if self._containers is None:
             raise RuntimeError("player has not joined")
         return await self._containers.take_from_container(
@@ -2147,7 +2152,11 @@ class Bot:
     async def put_into_container(
         self, source_slot: int, destination_slot: int, amount: int = 1, *, timeout: float = 15
     ):
-        """Return the server's verdict for inventory-to-container transfer."""
+        """Return the server's verdict for inventory-to-container transfer.
+
+        For a horse opened with open_entity_container(), put one saddle from
+        main inventory into its confirmed empty slot 0.
+        """
         if self._containers is None:
             raise RuntimeError("player has not joined")
         return await self._containers.put_into_container(
@@ -2332,7 +2341,8 @@ class Bot:
         The click waits for server-reported sneaking within the same timeout.
         The method leaves your pose alone.
         Return the matching server-opened window. Use wait_for_container_slots
-        for its contents. Horse equipment windows are read-only.
+        for its contents. Exact saddle transfers use slot 0 on a horse opened
+        through this method. Horse armor and range transfers are unsupported.
         Chest watercraft and hopper minecart transfers require matching
         27-slot and 5-slot windows, respectively.
         """

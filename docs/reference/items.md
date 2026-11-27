@@ -1,5 +1,20 @@
 # Inventory and items
 
+## Move a horse saddle
+
+Stand near a tamed horse while holding sneak with an empty hand. Open it
+with `await bot.open_entity_container(horse.runtime_id)` and wait for the
+two reported equipment slots with `await bot.wait_for_container_slots()`.
+Slot `0` holds the saddle. Use `await bot.take_from_container(0, player_slot, 1)`
+to remove it into a confirmed empty main inventory slot (`0`–`35`), or
+`await bot.put_into_container(player_slot, 0, 1)` to install one saddle
+in an empty saddle slot. Check the returned server verdict before making
+another move.
+
+Both actions require the server to have registered the source item as
+`minecraft:saddle`. Horse armor, range transfers and horse windows that
+arrive outside a matching `open_entity_container` call support observation only.
+
 ## Unequip armor
 
 Use the numeric armor slot (`0`–`3`) or its name (`head`, `chest`, `legs`,
