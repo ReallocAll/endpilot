@@ -26,8 +26,8 @@ from .enchanting import EnchantOption, Enchantment
 from .entities import (
     EntityActorEvent, EntityAttribute, EntityAttributeModifier, EntityAttributeUpdate, EntityCriticalEffect,
     EntityCursorResult, EntityEffectUpdate, EntityHealthEvent, EntityLifecycleEvent, EntityMovementUpdate,
-    EntitySwing, ItemPickup, PaintingSnapshot, PlayerEquipmentSnapshot, PlayerListChange, PlayerListEntry,
-    ShieldBlockEvent, VehicleLink, VehicleLinkChange,
+    EntitySwing, EntityVisibleEffectUpdate, ItemPickup, PaintingSnapshot, PlayerEquipmentSnapshot,
+    PlayerListChange, PlayerListEntry, ShieldBlockEvent, VehicleLink, VehicleLinkChange,
 )
 from .fishing import FishingResult
 from .inventory import HeldItemSnapshot, HeldItemStack, InventorySlotChange
@@ -126,6 +126,7 @@ __all__ = [
     "EntityPlacementResult",
     "EntitySwing",
     "EntityVisibilityGoal",
+    "EntityVisibleEffectUpdate",
     "FootGoal",
     "ForwardInput",
     "FurnaceProgress",

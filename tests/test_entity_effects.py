@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 from uuid import UUID
 
-from endpilot import Bot, EntityEffectUpdate, PlayerEffect
+from endpilot import Bot, EntityEffectUpdate, EntityVisibleEffectUpdate, PlayerEffect
 from endpilot.protocol import write_batch
 from test_scheduled_input import ManualClock, Wire
 
@@ -48,11 +48,18 @@ class EntityEffectTests(unittest.IsolatedAsyncioTestCase):
                       effect_duration_ticks=duration, effect_amplifier=amplifier,
                       show_particles=particles, ambient=ambient, tick=tick)
 
-    def visible_effects(self, value, *, runtime_id=8):
+    def visible_effect_metadata(self, value, *, typed=True):
         b = self.b
+        if value is None:
+            return b.SynchedActorData.CopyableDataList()
+        payload = b.DataItemInt64Payload if typed else b.DataItemIntPayload
         item = b.DataItemEntry(id=int(b.ActorDataIDs.VISIBLE_MOB_EFFECTS),
-                               payload=b.DataItemInt64Payload(value=value))
-        return b.SetActorDataPacket(id=runtime_id, packed_items=b.SynchedActorData.CopyableDataList(data=[item]))
+                               payload=payload(value=value))
+        return b.SynchedActorData.CopyableDataList(data=[item])
+
+    def visible_effects(self, value, *, runtime_id=8, tick=0, typed=True):
+        return self.b.SetActorDataPacket(id=runtime_id, tick=tick,
+                                         packed_items=self.visible_effect_metadata(value, typed=typed))
 
     def entity(self, runtime_id=8):
         return next(entity for entity in self.bot.observed_entities if entity.runtime_id == runtime_id)
@@ -67,6 +74,86 @@ class EntityEffectTests(unittest.IsolatedAsyncioTestCase):
     async def cancel(task):
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+    async def arm_visible(self, runtime_id):
+        task = asyncio.create_task(self.bot.wait_for_entity_visible_effect_change(runtime_id=runtime_id, timeout=1))
+        self.addAsyncCleanup(self.cancel, task)
+        await asyncio.sleep(0)
+        return task
+
+    async def test_visible_metadata_publishes_committed_changes_independently_of_mob_effect(self):
+        await self.join()
+        seen, states_at_dispatch, mob_effects = [], [], []
+
+        def record(update):
+            seen.append(update)
+            states_at_dispatch.append(self.entity(update.entity.runtime_id))
+
+        self.bot.subscribe_entity_visible_effect_changes(record)
+        self.bot.subscribe_entity_effect_updates(mob_effects.append)
+        sheep = self.sheep()
+        sheep.data = self.visible_effect_metadata(24)
+        await self.deliver(sheep)
+        initial = self.entity()
+        self.assertEqual((initial.visible_effects_value, initial.status_effects), (24, ()))
+        self.assertEqual(seen, [])
+        waiting = await self.arm_visible(8)
+
+        await self.deliver(
+            self.effect("ADD", duration=60, particles=True),
+            self.visible_effects(None), self.visible_effects(0, typed=False),
+            self.visible_effects(0, runtime_id=7), self.visible_effects(0, runtime_id=99),
+        )
+        speed = PlayerEffect(1, 0, 60, True, False)
+        self.assertEqual(self.entity(), replace(initial, status_effects=(speed,)))
+        self.assertEqual(seen, [])
+        self.assertFalse(waiting.done())
+
+        tick = 0x1_0000_0006
+        await self.deliver(
+            self.visible_effects(280, tick=tick), self.visible_effects(280, tick=tick + 1),
+            self.effect("REMOVE", particles=True),
+            self.visible_effects(24, tick=tick + 1), self.visible_effects(0, tick=tick + 1),
+        )
+        combined = replace(initial, visible_effects_value=280, status_effects=(speed,))
+        cleared = replace(initial, visible_effects_value=0)
+        self.assertEqual(seen, [EntityVisibleEffectUpdate(combined, tick),
+                                EntityVisibleEffectUpdate(initial, tick + 1),
+                                EntityVisibleEffectUpdate(cleared, tick + 1)])
+        for update, committed in zip(seen, states_at_dispatch, strict=True):
+            self.assertIs(update.entity, committed)
+        self.assertEqual(await waiting, seen[0])
+        self.assertEqual(self.entity(), cleared)
+        self.assertEqual([(event.action, event.entity.visible_effects_value) for event in mob_effects],
+                         [("add", 24), ("remove", 280)])
+
+    async def test_visible_effect_spawn_baseline_and_scoped_wait_follow_the_entity_instance(self):
+        await self.join()
+        b = self.b
+        seen, old_instance = [], []
+        subscribe = self.bot.subscribe_entity_visible_effect_changes
+        subscribe(seen.append)
+        await self.deliver(b.AddPlayerPacket(
+            uuid=UUID(int=108), runtime_id=8, name="Effects peer", unpack=self.visible_effect_metadata(24),
+            abilities_data=b.SerializedAbilitiesData(target_player=108),
+        ))
+        self.assertEqual(self.entity().visible_effects_value, 24)
+        self.assertEqual(seen, [])
+        subscribe(old_instance.append, runtime_id=8)
+        waiting = await self.arm_visible(8)
+
+        await self.deliver(self.sheep(109))
+        with self.assertRaises(LookupError):
+            await waiting
+        self.assertIsNone(self.entity().visible_effects_value)
+        waiting = await self.arm_visible(8)
+        signed = -(1 << 40) + 24
+        await self.deliver(self.visible_effects(signed, tick=15))
+        current = self.entity()
+        self.assertEqual((current.entity_id, current.visible_effects_value), (109, signed))
+        self.assertEqual(seen, [EntityVisibleEffectUpdate(current, 15)])
+        self.assertEqual(await waiting, seen[0])
+        self.assertEqual(old_instance, [])
 
     async def test_login_replays_effects_in_wire_order_across_start_game(self):
         await self.join(

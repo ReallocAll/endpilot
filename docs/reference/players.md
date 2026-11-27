@@ -501,10 +501,38 @@ dimensions. A deadline raises `TimeoutError`. Disconnection ends all
 subscriptions and raises `ConnectionError` in pending waits.
 
 The tuple covers `MobEffect` packets received while that actor instance was
-visible. A server can report some effects only in actor metadata. For example,
-stock BDS 1.26.66 sent visible Fire Resistance on a sheep through metadata
-alone. Those changes remain available through raw packets. An empty tuple means
-there are no effects currently recorded from `MobEffect` packets for the actor.
+visible. An empty tuple means there are no effects currently recorded from
+`MobEffect` packets for the actor.
+
+## Observe visible-effect metadata
+
+`EntityState.visible_effects_value` stores the signed integer reported by
+the server's `VISIBLE_MOB_EFFECTS` metadata. `None` means the value is
+unknown, and `0` is a reported value. The spawn packet can supply the initial
+value. Later packets that omit the field or carry an unexpected type preserve
+the last valid value.
+
+`bot.subscribe_entity_visible_effect_changes(callback, runtime_id=...)`
+calls a synchronous callback with an immutable `EntityVisibleEffectUpdate`.
+The event includes the committed `EntityState` and the packet tick. The
+first valid live metadata value and each subsequent change produce an
+event. Use `await bot.wait_for_entity_visible_effect_change(runtime_id=...,
+timeout=15)` for the next matching update. Both methods send zero packets.
+
+Omit `runtime_id` to observe any tracked remote actor. A runtime filter
+binds to the current instance. An untracked actor or the local player
+raises `LookupError`, as does a filtered wait whose actor leaves view,
+is replaced, or has a conflicting roster identity. A dimension change ends
+filtered subscriptions and raises `RuntimeError` in pending waits.
+Unfiltered subscriptions continue across dimensions. The returned
+unsubscribe function is idempotent. A deadline raises `TimeoutError`.
+Use `timeout=None` to wait without a deadline. Connection end closes
+subscriptions and raises `ConnectionError` in pending waits.
+
+Visible-effect metadata is a visual observation. Hidden effects may leave
+the value unchanged, and the SDK preserves the integer as received.
+`EntityState.status_effects` continues to reflect separately received
+`MobEffect` packets, which can report effect IDs, amplifiers, and durations.
 
 ## Observe native entity actor events
 

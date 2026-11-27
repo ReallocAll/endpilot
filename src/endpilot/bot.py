@@ -37,7 +37,7 @@ from .enchanting import Enchanting, EnchantOption
 from .entities import (
     Entities, EntityActorEvent, EntityAttributeUpdate, EntityCriticalEffect, EntityCriticalEffectKind,
     EntityCursorResult, EntityEffectUpdate, EntityHealthEvent, EntityHealthEventKind, EntityLifecycleEvent,
-    EntityMovement, EntityMovementUpdate, EntitySpawn, EntityState, EntitySwing, ItemPickup,
+    EntityMovement, EntityMovementUpdate, EntitySpawn, EntityState, EntitySwing, EntityVisibleEffectUpdate, ItemPickup,
     PlayerEquipmentSnapshot, PlayerListChange, PlayerListEntry, ShieldBlockEvent, VehicleLink, VehicleLinkChange,
 )
 from .expression import skin_packet
@@ -3200,6 +3200,22 @@ class Bot:
         if self._entities is None:
             raise RuntimeError("player has not joined")
         return self._entities.subscribe_entity_effect_updates(callback, runtime_id=runtime_id)
+
+    def subscribe_entity_visible_effect_changes(
+        self, callback: Callable[[EntityVisibleEffectUpdate], None], *, runtime_id: int | None = None,
+    ) -> Callable[[], None]:
+        """Observe future visual-effect metadata changes for tracked remote entities."""
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return self._entities.subscribe_entity_visible_effect_changes(callback, runtime_id=runtime_id)
+
+    async def wait_for_entity_visible_effect_change(
+        self, *, runtime_id: int | None = None, timeout: float | None = 15,
+    ) -> EntityVisibleEffectUpdate:
+        """Wait for the next matching visual-effect metadata change."""
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return await self._entities.wait_for_entity_visible_effect_change(runtime_id=runtime_id, timeout=timeout)
 
     def subscribe_entity_movement(self, callback: Callable[[EntityMovementUpdate], None]) -> Callable[[], None]:
         """Observe future movement packets for visible remote entities during this session.

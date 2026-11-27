@@ -89,6 +89,9 @@ class EntityState:
     ``firework_attached_entity_id`` is the unique ID reported in the spawn
     metadata of a firework rocket, when the packet identifies an attachment.
 
+    ``visible_effects_value`` retains the latest signed visual-effect metadata
+    value, when the server supplies it for this remote actor instance.
+
     ``attributes`` holds the latest server report for each observed attribute of
     this actor instance. An empty tuple means no attributes have been observed.
 
@@ -116,6 +119,7 @@ class EntityState:
     sneaking: bool | None = None
     sleeping: bool | None = None
     firework_attached_entity_id: int | None = None
+    visible_effects_value: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +222,14 @@ class EntityEffectUpdate:
     entity: EntityState
     action: Literal["add", "update", "remove"]
     effect: PlayerEffect
+    tick: int
+
+
+@dataclass(frozen=True, slots=True)
+class EntityVisibleEffectUpdate:
+    """An applied visible-effect metadata update and its packet tick."""
+
+    entity: EntityState
     tick: int
 
 
@@ -432,6 +444,12 @@ def _player_sleeping(metadata, binding) -> bool | None:
     return sleeping
 
 
+def _visible_effects_value(metadata, binding) -> int | None:
+    return next((int(entry.payload.value) for entry in reversed(metadata)
+                 if entry.id == binding.ActorDataIDs.VISIBLE_MOB_EFFECTS
+                 and isinstance(entry.payload, binding.DataItemInt64Payload)), None)
+
+
 def _unsupported_view_pose(words: _PlayerFlagWords, binding) -> bool:
     flags = binding.ActorFlags
     return any(_player_flag(words, flag)
@@ -521,6 +539,7 @@ class Entities:
         self._actor_event_observers: list[_EntityObserver[EntityActorEvent]] = []
         self._attribute_observers: list[_EntityObserver[EntityAttributeUpdate]] = []
         self._effect_observers: list[_EntityObserver[EntityEffectUpdate]] = []
+        self._visible_effect_observers: list[_EntityObserver[EntityVisibleEffectUpdate]] = []
         self._glide_observers: list[Callable[[EntityState], None]] = []
         self._crouch_observers: list[_EntityObserver[EntityState]] = []
         self._sleep_observers: list[_EntityObserver[EntityState]] = []
@@ -571,7 +590,7 @@ class Entities:
         for observers in (self._swing_observers, self._critical_effect_observers, self._health_observers,
                           self._actor_event_observers, self._attribute_observers, self._effect_observers,
                           self._crouch_observers, self._sleep_observers, self._attached_firework_observers,
-                          self._shield_block_observers):
+                          self._shield_block_observers, self._visible_effect_observers):
             self._end_entity_observers(observers, lambda _: True, ConnectionError, "entity session is closed", _cause)
         self._shield_block_asserted.clear()
         self._glide_observers.clear()
@@ -849,6 +868,27 @@ class Entities:
         self._require_live()
         self._require_remote_event_target(runtime_id)
         return await self._wait_for_entity_event(self._effect_observers, runtime_id, timeout)
+
+    def _visible_effect_target(self, runtime_id: int) -> bool:
+        return (runtime_id != self._own_runtime_id and runtime_id in self._actor_instances
+                and (runtime_id not in self._player_uuid_by_runtime or runtime_id in self._player_views))
+
+    def _require_visible_effect_target(self, runtime_id: int | None) -> None:
+        self._require_live()
+        if runtime_id is not None and not self._visible_effect_target(runtime_id):
+            raise LookupError("remote entity is not currently observed")
+
+    def subscribe_entity_visible_effect_changes(
+        self, callback: Callable[[EntityVisibleEffectUpdate], None], *, runtime_id: int | None = None,
+    ) -> Callable[[], None]:
+        self._require_visible_effect_target(runtime_id)
+        return self.packets._subscribe(self._visible_effect_observers, _EntityObserver(runtime_id, callback))
+
+    async def wait_for_entity_visible_effect_change(
+        self, *, runtime_id: int | None = None, timeout: float | None = 15,
+    ) -> EntityVisibleEffectUpdate:
+        self._require_visible_effect_target(runtime_id)
+        return await self._wait_for_entity_event(self._visible_effect_observers, runtime_id, timeout)
 
     async def _wait_for_entity_event[Event](
         self, observers: list[_EntityObserver[Event]], runtime_id: int | None, timeout: float | None,
@@ -1510,13 +1550,14 @@ class Entities:
             self._forget_entity_observers(self._actor_event_observers, runtime_id)
             self._forget_entity_observers(self._attribute_observers, runtime_id)
             self._forget_entity_observers(self._effect_observers, runtime_id)
+            self._forget_entity_observers(self._visible_effect_observers, runtime_id)
             self._forget_entity_observers(self._crouch_observers, runtime_id)
             self._forget_entity_observers(self._sleep_observers, runtime_id)
             self._forget_entity_observers(self._shield_block_observers, runtime_id)
             self._shield_block_asserted.discard(runtime_id)
-            if not new_instance and (state.attributes or state.status_effects):
+            if not new_instance and (state.attributes or state.status_effects or state.visible_effects_value is not None):
                 # A conflicting roster identity must not inherit the previous actor's reports.
-                state = replace(state, attributes=(), status_effects=())
+                state = replace(state, attributes=(), status_effects=(), visible_effects_value=None)
         if lifecycle_events is not None and new_instance:
             outgoing = self._by_runtime.get(runtime_id)
             if outgoing is not None:
@@ -1551,6 +1592,7 @@ class Entities:
         self._forget_entity_observers(self._actor_event_observers, runtime_id)
         self._forget_entity_observers(self._attribute_observers, runtime_id)
         self._forget_entity_observers(self._effect_observers, runtime_id)
+        self._forget_entity_observers(self._visible_effect_observers, runtime_id)
         self._forget_entity_observers(self._crouch_observers, runtime_id)
         self._forget_entity_observers(self._sleep_observers, runtime_id)
         self._forget_entity_observers(self._shield_block_observers, runtime_id)
@@ -1700,6 +1742,7 @@ class Entities:
             self._record(EntityState(
                 listed_id, runtime_id, _PLAYER, position, name=str(player.name), gliding=gliding, sneaking=sneaking,
                 sleeping=sleeping,
+                visible_effects_value=_visible_effects_value(metadata, b) if identity_matches else None,
             ), player_uuid=player_uuid, player_feet=feet,
                 unlisted_entity_id=entity_id if entity_id and not listed_id else None,
                 identity_matches=identity_matches, lifecycle_events=lifecycle_events)
@@ -1731,6 +1774,15 @@ class Entities:
             if self._shield_block_edge(runtime_id, metadata, b) and not startup and self._shield_block_observers:
                 shield_observers = tuple(self._shield_block_observers)
                 shield_block = ShieldBlockEvent(runtime_id, self._animation_entity_id(runtime_id), int(packet.tick))
+            state = self._by_runtime.get(runtime_id)
+            visible_observers = ()
+            if state is not None and self._visible_effect_target(runtime_id):
+                visible_effects = _visible_effects_value(metadata, b)
+                if visible_effects is not None and visible_effects != state.visible_effects_value:
+                    state = replace(state, visible_effects_value=visible_effects)
+                    self._by_runtime[runtime_id] = state
+                    if not startup:
+                        visible_observers = tuple(self._visible_effect_observers)
             body = self._cursor_bodies.get(runtime_id)
             if body is not None:
                 body = _cursor_body(metadata, b, body)
@@ -1782,6 +1834,9 @@ class Entities:
                         )
             if shield_observers and not self._closed:
                 self._notify_entity_observers(shield_observers, shield_block, runtime_id, "shield block observer failed")
+            if visible_observers and not self._closed:
+                event = EntityVisibleEffectUpdate(state, int(packet.tick))
+                self._notify_entity_observers(visible_observers, event, runtime_id, "visible effect observer failed")
         elif packet_id == b.MobEquipmentPacket.ID:
             packet = self.packets.protocol.decode(raw)
             runtime_id = int(packet.runtime_id)
@@ -1836,6 +1891,8 @@ class Entities:
                 if is_boat else (0.0, 0.0, 0.0),
                 attributes=tuple(attributes.values()),
                 firework_attached_entity_id=None if attachment == -1 else attachment,
+                visible_effects_value=_visible_effects_value(getattr(getattr(actor, "data", None), "data", ()), b)
+                if runtime_id != self._own_runtime_id else None,
             )
             if (not startup and self._attached_firework_observers and self._own_entity_id
                     and runtime_id != self._own_runtime_id and state.firework_attached_entity_id == self._own_entity_id):
@@ -1903,6 +1960,8 @@ class Entities:
                                        RuntimeError, "dimension changed while waiting for an entity attribute update")
             self._end_entity_observers(self._effect_observers, dimension_bound,
                                        RuntimeError, "dimension changed while waiting for an entity effect update")
+            self._end_entity_observers(self._visible_effect_observers, dimension_bound,
+                                       RuntimeError, "dimension changed while waiting for a visible effect change")
             self._end_entity_observers(self._crouch_observers, dimension_bound,
                                        RuntimeError, "dimension changed while waiting for an entity crouch change")
             self._end_entity_observers(self._sleep_observers, dimension_bound,
