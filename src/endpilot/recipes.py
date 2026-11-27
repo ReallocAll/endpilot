@@ -7,6 +7,7 @@ from functools import cache
 from importlib.resources import files
 import json
 from operator import index
+from typing import Literal
 
 from .inventory import _correct_observed_item, _response_item, _stack_snapshot
 
@@ -238,10 +239,18 @@ class Recipes:
             return aliases[recipe_id]
         return self.get(recipe_id)
 
-    def _grid_recipes(self, item: str, aux_value: int | None, crafting_table: bool):
-        name = item if ":" in item else f"minecraft:{item}"
+    def _recipe_grid_size(self, crafting_table: bool, grid_size: Literal[2, 3] | None) -> int:
+        if grid_size is not None:
+            if not isinstance(grid_size, int) or grid_size not in (2, 3):
+                raise ValueError("grid_size must be 2, 3 or None")
+            if grid_size == 3 and not crafting_table:
+                raise ValueError("grid_size=3 requires crafting_table=True")
+            return grid_size
         window = None if self.containers is None else self.containers.window
-        size = 3 if crafting_table and window is not None and window.container_type == "WORKBENCH" else 2
+        return 3 if crafting_table and window is not None and window.container_type == "WORKBENCH" else 2
+
+    def _grid_recipes(self, item: str, aux_value: int | None, size: int):
+        name = item if ":" in item else f"minecraft:{item}"
         for recipe in self._by_id.values():
             if recipe.tag != "crafting_table" or not recipe.ingredients:
                 continue
@@ -259,11 +268,13 @@ class Recipes:
                 yield recipe, output
 
     def recipes_all(self, item: str, aux_value: int | None = None, *,
-                    crafting_table: bool = True) -> tuple[Recipe, ...]:
-        return tuple(recipe for recipe, _ in self._grid_recipes(item, aux_value, crafting_table))
+                    crafting_table: bool = True, grid_size: Literal[2, 3] | None = None) -> tuple[Recipe, ...]:
+        size = self._recipe_grid_size(crafting_table, grid_size)
+        return tuple(recipe for recipe, _ in self._grid_recipes(item, aux_value, size))
 
     def recipes_for(self, item: str, aux_value: int | None = None, min_result_count: int = 1, *,
-                    crafting_table: bool = True) -> tuple[Recipe, ...]:
+                    crafting_table: bool = True, grid_size: Literal[2, 3] | None = None) -> tuple[Recipe, ...]:
+        size = self._recipe_grid_size(crafting_table, grid_size)
         requested = index(min_result_count)
         if requested <= 0:
             raise ValueError("min_result_count must be positive")
@@ -276,7 +287,7 @@ class Recipes:
             if name is not None and stack.stack_size > 0:
                 materials[name, int(stack.aux_value)] += int(stack.stack_size)
         return tuple(
-            recipe for recipe, output in self._grid_recipes(item, aux_value, crafting_table)
+            recipe for recipe, output in self._grid_recipes(item, aux_value, size)
             if (not limited or recipe.recipe_id in self._unlocked)
             and self._allocate_materials(recipe, materials, (requested + output - 1) // output) is not None
         )

@@ -651,26 +651,32 @@ class Bot:
         return self._recipes.unlocked_ids
 
     def recipes_all(self, item: str, aux_value: int | None = None, *,
-                    crafting_table: bool = True) -> tuple[Recipe, ...]:
-        """Catalog matches for this output and the current 2x2 or open workbench grid.
+                    crafting_table: bool = True, grid_size: Literal[2, 3] | None = None) -> tuple[Recipe, ...]:
+        """Catalog matches for this output in a 2x2 or 3x3 grid.
 
-        Set crafting_table=False to filter to the personal grid. The catalog
-        includes recipes regardless of materials or recipe-book membership.
+        Specify grid_size to query either size without opening a window. With
+        grid_size=None, an open workbench selects 3x3 when crafting_table is
+        true, and other cases use 2x2. crafting_table=False only allows 2x2.
+        The catalog includes recipes regardless of materials or recipe-book
+        membership.
         """
         if self._recipes is None:
             raise RuntimeError("player has not joined")
-        return self._recipes.recipes_all(item, aux_value, crafting_table=crafting_table)
+        return self._recipes.recipes_all(item, aux_value, crafting_table=crafting_table, grid_size=grid_size)
 
     def recipes_for(self, item: str, aux_value: int | None = None, min_result_count: int = 1, *,
-                    crafting_table: bool = True) -> tuple[Recipe, ...]:
+                    crafting_table: bool = True, grid_size: Literal[2, 3] | None = None) -> tuple[Recipe, ...]:
         """Catalog matches with known permission and carried ingredients for the requested output.
 
-        Each server recipe is checked individually. Materials already staged
-        in the grid are outside the carried inventory considered here.
+        Grid selection follows recipes_all(). Each server recipe is checked
+        individually. Materials already staged in the grid are outside the
+        carried inventory considered here.
         """
         if self._recipes is None:
             raise RuntimeError("player has not joined")
-        return self._recipes.recipes_for(item, aux_value, min_result_count, crafting_table=crafting_table)
+        return self._recipes.recipes_for(
+            item, aux_value, min_result_count, crafting_table=crafting_table, grid_size=grid_size,
+        )
 
     async def wait_for_recipes(self, *, timeout: float = 15) -> tuple[Recipe, ...]:
         """Wait for the first CraftingData from BDS, which may be an empty catalog."""

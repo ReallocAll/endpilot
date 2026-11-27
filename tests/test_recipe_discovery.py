@@ -211,6 +211,44 @@ class RecipeDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.delivered(self.inventory((1, 1, 2), (2, 1, 0)))
         self.assertEqual(self.bot.recipes_for("stick"), ())
 
+    async def test_explicit_grid_queries_without_opening_or_sending(self):
+        await self.join(False)
+        wide = self.bot.get_recipe(2)
+        send = self.bot.packets.transport.send
+        before = send.await_count
+        self.assertIsNone(self.bot.open_window)
+        for query in (self.bot.recipes_all, self.bot.recipes_for):
+            self.assertEqual(query("wooden_pickaxe"), ())
+            self.assertEqual(query("wooden_pickaxe", grid_size=3), (wide,))
+            self.assertEqual(query("wooden_pickaxe", grid_size=2, crafting_table=False), ())
+        self.assertEqual(self.bot.recipes_for("wooden_pickaxe", min_result_count=2, grid_size=3), ())
+        self.assertEqual(send.await_count, before)
+        self.assertIsNone(self.bot.open_window)
+
+        await self.delivered(self.b.ContainerOpenPacket(container_id=1, type=self.b.ContainerType.WORKBENCH))
+        window = self.bot.open_window
+        self.assertEqual(window.container_type, "WORKBENCH")
+        before = send.await_count
+        for query in (self.bot.recipes_all, self.bot.recipes_for):
+            self.assertEqual(query("wooden_pickaxe"), (wide,))
+            self.assertEqual(query("wooden_pickaxe", grid_size=2), ())
+        self.assertEqual(send.await_count, before)
+        self.assertIs(self.bot.open_window, window)
+
+    async def test_invalid_grid_queries_raise_even_before_crafting_rule_is_known(self):
+        await self.join()
+        self.assertIsNone(self.bot.limited_crafting)
+        self.assertEqual(self.bot.recipes_all("wooden_pickaxe", grid_size=3), (self.bot.get_recipe(2),))
+        self.assertEqual(self.bot.recipes_for("wooden_pickaxe", grid_size=3), ())
+        for query in (self.bot.recipes_all, self.bot.recipes_for):
+            for invalid in (1, 4, 3.0, "3", True):
+                with self.subTest(query=query.__name__, grid_size=invalid):
+                    with self.assertRaisesRegex(ValueError, "grid_size must be 2, 3 or None"):
+                        query("wooden_pickaxe", grid_size=invalid)
+            with self.subTest(query=query.__name__):
+                with self.assertRaisesRegex(ValueError, "grid_size=3 requires crafting_table=True"):
+                    query("wooden_pickaxe", grid_size=3, crafting_table=False)
+
     async def test_unlocked_updates_across_join_and_rule_authority(self):
         b = self.b
         await self.join(False, (
