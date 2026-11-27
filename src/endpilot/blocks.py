@@ -18,6 +18,7 @@ from .block_raycast import (
 )
 from .compression import PacketConnection
 from .protocol import RawPacket
+from .recoverable_error import RecoverableError
 from .subchunks import SubChunk, _PalettedStorage, parse_biome_sections, parse_sub_chunk_prefix
 
 # Network hash of minecraft:air.
@@ -245,7 +246,8 @@ def _vein_bit(x: int, y: int, z: int) -> int:
 class Blocks:
     def __init__(self, packets, movement, inventory, *, hashed_runtime_ids: bool = False,
                  custom_blocks: bool = False, dimension_id: int = 0,
-                 player_game_type: str | None = None, player_unique_id: int | None = None):
+                 player_game_type: str | None = None, player_unique_id: int | None = None,
+                 _publish_error: Callable[[RecoverableError], None] | None = None):
         self.packets = packets
         self.movement = movement
         self.inventory = inventory
@@ -255,6 +257,7 @@ class Blocks:
         self.dimension_id = dimension_id
         self._player_game_type = player_game_type
         self._player_unique_id = player_unique_id
+        self._publish_error = _publish_error
         self._mining_lock = asyncio.Lock()
         self._mining_target: MiningTarget | None = None
         self._mining_completed = False
@@ -409,12 +412,24 @@ class Blocks:
                     if data is None:
                         self._set_section_block_entities(key, {})
                         continue
+                    diagnostic = None
                     try:
                         chunk, offset = parse_sub_chunk_prefix(data)
-                    except ValueError:
+                    except ValueError as error:
                         self._set_section_block_entities(key, {})
-                        continue
-                    self._set_sub_chunk(key, chunk, self._read_section_block_entities(key, data, offset))
+                        diagnostic = RecoverableError("blocks", raw.packet_id, type(error).__name__, str(error))
+                    else:
+                        try:
+                            roots = self._read_section_block_entities(key, data, offset)
+                        except ValueError as error:
+                            # A partially decoded tail cannot attest to the current contents of this section.
+                            roots = {}
+                            diagnostic = RecoverableError(
+                                "blocks", raw.packet_id, type(error).__name__, "could not decode SubChunk block entities",
+                            )
+                        self._set_sub_chunk(key, chunk, roots)
+                    if diagnostic is not None and self._publish_error is not None:
+                        self._publish_error(diagnostic)
         elif raw.packet_id == b.NetworkChunkPublisherUpdatePacket.ID:
             bounds = _publisher_bounds(self.packets.protocol.decode(raw))
             if bounds != self._published_bounds:
@@ -528,17 +543,20 @@ class Blocks:
         lower, upper = bounds
         limit = packet.client_request_sub_chunk_limit
         if limit is not None:
+            diagnostic = None
             if (self._protocol == 2225 and bounds == _VANILLA_SECTION_RANGES.get(self.dimension_id)
                     and packet.sub_chunks_count == 0):
                 try:
                     state.biomes = parse_biome_sections(packet.serialized_chunk, upper - lower)
-                except ValueError:
+                except ValueError as error:
                     # A failed biome decode leaves block announcements and requests intact.
-                    pass
+                    diagnostic = RecoverableError("blocks", packet.ID, type(error).__name__, str(error))
             stop = upper if limit == -1 else min(upper, lower + int(limit))
             state.requestable_sections = range(lower, stop)
             if self._request_column is not None:
                 self._request_column(column, state.requestable_sections)
+            if diagnostic is not None and self._publish_error is not None:
+                self._publish_error(diagnostic)
             return
         count = int(packet.sub_chunks_count)
         if not 0 < count <= upper - lower:
@@ -657,23 +675,19 @@ class Blocks:
         if decode is None:
             return {}
         roots = {}
-        try:
-            while offset < len(data):
-                root, next_offset = decode(data, offset)
-                if not offset < next_offset <= len(data):
-                    return {}
-                offset = next_offset
-                if not all(axis in root and isinstance(root[axis], nbt.IntTag) for axis in "xyz"):
-                    return {}
-                position = tuple(root[axis].value for axis in "xyz")
-                if tuple(value >> 4 for value in position) != key:
-                    continue
-                if position in roots:
-                    return {}
-                roots[position] = root
-        except ValueError:
-            # A partially decoded tail cannot attest to the current contents of this section.
-            return {}
+        while offset < len(data):
+            root, next_offset = decode(data, offset)
+            if not offset < next_offset <= len(data):
+                return {}
+            offset = next_offset
+            if not all(axis in root and isinstance(root[axis], nbt.IntTag) for axis in "xyz"):
+                return {}
+            position = tuple(root[axis].value for axis in "xyz")
+            if tuple(value >> 4 for value in position) != key:
+                continue
+            if position in roots:
+                return {}
+            roots[position] = root
         return roots
 
     @staticmethod

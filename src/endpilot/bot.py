@@ -7,6 +7,7 @@ from math import inf
 from re import Pattern, fullmatch
 from typing import Any, Literal
 from uuid import UUID
+from weakref import ref
 
 from bedrock_protocol import GeneratorType, nbt
 from bedrock_protocol.v712 import CommandOutputPacket
@@ -62,6 +63,7 @@ from .player_state import DeathEvent, GlideBoostEvent, PlayerAbilities, PlayerEf
 from .qa import PacketTimeline
 from .qa_terrain import _TerrainObserver
 from .recipes import Recipe, Recipes
+from .recoverable_error import RecoverableError
 from .resource_packs import PackDecisionHandler, ResourcePackIndex
 from .scoreboard import Scoreboard, ScoreboardObserver, ScoreboardSnapshot
 from .signs import SignEditor, SignObservation, SignSide, Signs
@@ -105,6 +107,7 @@ class Bot:
         self._clock: ClientClock | None = None
         self._online_join: _PendingOnlineJoin | None = None
         self._session: JoinSession | None = None
+        self._error_observers: dict[object, Callable[[RecoverableError], None]] = {}
         self._session_end_state: _SessionEndState | None = None
         self._session_end_observers: dict[object, Callable[[SessionEnd], None]] = {}
         self._movement: Movement | None = None
@@ -335,6 +338,14 @@ class Bot:
         xuid = identity._xuid if isinstance(identity, _OnlineIdentity) else ""
         session._observe_session_end()
         session.observe_chunk_radius()
+
+        bot_ref, session_ref = ref(self), ref(session)
+
+        def publish_error(error: RecoverableError) -> None:
+            bot, source_session = bot_ref(), session_ref()
+            if bot is not None and source_session is not None:
+                bot._publish_error(source_session, error)
+
         self._entities = Entities(
             session.packets, item_names=session.item_names if session.item_registry is None else None,
             own_runtime_id=session.player_id, own_entity_id=session.player_unique_id,
@@ -360,6 +371,7 @@ class Bot:
             custom_blocks=session.has_custom_blocks,
             dimension_id=session.dimension_id,
             player_game_type=session.player_game_type, player_unique_id=session.player_unique_id,
+            _publish_error=publish_error,
         )
         self._containers = Containers(
             session.packets, self._movement, self._inventory, entities=self._entities, blocks=self._blocks,
@@ -386,7 +398,7 @@ class Bot:
         )
         self._signs = Signs(session.packets, self._blocks, self._movement, self._inventory, session.player_id)
         self._chat = Chat(session.packets, identity.name, _xuid=xuid)
-        self._titles = Titles(session.packets, session._end_state)
+        self._titles = Titles(session.packets, session._end_state, _publish_error=publish_error)
         self._commands = Commands(
             session.packets, session.identity.uuid, session.player_unique_id,
             initial_catalog_packets=session.command_catalog_packets,
@@ -454,6 +466,8 @@ class Bot:
         for raw in session.terrain_packets:
             PacketConnection._notify(terrain_observers, raw)
         session.terrain_packets.clear()
+        if self._session is not session:
+            return  # The caller reports the invalidated join.
         session.packets.subscribe_reader_end(session._dimensions.close)
         self._movement.start(_before_dispatch=session._receive_dimension_packet)
 
@@ -3362,6 +3376,37 @@ class Bot:
         if self._session is None:
             raise RuntimeError("player has not joined")
         return await self._session.wait_for_server_disconnect(timeout)
+
+    def subscribe_error(self, callback: Callable[[RecoverableError], None]) -> Callable[[], None]:
+        """Observe future recoverable inbound parse errors synchronously.
+
+        Register before or after joining. The subscription follows this Bot across joins.
+        The returned function unsubscribes. Use subscribe_session_end for reader termination.
+        """
+        token = object()
+        self._error_observers[token] = callback
+        owner_ref = ref(self)
+
+        def unsubscribe() -> None:
+            owner = owner_ref()
+            if owner is not None:
+                owner._error_observers.pop(token, None)
+
+        return unsubscribe
+
+    def _publish_error(self, session: JoinSession, diagnostic: RecoverableError) -> None:
+        if self._session is not session or session._end_state.result is not None:
+            return
+        observers = self._error_observers
+        for token, callback in tuple(observers.items()):
+            if token not in observers:
+                continue
+            try:
+                callback(diagnostic)
+            except (Exception, asyncio.CancelledError) as error:
+                asyncio.get_running_loop().call_exception_handler({
+                    "message": "error observer failed", "exception": error, "callback": callback,
+                })
 
     def subscribe_session_end(self, callback: Callable[[SessionEnd], None]) -> Callable[[], None]:
         """Call back synchronously with the first end of each joined session.

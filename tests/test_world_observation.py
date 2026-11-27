@@ -12,6 +12,7 @@ from bedrock_protocol import nbt
 
 from endpilot import (
     BlockEntityUpdate, BlockObservation, BlockStateObservation, Bot, ColumnCoverageInvalidated, DimensionBounds,
+    RecoverableError,
 )
 from endpilot.compression import PacketConnection
 from endpilot.login import JoinSession
@@ -123,12 +124,12 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
             })
         return self.b.BlockActorDataPacket(pos=self.b.BlockPos(x=x, y=20, z=9), data=tag)
 
-    def entity_section(self, *packets, tail=b""):
+    def entity_section(self, *packets, prefix=bytes((9, 1, 1, 1, 2)), tail=b""):
         b = self.b
         roots = b"".join(self.bot.protocol.encode(b.BlockActorDataPacket(
             pos=b.BlockPos(x=0, y=0, z=0), data=packet.data,
         )).body[3:] for packet in packets)
-        data = bytes((9, 1, 1, 1, 2)) + roots + tail
+        data = prefix + roots + tail
         return b.SubChunkPacket(center_pos=b.SubChunkPos(x=0, y=1, z=0), dimension_type=0, sub_chunk_data=[
             b.SubChunkPacket.SubChunkPacketData(result=b.SubChunkPacket.SubChunkRequestResult.SUCCESS,
                                                serialized_sub_chunk=data),
@@ -453,7 +454,9 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
         await self.deliver(self.entity(24, "neighbor"))
         seen = []
         updates = []
+        errors = []
         self.bot.subscribe_block_entity_updates(updates.append)
+        self.bot.subscribe_error(lambda error: errors.append((error, self.bot.observed_block_entity(one))))
 
         def observed(event):
             roots = (self.bot.observed_block_entity(pos) for pos in (one, two))
@@ -469,6 +472,7 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
             unsubscribe()
         self.assertEqual(seen, [("one", long_name)])
         self.assertEqual(updates, [])
+        self.assertEqual(errors, [])
         self.assertEqual(self.bot.observed_block_entity(neighbor)["CustomName"].value, "neighbor")
         self.assertIsNone(self.bot.observed_block_entity((25, 20, 9)))
         await self.deliver(self.entity_section(self.entity(8, "updated")))
@@ -477,10 +481,33 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
         await self.deliver(self.entity_section(self.entity(8, "incomplete"), tail=b"\x0a\x00"))
         self.assertIsNone(self.bot.observed_block_entity(one))
         self.assertEqual(self.bot.observed_block_entity(neighbor)["CustomName"].value, "neighbor")
+        diagnostic = RecoverableError(
+            "blocks", self.b.SubChunkPacket.ID, "DecodeError", "could not decode SubChunk block entities",
+        )
+        self.assertEqual(errors, [(diagnostic, None)])
         await self.deliver(self.entity_section(self.entity(8, "first"), self.entity(8, "duplicate")))
         self.assertIsNone(self.bot.observed_block_entity(one))
         await self.deliver(self.entity(9, "put back"), self.air(1))
         self.assertIsNone(self.bot.observed_block_entity(two))
+        self.assertEqual(errors, [(diagnostic, None)])
+        self.assertIsNone(self.bot.session_end)
+
+    async def test_sub_chunk_prefix_error_preserves_previous_blocks_and_clears_entities(self):
+        await self.connect()
+        position = (8, 20, 9)
+        errors = []
+        self.bot.subscribe_error(errors.append)
+        await self.deliver(self.entity_section(self.entity(8, "before")))
+
+        await self.deliver(self.entity_section(prefix=bytes((9, 1, 6, 1))))
+        diagnostic = RecoverableError("blocks", self.b.SubChunkPacket.ID, "ValueError", "truncated sub-chunk varint")
+        self.assertEqual(errors, [diagnostic])
+        self.assertEqual(self.bot.observed_block(position).runtime_id, 1)
+        self.assertIsNone(self.bot.observed_block_entity(position))
+        await self.deliver(self.entity_section(self.entity(8, "after")))
+        self.assertEqual(self.bot.observed_block_entity(position)["CustomName"].value, "after")
+        self.assertEqual(errors, [diagnostic])
+        self.assertIsNone(self.bot.session_end)
 
     async def test_block_entity_login_keeps_main_layer_and_actor_data_in_wire_order(self):
         for retain in (False, True):

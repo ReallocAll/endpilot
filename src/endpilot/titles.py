@@ -10,6 +10,7 @@ from bedrock_protocol import DecodeError, SetTitlePacket
 
 from .compression import PacketConnection
 from .protocol import RawPacket
+from .recoverable_error import RecoverableError
 
 if TYPE_CHECKING:
     from .login import _SessionEndState
@@ -69,9 +70,11 @@ def _title_event(packet: SetTitlePacket) -> TitleEvent | None:
 
 
 class Titles:
-    def __init__(self, packets: PacketConnection, end_state: "_SessionEndState"):
+    def __init__(self, packets: PacketConnection, end_state: "_SessionEndState", *,
+                 _publish_error: Callable[[RecoverableError], None] | None = None):
         self.packets = packets
         self._end_state = end_state
+        self._publish_error = _publish_error
         self._subscriptions: dict[object, Callable[[], None]] = {}
         self._unsubscribe_reader_end: Callable[[], None] | None = None
         self._closed = False
@@ -81,15 +84,24 @@ class Titles:
     def _read_event(self, raw: RawPacket) -> TitleEvent | DecodeError | None:
         # Waiters and subscribers see the same raw packet during dispatch.
         # Use identity so identical packets received twice are projected independently.
-        if self._last_event is None or self._last_event[0] is not raw:
-            event: TitleEvent | DecodeError | None
-            try:
-                event = _title_event(self.packets.protocol.decode(raw))
-            except DecodeError as error:
-                event = error.with_traceback(None)
-            self._last_event = raw, event
-            self._decode_error_reported = False
-        return self._last_event[1]
+        cached = self._last_event
+        if cached is not None and cached[0] is raw:
+            return cached[1]
+
+        event: TitleEvent | DecodeError | None
+        try:
+            event = _title_event(self.packets.protocol.decode(raw))
+        except DecodeError as error:
+            event = error.with_traceback(None)
+        self._last_event = raw, event
+        if self._closed and cached is None:
+            asyncio.get_running_loop().call_soon(self._clear_last_event)
+        self._decode_error_reported = False
+        if isinstance(event, DecodeError) and self._publish_error is not None:
+            self._publish_error(RecoverableError(
+                "titles", raw.packet_id, type(event).__name__, "could not decode SetTitle",
+            ))
+        return event
 
     async def wait_for_event(self, *, kind: TitleKind | None, timeout: float) -> TitleEvent:
         event = None
@@ -164,9 +176,14 @@ class Titles:
 
         return unsubscribe
 
-    def close(self, _cause: BaseException | None = None) -> None:
-        self._closed = True
+    def _clear_last_event(self) -> None:
         self._last_event = None
+
+    def close(self, _cause: BaseException | None = None) -> None:
+        if not self._closed and self._last_event is not None:
+            # Waiters already in the current dispatch still share the cached result.
+            asyncio.get_running_loop().call_soon(self._clear_last_event)
+        self._closed = True
         while self._subscriptions:
             _, detach = self._subscriptions.popitem()
             detach()

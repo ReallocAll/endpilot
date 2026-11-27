@@ -3,7 +3,9 @@
 import asyncio
 import struct
 import unittest
+from unittest.mock import patch
 
+from endpilot import Bot, RecoverableError
 from endpilot.blocks import Blocks
 from endpilot.compression import PacketConnection
 from endpilot.protocol import Protocol, write_batch
@@ -217,3 +219,106 @@ class BiomeObservationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ConnectionError, "reader lost"):
             await self.reader
         self.assertIsNone(self.blocks.observed_biome(position))
+
+
+class BiomeErrorObservationTests(unittest.IsolatedAsyncioTestCase):
+    def announced(self, bot, payload, **options):
+        b = bot.protocol.binding
+        return b.LevelChunkPacket(
+            pos=b.ChunkPos(x=-1, z=-1), dimension_id=0, sub_chunks_count=0,
+            client_request_sub_chunk_limit=8, serialized_chunk=payload, **options,
+        )
+
+    def startup_transport(self, bot, *terrain):
+        b = bot.protocol.binding
+        transport = Transport()
+        for packet in (
+            b.NetworkSettingsPacket(compression_algorithm=b.PacketCompressionAlgorithm.NONE),
+            b.ResourcePacksInfoPacket(), b.ResourcePackStackPacket(),
+            b.StartGamePacket(runtime_id=4, entity_id=17), *terrain,
+            b.PlayStatusPacket(status=b.PlayStatus.PLAYER_SPAWN),
+        ):
+            transport.incoming.put_nowait(write_batch((bot.protocol.encode(packet),)))
+        return transport
+
+    async def test_bot_observes_initial_biome_error_and_later_recovers(self):
+        bot = Bot(protocol=2225)
+        self.addAsyncCleanup(bot.close)
+        b = bot.protocol.binding
+        position = (-8, 0, -8)
+        seen = []
+
+        def observe(error):
+            seen.append((error, bot.observed_biome(position), bot.column_coverage((-1, -1)).announced))
+
+        bot.subscribe_error(observe)
+
+        malformed = self.announced(bot, constant_column(17)[:-1])
+        diagnostic = RecoverableError(
+            "blocks", b.LevelChunkPacket.ID, "ValueError", "missing zero border block count after biome sections",
+        )
+        for count, retain in enumerate((False, True), start=1):
+            with self.subTest(retain_initial_chunks=retain):
+                transport = self.startup_transport(bot, malformed)
+
+                async def deliver(*packets):
+                    marker = asyncio.create_task(bot.packets.wait_for_packet(b.SetTimePacket.ID, timeout=1))
+                    await asyncio.sleep(0)
+                    transport.incoming.put_nowait(write_batch(map(bot.protocol.encode, (*packets, b.SetTimePacket()))))
+                    await marker
+
+                with patch("endpilot.transport.nethernet.connect", return_value=transport):
+                    await bot.join_nethernet("http://127.0.0.1:19132", retain_initial_chunks=retain)
+                await deliver()
+                self.assertEqual(seen, [(diagnostic, None, True)] * count)
+                self.assertIsNone(bot.session_end)
+
+                await deliver(self.announced(bot, constant_column(187)))
+                self.assertEqual(bot.observed_biome(position), 187)
+                await deliver(self.announced(bot, constant_column(17)[:-1], cache_enabled=True))
+                self.assertIsNone(bot.observed_biome(position))
+                self.assertEqual(len(seen), count)
+                self.assertIsNone(bot.session_end)
+                await bot.close()
+
+    async def test_initial_error_observer_can_close_or_replace_the_joining_session(self):
+        loop = asyncio.get_running_loop()
+        address = "http://127.0.0.1:19132"
+        for replace in (False, True):
+            with self.subTest(replace=replace):
+                bot = Bot(protocol=2225)
+                self.addAsyncCleanup(bot.close)
+                malformed = self.announced(bot, constant_column(17)[:-1])
+                initial = self.startup_transport(bot, malformed, malformed)
+                replacement = self.startup_transport(bot, self.announced(bot, constant_column(187)))
+                seen, closing, joining, replacement_tickers = [], [], [], []
+
+                def close_or_replace(error):
+                    seen.append(error)
+                    closing.append(asyncio.eager_task_factory(loop, bot.close()))
+                    if replace:
+                        joining.append(asyncio.eager_task_factory(loop, bot.join_nethernet(address)))
+                        if joining[-1].done() and joining[-1].exception() is None:
+                            replacement_tickers.append(bot._movement._ticker)
+
+                bot.subscribe_error(close_or_replace)
+                with (
+                    patch("endpilot.transport.nethernet.connect", side_effect=[initial, replacement]),
+                    patch.object(initial, "close", wraps=initial.close) as close_initial,
+                ):
+                    try:
+                        with self.assertRaisesRegex(ConnectionError, "^player closed while joining$"):
+                            await bot.join_nethernet(address, retain_initial_chunks=False)
+                    finally:
+                        await asyncio.gather(*closing, *joining)
+                close_initial.assert_awaited_once()
+                self.assertEqual(len(seen), 1)
+                self.assertIsNone(bot.session_end)
+                if replace:
+                    self.assertEqual(len(replacement_tickers), 1)
+                    self.assertIs(bot._movement._ticker, replacement_tickers[0])
+                    self.assertIs(bot.packets.transport, replacement)
+                    self.assertEqual(bot.observed_biome((-8, 0, -8)), 187)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "player has not joined"):
+                        _ = bot.packets
