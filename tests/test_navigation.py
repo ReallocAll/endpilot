@@ -532,7 +532,7 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
             self.set_block((step * dx, 99 + height, step * dz), self.STONE)
         return (3 * dx, 100 + height, 3 * dz), (6 * dx, 100 + height, 6 * dz)
 
-    def prepare_ladder_descent(self, face=2):
+    def prepare_ladder_descent(self, face=2, *, height=4):
         (ox, oz), dx, dz, _, rung = self.LADDER_DESCENT_FIXTURES[face]
         self.blocks._player_game_type = "SURVIVAL"
         self.movement._gap_jump_allowed = lambda: True
@@ -549,14 +549,14 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
             wx, y, wz = at(x - 0.5, y, z - 0.5)
             return wx + 0.5, y, wz + 0.5
 
-        x, y, z = pose(0.5, 105.62, 3.75)
+        x, y, z = pose(0.5, 101.62 + height, 3.75)
         self.set_position(x, z, y=y, teleport=True, on_ground=True)
-        for y in range(100, 104):
+        for y in range(100, 100 + height):
             self.set_block(at(0, y, 2), rung)
             self.set_block(at(0, y, 3), self.STONE)
         for z in range(-1, 3):
             self.set_block(at(0, 99, z), self.STONE)
-        self.set_block(at(0, 103, 4), self.STONE)
+        self.set_block(at(0, 99 + height, 4), self.STONE)
         return at, pose
 
     def prepare_water(self, dx=0, dz=1):
@@ -1191,6 +1191,63 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
             result = await self.bot.navigate(FootGoal(landing), ticks=ticks, timeout=timeout)
             self.assertEqual((result.status, result.frames), ("budget", 0))
         self.assertEqual(self.stream.sent, [])
+
+    async def test_six_rung_ladder_descent_reserves_lowering_frames_before_entering(self):
+        at, _ = self.prepare_ladder_descent(face=4, height=6)
+        goal = FootGoal(at(0, 100, 0))
+        sleep = asyncio.sleep
+
+        async def yield_frame(_delay):
+            await sleep(0)
+
+        # One tick short of approach, hold, 53 lower frames, exit, and settle.
+        with patch("endpilot.movement.asyncio.sleep", yield_frame):
+            result = await self.bot.navigate(goal, rules=NavigationRules(vertical_radius=6), ticks=153)
+        self.assertEqual((result.status, result.frames), ("budget", 0))
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_six_rung_ladder_descent_waits_for_late_grounded_correction(self):
+        at, pose = self.prepare_ladder_descent(face=4, height=6)
+        goal = FootGoal(at(0, 100, -1))
+        flags = self.binding.PlayerAuthInputPacket.InputData
+        hold_tick = release_tick = ground_tick = None
+        sleep = asyncio.sleep
+
+        async def yield_frame(_delay):
+            await sleep(0)
+
+        def report():
+            nonlocal hold_tick, release_tick, ground_tick
+            frame = self.stream.sent[-1]
+            tick = int(frame.client_tick)
+            if flags.START_SNEAKING in frame.input_data:
+                hold_tick = tick
+            elif hold_tick is not None and tick == hold_tick + 7:
+                self.correct_position(*pose(0.5, 106.916, 2.260), on_ground=False,
+                                      tick=tick, delta=(0, -0.0784, 0))
+            if flags.STOP_SNEAKING in frame.input_data:
+                release_tick = tick
+            if release_tick is None:
+                return
+            lower_tick = tick - release_tick
+            if lower_tick in (6, 12, 38):
+                height = {6: 106.115, 12: 105.115, 38: 101.815}[lower_tick]
+                self.correct_position(*pose(0.5, height, 2.194), on_ground=False, tick=tick)
+            elif lower_tick == 46:
+                ground_tick = tick
+                self.correct_position(*pose(0.5, 101.62, 2.194), on_ground=True, tick=tick)
+
+        self.stream.on_send = report
+        with patch("endpilot.movement.asyncio.sleep", yield_frame):
+            result = await self.bot.navigate(goal, rules=NavigationRules(vertical_radius=6))
+
+        self.assertEqual((result.status, result.stand_position), ("reached", goal.position))
+        self.assertEqual(ground_tick, release_tick + 46)
+        bottom_moves = [p for p in self.stream.sent if p.client_tick >= release_tick and (p.move.x or p.move.y)]
+        self.assertTrue(bottom_moves)
+        self.assertGreater(bottom_moves[0].client_tick, ground_tick)
+        self.assertAlmostEqual(bottom_moves[0].move.y, -0.65)
+        self.assertEqual(bottom_moves[0].rot.y, -90)
 
     async def test_ladder_descent_requires_ordered_hold_lowering_and_ground_corrections(self):
         for face in self.LADDER_DESCENT_FIXTURES:

@@ -56,12 +56,8 @@ _LADDER_RELEASE_PROGRESS = 2.0
 _LADDER_NEUTRAL_FRAMES = 24
 _LADDER_SETTLE_FRAMES = 6
 _LADDER_SETTLE_DISTANCE = 0.035
-_LADDER_DESCENT_PHASE_FRAMES = {"align": 20, "approach": 59, "hold": 37, "lower": 41, "exit": 24, "settle": 12}
+_LADDER_DESCENT_PHASE_FRAMES = {"align": 20, "approach": 59, "hold": 37, "exit": 24, "settle": 12}
 _LADDER_DESCENT_HOLD_FRAMES = 24
-_LADDER_DESCENT_MIN_TICKS = (
-    _LADDER_DESCENT_PHASE_FRAMES["approach"] + _LADDER_DESCENT_HOLD_FRAMES
-    + _LADDER_DESCENT_PHASE_FRAMES["lower"] + 12 + _LADDER_SETTLE_FRAMES
-)
 _WATER_PHASE_TICKS = {
     "enter": 36, "submerge": 15, "prime": 1, "start": 12, "wall": 25,
     "rise": 25, "lip": 8, "brake": 20, "settle": 12,
@@ -3132,8 +3128,14 @@ class Movement:
                     if first_lowering is None:
                         first_lowering = last_lowering
 
-            if (remaining < _LADDER_DESCENT_MIN_TICKS
-                    or (deadline is not None and loop.time() + _LADDER_DESCENT_MIN_TICKS * 0.05 > deadline)):
+            # Each additional rung takes about five ticks plus time for a correction.
+            lower_frames = 41 + 6 * (sy - ly - 4)
+            minimum_ticks = (
+                _LADDER_DESCENT_PHASE_FRAMES["approach"] + _LADDER_DESCENT_HOLD_FRAMES
+                + lower_frames + 12 + _LADDER_SETTLE_FRAMES
+            )
+            if (remaining < minimum_ticks
+                    or (deadline is not None and loop.time() + minimum_ticks * 0.05 > deadline)):
                 return outcome("budget")
             use_ground_velocity = True
             self._observe_travel_position = observe
@@ -3203,7 +3205,8 @@ class Movement:
 
                     if remaining <= 0:
                         return outcome("budget")
-                    if frames >= _LADDER_DESCENT_PHASE_FRAMES[phase]:
+                    frame_limit = lower_frames if phase == "lower" else _LADDER_DESCENT_PHASE_FRAMES[phase]
+                    if frames >= frame_limit:
                         return abandon("unknown", "edge_unavailable")
                     sneak_changed = frames == 0 and phase in ("hold", "lower")
                     if sneak_changed:

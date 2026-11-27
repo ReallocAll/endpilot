@@ -20,6 +20,7 @@ _HORIZONTAL_FACES = {offset: face for face, offset in FACE_OFFSETS.items() if of
 _LADDER_APPROACH = 2
 _LADDER_STRIDE = _LADDER_APPROACH + 1
 _LADDER_DECK_LENGTH = 5
+_LADDER_DESCENT_HEIGHTS = range(4, 7)
 _WATER_STRIDE = 6
 _WATER_DECK_LENGTH = 5
 
@@ -569,7 +570,8 @@ class _LadderDescent:
 
 def _ladder_descent_geometry(source: Cell, landing: Cell) -> _LadderDescent | None:
     dx, dz = source[0] - landing[0], source[2] - landing[2]
-    if source[1] - landing[1] != 4 or (abs(dx), abs(dz)) not in ((_LADDER_STRIDE, 0), (0, _LADDER_STRIDE)):
+    if (source[1] - landing[1] not in _LADDER_DESCENT_HEIGHTS
+            or (abs(dx), abs(dz)) not in ((_LADDER_STRIDE, 0), (0, _LADDER_STRIDE))):
         return None
     dx, dz = dx // _LADDER_STRIDE, dz // _LADDER_STRIDE
     return _LadderDescent(source[0] - dx, source[2] - dz, dx, dz)
@@ -724,7 +726,8 @@ class _StandingGraph:
         if self.allow_drop_two:
             steps.append((-2, 1, 2 * down))
         if self.allow_ladder:
-            steps.extend(((4, _LADDER_STRIDE, 4 * up), (6, _LADDER_STRIDE, 6 * up), (-4, _LADDER_STRIDE, 4 * down)))
+            steps.extend(((4, _LADDER_STRIDE, 4 * up), (6, _LADDER_STRIDE, 6 * up)))
+            steps.extend((-height, _LADDER_STRIDE, height * down) for height in _LADDER_DESCENT_HEIGHTS)
         order = count()
         uncertain = stance is None
         water_steps = (*steps, (0, _WATER_STRIDE, _WATER_STRIDE * walk))
