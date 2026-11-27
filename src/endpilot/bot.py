@@ -2677,6 +2677,31 @@ class Bot:
             raise RuntimeError("player has not joined")
         return self._entities.subscribe_entity_glides(callback)
 
+    def subscribe_entity_crouch_changes(
+        self, callback: Callable[[EntityState], None], *, runtime_id: int | None = None,
+    ) -> Callable[[], None]:
+        """Observe changes to the reported sneaking flag of visible remote players.
+
+        Callbacks receive the immutable snapshot after each change between known
+        flag values. A runtime filter binds the current player instance. The
+        returned function unsubscribes and can be called repeatedly.
+        """
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return self._entities.subscribe_entity_crouch_changes(callback, runtime_id=runtime_id)
+
+    async def wait_for_entity_crouch_change(
+        self, *, runtime_id: int | None = None, timeout: float | None = 15,
+    ) -> EntityState:
+        """Wait for the next change between known sneaking flag values.
+
+        The result is the updated snapshot. A runtime filter binds the current
+        remote player instance. Use ``timeout=None`` to wait without a deadline.
+        """
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return await self._entities.wait_for_entity_crouch_change(runtime_id=runtime_id, timeout=timeout)
+
     def entity_at_cursor(self, *, max_distance: float = 3.5) -> EntityCursorResult:
         """Read the first supported target on the ordinary player's current view ray.
 

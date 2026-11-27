@@ -162,6 +162,36 @@ session has lost its connection.
 
 Use `await bot.wait_for_player_equipment_change(runtime_id)` for one change.
 
+## Observe remote player crouching
+
+`EntityState.sneaking` in `bot.observed_entities` holds the last valid server
+report of `ActorFlags.SNEAKING` for a visible remote player instance.
+`None` means the flag is unknown or does not apply. The spawn packet can
+provide the initial value. Later metadata that omits the flag word or carries
+it in an unexpected format leaves the last valid value intact. The flag
+describes observed Bedrock posture. The SDK reads it directly from metadata,
+independently of movement, bounding boxes, and input actions.
+
+`bot.subscribe_entity_crouch_changes(callback, runtime_id=...)` calls a
+synchronous callback with the immutable updated `EntityState` when the flag
+changes from `False` to `True` or from `True` to `False`.
+`await bot.wait_for_entity_crouch_change(runtime_id=..., timeout=15)` returns
+the same kind of snapshot for the next matching change. Both methods send
+no packets. Read the initial value from `observed_entities`. The first known
+value, repeated reports, spawns, and removals do not produce events. Java
+Mineflayer's `entityCrouch` can fire on repeated crouching reports. EndPilot
+delivers one event per observed transition.
+
+Omit `runtime_id` to observe any visible remote player. A runtime filter binds
+the current instance and raises `LookupError` for an untracked target or the
+local player. Removal, replacement, or a conflicting roster identity ends the
+filtered subscription and raises `LookupError` in a pending filtered wait.
+Dimension changes end filtered subscriptions and raise `RuntimeError` in all
+pending waits. Unfiltered subscriptions continue across dimensions. The
+subscription returns an idempotent unsubscribe function. A deadline raises
+`TimeoutError`. Use `timeout=None` to wait without a deadline. Disconnection
+ends subscriptions and raises `ConnectionError` in pending waits.
+
 ## Find a nearby or targeted entity
 
 `bot.nearest_entity(match=None)` searches the observed actors in the current
