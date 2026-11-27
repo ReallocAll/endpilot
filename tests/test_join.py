@@ -742,7 +742,7 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
             session = JoinSession(PreSpawnPackets(), OfflineIdentity("EndPilotTest"), "")
             await session.join()
         self.assertTrue(session.spawned)
-        self.assertEqual(session.entity_packets, initial)
+        self.assertEqual(session.entity_packets, initial[:3] + [own_metadata] + initial[3:])
         self.assertIn(own_metadata, session.movement_packets)
 
     async def test_compressed_typed_raw_roundtrip(self):
