@@ -1511,7 +1511,7 @@ class Blocks:
             return False
         return True if all(required) else None
 
-    def _drop_two(
+    def _stone_ledge_drop(
         self, source: tuple[int, int, int], runout: tuple[tuple[int, int, int], ...],
     ) -> bool | None:
         sx, sy, sz = source

@@ -301,10 +301,17 @@ and `expanded` counts all search work for the action.
 
 The standing route uses observed support and clearance. It supports ordinary
 walking, one-block height changes, and specific observed layouts for
-one-block gaps, two-block drops, and ladders. Ladder descents support four to
-six rungs in the observed stone-backed layout. Set `vertical_radius` high
-enough to include the landing. For a direct six-rung descent, use
-`NavigationRules(vertical_radius=6)`.
+one-block gaps, platform drops, and ladders. A two- or three-block drop needs
+observed dry ordinary stone at the ledge and under the first three columns of
+the lower platform along the route, with clearance in both block layers.
+Navigation waits for server corrections matching submitted inputs to confirm
+the descent and grounded landing, then settles before walking on. It returns
+`budget` before stepping off if the remaining frames or time fall below the
+minimum for the drop.
+
+Ladder descents support four to six rungs in the observed stone-backed layout.
+Set `vertical_radius` high enough to include the landing. For a direct six-rung
+descent, use `NavigationRules(vertical_radius=6)`.
 Still-water crossings are limited to supported pool layouts and require
 `NavigationRules(allow_swimming=True)`.
 On protocol 2225, ordinary same-level walking can pass through observed vanilla

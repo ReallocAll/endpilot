@@ -1480,14 +1480,15 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
     async def test_ladder_descent_drops_held_input_on_disconnect(self):
         await self.check_ladder_descent_interruption("disconnect", ConnectionError)
 
-    def prepare_drop_two(self):
+    def prepare_stone_drop(self, *, height=2):
         self.blocks._player_game_type = "SURVIVAL"
         self.movement._gap_jump_allowed = lambda: True
         self.correct_position(0.5, 101.62, 0.5, on_ground=True, tick=0)
-        support = {(0, 99, 0), (1, 97, 0), (2, 97, 0), (3, 97, 0)}
+        floor = 99 - height
+        support = {(0, 99, 0), (1, floor, 0), (2, floor, 0), (3, floor, 0)}
         for x in range(-3, 4):
             for z in range(-3, 4):
-                for y in range(97, 103):
+                for y in range(floor, 103):
                     cell = x, y, z
                     self.set_block(cell, self.STONE if cell in support else self.AIR)
                     self.set_block(cell, self.AIR, layer=1)
@@ -1623,7 +1624,7 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNone(result.stand_position)
 
     async def test_drop_two_is_a_distinct_zero_send_edge_with_two_downward_units(self):
-        self.prepare_drop_two()
+        self.prepare_stone_drop()
         goal = FootGoal((1, 98, 0))
         costs = NavigationCosts(down=2.5)
         rules = NavigationRules(search_radius=3, vertical_radius=2, costs=costs)
@@ -1634,7 +1635,7 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.stream.sent, [])
 
     async def test_drop_two_requires_known_head_space_and_all_three_low_supports(self):
-        self.prepare_drop_two()
+        self.prepare_stone_drop()
         goal = FootGoal((1, 98, 0))
         rules = NavigationRules(search_radius=3, vertical_radius=2)
         for cell, layer, blocked, restore, status in (
@@ -1651,7 +1652,7 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                 self.set_block(cell, restore, layer=layer)
 
     async def test_drop_two_needs_budget_for_the_first_descent_before_moving(self):
-        self.prepare_drop_two()
+        self.prepare_stone_drop()
         rules = NavigationRules(search_radius=3, vertical_radius=2)
         goal = FootGoal((1, 98, 0))
         for ticks, timeout in ((20, 4), (100, 0.2)):
@@ -1661,7 +1662,7 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.stream.sent, [])
 
     async def test_drop_two_accepts_same_batch_air_and_ground_then_walks_from_the_actual_low_cell(self):
-        self.prepare_drop_two()
+        self.prepare_stone_drop()
         rules = NavigationRules(search_radius=3, vertical_radius=2)
         goal = FootGoal((3, 98, 0))
         step_tick = ground_tick = None
@@ -1688,7 +1689,7 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(frame.pos.x >= 2.5 for frame in self.stream.sent if frame.client_tick > ground_tick))
 
     async def test_drop_two_rejects_corrections_outside_the_current_ordered_descent(self):
-        self.prepare_drop_two()
+        self.prepare_stone_drop()
         rules = NavigationRules(search_radius=3, vertical_radius=2)
         goal = FootGoal((1, 98, 0))
         for stale_air in (True, False):
@@ -1717,7 +1718,7 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.jump_input(), [])
 
     async def test_drop_two_lower_air_position_with_upward_delta_cannot_confirm_descent(self):
-        self.prepare_drop_two()
+        self.prepare_stone_drop()
         rules = NavigationRules(search_radius=3, vertical_radius=2)
         goal = FootGoal((1, 98, 0))
         step = None
@@ -1738,7 +1739,7 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.jump_input(), [])
 
     async def test_drop_two_return_to_upper_ground_interrupts_same_batch_and_split_corrections(self):
-        self.prepare_drop_two()
+        self.prepare_stone_drop()
         rules = NavigationRules(search_radius=3, vertical_radius=2)
         goal = FootGoal((1, 98, 0))
         for same_batch in (False, True):
@@ -1772,7 +1773,7 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((result.status, result.frames, result.stand_position), ("unreachable", 9, None))
 
     async def test_drop_two_landing_center_near_the_lip_does_not_establish_full_support(self):
-        self.prepare_drop_two()
+        self.prepare_stone_drop()
         rules = NavigationRules(search_radius=3, vertical_radius=2)
         goal = FootGoal((1, 98, 0))
         step = None
@@ -1793,7 +1794,7 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len([frame for frame in self.stream.sent if frame.client_tick > step + 14]), 2)
 
     async def test_drop_two_cancellation_releases_forward_without_predicting_a_landing(self):
-        self.prepare_drop_two()
+        self.prepare_stone_drop()
         rules = NavigationRules(search_radius=3, vertical_radius=2)
         sent = asyncio.Event()
 
@@ -1811,6 +1812,82 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(self.movement._pending_landing)
         self.assertTrue(all(frame.pos_delta.y == 0 and self.up not in frame.input_data
                             for frame in self.stream.sent[1:]))
+
+    async def test_drop_three_plans_at_three_down_units_but_four_is_unreachable(self):
+        self.prepare_stone_drop(height=3)
+        rules = NavigationRules(search_radius=3, vertical_radius=4, costs=NavigationCosts(down=2.5))
+        goal = FootGoal((1, 97, 0))
+        plan = self.bot.plan_navigation(goal, rules=rules)
+        self.assertEqual((plan.status, plan.nodes, plan.cost),
+                         ("found", ((0, 100, 0), goal.position), Fraction(15, 2)))
+        self.assertEqual(self.stream.sent, [])
+
+        self.prepare_stone_drop(height=4)
+        goal = FootGoal((1, 96, 0))
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unreachable")
+        result = await self.bot.navigate(goal, rules=rules, ticks=100)
+        self.assertEqual((result.status, result.frames), ("unreachable", 0))
+        self.assertEqual(self.stream.sent, [])
+
+    async def run_drop_three(self, *, same_batch, matched_ground=True):
+        self.prepare_stone_drop(height=3)
+        self.set_position(0.5, 0.5, teleport=True, on_ground=True)
+        self.stream.sent.clear()
+        step = ground = None
+        sleep = asyncio.sleep
+
+        async def yield_frame(_delay):
+            await sleep(0)
+
+        def report():
+            nonlocal step, ground
+            frame = self.stream.sent[-1]
+            tick = int(frame.client_tick)
+            if step is None and self.up in frame.input_data:
+                step = tick
+            if step is None:
+                return
+            # Stock C22 and C28 relative to the first forward input, rotated onto the X axis.
+            if tick == step + (14 if same_batch else 8):
+                self.correct_position(1.883251, 100.861511, 0.5, on_ground=False, tick=step + 8,
+                                      delta=(0.120090, -0.370574, 0.0))
+            if tick == step + 14:
+                ground = tick
+                if matched_ground:
+                    self.correct_position(2.459856, 98.620010, 0.5, on_ground=True, tick=tick,
+                                          delta=(0.040917, -0.0784, 0.0))
+                else:
+                    self.set_position(2.459856, 0.5, y=98.620010, on_ground=True)
+
+        self.stream.on_send = report
+        goal = FootGoal((3, 97, 0))
+        rules = NavigationRules(search_radius=3, vertical_radius=3)
+        with patch("endpilot.movement.asyncio.sleep", yield_frame):
+            result = await self.bot.navigate(goal, rules=rules, ticks=100 if matched_ground else 32)
+        return result, step, ground
+
+    async def test_drop_three_settles_on_the_matched_low_stone_then_continues(self):
+        for same_batch in (True, False):
+            with self.subTest(same_batch=same_batch):
+                result, step, ground = await self.run_drop_three(same_batch=same_batch)
+                self.assertEqual((result.status, result.stand_position), ("reached", (3, 97, 0)))
+                self.assertEqual(ground, step + 14)
+                before = [frame for frame in self.moving_input() if frame.client_tick <= ground]
+                after = [frame for frame in self.stream.sent if frame.client_tick > ground]
+                self.assertEqual(len(before), 9)
+                self.assertTrue(all(abs(frame.pos.y - 101.62) < 0.001 for frame in before))
+                self.assertTrue(all(abs(frame.pos.y - 98.62) < 0.001 for frame in after))
+                self.assertTrue(all(not (frame.move.x or frame.move.y) for frame in after[:6]))
+                self.assertTrue(any(self.up in frame.input_data for frame in after[6:]))
+                self.assertEqual(self.jump_input(), [])
+
+    async def test_drop_three_does_not_walk_on_low_stone_without_a_matched_ground_correction(self):
+        result, step, ground = await self.run_drop_three(same_batch=False, matched_ground=False)
+        self.assertIsNotNone(step)
+        self.assertEqual(ground, step + 14)
+        self.assertEqual((result.status, result.frames, result.stand_position), ("budget", 9, None))
+        self.assertTrue(all(frame.client_tick <= step + 8 for frame in self.moving_input()))
+        self.assertEqual(self.jump_input(), [])
 
     def prepare_ascent(self):
         target = (2, 101, 0)

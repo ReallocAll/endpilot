@@ -17,6 +17,7 @@ Point = tuple[float, float, float]
 _STANDING_HEAD_HEIGHT = 1.52
 _HORIZONTAL_STEPS = ((0, 1), (1, 0), (0, -1), (-1, 0))
 _HORIZONTAL_FACES = {offset: face for face, offset in FACE_OFFSETS.items() if offset[1] == 0}
+_STONE_DROP_HEIGHTS = (2, 3)
 _LADDER_APPROACH = 2
 _LADDER_STRIDE = _LADDER_APPROACH + 1
 _LADDER_DECK_LENGTH = 5
@@ -220,7 +221,7 @@ def _require_goal(goal) -> None:
 class NavigationCosts:
     """Positive costs for directed standing steps.
 
-    A gap jump costs two walks. A two-block drop costs two downward steps.
+    A gap jump costs two walks. A stone ledge drop costs one downward step per block.
     A ladder traversal costs one upward or downward step per rung.
     A water crossing costs one walk per column of horizontal displacement.
     """
@@ -535,8 +536,8 @@ def _is_gap_jump(source: Cell, landing: Cell) -> bool:
     return source[1] == landing[1] and (dx, dz) in ((2, 0), (0, 2))
 
 
-def _is_two_block_drop(source: Cell, landing: Cell) -> bool:
-    return (source[1] - landing[1] == 2
+def _is_stone_ledge_drop(source: Cell, landing: Cell) -> bool:
+    return (source[1] - landing[1] in _STONE_DROP_HEIGHTS
             and abs(landing[0] - source[0]) + abs(landing[2] - source[2]) == 1)
 
 
@@ -591,14 +592,14 @@ def _block_face_cells(position: Cell):
 
 class _StandingGraph:
     def __init__(self, blocks, start: Cell, rules: NavigationRules, *, allow_vertical: bool,
-                 allow_gap: bool = False, allow_drop_two: bool = False, allow_ladder: bool = False,
+                 allow_gap: bool = False, allow_stone_ledge_drop: bool = False, allow_ladder: bool = False,
                  allow_water: bool = False, allow_lower_slab_lane: bool = False):
         self.blocks = blocks
         self.origin = start
         self.rules = rules
         self.allow_vertical = allow_vertical
         self.allow_gap = allow_gap
-        self.allow_drop_two = allow_drop_two
+        self.allow_stone_ledge_drop = allow_stone_ledge_drop
         self.allow_ladder = allow_ladder
         self.allow_water = allow_water
         self.allow_lower_slab_lane = allow_lower_slab_lane
@@ -640,10 +641,10 @@ class _StandingGraph:
         buffer = _runout(source, destination)
         if not self.in_bounds(buffer):
             return False
-        if _is_two_block_drop(source, destination):
+        if _is_stone_ledge_drop(source, destination):
             last = _runout(destination, buffer)
-            return self.blocks._drop_two(source, (destination, buffer, last)) if (
-                self.allow_drop_two and self.in_bounds(last)
+            return self.blocks._stone_ledge_drop(source, (destination, buffer, last)) if (
+                self.allow_stone_ledge_drop and self.in_bounds(last)
             ) else False
         if source[1] - destination[1] != 1:
             return False
@@ -738,8 +739,8 @@ class _StandingGraph:
             steps.append((0, 2, 2 * walk))
         if self.allow_lower_slab_lane:
             steps.append((0, _LOWER_SLAB_STRIDE, _LOWER_SLAB_STRIDE * walk))
-        if self.allow_drop_two:
-            steps.append((-2, 1, 2 * down))
+        if self.allow_stone_ledge_drop:
+            steps.extend((-height, 1, height * down) for height in _STONE_DROP_HEIGHTS)
         if self.allow_ladder:
             steps.extend(((4, _LADDER_STRIDE, 4 * up), (6, _LADDER_STRIDE, 6 * up)))
             steps.extend((-height, _LADDER_STRIDE, height * down) for height in _LADDER_DESCENT_HEIGHTS)

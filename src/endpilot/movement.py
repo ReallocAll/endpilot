@@ -19,7 +19,7 @@ from .navigation import (
     _GoalState, _LADDER_APPROACH, _LADDER_DECK_LENGTH, _LADDER_STRIDE, _LOWER_SLAB_STRIDE, _STANDING_HEAD_HEIGHT,
     _StandingGraph,
     _VisibilityBudgetExhausted, _VisibilityScanBudget, _WATER_DECK_LENGTH, _WATER_STRIDE, _aim_point,
-    _block_face_cells, _is_gap_jump, _is_ladder_climb, _is_lower_slab_lane, _is_two_block_drop,
+    _block_face_cells, _is_gap_jump, _is_ladder_climb, _is_lower_slab_lane, _is_stone_ledge_drop,
     _is_water_crossing, _ladder_descent_geometry, _require_goal, _resolve_goal, _runout,
 )
 from .player_state import PlayerState, movement_speed_attribute, swimming_metadata
@@ -50,9 +50,9 @@ _FLIGHT_JUMP_RELEASE_TICKS = 10
 _GAP_FORWARD_FRAMES = 12
 _GAP_SETTLE_FRAMES = 6
 _GAP_MIN_TICKS = _GAP_FORWARD_FRAMES + 3 + _GAP_SETTLE_FRAMES
-_DROP_TWO_FORWARD_FRAMES = 9
-_DROP_TWO_SETTLE_FRAMES = 6
-_DROP_TWO_MIN_TICKS = _DROP_TWO_FORWARD_FRAMES + 6 + _DROP_TWO_SETTLE_FRAMES
+_STONE_DROP_FORWARD_FRAMES = 9
+_STONE_DROP_SETTLE_FRAMES = 6
+_STONE_DROP_MIN_TICKS = _STONE_DROP_FORWARD_FRAMES + 6 + _STONE_DROP_SETTLE_FRAMES
 _LOWER_SLAB_SETTLE_FRAMES = 6
 # The calibrated walk used 35 moving frames, then three to receive the exit correction and one to stop.
 _LOWER_SLAB_MIN_TICKS = 35 + 4 + _LOWER_SLAB_SETTLE_FRAMES
@@ -2384,7 +2384,7 @@ class Movement:
             return NavigationPlan(goal, rules, blocks.dimension_id, start, "unreachable")
         calibrated = self._standard_ground_motion(blocks)
         graph = _StandingGraph(blocks, start, rules, allow_vertical=not (self._sprint_key or self._sneaking),
-                               allow_gap=calibrated, allow_drop_two=calibrated, allow_ladder=calibrated,
+                               allow_gap=calibrated, allow_stone_ledge_drop=calibrated, allow_ladder=calibrated,
                                allow_lower_slab_lane=calibrated,
                                allow_water=calibrated and rules.allow_swimming and self._water_ready())
         current_goal = self._navigation_goal(blocks, goal, visibility_budget=_VisibilityScanBudget(rules.max_expansions))
@@ -2541,7 +2541,7 @@ class Movement:
                              near_anchor=None, near_clearance=None, follow_wake: asyncio.Event | None = None):
         calibrated = not legacy and self._standard_ground_motion(blocks)
         graph = _StandingGraph(blocks, start, rules, allow_vertical=not (self._sprint_key or self._sneaking),
-                               allow_gap=calibrated, allow_drop_two=calibrated, allow_ladder=calibrated,
+                               allow_gap=calibrated, allow_stone_ledge_drop=calibrated, allow_ladder=calibrated,
                                allow_lower_slab_lane=calibrated,
                                allow_water=calibrated and rules.allow_swimming and self._water_ready())
         if legacy and not any(map(graph.in_bounds, _block_face_cells(goal.position))):
@@ -2872,7 +2872,7 @@ class Movement:
                         release_input = False
                 await asyncio.sleep(0.05)
 
-        async def drop_two(source, landing):
+        async def descend_stone_ledge(source, landing):
             nonlocal remaining, submitted, release_input, accepted_level, use_ground_velocity
             sx, sy, sz = source
             lx, ly, lz = landing
@@ -2934,8 +2934,8 @@ class Movement:
 
                     x, y, z = self._input_position
                     if step_tick is None:
-                        if (remaining < _DROP_TWO_MIN_TICKS
-                                or (deadline is not None and loop.time() + _DROP_TWO_MIN_TICKS * 0.05 > deadline)):
+                        if (remaining < _STONE_DROP_MIN_TICKS
+                                or (deadline is not None and loop.time() + _STONE_DROP_MIN_TICKS * 0.05 > deadline)):
                             return outcome("budget")
                         observed = self.position
                         if (not self._at_standing_height(sy) or self._observed_ground is False or observed is None
@@ -2969,7 +2969,7 @@ class Movement:
                         if self._observed_ground is True and landed(self.position) and self._input_position == self.position:
                             if self.position != settled_at:
                                 settled_at, settled_frames = self.position, 0
-                            if settled_frames >= _DROP_TWO_SETTLE_FRAMES:
+                            if settled_frames >= _STONE_DROP_SETTLE_FRAMES:
                                 accepted_level = ly
                                 release_input = False
                                 use_ground_velocity = True
@@ -2981,7 +2981,7 @@ class Movement:
 
                     if remaining <= 0:
                         return outcome("budget")
-                    forward = (air_tick is None and forward_frames < _DROP_TWO_FORWARD_FRAMES
+                    forward = (air_tick is None and forward_frames < _STONE_DROP_FORWARD_FRAMES
                                and progress(self._input_position) < 0.5 + _PLAYER_HALF_WIDTH
                                and y >= upper_eye - 0.05)
                     if forward:
@@ -3940,8 +3940,8 @@ class Movement:
 
                         if _is_gap_jump(anchor, route[0]):
                             transition = cross_gap
-                        elif _is_two_block_drop(anchor, route[0]):
-                            transition = drop_two
+                        elif _is_stone_ledge_drop(anchor, route[0]):
+                            transition = descend_stone_ledge
                         elif _is_ladder_climb(anchor, route[0]):
                             transition = climb_ladder
                         elif _ladder_descent_geometry(anchor, route[0]) is not None:
