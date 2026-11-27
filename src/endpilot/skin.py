@@ -18,8 +18,27 @@ _SkinModel = Literal["wide", "slim"]
 
 
 @dataclass(frozen=True, slots=True)
+class PlayerCapeSnapshot:
+    """The cape ID and image reported by the server, including an empty image."""
+
+    id: str
+    width: int
+    height: int
+    rgba: bytes = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.rgba, bytes):
+            raise TypeError("cape RGBA must be immutable bytes")
+
+
+@dataclass(frozen=True, slots=True)
 class PlayerSkinSnapshot:
-    """The base skin image and metadata reported by the server."""
+    """The skin image and metadata reported by the server.
+
+    A report can contain a cape with an empty base skin image.
+    Cape fields absent from the source produce ``cape=None``. A reported empty
+    cape has an empty ID, zero dimensions and empty RGBA bytes.
+    """
 
     skin_id: str
     width: int
@@ -27,6 +46,23 @@ class PlayerSkinSnapshot:
     rgba: bytes = field(repr=False)
     model: _SkinModel | None
     resource_patch: str
+    cape: PlayerCapeSnapshot | None = field(default=None, kw_only=True)
+
+
+def _player_cape_snapshot(skin) -> PlayerCapeSnapshot | None:
+    cape_id = getattr(skin, "cape_id", None)
+    image = getattr(skin, "cape_image", None)
+    if image is None:
+        width = getattr(skin, "cape_image_width", None)
+        height = getattr(skin, "cape_image_height", None)
+        rgba = getattr(skin, "cape_image_bytes", None)
+    else:
+        width = getattr(image, "width", None)
+        height = getattr(image, "height", None)
+        rgba = getattr(image, "image_bytes", None)
+    if cape_id is None or width is None or height is None or rgba is None:
+        return None
+    return PlayerCapeSnapshot(str(cape_id), int(width), int(height), bytes(rgba))
 
 
 def _player_skin_snapshot(skin) -> PlayerSkinSnapshot | None:
@@ -41,10 +77,12 @@ def _player_skin_snapshot(skin) -> PlayerSkinSnapshot | None:
         width, height, rgba = int(image.width), int(image.height), bytes(image.image_bytes)
         arm_size = skin.arm_size_type
     skin_id = str(skin.id)
+    cape = _player_cape_snapshot(skin)
     if not skin_id and width == height == 0 and not rgba:
-        return None
+        if cape is None or (not cape.id and cape.width == cape.height == 0 and not cape.rgba):
+            return None
     model = {"WIDE": "wide", "SLIM": "slim"}.get(getattr(arm_size, "name", None))
-    return PlayerSkinSnapshot(skin_id, width, height, rgba, model, str(skin.resource_patch))
+    return PlayerSkinSnapshot(skin_id, width, height, rgba, model, str(skin.resource_patch), cape=cape)
 
 
 def _validate_model(model: _SkinModel) -> None:

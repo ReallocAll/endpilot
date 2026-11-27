@@ -51,7 +51,7 @@ from .resource_packs import (
     ResourcePackError, ResourcePackIndex, ResourcePackOffer,
 )
 from .signs import SignEditor, SignObservation, SignSide
-from .skin import PlayerSkinSnapshot, Skin
+from .skin import PlayerCapeSnapshot, PlayerSkinSnapshot, Skin
 from .titles import TitleEvent, TitleKind
 from .trading import TradeManyRequest, TradeManyResult
 from .world_environment import Weather, WorldClock, WorldRule, WorldSpawn, WorldTime
@@ -163,6 +163,7 @@ __all__ = [
     "PlacementInventoryChange",
     "PlacementResult",
     "PlayerAbilities",
+    "PlayerCapeSnapshot",
     "PlayerEffect",
     "PlayerEquipmentSnapshot",
     "PlayerListChange",

@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import FrozenInstanceError, replace
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from uuid import UUID
@@ -7,9 +8,36 @@ import weakref
 
 from bedrock_protocol import DecodeError
 
-from endpilot import Bot, PlayerListChange, PlayerListEntry, PlayerSkinSnapshot
+from endpilot import Bot, PlayerCapeSnapshot, PlayerListChange, PlayerListEntry, PlayerSkinSnapshot
 from endpilot.protocol import Protocol, RawPacket, write_batch
 from endpilot.skin import _player_skin_snapshot
+
+
+EMPTY_CAPE = PlayerCapeSnapshot("", 0, 0, b"")
+
+# bedrock-protocol 1aa8ae119 tests/goldens/v2225/063_player_list.json, add_and_remove_entries.
+GOLDEN_ROSTER = RawPacket(63, bytes.fromhex(
+    "020100000000000000000001000000000000000e055374657665103235333534313030303030303030303104706669640470636964"
+    "0800000003736964257b2267656f6d65747279223a7b2264656661756c74223a2267656f6d657472792e61227d7d010000000100"
+    "000004010203040001000000010000000405060708037b7d0a05312e302e30025b5d036369640366696401040302010000010101"
+    "01010474727565046861736801010108070605000100000000000000000200000000000000"
+))
+# tests/goldens/v2225/093_player_skin.json, player_skin_update.
+GOLDEN_UPDATE = RawPacket(93, bytes.fromhex(
+    "8e3b48a5588c689ebfd05a00e1c969af03736964257b2267656f6d65747279223a7b2264656661756c74223a2267656f6d657472"
+    "792e61227d7d0100000001000000040102030401010000000100000004090a0b0c010000803f010100000001000000040506070803"
+    "7b7d0a05312e302e30025b5d04636170650466756c6c0101020304010270310100000089351bad0840a55541dfc129260d21aa0104"
+    "70726f640108736b656c65746f6e0100000002000000030000000400000001010101010566616c73650468617368036e6577036f6c64"
+))
+# tests/goldens/v1001/093_player_skin.json, player_skin_update.
+GOLDEN_HISTORICAL_UPDATE = RawPacket(93, bytes.fromhex(
+    "8e3b48a5588c689ebfd05a00e1c969af037369640470666964267b2267656f6d65747279223a7b2264656661756c74223a226765"
+    "6f6d657472792e61227d7d0a0100000001000000040102030401000000010000000100000004090a0b0c01000000000000400100"
+    "000001000000010000000405060708037b7d0a05312e302e30035b5d0a0363696403666964047769646509236666303130323033"
+    "01000000037069640c706572736f6e615f686169722430303030303030302d303030302d303030302d303030302d303030303030"
+    "303030303033010470726f64010000000c706572736f6e615f686169720400000009236666303130323033092366663035303630"
+    "3709236666303130323034092366663035303630380101010101036e6577036f6c6401"
+))
 
 
 class BatchTransport:
@@ -44,9 +72,12 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
     def native_skin(self, snapshot):
         binding = self.binding
         model = "UNKNOWN" if snapshot.model is None else snapshot.model.upper()
+        cape = snapshot.cape or EMPTY_CAPE
         return binding.SerializedSkinRef(
             id=snapshot.skin_id, resource_patch=snapshot.resource_patch,
             skin_image=binding.SkinImage(width=snapshot.width, height=snapshot.height, image_bytes=snapshot.rgba),
+            cape_id=cape.id,
+            cape_image=binding.SkinImage(width=cape.width, height=cape.height, image_bytes=cape.rgba),
             arm_size_type=binding.ArmSizeType[model],
         )
 
@@ -54,7 +85,9 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
         return self.binding.PlayerSkinPacket(uuid=uuid, skin=self.native_skin(snapshot))
 
     def deliver(self, *packets):
-        self.transport.incoming.put_nowait(write_batch(self.bot.protocol.encode(packet) for packet in packets))
+        self.transport.incoming.put_nowait(write_batch(
+            packet if isinstance(packet, RawPacket) else self.bot.protocol.encode(packet) for packet in packets
+        ))
 
     async def deliver_through(self, *packets):
         last = self.bot.protocol.encode(packets[-1])
@@ -77,7 +110,8 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
     async def test_login_roster_survives_actor_removal_and_dimension_change(self):
         uuid = UUID(int=110)
         binding = self.binding
-        skin = PlayerSkinSnapshot("initial", 2, 1, b"\x07\x0d\x17\xff\x03\x02\x01\x00", "wide", "patch")
+        skin = PlayerSkinSnapshot("initial", 2, 1, b"\x07\x0d\x17\xff\x03\x02\x01\x00", "wide", "patch",
+                                  cape=EMPTY_CAPE)
         await self.join(
             self.roster(entries=[self.add(uuid, "Peer", id=301, xuid="1234", play_fab_id="abcdef",
                                           platform_online_id="platform", build_platform=binding.BuildPlatform.WIN32,
@@ -116,11 +150,61 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
         await self.deliver_through(self.roster(entries=[self.remove(uuid)]))
         self.assertEqual(changes, [(PlayerListChange("remove", uuid),)])
 
+    async def test_golden_capes_through_roster_and_live_update(self):
+        peer = UUID("9e688c58-a548-3b8e-af69-c9e1005ad0bf")
+        old_cape = PlayerCapeSnapshot("previous", 1, 2, b"\x10\x20\x30\xff\x40\x50\x60\x00")
+        initial = PlayerSkinSnapshot("previous skin", 1, 1, b"\x11\x22\x33\xff", "wide", "", cape=old_cape)
+        await self.join(GOLDEN_ROSTER, self.roster(entries=[self.add(peer, "Peer", skin=self.native_skin(initial))]))
+        listed, before = self.bot.observed_players
+        self.assertEqual(listed.uuid, UUID(int=1))
+        self.assertEqual(listed.skin.cape, PlayerCapeSnapshot("cid", 1, 1, b"\x05\x06\x07\x08"))
+        self.assertEqual(before.skin.cape, old_cape)
+
+        updates = []
+        self.bot.subscribe_player_skin_updates(updates.append, player_uuid=peer)
+        waiting = asyncio.create_task(self.bot.wait_for_player_skin_update(peer, timeout=1))
+        await asyncio.sleep(0)
+        self.deliver(GOLDEN_UPDATE)
+        current = await waiting
+        self.assertEqual(current.cape, PlayerCapeSnapshot("cape", 1, 1, b"\x05\x06\x07\x08"))
+        after = replace(before, skin=current)
+        self.assertEqual(self.bot.observed_players, (listed, after))
+        self.assertEqual(updates, [after])
+        self.assertEqual(before.skin, initial)
+        with self.assertRaises(FrozenInstanceError):
+            current.cape = None
+        with self.assertRaises(FrozenInstanceError):
+            current.cape.rgba = b""
+        self.assertNotIn("rgba=", repr(current.cape))
+
+    async def test_cape_only_reports_survive_roster_and_live_update(self):
+        peer = UUID(int=109)
+        initial = PlayerSkinSnapshot("", 0, 0, b"", None, "",
+                                     cape=PlayerCapeSnapshot("first", 1, 1, b"\x01\x02\x03\xff"))
+        latest = replace(initial, cape=PlayerCapeSnapshot("latest", 1, 1, b"\x04\x05\x06\xff"))
+        empty = replace(initial, cape=EMPTY_CAPE)
+        await self.join(self.roster(entries=[self.add(peer, "Peer", skin=self.native_skin(initial))]))
+        saved, = self.bot.observed_players
+        self.assertEqual(saved.skin, initial)
+
+        updates = []
+        self.bot.subscribe_player_skin_updates(updates.append, player_uuid=peer)
+        waiting = asyncio.create_task(self.bot.wait_for_player_skin_update(peer, timeout=1))
+        await asyncio.sleep(0)
+        self.deliver(self.skin_packet(peer, latest))
+        self.assertEqual(await waiting, latest)
+        self.assertEqual(self.bot.observed_players, (replace(saved, skin=latest),))
+
+        await self.deliver_through(self.skin_packet(peer, empty))
+        self.assertEqual(self.bot.observed_players, (replace(saved, skin=None),))
+        self.assertEqual(updates, [replace(saved, skin=latest), replace(saved, skin=None)])
+        self.assertEqual(saved.skin, initial)
+
     async def test_startup_skin_updates_precede_queued_live_updates(self):
         peer, late = UUID(int=111), UUID(int=112)
-        initial = PlayerSkinSnapshot("initial", 1, 1, b"\x01\x02\x03\xff", "wide", "")
-        startup = PlayerSkinSnapshot("startup", 1, 1, b"\x04\x05\x06\x80", "slim", "startup patch")
-        queued = PlayerSkinSnapshot("queued", 1, 1, b"\x07\x08\x09\x00", None, "queued patch")
+        initial = PlayerSkinSnapshot("initial", 1, 1, b"\x01\x02\x03\xff", "wide", "", cape=EMPTY_CAPE)
+        startup = PlayerSkinSnapshot("startup", 1, 1, b"\x04\x05\x06\x80", "slim", "startup patch", cape=EMPTY_CAPE)
+        queued = PlayerSkinSnapshot("queued", 1, 1, b"\x07\x08\x09\x00", None, "queued patch", cape=EMPTY_CAPE)
         await self.join(
             self.roster(entries=[self.add(peer, "Peer", skin=self.native_skin(initial))]),
             self.skin_packet(late, startup),
@@ -145,8 +229,8 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_wait_captures_first_skin_in_batch_and_accepts_repeats_and_empty_reports(self):
         peer, other = UUID(int=120), UUID(int=121)
-        first = PlayerSkinSnapshot("first", 1, 1, b"\x01\x13\x17\xff", "slim", "patch one")
-        latest = PlayerSkinSnapshot("", 1, 2, b"\x04\x05\x06\xff\x03\x02\x01\x00", None, "patch two")
+        first = PlayerSkinSnapshot("first", 1, 1, b"\x01\x13\x17\xff", "slim", "patch one", cape=EMPTY_CAPE)
+        latest = PlayerSkinSnapshot("", 1, 2, b"\x04\x05\x06\xff\x03\x02\x01\x00", None, "patch two", cape=EMPTY_CAPE)
         latest_skin = self.native_skin(latest)
         latest_skin.arm_size_type = 250  # The decoder can return an unrecognized integer.
         latest_packet = self.binding.PlayerSkinPacket(uuid=peer, skin=latest_skin)
@@ -200,7 +284,7 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_wait_skips_a_skin_packet_that_cannot_be_applied(self):
         peer = UUID(int=125)
-        skin = PlayerSkinSnapshot("valid", 1, 1, b"\x01\x02\x03\xff", "wide", "")
+        skin = PlayerSkinSnapshot("valid", 1, 1, b"\x01\x02\x03\xff", "wide", "", cape=EMPTY_CAPE)
         await self.join(self.roster(entries=[self.add(peer, "Peer")]))
         loop = asyncio.get_running_loop()
         errors = []
@@ -221,8 +305,8 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_removed_player_skin_updates_are_ignored_until_readd(self):
         peer = UUID(int=130)
-        initial = PlayerSkinSnapshot("initial", 1, 1, b"\x90\x80\x70\xff", "wide", "")
-        offered = PlayerSkinSnapshot("offered", 1, 1, b"\x60\x50\x40\xff", "wide", "")
+        initial = PlayerSkinSnapshot("initial", 1, 1, b"\x90\x80\x70\xff", "wide", "", cape=EMPTY_CAPE)
+        offered = PlayerSkinSnapshot("offered", 1, 1, b"\x60\x50\x40\xff", "wide", "", cape=EMPTY_CAPE)
         await self.join(self.roster(entries=[self.add(peer, "Peer", skin=self.native_skin(initial))]))
         saved, = self.bot.observed_players
         skins = []
@@ -378,7 +462,7 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
         peer = UUID(int=145)
         await self.join(self.roster(entries=[self.add(peer, "Peer")]))
         saved, = self.bot.observed_players
-        skin = PlayerSkinSnapshot("changed", 1, 1, b"\x00\x00\x00\xff", "wide", "")
+        skin = PlayerSkinSnapshot("changed", 1, 1, b"\x00\x00\x00\xff", "wide", "", cape=EMPTY_CAPE)
 
         def register(subscribe):
             duplicates, added, kept = [], [], []
@@ -435,15 +519,30 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.close()
 
 
-class HistoricalSkinTests(unittest.TestCase):
-    def test_native_codec_exposes_flat_skin_fields(self):
-        protocol = Protocol(1001)
-        binding = protocol.binding
-        rgba = b"\x01\x02\x03\x04"
-        skin = binding.SerializedSkinRef(
-            id="historical", image_width=1, image_height=1, image_bytes=rgba,
-            arm_size=binding.ArmSizeType.WIDE, resource_patch="historical patch",
-        )
-        raw = protocol.encode(binding.PlayerSkinPacket(uuid=UUID(int=150), skin=skin))
-        observed = _player_skin_snapshot(protocol.decode(raw).skin)
-        self.assertEqual(observed, PlayerSkinSnapshot("historical", 1, 1, rgba, "wide", "historical patch"))
+class SkinProjectionTests(unittest.TestCase):
+    def test_historical_golden_exposes_flat_cape_fields(self):
+        observed = _player_skin_snapshot(Protocol(1001).decode(GOLDEN_HISTORICAL_UPDATE).skin)
+        self.assertEqual(observed, PlayerSkinSnapshot(
+            "sid", 1, 1, b"\x01\x02\x03\x04", "wide", '{"geometry":{"default":"geometry.a"}}\n',
+            cape=PlayerCapeSnapshot("cid", 1, 1, b"\x05\x06\x07\x08"),
+        ))
+
+    def test_missing_fields_and_explicit_empty_cape_are_distinct(self):
+        rgba = bytes((1, 2, 3, 4))
+        skin = SimpleNamespace(id="base", skin_image=SimpleNamespace(width=1, height=1, image_bytes=rgba),
+                               arm_size_type=None, resource_patch="")
+        self.assertEqual(_player_skin_snapshot(skin), PlayerSkinSnapshot("base", 1, 1, rgba, None, ""))
+        self.assertIsNone(_player_skin_snapshot(skin).cape)
+        skin.cape_id = ""
+        self.assertIsNone(_player_skin_snapshot(skin).cape)
+        skin.cape_image = SimpleNamespace(width=0, height=0)
+        self.assertIsNone(_player_skin_snapshot(skin).cape)
+        skin.cape_image.image_bytes = b""
+        self.assertEqual(_player_skin_snapshot(skin).cape, EMPTY_CAPE)
+
+        cape_rgba = bytes((5, 6, 7, 8))
+        skin.cape_id = "cape"
+        skin.cape_image = SimpleNamespace(width=1, height=1, image_bytes=cape_rgba)
+        self.assertIs(_player_skin_snapshot(skin).cape.rgba, cape_rgba)
+        with self.assertRaisesRegex(TypeError, "immutable bytes"):
+            PlayerCapeSnapshot("cape", 1, 1, bytearray(cape_rgba))
