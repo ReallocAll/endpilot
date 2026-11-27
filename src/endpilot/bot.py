@@ -1237,8 +1237,12 @@ class Bot:
         self, names: str | int | Iterable[str] | Iterable[int] | None = None, *,
         radius: int = 16, limit: int | None = None,
         predicate: Callable[[BlockMatch], bool | None] | None = None,
+        center: tuple[float, float, float] | None = None,
     ) -> BlockSearchResult:
-        """Search cached primary-layer blocks around floor(position) in the current dimension.
+        """Search cached primary-layer blocks in the current dimension.
+
+        Each coordinate of center is floored to a block coordinate. Omit center
+        to use the player's synchronized position.
 
         Pass a name, a Bedrock session runtime ID, an iterable of names, or an
         iterable of IDs. Bare names use the minecraft namespace. Hash sessions
@@ -1253,14 +1257,15 @@ class Bot:
         """
         if self._blocks is None:
             raise RuntimeError("player has not joined")
-        return self._blocks.find_blocks(names, radius=radius, limit=limit, predicate=predicate)
+        return self._blocks.find_blocks(names, radius=radius, limit=limit, predicate=predicate, center=center)
 
     def find_block(
         self, names: str | int | Iterable[str] | Iterable[int] | None = None, *, radius: int = 16,
         predicate: Callable[[BlockMatch], bool | None] | None = None,
+        center: tuple[float, float, float] | None = None,
     ) -> BlockSearchResult:
         """Run find_blocks with limit=1 and the same completeness rules."""
-        return self.find_blocks(names, radius=radius, limit=1, predicate=predicate)
+        return self.find_blocks(names, radius=radius, limit=1, predicate=predicate, center=center)
 
     def find_block_vein(
         self, position: tuple[int, int, int], *, max_blocks: int = 100,

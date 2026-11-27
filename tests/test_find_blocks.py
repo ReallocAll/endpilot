@@ -102,6 +102,60 @@ class BlockSearchTests(unittest.TestCase):
         self.assertEqual(layer_one.matches, ())
         self.assertTrue(layer_one.complete)
 
+    def test_explicit_center_reorders_matches_without_reading_player_position(self):
+        west, east = (-21, 216, -20), (-19, 216, -20)
+        self.section((-2, 13, -2))
+        self.update(west, 4065577688)
+        self.update(east, 825916963)
+        del self.movement.position
+
+        for center, origin, expected in (
+            ((-20.5, 216.5, -19.5), west, (
+                BlockMatch(west, "minecraft:oak_log", 4065577688, 0),
+                BlockMatch(east, "minecraft:oak_log", 825916963, 4),
+            )),
+            ((-18.5, 216.5, -19.5), east, (
+                BlockMatch(east, "minecraft:oak_log", 825916963, 0),
+                BlockMatch(west, "minecraft:oak_log", 4065577688, 4),
+            )),
+        ):
+            with self.subTest(center=center):
+                result = self.bot.find_blocks("oak_log", radius=2, center=center)
+                self.assertEqual(result.center, origin)
+                self.assertEqual(result.dimension_id, 0)
+                self.assertTrue(result.complete)
+                self.assertEqual(result.matches, expected)
+                nearest = self.bot.find_block("oak_log", radius=2, center=center)
+                self.assertEqual(nearest, self.bot.find_blocks("oak_log", radius=2, center=center, limit=1))
+                self.assertTrue(nearest.complete)
+                self.assertEqual(nearest.matches, expected[:1])
+
+    def test_explicit_center_scopes_coverage_and_predicate_before_limit(self):
+        near, far, outside = (-31, 216, -20), (-29, 216, -20), (-28, 216, -20)
+        center = (-30.5, 216, -19.5)
+        self.section((-2, 13, -2))
+        for cell in (near, far, outside):
+            self.update(cell, 4065577688)
+        seen = []
+
+        def farther(match):
+            seen.append((match.position, match.distance_squared))
+            return match.distance_squared != 0
+
+        partial = self.bot.find_blocks("oak_log", center=center, radius=2, limit=1, predicate=farther)
+        expected = (BlockMatch(far, "minecraft:oak_log", 4065577688, 4),)
+        self.assertFalse(partial.complete)
+        self.assertEqual(partial.matches, expected)
+        self.assertCountEqual(seen, ((near, 0), (far, 4)))
+
+        self.section((-3, 13, -2))
+        known = self.bot.find_block("oak_log", center=center, radius=2, predicate=farther)
+        self.assertTrue(known.complete)
+        self.assertEqual(known.matches, expected)
+        pending = self.bot.find_blocks("oak_log", center=center, radius=2, limit=0, predicate=lambda _: None)
+        self.assertFalse(pending.complete)
+        self.assertEqual(pending.matches, ())
+
     def test_unknown_and_custom_states_cannot_certify_air_or_completeness(self):
         center = (-17, 224, -17)
         for runtime_id in (0xFFFFFFFE, 0x12345678):
@@ -320,3 +374,14 @@ class BlockSearchTests(unittest.TestCase):
         self.movement.position = None
         with self.assertRaisesRegex(RuntimeError, "position has not synchronized"):
             self.bot.find_block("oak_log")
+        with self.assertRaisesRegex(RuntimeError, "position has not synchronized"):
+            self.bot.find_blocks("oak_log", center=None)
+
+    def test_invalid_explicit_centers(self):
+        for invalid in ((1, 2), (1, 2, 3, 4), (float("inf"), 2, 3), (1, float("-inf"), 3), (1, 2, float("nan"))):
+            with self.subTest(center=invalid), self.assertRaisesRegex(ValueError, "three finite coordinates"):
+                self.bot.find_blocks("oak_log", center=invalid)
+        with self.assertRaises(TypeError):
+            self.bot.find_block("oak_log", center=("1", 2, 3))
+        with self.assertRaisesRegex(RuntimeError, "player has not joined"):
+            Bot("Unjoined").find_block("oak_log", center=(1, 2, 3))

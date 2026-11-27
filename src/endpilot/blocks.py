@@ -951,6 +951,7 @@ class Blocks:
     def find_blocks(
         self, names: str | int | Iterable[str] | Iterable[int] | None = None, *, radius: int, limit: int | None,
         predicate: Callable[[BlockMatch], bool | None] | None = None,
+        center: tuple[float, float, float] | None = None,
     ) -> BlockSearchResult:
         if not isinstance(radius, int) or (limit is not None and not isinstance(limit, int)):
             raise TypeError("radius and limit must be integers")
@@ -982,17 +983,24 @@ class Blocks:
                 raise TypeError("block names and runtime IDs cannot be mixed")
             if not wanted_names and not wanted_ids:
                 raise ValueError("at least one block name or runtime ID is required")
-        position = self.movement.position
-        if position is None:
-            raise RuntimeError("player position has not synchronized")
+        if center is None:
+            position = self.movement.position
+            if position is None:
+                raise RuntimeError("player position has not synchronized")
+        else:
+            from math import isfinite
+
+            if len(center) != 3 or not all(isinstance(axis, int) or isfinite(axis) for axis in center):
+                raise ValueError("center must contain three finite coordinates")
+            position = center
         x, y, z = position
-        center = (floor(x), floor(y), floor(z))
+        origin = (floor(x), floor(y), floor(z))
         resolved = 0
         predicates_resolved = True
 
         def matches() -> Iterator[BlockMatch]:
             nonlocal resolved, predicates_resolved
-            for cell, distance in self._observed_positions_in_sphere(center, radius):
+            for cell, distance in self._observed_positions_in_sphere(origin, radius):
                 observation = self.observed_block(cell)
                 if observation is None:
                     continue
@@ -1031,7 +1039,7 @@ class Blocks:
 
         ordered = sorted(matches(), key=rank) if not limit else nsmallest(limit, matches(), key=rank)
         complete = predicates_resolved and _sphere_is_covered(radius, resolved)
-        return BlockSearchResult(center, self.dimension_id, tuple(ordered), complete)
+        return BlockSearchResult(origin, self.dimension_id, tuple(ordered), complete)
 
     def _wide_vein_neighbors(self, center: tuple[int, int, int], distance: int):
         """Share unread section masks across searches from the same seed."""
