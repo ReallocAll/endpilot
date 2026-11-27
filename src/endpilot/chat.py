@@ -291,6 +291,7 @@ class Chat:
         self._message_observers: list[Callable[[ChatMessage], None]] = []
         self._text_observers: list[Callable[[_IncomingText], None]] = []
         self._match_observers: list[Callable[[ChatMatch], None]] = []
+        self._display_match_observers: list[Callable[[DisplayMatch], None]] = []
         self._content_waits: set[asyncio.Future[str]] = set()
         # A disconnect can precede the first subscription while the reader is still running.
         self._unsubscribe = packets.subscribe_raw(self._on_packet)
@@ -522,6 +523,14 @@ class Chat:
         return self._subscribe(self._match_observers, callback,
                                lambda event: name_or_id in (event.pattern_id, event.name))
 
+    def subscribe_display_match(
+        self, name_or_id: str | int, callback: Callable[[DisplayMatch], None],
+    ) -> Callable[[], None]:
+        self._require_subscription_stream()
+        self._require_pattern(self._display_patterns, name_or_id)
+        return self._subscribe(self._display_match_observers, callback,
+                               lambda event: name_or_id in (event.pattern_id, event.name))
+
     @staticmethod
     def _require_pattern[T](registrations: dict[int, _RegisteredPattern[T]], name_or_id: str | int) -> None:
         if isinstance(name_or_id, int):
@@ -554,6 +563,7 @@ class Chat:
         self._message_observers.clear()
         self._text_observers.clear()
         self._match_observers.clear()
+        self._display_match_observers.clear()
         self._display_patterns.clear()
         self._display_completed.clear()
         for waiting in self._content_waits:
@@ -625,6 +635,8 @@ class Chat:
             self._notify(self._message_observers, message)
         for completed in self._completed:
             self._notify(self._match_observers, completed)
+        for completed in self._display_completed:
+            self._notify(self._display_match_observers, completed)
 
     @staticmethod
     def _advance_patterns[T, M](

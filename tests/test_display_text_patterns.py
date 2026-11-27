@@ -18,6 +18,10 @@ class DisplayTextPatternTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.bot.close)
         self.b = b = self.bot.protocol.binding
         self.text = b.TextPacket
+        await self.join()
+
+    async def join(self):
+        b = self.b
         self.wire = Wire(self.bot.protocol)
         for packet in (
             b.NetworkSettingsPacket(compression_algorithm=b.PacketCompressionAlgorithm.NONE),
@@ -170,8 +174,41 @@ class DisplayTextPatternTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.bot._chat._text_observers)
         self.assertFalse(self.bot._chat._content_waits)
 
+    async def test_display_subscriptions_follow_batch_and_registration_order(self):
+        sent = list(self.wire.sent)
+        first = self.bot.add_display_pattern("report", r"^report (\d+)$")
+        second = self.bot.add_display_pattern("report", r"^report (\d+)$", repeat=False)
+        chat_id = self.bot.add_chat_pattern("report", ".*")
+        for selector in (chat_id, "missing"):
+            with self.assertRaises(KeyError):
+                self.bot.subscribe_display_match(selector, self.fail)
+
+        named, identified, texts = [], [], []
+        unsubscribe = self.bot.subscribe_display_match("report", named.append)
+        self.bot.subscribe_display_match(first, identified.append)
+        self.bot.subscribe_text(texts.append)
+        waiting = await self.arm(self.bot.wait_for_display_match("report", timeout=1))
+        await self.deliver(self.rawtext({"text": "report 1"}), self.rawtext({"text": "report 2"}))
+        self.assertEqual([(match.pattern_id, match.matches[0][1]) for match in named], [
+            (first, "1"), (second, "1"), (first, "2"),
+        ])
+        self.assertIs(await waiting, named[0])
+        self.assertEqual(identified, [named[0], named[2]])
+        self.assertIs(named[0].events[0], texts[0])
+        self.assertIs(named[2].events[0], texts[1])
+
+        unsubscribe()
+        unsubscribe()
+        await self.deliver(self.rawtext({"text": "report 3"}))
+        self.assertEqual(len(named), 3)
+        self.assertEqual([match.matches[0][1] for match in identified], ["1", "2", "3"])
+        self.assertIs(identified[2].events[0], texts[2])
+        self.assertEqual(self.wire.sent, sent)
+
     async def test_disconnect_prevents_a_matching_text_object_in_the_same_batch(self):
         pattern = self.bot.add_display_pattern("late", "late", locale="fr_FR")
+        old_matches = []
+        unsubscribe = self.bot.subscribe_display_match("late", old_matches.append)
         waiting = await self.arm(self.bot.wait_for_display_match(pattern, timeout=1))
         content = await self.arm(self.bot.wait_for_message("late", locale="fr_FR", timeout=1))
         await self.deliver(self.b.DisconnectPacket(), self.rawtext({"text": "late"}))
@@ -182,3 +219,18 @@ class DisplayTextPatternTests(unittest.IsolatedAsyncioTestCase):
             self.bot.add_display_pattern("closed", "late")
         with self.assertRaises(ConnectionError):
             await self.bot.wait_for_display_match(pattern, timeout=1)
+        with self.assertRaises(ConnectionError):
+            self.bot.subscribe_display_match(pattern, old_matches.append)
+        self.assertFalse(old_matches)
+
+        await self.bot.close()
+        with self.assertRaises(RuntimeError):
+            self.bot.subscribe_display_match(pattern, old_matches.append)
+        await self.join()
+        self.assertEqual(self.bot.add_display_pattern("late", "late", locale="fr_FR"), pattern)
+        new_matches = []
+        self.bot.subscribe_display_match("late", new_matches.append)
+        unsubscribe()
+        await self.deliver(self.rawtext({"text": "late"}))
+        self.assertFalse(old_matches)
+        self.assertEqual([match.matches[0].string for match in new_matches], ["late"])

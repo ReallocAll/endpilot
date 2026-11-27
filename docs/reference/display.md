@@ -42,6 +42,13 @@ while the bot named `Knight` is waiting.
 tellraw Knight {"rawtext":[{"text":"Checkpoint 3 saved"}]}
 ```
 
+For repeated matches, leave `repeat=True` when registering the pattern and use
+`subscribe_display_match(pattern_id, callback)`. The synchronous callback
+receives a `DisplayMatch` for each completion, including multiple completions in
+one packet batch. Pass a pattern name to listen to all registrations of that
+name in registration order. Call the returned function to unsubscribe. The
+subscription ends with the current connection.
+
 Pass an exact Bedrock locale such as `locale="fr_FR"` to
 `add_display_pattern()` or `wait_for_message()` to include text objects whose
 translations resolve in full using the resource packs loaded by this connection.

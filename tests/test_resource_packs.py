@@ -328,9 +328,10 @@ class ResourcePackTests(unittest.IsolatedAsyncioTestCase):
         english = self.bot.add_display_pattern("report", pattern, locale="en_US")
         self.bot.add_display_pattern("report", pattern, locale="de_DE")
         self.bot.add_display_pattern("report", pattern)
-        events, sent = [], []
+        events, sent, display_matches = [], [], []
         self.bot.subscribe_text(events.append)
         self.bot.packets.subscribe_sent(sent.append)
+        self.bot.subscribe_display_match("report", display_matches.append)
         text = self.b.TextPacket
 
         def report(key):
@@ -372,6 +373,7 @@ class ResourcePackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await by_name).matches[1][1], "Alice reçoit snow")
         self.assertEqual((await by_name).events, (events[0], events[2]))
         self.assertEqual((await by_id).events, (events[0], events[2]))
+        self.assertEqual(display_matches, [await by_name, await by_id])
         self.assertEqual(events[0].author, "Player\u00a7r")
         self.assertEqual(await content_en, "report|[Alice]  snow|end")
         self.assertEqual(await content_fr, "report|Alice reçoit snow|end")

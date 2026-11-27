@@ -2701,6 +2701,18 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._chat.wait_for_display_match(name_or_id, timeout=timeout)
 
+    def subscribe_display_match(
+        self, name_or_id: str | int, callback: Callable[[DisplayMatch], None],
+    ) -> Callable[[], None]:
+        """Run a synchronous callback for display pattern completions in this session.
+
+        Select a registered pattern by ID or all registered patterns of a given
+        name. The returned unsubscribe function can be called more than once.
+        """
+        if self._chat is None:
+            raise RuntimeError("player has not joined")
+        return self._chat.subscribe_display_match(name_or_id, callback)
+
     def subscribe_chat_match(
         self, name_or_id: str | int, callback: Callable[[ChatMatch], None],
     ) -> Callable[[], None]:
