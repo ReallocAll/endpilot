@@ -320,6 +320,8 @@ in the primary feet layer.
 The extra feet layer and both head layers must contain observed air, and the
 floor must provide safe support. The same vegetation is allowed at the
 launch stance of a one-block descent, but not at its landing or runout.
+A one-block ascent can enter beneath a known full-cell vanilla leaf canopy
+when the launch and both landing body layers still have clear space.
 Elevation changes require server landing evidence before continuing. A ladder
 descent waits for a grounded server correction at the ladder foot before
 stepping off. Use `reached` and the final match to choose a click, then observe

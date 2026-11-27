@@ -2477,6 +2477,33 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                                  BlockApproach(status, 0))
                 self.assertEqual(self.stream.sent, [])
 
+    async def test_ascent_plan_accepts_only_observed_dry_full_cell_leaf_ceiling(self):
+        source, landing = (0, 100, 0), (1, 101, 0)
+        roof, launch_roof, head = (1, 103, 0), (0, 103, 0), (1, 102, 0)
+        birch, oak = 0x67BDEDE8, 0x7DCEF1FD
+        rules = NavigationRules(search_radius=1, vertical_radius=1)
+        for cell, layer, runtime_id, status in (
+            (roof, 0, birch, "found"),
+            (roof, 0, oak, "found"),
+            (roof, 0, self.STONE, "unreachable"),
+            (roof, 0, 0xD99F59FD, "unreachable"),  # moving block
+            (roof, 0, 0x195BFACD, "unreachable"),  # oak fence
+            (roof, 0, 0xFFFFFFFE, "unknown"),
+            (roof, 1, 0x483B8B2A, "unreachable"),  # water
+            (roof, 1, 0xFFFFFFFE, "unknown"),
+            (launch_roof, 0, birch, "unreachable"),
+            (head, 0, self.STONE, "unreachable"),
+            (head, 1, self.STONE, "unreachable"),
+        ):
+            with self.subTest(cell=cell, layer=layer, runtime_id=hex(runtime_id)):
+                self.prepare_ascent()
+                self.set_block(roof, birch)
+                self.set_block(cell, runtime_id, layer=layer)
+                plan = self.bot.plan_navigation(FootGoal(landing), rules=rules)
+                self.assertEqual((plan.status, plan.nodes),
+                                 (status, (source, landing) if status == "found" else ()))
+                self.assertEqual(self.stream.sent, [])
+
     async def test_ascent_lands_with_foot_overlap_before_the_center_reaches_the_upper_cell(self):
         target = self.prepare_ascent()
         corrected = False

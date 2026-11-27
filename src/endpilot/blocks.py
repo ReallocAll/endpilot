@@ -1392,13 +1392,23 @@ class Blocks:
     ) -> bool | None:
         sx, sy, sz = source
         lx, ly, lz = landing
+        ceiling = (lx, ly + 2, lz)
+        overhead = self._stance_clearance(ceiling)
+        if overhead is False:
+            block = self.observed_block(ceiling)
+            roof = None if block is None else self._vanilla_state(block.runtime_id)
+            # Stock BDS can settle the step under a full-cell leaf canopy.
+            # Limit the exception to that shape over the landing, not the launch.
+            if (roof is not None and roof.name.endswith("_leaves") and roof.unit_cube
+                    and roof.outline == _UNIT_BOX and not roof.unsafe_support and not roof.unresolved_overhang):
+                overhead = self._stance_air(self.observed_block(ceiling, layer=1))
         # A 1.25-block rise and 1.8-block player can enter the fourth block
-        # above the lower floor, including while overlapping both columns.
+        # above the lower floor while still overlapping the launch column.
         clearance = (
             self._flat_stance(source), self._flat_stance(landing),
             self._stance_clearance((sx, sy + 2, sz)),
             self._stance_clearance((sx, sy + 3, sz)),
-            self._stance_clearance((lx, ly + 2, lz)),
+            overhead,
         )
         if False in clearance:
             return False
