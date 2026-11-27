@@ -521,6 +521,79 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(frame.pos.y, 101.62 - 1 / 16, places=4)
         self.assertFalse(self.jump_input())
 
+    async def test_dry_straight_walk_passes_centres_but_stops_before_a_new_obstacle(self):
+        self.blocks._player_game_type = "SURVIVAL"
+        self.movement._gap_jump_allowed = lambda: True
+        for x in range(-1, 9):
+            for z in range(-1, 2):
+                for y in (99, 100, 101):
+                    solid = y == 99 or z != 0 or x in (-1, 8)
+                    self.set_block((x, y, z), self.STONE if solid else self.AIR)
+                    self.set_block((x, y, z), self.AIR, layer=1)
+        blocked = (5, 100, 0)
+        goal = FootGoal((7, 100, 0))
+        rules = NavigationRules(search_radius=7, vertical_radius=0)
+        self.set_position(0.5, 0.5, on_ground=True)
+        self.assertEqual((await self.bot.navigate(goal, rules=rules)).status, "reached")
+        for x in range(1, 7):
+            crossing = next(f for f in self.stream.sent if f.pos.x >= x + 0.5)
+            self.assertGreater(crossing.pos_delta.x, 0.12)
+        self.assert_released()
+
+        self.set_position(0.5, 0.5, on_ground=True, teleport=True)
+        self.stream.sent.clear()
+        observed_at = None
+
+        def obstruct():
+            nonlocal observed_at
+            frame = self.stream.sent[-1]
+            if observed_at is None and frame.pos.x >= 3.75:
+                self.set_block(blocked, self.STONE)
+                observed_at = len(self.stream.sent)
+
+        self.stream.on_send = obstruct
+        result = await self.bot.navigate(goal, rules=rules)
+        self.assertEqual(result.status, "unreachable")
+        self.assertIsNotNone(observed_at)
+        self.assertLess(max(frame.pos.x for frame in self.stream.sent[observed_at:]), 5 - 0.30)
+        self.assert_released()
+
+        self.stream.on_send = None
+        self.set_block(blocked, self.AIR)
+        self.assertEqual((await self.bot.navigate(goal, rules=rules)).status, "reached")
+
+    async def test_dry_straight_walk_recentres_after_a_fresh_stationary_ground_correction(self):
+        self.blocks._player_game_type = "SURVIVAL"
+        self.movement._gap_jump_allowed = lambda: True
+        for x in range(8):
+            for z in (0, 1):
+                for y in (99, 100, 101):
+                    self.set_block((x, y, z), self.STONE if y == 99 else self.AIR)
+                    self.set_block((x, y, z), self.AIR, layer=1)
+        self.set_position(0.5, 0.5, on_ground=True)
+        corrected_at = None
+
+        def correct_off_axis():
+            nonlocal corrected_at
+            frame = self.stream.sent[-1]
+            if corrected_at is None and frame.pos.x >= 1.30:
+                self.assertGreater(frame.pos_delta.x, 0.12)
+                corrected_at = len(self.stream.sent)
+                self.correct_position(frame.pos.x, frame.pos.y, 0.75, on_ground=True, tick=frame.client_tick)
+                self.assertEqual(self.movement._server_grounding,
+                                 (frame.client_tick, True, (frame.pos.x, frame.pos.y, 0.75), (0.0, 0.0, 0.0)))
+
+        self.stream.on_send = correct_off_axis
+        goal = FootGoal((7, 100, 0))
+        events = []
+        result = await self.bot.navigate(goal, rules=NavigationRules(search_radius=7, vertical_radius=0),
+                                         on_event=events.append)
+        self.assertEqual((result.status, result.stand_position), ("reached", goal.position))
+        self.assertIn("position_changed", [event.reason for event in events if event.kind == "invalidated"])
+        self.assertIsNotNone(corrected_at)
+        self.assertLess(self.stream.sent[corrected_at].pos.z, 0.75)
+        self.assert_released()
+
     async def test_grass_path_walking_does_not_widen_pose_geometry_or_goal_contracts(self):
         ids = self.prepare_vegetation_corridor(hashed=True)
         self.blocks._player_game_type = "SURVIVAL"

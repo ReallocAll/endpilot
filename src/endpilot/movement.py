@@ -146,6 +146,10 @@ class _LowerSlabDeparture(Exception):
     pass
 
 
+class _StraightWalkUnsafe(Exception):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class ForwardInput:
     """Facing in degrees and forward distance in blocks for one flat-ground frame."""
@@ -2576,6 +2580,7 @@ class Movement:
         release_input = False
         release_sneak = False
         use_ground_velocity = not legacy and self._observed_ground is not False
+        rolling = False
         used_ascents = set()
         aimed_cell = None
         parked = False
@@ -2606,6 +2611,50 @@ class Movement:
 
         def reached_cell(cell, x, z):
             return at_center(cell, x, z) and (not use_ground_velocity or horizontal_speed() < _REST_SPEED)
+
+        def dry_cruise_stance(cell):
+            x, y, z = cell
+            floor = (x, y - 1, z)
+            block = blocks.observed_block(floor)
+            state = None if block is None else blocks._vanilla_state(block.runtime_id)
+            # These full-height surfaces use the calibrated ordinary ground friction.
+            return (state is not None and state.name in ("minecraft:grass_block", "minecraft:stone")
+                    and state.unit_cube and not state.unsafe_support
+                    and blocks._stance_air(blocks.observed_block(floor, layer=1)) is True
+                    and blocks._flat_stance(cell) is True)
+
+        def cruise_target(anchor, route):
+            if (not isinstance(original_goal, FootGoal) or not use_ground_velocity or not calibrated
+                    or self._observed_ground is not True or not self._standard_ground_motion(blocks)
+                    or len(route) < 2):
+                return None
+            first, second = route[0], route[1]
+            dx, dz = first[0] - anchor[0], first[2] - anchor[2]
+            if (abs(dx) + abs(dz) == 1 and anchor[1] == first[1] == second[1]
+                    and second == (first[0] + dx, first[1], first[2] + dz)
+                    and graph.edge(first, second) is True
+                    and all(map(dry_cruise_stance, (anchor, first, second)))):
+                return second
+            return None
+
+        def check_cruise_step(origin, proposal, corridor):
+            # Bound one proposed frame plus all subsequent neutral coasting,
+            # not just the frame endpoint (or the feet centre).
+            if (proposal[1] != origin[1] or self._observed_ground is not True
+                    or not self._standard_ground_motion(blocks)):
+                raise _StraightWalkUnsafe
+            bounds = []
+            for axis in (0, 2):
+                start = origin[axis]
+                end = start + (proposal[axis] - start) / (1 - _GROUND_FRICTION)
+                bounds.append(range(math.floor(min(start, end) - _PLAYER_HALF_WIDTH),
+                                    math.floor(max(start, end) + _PLAYER_HALF_WIDTH) + 1))
+            y = corridor[0][1]
+            for x in bounds[0]:
+                for z in bounds[1]:
+                    cell = (x, y, z)
+                    if cell not in corridor or not dry_cruise_stance(cell):
+                        raise _StraightWalkUnsafe
 
         def stance_failure(clear: bool | None, target: bool | None = True):
             if target is False or clear is False:
@@ -3919,6 +3968,11 @@ class Movement:
                                 return outcome(plan.status)
                             if not legacy and remaining < 0:
                                 return outcome("budget")
+                            if (rolling and self._ground_correction_tick == self._tick - 1
+                                    and self._input_position is self.position and self._teleport_pending is None
+                                    and self._observed_ground is True and horizontal_speed() < _REST_SPEED):
+                                # A fresh stationary correction supersedes the prior coast; centre the new start normally.
+                                rolling = False
                             anchor = current
                             walk_origin = (self.position if self._observed_ground is True
                                            and start_eye == self.position else None)
@@ -3938,13 +3992,21 @@ class Movement:
                             # An ascent starts from rest, including after a flat approach to the ledge.
                             use_ground_velocity |= any(cell[1] > current_y for cell in plan.nodes)
 
+                        extra = cruise_target(anchor, route)
+                        through_center = extra is not None and current == route[0] and (
+                            (x - current[0] - 0.5) * (current[0] - anchor[0])
+                            + (z - current[2] - 0.5) * (current[2] - anchor[2]) >= 0
+                        )
+                        stopped_here = reached_cell(route[0], x, z)
                         ladder_top = False
                         if len(route) > 1 and route[0] == current:
                             ladder = _ladder_descent_geometry(current, route[1])
                             if ladder is not None:
                                 lateral, forward = ladder.offsets(x, z)
                                 ladder_top = abs(lateral) <= 0.20 and forward >= 1.30
-                        if route[0][1] == current_y and (reached_cell(route[0], x, z) or ladder_top):
+                        if route[0][1] == current_y and (stopped_here or through_center or ladder_top):
+                            if stopped_here:
+                                rolling = False
                             anchor = route.popleft()
                             if not route:
                                 matches, faces = graph.check_goal(current_goal, anchor, eye=(x, y, z),
@@ -3964,6 +4026,7 @@ class Movement:
                             if graph.edge(anchor, route[0]) is not True:
                                 invalidate("edge_unavailable")
                                 continue
+                            extra = cruise_target(anchor, route)
 
                         if _is_gap_jump(anchor, route[0]):
                             transition = cross_gap
@@ -3996,7 +4059,8 @@ class Movement:
                             continue
                         if remaining <= 0:
                             return outcome("budget")
-                        cell_x, _, cell_z = route[0]
+                        aim = route[0] if extra is None else extra
+                        cell_x, _, cell_z = aim
                         if use_ground_velocity:
                             # Keep the observed ground velocity through steering and braking.
                             dx, dz = cell_x + 0.5 - x, cell_z + 0.5 - z
@@ -4005,7 +4069,15 @@ class Movement:
                             directions = self._ground_target_directions(dx, dz, yaw)
                             if directions is None:
                                 return abandon("unreachable", "edge_unavailable")
-                            await send_input(False, move_vector=directions)
+                            rolling |= extra is not None
+                            try:
+                                await send_input(
+                                    False, move_vector=directions,
+                                    validate_step=(lambda a, b: check_cruise_step(a, b, (anchor, route[0], aim)))
+                                    if rolling else None,
+                                )
+                            except _StraightWalkUnsafe:
+                                return abandon("unknown", "edge_unavailable")
                             submitted += int(max(map(abs, directions)) > 0.01)
                         else:
                             previous_yaw = self._rotation[1]
