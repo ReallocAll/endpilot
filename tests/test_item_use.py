@@ -16,6 +16,7 @@ class ItemUseTests(unittest.IsolatedAsyncioTestCase):
         self.incoming = asyncio.Queue()
         self.sent = asyncio.Queue()
         self.send_gate = None
+        self.send_error = None
         self.addAsyncCleanup(self.bot.close)
 
         async def send(batch):
@@ -24,6 +25,8 @@ class ItemUseTests(unittest.IsolatedAsyncioTestCase):
                     self.sent.put_nowait(self.bot.protocol.decode(raw).variant_transaction)
                     if self.send_gate is not None:
                         await self.send_gate.wait()
+                    if self.send_error is not None:
+                        raise self.send_error
 
         transport = SimpleNamespace(send=send, recv=self.incoming.get, close=AsyncMock())
         b = self.b
@@ -171,7 +174,7 @@ class ItemUseTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.use_item()
         self.assertIsInstance(await asyncio.wait_for(self.sent.get(), 1), b.ItemUseInventoryTransaction)
         await self.deliver(self.using(True))
-        await self.bot.release_using_item()
+        self.assertIsNone(await self.bot.release_using_item())
         release = await asyncio.wait_for(self.sent.get(), 1)
         self.assertIsInstance(release, b.ItemReleaseInventoryTransaction)
         self.assertEqual((release.action_type, release.slot, release.hand, release.item.id),
@@ -180,6 +183,198 @@ class ItemUseTests(unittest.IsolatedAsyncioTestCase):
         await self.deliver(self.using(False))
         self.assertFalse(self.bot.using_item)
         self.assertEqual(self.bot.inventory_slots[0].stack_size, 3)
+
+    async def start_consuming(self):
+        consuming = asyncio.create_task(self.bot.consume(timeout=2))
+        self.addAsyncCleanup(self.cancel_task, consuming)
+        self.assertIsInstance(await asyncio.wait_for(self.sent.get(), 1), self.b.ItemUseInventoryTransaction)
+        return consuming
+
+    async def assert_consuming(self, consuming):
+        done, _ = await asyncio.wait((consuming,), timeout=0.02)
+        self.assertNotIn(consuming, done)
+
+    async def test_observed_early_release_frees_consumption_for_reuse(self):
+        await self.sync_position()
+        consuming = await self.start_consuming()
+        await self.deliver(self.using(True))
+        self.assertIsNone(await self.bot.release_using_item())
+        release = await asyncio.wait_for(self.sent.get(), 1)
+        self.assertEqual(release.action_type, self.b.ItemReleaseInventoryTransaction.ActionType.RELEASE)
+        await self.deliver(self.using(False, player_id=34),
+                           self.b.PlayerStartItemCooldownPacket(item_category="minecraft:chorusfruit", duration_ticks=20),
+                           self.b.CompletedUsingItemPacket(item_id=430, item_use_method=1))
+        await self.assert_consuming(consuming)
+
+        await self.deliver(self.using(False))
+        with self.assertRaisesRegex(RuntimeError, "^item use was released before consumption was confirmed$"):
+            await asyncio.wait_for(consuming, 0.25)
+        self.assertEqual(self.bot.inventory_slots[0].stack_size, 3)
+
+        consuming = await self.start_consuming()
+        await self.deliver(self.using(True), self.b.CompletedUsingItemPacket(item_id=261, item_use_method=1),
+                           self.consumption_transaction(), self.using(False))
+        self.assertEqual(await consuming, ItemConsumption(0, 261, "eat", 261, 2))
+
+    async def test_completion_before_release_retains_wait_for_matching_transaction(self):
+        await self.sync_position()
+        consuming = await self.start_consuming()
+        await self.deliver(self.using(True), self.b.CompletedUsingItemPacket(item_id=261, item_use_method=1))
+        self.assertIsNone(await self.bot.release_using_item())
+        await self.deliver(self.using(False), self.consumption_transaction(off_hand=True),
+                           self.consumption_transaction(slot=1))
+        await self.assert_consuming(consuming)
+
+        await self.deliver(self.consumption_transaction())
+        self.assertEqual(await asyncio.wait_for(consuming, 0.25), ItemConsumption(0, 261, "eat", 261, 2))
+
+    async def test_release_waits_for_transport_success_when_stop_arrives_during_write(self):
+        await self.sync_position()
+        for write_succeeds in (False, True):
+            with self.subTest(write_succeeds=write_succeeds):
+                consuming = await self.start_consuming()
+                await self.deliver(self.using(True))
+                self.send_gate = asyncio.Event()
+                releasing = asyncio.create_task(self.bot.release_using_item())
+                self.addAsyncCleanup(self.cancel_task, releasing)
+                await asyncio.wait_for(self.sent.get(), 1)
+                await self.deliver(self.using(False))
+                await self.assert_consuming(consuming)
+                self.assertFalse(releasing.done())
+                if not write_succeeds:
+                    self.send_error = OSError("release write failed")
+                self.send_gate.set()
+
+                if write_succeeds:
+                    self.assertIsNone(await releasing)
+                    with self.assertRaisesRegex(RuntimeError, "item use was released"):
+                        await asyncio.wait_for(consuming, 0.25)
+                else:
+                    with self.assertRaisesRegex(OSError, "release write failed"):
+                        await releasing
+                    await self.assert_consuming(consuming)
+                    consuming.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await consuming
+                    self.send_error = None
+                self.send_gate = None
+
+    async def test_false_without_own_start_cannot_confirm_release(self):
+        await self.sync_position()
+        consuming = await self.start_consuming()
+        await self.deliver(self.using(True, player_id=34))
+        await self.bot.release_using_item()
+        await self.deliver(self.using(False))
+        await self.assert_consuming(consuming)
+
+    async def test_release_before_use_write_cannot_claim_later_stop(self):
+        await self.sync_position()
+        packets = self.bot.packets
+        send = packets.send
+        entered = asyncio.Event()
+        gate = asyncio.Event()
+
+        async def delayed_use(packet, **options):
+            if (isinstance(packet, self.b.InventoryTransactionPacket)
+                    and isinstance(packet.variant_transaction, self.b.ItemUseInventoryTransaction)):
+                entered.set()
+                await gate.wait()
+            await send(packet, **options)
+
+        with patch.object(packets, "send", delayed_use):
+            consuming = asyncio.create_task(self.bot.consume(timeout=2))
+            self.addAsyncCleanup(self.cancel_task, consuming)
+            await asyncio.wait_for(entered.wait(), 1)
+            await self.bot.release_using_item()
+            self.assertIsInstance(await asyncio.wait_for(self.sent.get(), 1), self.b.ItemReleaseInventoryTransaction)
+            gate.set()
+            self.assertIsInstance(await asyncio.wait_for(self.sent.get(), 1), self.b.ItemUseInventoryTransaction)
+            await self.deliver(self.using(True), self.using(False))
+            await self.assert_consuming(consuming)
+
+    async def test_release_delayed_at_write_cannot_follow_replaced_consumption(self):
+        await self.sync_position()
+        old = await self.start_consuming()
+        await self.deliver(self.using(True))
+        packets = self.bot.packets
+        send = packets.send
+        entered = asyncio.Event()
+        gate = asyncio.Event()
+
+        async def delayed_release(packet, **options):
+            if (isinstance(packet, self.b.InventoryTransactionPacket)
+                    and isinstance(packet.variant_transaction, self.b.ItemReleaseInventoryTransaction)):
+                entered.set()
+                await gate.wait()
+            await send(packet, **options)
+
+        with patch.object(packets, "send", delayed_release):
+            releasing = asyncio.create_task(self.bot.release_using_item())
+            self.addAsyncCleanup(self.cancel_task, releasing)
+            await asyncio.wait_for(entered.wait(), 1)
+            await self.cancel_task(old)
+            await self.deliver(self.using(False))
+            current = await self.start_consuming()
+            await self.deliver(self.using(True))
+            gate.set()
+            self.assertIsNone(await releasing)
+            self.assertTrue(self.sent.empty())
+            await self.deliver(self.b.CompletedUsingItemPacket(item_id=261, item_use_method=1),
+                               self.consumption_transaction(), self.using(False))
+            self.assertEqual(await current, ItemConsumption(0, 261, "eat", 261, 2))
+
+    async def test_unowned_release_binds_before_waiting_for_position(self):
+        await self.sync_position()
+        movement = self.bot._movement
+        sync = movement.wait_for_position_sync
+        entered = asyncio.Event()
+        gate = asyncio.Event()
+
+        async def delay_first_sync(*args, **options):
+            if not entered.is_set():
+                entered.set()
+                await gate.wait()
+            return await sync(*args, **options)
+
+        with patch.object(movement, "wait_for_position_sync", delay_first_sync):
+            releasing = asyncio.create_task(self.bot.release_using_item())
+            self.addAsyncCleanup(self.cancel_task, releasing)
+            await asyncio.wait_for(entered.wait(), 1)
+            consuming = await self.start_consuming()
+            await self.deliver(self.using(True))
+            gate.set()
+            self.assertIsNone(await releasing)
+            self.assertTrue(self.sent.empty())
+            await self.deliver(self.using(False))
+            await self.assert_consuming(consuming)
+
+    async def test_slot_change_after_release_cannot_confirm_stop(self):
+        await self.sync_position()
+        consuming = await self.start_consuming()
+        await self.deliver(self.using(True))
+        await self.bot.release_using_item()
+        await self.bot.select_hotbar(1)
+        await self.bot.select_hotbar(0)
+        await self.deliver(self.using(False))
+        await self.assert_consuming(consuming)
+        await self.deliver(self.consumption_transaction())
+        with self.assertRaisesRegex(RuntimeError, "selected slot changed"):
+            await consuming
+
+    async def test_close_interrupts_consume_while_release_is_in_flight(self):
+        await self.sync_position()
+        consuming = await self.start_consuming()
+        await self.deliver(self.using(True))
+        self.send_gate = asyncio.Event()
+        releasing = asyncio.create_task(self.bot.release_using_item())
+        self.addAsyncCleanup(self.cancel_task, releasing)
+        await asyncio.wait_for(self.sent.get(), 1)
+        await self.deliver(self.using(False))
+        await self.bot.close()
+        with self.assertRaises(ConnectionError):
+            await asyncio.wait_for(consuming, 0.25)
+        self.send_gate.set()
+        self.assertIsNone(await releasing)
 
     async def test_timeout_preserves_slot_and_allows_another_submission(self):
         await self.sync_position()
