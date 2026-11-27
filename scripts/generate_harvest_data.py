@@ -3,6 +3,7 @@
 import argparse
 from itertools import groupby, product
 import json
+from math import isfinite
 from pathlib import Path
 import re
 
@@ -179,8 +180,26 @@ def encode_rules(names, mining):
     return rules, block_ids
 
 
+def block_catalog_metadata(blocks, names, qualification):
+    hardness = {}
+    for block in blocks:
+        name, value = block["name"], block["destroy_speed"]
+        if type(value) not in (int, float) or not isfinite(value):
+            raise ValueError(f"invalid hardness for {name}: {value!r}")
+        if hardness.setdefault(name, value) != value:
+            raise ValueError(f"block catalog needs per-state hardness for {name}")
+    by_block = qualification["by_block"]
+    return {
+        "hardness_source": f"EndstoneMC/bedrock-data@{SOURCE_REVISION}:block_palette.json:destroy_speed",
+        "hardness": [hardness[name] for _, name in names],
+        # The named qualification tools were also measured in the native speed capture.
+        "tools": qualification["tools"][1:],
+        "unknown_qualification": [name for _, name in names if by_block[name][0] == "A"],
+    }
+
+
 def generate(source: Path) -> str:
-    from bedrock_mining import mining_rules
+    from bedrock_mining import build_rules, mining_observations
 
     document = load_json(source, "block_palette.json")
     if document["type"] != "hashed":
@@ -191,7 +210,9 @@ def generate(source: Path) -> str:
 
     hashes, metadata = palette_metadata(blocks, block_types)
     names = metadata["block_names"]
-    rules, block_ids = encode_rules(names, mining_rules(block_types, items, blocks))
+    qualification, speeds = mining_observations()
+    mining = build_rules(block_types, items, blocks, qualification=qualification, speeds=speeds)
+    rules, block_ids = encode_rules(names, mining)
     palette = [(network_hash, block_ids[block["name"]]) for block, network_hash in zip(blocks, hashes, strict=True)]
 
     def compact(value):
@@ -203,9 +224,11 @@ def generate(source: Path) -> str:
     terrain = compact(metadata["terrain"])
     beds = compact(metadata["bed_states"])
     lookup = compact(metadata["state_lookup"])
+    catalog = compact(block_catalog_metadata(blocks, names, qualification))
     return (
         f'{{\n  "terrain": {terrain},\n  "bed_states": {beds},\n  "rules": [\n{rule_rows}\n  ],\n'
-        f'  "block_names": [\n{name_rows}\n  ],\n  "palette": [\n{state_rows}\n  ],\n  "state_lookup": {lookup}\n}}\n'
+        f'  "block_names": [\n{name_rows}\n  ],\n  "palette": [\n{state_rows}\n  ],\n'
+        f'  "state_lookup": {lookup},\n  "block_catalog": {catalog}\n}}\n'
     )
 
 

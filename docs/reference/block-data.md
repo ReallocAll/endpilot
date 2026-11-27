@@ -1,5 +1,30 @@
 # Bedrock data tables
 
+## Look up vanilla block properties
+
+`vanilla_blocks(protocol=2225)` returns a cached read-only mapping of canonical
+block names to `VanillaBlock` records. It works before connecting to a server.
+
+```python
+from endpilot import vanilla_blocks
+
+ore = vanilla_blocks()["minecraft:iron_ore"]
+print(ore.hardness)  # 3.0
+copper = ore.tool_properties("minecraft:copper_pickaxe")
+print(copper.speed_multiplier, copper.qualifies_for_drops)  # 5.0 True
+gold = ore.tool_properties("minecraft:golden_pickaxe")
+print(gold.speed_multiplier, gold.qualifies_for_drops)  # 12.0 False
+```
+
+`hardness` is the pinned block palette's raw `destroy_speed` value.
+`tool_properties()` covers the 48 measured, unenchanted items. Measured
+tools with no speed bonus have multiplier `1.0`. A result of `None`
+means the item is outside the measured set or the block has no mining rule.
+A result with `qualifies_for_drops=None` means that the base speed is known
+and drop eligibility is unknown. Eligibility describes whether the tool
+satisfies the ordinary drop requirement. Actual drops depend on the block's
+loot table and the conditions of the break.
+
 ## Regenerate the protocol 2225 block tables
 
 EndstoneMC/bedrock-data at `r26_u6@40570f03ef64e37c71a81388b52fd55da5d73521`

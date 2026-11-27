@@ -4,6 +4,7 @@ from .anvil import AnvilPreview
 from .authentication import BedrockCredentialProvider, BedrockCredentials
 from .beds import BedObservation, PlayerRespawnPoint, SleepRejected
 from .biome_data import VanillaBiome, vanilla_biomes
+from .block_catalog import VanillaBlock, VanillaBlockToolProperties, vanilla_blocks
 from .block_raycast import BlockRaycastResult, MiningFaceResult
 from .blocks import (
     BlockChange, BlockEntityUpdate, BlockMatch, BlockObservation, BlockSearchResult, BlockStateObservation, ColumnCoverage,
@@ -194,6 +195,8 @@ __all__ = [
     "TradeManyRequest",
     "TradeManyResult",
     "VanillaBiome",
+    "VanillaBlock",
+    "VanillaBlockToolProperties",
     "VehicleLink",
     "VehicleLinkChange",
     "WaterBucketFillResult",
@@ -208,4 +211,5 @@ __all__ = [
     "transfer_item",
     "transfer_range",
     "vanilla_biomes",
+    "vanilla_blocks",
 ]

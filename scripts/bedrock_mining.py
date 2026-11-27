@@ -23,6 +23,12 @@ type MiningRule = tuple[frozenset[str] | None, dict[str, float]]
 
 def mining_rules(block_types, items, blocks) -> dict[str, MiningRule | None]:
     """Read the checked-in BDS observations beside the data generator."""
+    qualification, speeds = mining_observations()
+    return build_rules(block_types, items, blocks, qualification=qualification, speeds=speeds)
+
+
+def mining_observations() -> tuple[dict, dict]:
+    """Return the observed tool qualification and speeds by block name."""
     observations = json.loads(_OBSERVATIONS.read_text(encoding="utf-8"))
     if (
         observations["bedrock_data_revision"] != _BEDROCK_DATA_REVISION
@@ -42,7 +48,7 @@ def mining_rules(block_types, items, blocks) -> dict[str, MiningRule | None]:
         by_block[name] = row
         speeds[name] = speed_profiles[speed_id]
     qualification["by_block"] = by_block
-    return build_rules(block_types, items, blocks, qualification=qualification, speeds=speeds)
+    return qualification, speeds
 
 
 def build_rules(block_types, items, blocks, *, qualification, speeds) -> dict[str, MiningRule | None]:
