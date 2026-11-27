@@ -1186,8 +1186,13 @@ class Blocks:
                     return True
         return None if unknown else False
 
-    def _stance_clearance(self, position: tuple[int, int, int]) -> bool | None:
-        body = self._stance_air(self.observed_block(position))
+    def _stance_clearance(self, position: tuple[int, int, int], *, allow_vegetation: bool = False) -> bool | None:
+        block = self.observed_block(position)
+        if allow_vegetation and block is not None and block.is_air is False:
+            state = self._vanilla_state(block.runtime_id)
+            body = None if state is None else state.name in ("minecraft:dandelion", "minecraft:short_grass")
+        else:
+            body = self._stance_air(block)
         extra = self._stance_air(self.observed_block(position, layer=1))
         if body is False or extra is False:
             return False
@@ -1333,16 +1338,16 @@ class Blocks:
             return None
         return True
 
-    def _flat_stance(self, position: tuple[int, int, int]) -> bool | None:
-        """Classify clearance and support for standing at this block's center."""
+    def _flat_stance(self, position: tuple[int, int, int], *, allow_vegetation: bool = False) -> bool | None:
+        """Classify a standing column, with optional vegetation in the primary feet layer."""
         x, y, z = position
         support = self._stance_support((x, y - 1, z))
         if support is False:
             return False
 
         known = support is True
-        for cell in (position, (x, y + 1, z)):
-            clear = self._stance_clearance(cell)
+        for cell, vegetation in ((position, allow_vegetation), ((x, y + 1, z), False)):
+            clear = self._stance_clearance(cell, allow_vegetation=vegetation)
             if clear is False:
                 return False
             known = known and clear is True

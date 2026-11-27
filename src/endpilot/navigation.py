@@ -586,7 +586,7 @@ class _StandingGraph:
                 and abs(cell[1] - self.origin[1]) <= self.rules.vertical_radius
                 and abs(cell[2] - self.origin[2]) <= self.rules.search_radius)
 
-    def edge(self, source: Cell, destination: Cell) -> bool | None:
+    def edge(self, source: Cell, destination: Cell, *, check_descent_source: bool = True) -> bool | None:
         if not self.in_bounds(destination):
             return False
         if _is_water_crossing(source, destination):
@@ -600,7 +600,7 @@ class _StandingGraph:
         if _is_gap_jump(source, destination):
             return self.blocks._gap_jump(source, destination) if self.allow_gap else False
         if source[1] == destination[1]:
-            return self.blocks._flat_stance(destination)
+            return self.blocks._flat_stance(destination, allow_vegetation=True)
         if not self.allow_vertical:
             return False
         if destination[1] > source[1]:
@@ -619,11 +619,14 @@ class _StandingGraph:
             ) else False
         if source[1] - destination[1] != 1:
             return False
-        landing = self.blocks._descent_landing(destination)
-        runoff = self.blocks._descent_landing(buffer)
-        if landing is False or runoff is False:
+        required = (
+            self.blocks._flat_stance(source) if check_descent_source else True,
+            self.blocks._descent_landing(destination),
+            self.blocks._descent_landing(buffer),
+        )
+        if False in required:
             return False
-        return True if landing is True and runoff is True else None
+        return True if all(required) else None
 
     def _ladder_column(self, rung: Cell, dx: int, dz: int, top: int) -> bool | None:
         x, bottom, z = rung
@@ -695,7 +698,7 @@ class _StandingGraph:
         args = goal.goal, self.rules, self.blocks.dimension_id, start
         if not self.in_bounds(start):
             return NavigationPlan(*args, "unreachable")
-        stance = self.blocks._flat_stance(start)
+        stance = self.blocks._flat_stance(start, allow_vegetation=True)
         if stance is False:
             return NavigationPlan(*args, "unreachable")
 

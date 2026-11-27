@@ -297,6 +297,7 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
 class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
     AIR = 0xDBF44120
     STONE = 0x80310E21
+    DANDELION = 0x8E0BE318
     TARGET = (4, 100, 0)
     LADDER_DESCENT_FIXTURES = {
         2: ((0, 0), 0, 1, 0, 0x547A1F1A),
@@ -360,6 +361,126 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                     if pos not in unknown:
                         solid = y == 99 or pos == self.TARGET or pos in blocked
                         self.set_block(pos, self.STONE if solid else self.AIR)
+
+    def prepare_vegetation_corridor(self, *, hashed):
+        self.blocks.hashed_runtime_ids = hashed
+        palette = {
+            "air": (self.AIR, 18894),
+            "stone": (self.STONE, 3317),
+            "dandelion": (self.DANDELION, 23959),
+            "short_grass": (0xA88E6325, 18720),
+            "water": (0x483B8B2A, 14122),
+            "unknown": (0xFFFFFFFE, 11244),
+        }
+        ids = {name: pair[0 if hashed else 1] for name, pair in palette.items()}
+        for x in range(-1, 4):
+            for z in range(-1, 2):
+                for y in (99, 100, 101):
+                    pos = (x, y, z)
+                    solid = y == 99 or z != 0 or x in (-1, 3)
+                    self.set_block(pos, ids["stone" if solid else "air"])
+                    self.set_block(pos, ids["air"], layer=1)
+        return ids
+
+    async def test_flat_navigation_plans_and_walks_through_passable_vegetation(self):
+        path = ((0, 100, 0), (1, 100, 0), (2, 100, 0))
+        goal = FootGoal(path[-1])
+        rules = NavigationRules(search_radius=2, vertical_radius=0)
+        for hashed in (True, False):
+            ids = self.prepare_vegetation_corridor(hashed=hashed)
+            for block in ("air", "dandelion", "short_grass"):
+                with self.subTest(hashed=hashed, block=block):
+                    self.set_position(0.5, 0.5, on_ground=True)
+                    self.stream.sent.clear()
+                    self.set_block(path[1], ids[block])
+                    self.assertEqual(self.bot.observed_block_state(path[1]).name, f"minecraft:{block}")
+
+                    plan = self.bot.plan_navigation(goal, rules=rules)
+                    self.assertEqual((plan.status, plan.nodes, plan.cost), ("found", path, Fraction(2)))
+                    self.assertEqual(self.stream.sent, [])
+
+                    result = await self.bot.navigate(goal, rules=rules)
+                    self.assertEqual((result.status, result.stand_position), ("reached", goal.position))
+                    self.assertGreater(result.frames, 0)
+                    self.assertTrue(any(1.0 <= frame.pos.x < 2.0 for frame in self.moving_input()))
+                    for frame in self.stream.sent:
+                        self.assertAlmostEqual(frame.pos.y, 101.62, places=4)
+                        self.assertAlmostEqual(frame.pos.z, 0.5, places=4)
+                    self.assert_released()
+
+    async def test_flat_navigation_can_start_in_passable_vegetation(self):
+        start, destination = (1, 100, 0), (2, 100, 0)
+        goal = FootGoal(destination)
+        rules = NavigationRules(search_radius=1, vertical_radius=0)
+        for hashed in (True, False):
+            ids = self.prepare_vegetation_corridor(hashed=hashed)
+            for block in ("dandelion", "short_grass"):
+                with self.subTest(hashed=hashed, block=block):
+                    self.set_block(start, ids[block])
+                    self.set_position(1.5, 0.5, on_ground=True)
+                    self.stream.sent.clear()
+                    plan = self.bot.plan_navigation(goal, rules=rules)
+                    self.assertEqual((plan.status, plan.nodes), ("found", (start, destination)))
+                    self.assertEqual(self.stream.sent, [])
+
+                    result = await self.bot.navigate(goal, rules=rules)
+                    self.assertEqual((result.status, result.stand_position), ("reached", destination))
+                    self.assertGreater(result.frames, 0)
+                    self.assert_released()
+
+                    self.set_position(1.5, 0.5, on_ground=True)
+                    self.stream.sent.clear()
+                    self.assertGreater(await self.bot.navigate_to(destination, search_radius=1), 0)
+                    self.assertGreater(self.moving_input()[-1].pos.x, 2.0)
+                    self.assert_released()
+
+    async def test_flat_navigation_requires_clear_layers_and_support_around_vegetation(self):
+        plant, head, support = (1, 100, 0), (1, 101, 0), (1, 99, 0)
+        goal = FootGoal((2, 100, 0))
+        rules = NavigationRules(search_radius=2, vertical_radius=0)
+        for hashed in (True, False):
+            ids = self.prepare_vegetation_corridor(hashed=hashed)
+            self.set_block(plant, ids["dandelion"])
+            for cell, layer, replacement, restore, status in (
+                (plant, 0, "stone", "dandelion", "unreachable"),
+                (plant, 1, "water", "air", "unreachable"),
+                (plant, 1, "dandelion", "air", "unreachable"),
+                (plant, 1, "unknown", "air", "unknown"),
+                (head, 0, "short_grass", "air", "unreachable"),
+                (head, 1, "short_grass", "air", "unreachable"),
+                (support, 0, "air", "stone", "unreachable"),
+            ):
+                with self.subTest(hashed=hashed, cell=cell, layer=layer, block=replacement):
+                    self.set_block(cell, ids[replacement], layer=layer)
+                    plan = self.bot.plan_navigation(goal, rules=rules)
+                    self.assertEqual((plan.status, plan.nodes), (status, ()))
+                    result = await self.bot.navigate(goal, rules=rules)
+                    self.assertEqual((result.status, result.frames), (status, 0))
+                    self.assertEqual(self.stream.sent, [])
+                    self.set_block(cell, ids[restore], layer=layer)
+
+    async def test_flat_navigation_rechecks_vegetation_before_entry(self):
+        ids = self.prepare_vegetation_corridor(hashed=True)
+        plant = (1, 100, 0)
+        self.set_block(plant, ids["dandelion"])
+        goal = FootGoal((2, 100, 0))
+        rules = NavigationRules(search_radius=2, vertical_radius=0)
+        plans = []
+
+        def flood_after_first_step():
+            if self.up in self.stream.sent[-1].input_data:
+                self.set_block(plant, ids["water"], layer=1)
+                self.stream.on_send = None
+
+        self.stream.on_send = flood_after_first_step
+        result = await self.bot.navigate(goal, rules=rules, on_plan=plans.append)
+
+        plan, = plans
+        self.assertEqual((plan.status, plan.nodes), ("found", ((0, 100, 0), plant, goal.position)))
+        self.assertEqual((result.status, result.frames, result.stand_position), ("unreachable", 1, None))
+        self.assertEqual(len(self.moving_input()), 1)
+        self.assertTrue(all(frame.pos.x < 1.0 for frame in self.stream.sent))
+        self.assert_released()
 
     async def test_flat_navigation_can_leave_but_not_enter_magma(self):
         self.prepare_terrain()
@@ -2300,6 +2421,27 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await self.bot.approach_block(target, search_radius=search_radius),
                                  BlockApproach("unreachable", 0))
                 self.assertEqual(self.stream.sent, [])
+
+    async def test_one_block_descent_requires_air_at_the_source_landing_and_runout(self):
+        self.prepare_descent()
+        source, landing, runoff = (0, 100, 0), (1, 99, 0), (2, 99, 0)
+        goal = FootGoal(landing)
+        rules = NavigationRules(search_radius=2, vertical_radius=1)
+        plan = self.bot.plan_navigation(goal, rules=rules)
+        self.assertEqual((plan.status, plan.nodes), ("found", (source, landing)))
+        self.assertEqual(self.stream.sent, [])
+
+        for cell in (source, landing, runoff):
+            with self.subTest(cell=cell):
+                self.set_block(cell, self.DANDELION)
+                plan = self.bot.plan_navigation(goal, rules=rules)
+                self.assertEqual((plan.status, plan.nodes), ("unreachable", ()))
+                self.assertEqual(self.stream.sent, [])
+                plans = []
+                result = await self.bot.navigate(goal, rules=rules, on_plan=plans.append)
+                self.assertEqual((result.status, result.frames), ("unreachable", 0))
+                self.assertEqual((plans, self.stream.sent), ([], []))
+                self.set_block(cell, self.AIR)
 
     async def test_neutral_descent_frames_share_the_budget_and_stale_ground_is_ignored(self):
         target = self.prepare_descent()

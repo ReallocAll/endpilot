@@ -248,6 +248,10 @@ The standing route uses observed support and clearance. It supports ordinary
 walking, one-block height changes, and specific observed layouts for
 one-block gaps, two-block drops, and ladders. Still-water crossings are limited
 to supported pool layouts and require `NavigationRules(allow_swimming=True)`.
+On protocol 2225, ordinary same-level walking can pass through observed vanilla
+`minecraft:dandelion` and `minecraft:short_grass` in the primary feet layer.
+The extra feet layer and both head layers must contain observed air, and the
+floor must provide safe support.
 Elevation changes require server landing evidence before continuing. Use
 `reached` and the final match to choose a click, then observe the server
 effect separately.

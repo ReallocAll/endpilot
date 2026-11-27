@@ -1987,9 +1987,11 @@ class Movement:
 
             def clear(cell):
                 x, z = cell
-                # The occupied start is not a destination: allow walking off a hazard.
-                if cell != start and self.packets.protocol.number == 2225:
-                    return blocks._flat_stance((x, feet_y, z)) is True
+                if self.packets.protocol.number == 2225:
+                    standing = blocks._flat_stance((x, feet_y, z), allow_vegetation=True)
+                    if cell != start or standing is True:
+                        return standing is True
+                # Keep the original air check at the start so the bot can leave a hazard.
                 body = blocks.observed_block((x, feet_y, z))
                 head = blocks.observed_block((x, feet_y + 1, z))
                 floor = blocks.observed_block((x, feet_y - 1, z))
@@ -2051,7 +2053,8 @@ class Movement:
             return True
         ground_tick = self._ground_correction_tick
         return (ground_tick is not None and ground_tick >= self._pending_landing[0]
-                and self._input_position == self.position and blocks._flat_stance(cell) is True)
+                and self._input_position == self.position
+                and blocks._flat_stance(cell, allow_vegetation=True) is True)
 
     def _navigation_visibility_standing(self) -> bool:
         flags = self.packets.protocol.binding.ActorFlags
@@ -2332,7 +2335,8 @@ class Movement:
                     if not crossed and off_axis > 0.12:
                         return None
 
-                clear = graph.edge(source, landing)
+                # The launch stance was checked while the player was in the upper column.
+                clear = graph.edge(source, landing, check_descent_source=False)
                 if clear is not True:
                     return outcome("unknown" if clear is None else "unreachable")
                 if on_lower:
@@ -3230,7 +3234,7 @@ class Movement:
                         current_goal = self._navigation_goal(blocks, requested_goal, instances,
                                                              visibility_budget=visibility_budget)
                         target = current_goal.block_exists if legacy else True
-                        status = stance_failure(blocks._flat_stance(current), target)
+                        status = stance_failure(blocks._flat_stance(current, allow_vegetation=True), target)
                         if status is not None:
                             if legacy or status == "unreachable":
                                 return outcome(status)

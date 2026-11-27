@@ -1131,7 +1131,7 @@ class Bot:
 
         The search stays within search_radius blocks along each horizontal axis
         and within vertical_radius levels vertically from the start. Each edge
-        changes height by at most one block and needs observed air and full-block support.
+        changes height by at most one block and needs observed clearance and suitable support.
         A descent needs two clear, supported lower columns. Each ascent can
         submit one ordinary jump and needs overhead clearance in both columns.
         Movement and each server landing confirmation share the frame budget.
