@@ -2405,6 +2405,7 @@ class Movement:
         graph = _StandingGraph(blocks, start, rules, allow_vertical=not (self._sprint_key or self._sneaking),
                                allow_gap=calibrated, allow_stone_ledge_drop=calibrated, allow_ladder=calibrated,
                                allow_lower_slab_lane=calibrated,
+                               allow_short_descent=calibrated and isinstance(goal, FootGoal),
                                allow_water=calibrated and rules.allow_swimming and self._water_ready(),
                                grass_path_walking=grass_path_walking)
         current_goal = self._navigation_goal(blocks, goal, visibility_budget=_VisibilityScanBudget(rules.max_expansions))
@@ -2566,6 +2567,7 @@ class Movement:
         graph = _StandingGraph(blocks, start, rules, allow_vertical=not (self._sprint_key or self._sneaking),
                                allow_gap=calibrated, allow_stone_ledge_drop=calibrated, allow_ladder=calibrated,
                                allow_lower_slab_lane=calibrated,
+                               allow_short_descent=calibrated and isinstance(goal, FootGoal),
                                allow_water=calibrated and rules.allow_swimming and self._water_ready(),
                                grass_path_walking=grass_path_walking)
         if legacy and not any(map(graph.in_bounds, _block_face_cells(goal.position))):
@@ -2777,14 +2779,49 @@ class Movement:
                             raise
 
         async def descend(source, landing):
-            nonlocal remaining, submitted, release_input, accepted_level
+            nonlocal remaining, submitted, release_input, accepted_level, use_ground_velocity
             buffer = _runout(source, landing)
+            short = blocks._descent_landing(buffer) is not True
+            dx, dz = landing[0] - source[0], landing[2] - source[2]
+            yaw = math.atan2(-dx, dz)
+            lip = 0.5 + _PLAYER_HALF_WIDTH
+            clearance = 0.5 - _PLAYER_HALF_WIDTH
+            strength = 0.12
+            # Reserve space for a complete neutral coast at air drag, even
+            # though the first neutral frame normally still has ground drag.
+            max_step = 0.1 * _GROUND_ACCELERATION * strength / (1 - _GROUND_FRICTION)
+            # Continue just beyond whole-body lip clearance before neutral.
+            stop_at = lip + 0.035
+            margin = 0.005
+            side_safe = clearance - margin
+            last_safe = 1 + side_safe
+
+            def offsets(pos):
+                x, _, z = pos
+                x, z = x - source[0] - 0.5, z - source[2] - 0.5
+                return x * dx + z * dz, z * dx - x * dz
+
+            def check_short_step(origin, proposal):
+                along, across = offsets(origin)
+                end, side = offsets(proposal)
+                coast = 0.91 / (1 - 0.91)
+                delta = end - along
+                min_progress = lip + margin if crossed else -side_safe
+                if (abs(side) + abs(side - across) * coast >= side_safe
+                        or end + max(0, delta) * coast >= last_safe
+                        or end + min(0, delta) * coast <= min_progress
+                        or delta > max_step + 0.00001):
+                    raise _StraightWalkUnsafe
+
             approach_column = (source[0], source[2])
-            lower_columns = frozenset({(landing[0], landing[2]), (buffer[0], buffer[2])})
+            columns = {(landing[0], landing[2])}
+            if not short:
+                columns.add((buffer[0], buffer[2]))
+            lower_columns = frozenset(columns)
             lower_y = landing[1] + 1.62
             upper_y = source[1] + 1.62
             entry_tick = self._tick
-            step_tick = None
+            step_tick = settle_tick = None
             # Stock BDS can report grounded more than two seconds into this edge.
             deadline = asyncio.get_running_loop().time() + 3.0
             brake = 2 if release_input else 0
@@ -2815,21 +2852,47 @@ class Movement:
                         return "position_changed"
 
                 # The launch stance was checked while the player was in the upper column.
-                clear = graph.edge(source, landing, check_descent_source=False)
+                # Do not switch to the low-speed envelope mid-edge if a
+                # previously open runout is obstructed during normal descent.
+                if short:
+                    clear = blocks._short_descent(source, landing, buffer)
+                else:
+                    clear = blocks._descent_landing(buffer)
+                    if clear is True:
+                        clear = graph.edge(source, landing, check_descent_source=False)
                 if clear is not True:
                     return abandon("unknown" if clear is None else "unreachable", "edge_unavailable")
-                if on_lower:
-                    progress = ((x - source[0] - 0.5) * (landing[0] - source[0])
-                                + (z - source[2] - 0.5) * (landing[2] - source[2]))
+                if short:
+                    if not self._standard_ground_motion(blocks):
+                        return abandon("unknown", "edge_unavailable")
+                    progress, lateral = offsets(self._input_position)
+                    if abs(lateral) >= side_safe or progress >= last_safe:
+                        return abandon("unreachable", "position_changed")
+                    if step_tick is None:
+                        if not at_center(source, x, z) or self._observed_ground is False:
+                            return abandon("unknown", "position_changed")
+                        use_ground_velocity = True
+                    crossed |= progress >= stop_at or y < upper_y - 0.05
+                elif on_lower:
+                    progress = ((x - source[0] - 0.5) * dx + (z - source[2] - 0.5) * dz)
                     # From a still upper stance, clear the ledge with the whole foot.
-                    crossed = (crossed or not use_ground_velocity or y < upper_y - 0.05
-                               or progress >= 0.5 + _PLAYER_HALF_WIDTH)
+                    crossed = (crossed or not use_ground_velocity or y < upper_y - 0.05 or progress >= lip)
                 ground_tick = self._ground_correction_tick
                 grounded = (ground_tick is not None and step_tick is not None
                             and step_tick <= ground_tick < self._tick
                             and self._input_position == self.position)
+                if short:
+                    witness = self._server_grounding
+                    grounded = False
+                    if settle_tick is not None and witness is not None:
+                        tick, on_ground, received, _ = witness
+                        along, across = offsets(received)
+                        grounded = (settle_tick <= tick < self._tick and on_ground
+                                    and abs(received[1] - lower_y) <= 0.05
+                                    and lip + margin < along < last_safe and abs(across) < side_safe)
                 if grounded and crossed and resting_frames >= 2:
-                    if on_lower and abs(y - lower_y) <= 0.05:
+                    if on_lower and abs(y - lower_y) <= 0.05 and (
+                            not short or horizontal_speed() < _REST_SPEED):
                         accepted_level = landing[1]
                         return None
                     if not on_lower:
@@ -2838,13 +2901,23 @@ class Movement:
                 if remaining <= 0 or asyncio.get_running_loop().time() >= deadline:
                     return outcome("budget")
 
+                if short and step_tick is None and horizontal_speed() >= _REST_SPEED:
+                    brake = max(brake, 1)
                 forward = not crossed and brake == 0
                 if forward:
-                    await self.look_at((landing[0] + 0.5, y, landing[2] + 0.5))
+                    if short:
+                        self._rotation = (self._rotation[0], math.degrees(yaw))
+                    else:
+                        await self.look_at((landing[0] + 0.5, y, landing[2] + 0.5))
                 first_step = forward and step_tick is None
-                tick = await send_input(
-                    forward, landing_target=(landing[1], lower_columns) if first_step else None,
-                )
+                try:
+                    tick = await send_input(
+                        forward, landing_target=(landing[1], lower_columns) if first_step else None,
+                        move_vector=(0., strength if forward else 0.) if short else None,
+                        validate_step=check_short_step if short else None,
+                    )
+                except _StraightWalkUnsafe:
+                    return abandon("unreachable", "position_changed")
                 remaining -= 1
                 if forward:
                     if first_step:
@@ -2853,6 +2926,8 @@ class Movement:
                     submitted += 1
                 else:
                     brake = max(0, brake - 1)
+                    if crossed and settle_tick is None:
+                        settle_tick = tick
                     resting_frames += int(crossed)
                     if (crossed and resting_frames >= 2) or (not crossed and brake == 0):
                         release_input = False

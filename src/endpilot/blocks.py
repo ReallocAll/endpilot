@@ -1414,6 +1414,37 @@ class Blocks:
             return False
         return True if standing is True and overhead is True else None
 
+    def _short_descent(self, source, landing, buffer) -> bool | None:
+        # Limit the low-speed approach to the ordinary dry grass surface on
+        # which its acceleration and braking have been measured.
+        required = [self._descent_landing(landing), self._flat_stance(source)]
+        for x, y, z in (source, landing, buffer):
+            floor = (x, y - 1, z)
+            block = self.observed_block(floor)
+            state = None if block is None else self._vanilla_state(block.runtime_id)
+            grass = (False if block is not None and block.is_air is True else
+                     None if state is None else state.name == "minecraft:grass_block" and state.unit_cube
+                     and state.outline == _UNIT_BOX and not state.unsafe_support)
+            required.extend((grass, self._stance_air(self.observed_block(floor, layer=1))))
+        # The third column is never a landing target. The only obstructions
+        # admitted there have the measured, entirely in-cell geometry.
+        x, y, z = buffer
+        for height in range(y, y + 3):
+            cell = (x, height, z)
+            block = self.observed_block(cell)
+            primary = self._stance_air(block)
+            if primary is False:
+                state = self._vanilla_state(block.runtime_id)
+                primary = not state.unsafe_support and not state.unresolved_overhang and (
+                    (height == y and state.name == "minecraft:leaf_litter")
+                    or (height == y + 2 and state.name == "minecraft:birch_leaves"
+                        and state.unit_cube and state.outline == _UNIT_BOX)
+                )
+            required.extend((primary, self._stance_air(self.observed_block(cell, layer=1))))
+        if False in required:
+            return False
+        return True if all(required) else None
+
     def _dry_grass_path_stance(self, position: tuple[int, int, int]) -> bool | None:
         x, y, z = position
         floor = (x, y - 1, z)

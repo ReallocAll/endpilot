@@ -594,6 +594,7 @@ class _StandingGraph:
     def __init__(self, blocks, start: Cell, rules: NavigationRules, *, allow_vertical: bool,
                  allow_gap: bool = False, allow_stone_ledge_drop: bool = False, allow_ladder: bool = False,
                  allow_water: bool = False, allow_lower_slab_lane: bool = False,
+                 allow_short_descent: bool = False,
                  grass_path_walking: Callable[[], bool] | None = None):
         self.blocks = blocks
         self.origin = start
@@ -602,6 +603,7 @@ class _StandingGraph:
         self.allow_gap = allow_gap
         self.allow_stone_ledge_drop = allow_stone_ledge_drop
         self.allow_ladder = allow_ladder
+        self.allow_short_descent = allow_short_descent
         self.allow_water = allow_water
         self.allow_lower_slab_lane = allow_lower_slab_lane
         self.grass_path_walking = grass_path_walking
@@ -672,11 +674,17 @@ class _StandingGraph:
         required = (
             self.blocks._flat_stance(source, allow_vegetation=True) if check_descent_source else True,
             self.blocks._descent_landing(destination),
-            self.blocks._descent_landing(buffer),
         )
         if False in required:
             return False
-        return True if all(required) else None
+        clearance = self.blocks._descent_landing(buffer)
+        if clearance is not True and self.allow_short_descent:
+            short = self.blocks._short_descent(source, destination, buffer)
+            if short is not False:
+                clearance = short
+        if clearance is False:
+            return False
+        return True if clearance is True and all(required) else None
 
     def _ladder_column(self, rung: Cell, dx: int, dz: int, top: int) -> bool | None:
         x, bottom, z = rung

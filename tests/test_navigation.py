@@ -3003,6 +3003,27 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((plans, self.stream.sent), ([], []))
                 self.set_block(cell, self.AIR)
 
+    async def test_descent_does_not_switch_to_short_runout_after_launch(self):
+        self.prepare_descent()
+        self.blocks._player_game_type = "SURVIVAL"
+        self.movement._gap_jump_allowed = lambda: True
+        for cell in ((0, 99, 0), (1, 98, 0), (2, 98, 0)):
+            self.set_block(cell, 3727763636)  # grass block
+        self.correct_position(0.5, 101.62, 0.5, on_ground=True, tick=0)
+        source, landing, runout = (0, 100, 0), (1, 99, 0), (2, 99, 0)
+
+        def obstruct_runout():
+            if self.up in self.stream.sent[-1].input_data:
+                self.set_block((2, 101, 0), 1740500456)  # birch leaves
+                self.stream.on_send = None
+
+        self.stream.on_send = obstruct_runout
+        result = await self.bot.navigate(FootGoal(landing), rules=NavigationRules(2, 1))
+        self.assertEqual((result.status, result.frames), ("unreachable", 1))
+        self.assertIs(self.blocks._short_descent(source, landing, runout), True)
+        self.assertEqual(len(self.moving_input()), 1)
+        self.assert_released()
+
     async def test_neutral_descent_frames_share_the_budget_and_stale_ground_is_ignored(self):
         target = self.prepare_descent()
         corrected = False
