@@ -11,7 +11,7 @@ from bedrock_protocol import nbt
 from .anvil import AnvilPreview, _estimate_anvil
 from .block_data import _catalog
 from .blocks import (
-    FACE_OFFSETS, HASHED_UNKNOWN_RUNTIME_ID, Blocks, BlockStateObservation, ColumnCoverageInvalidated,
+    FACE_OFFSETS, HASHED_UNKNOWN_RUNTIME_ID, BlockObservation, Blocks, BlockStateObservation, ColumnCoverageInvalidated,
 )
 from .compression import PacketConnection
 from .entities import Entities, EntityState
@@ -129,6 +129,7 @@ _ANVIL_SLOTS = {1: "ANVIL_INPUT_CONTAINER", 2: "ANVIL_MATERIAL_CONTAINER"}
 _ANVIL_WINDOW_SLOTS = {0: 1, 1: 2}
 _ANVIL_UI_SLOTS = {1: 1, 2: 2}
 _CHEST_FACINGS = {3162850062: "north", 741882976: "south", 1429214429: "west", 2001328343: "east"}
+_UNDYED_SHULKER_BOX = "minecraft:undyed_shulker_box"
 
 
 def _same_stack(before, current):
@@ -165,6 +166,7 @@ class Containers:
         self._layout_token = object()
         self._window_block_name: str | None = None
         self._window_slot_count: int | None = None
+        self._transfer_block_watches: set[Callable[[], None]] = set()
         self._slots: dict[int, object] | None = None
         self._slot_observers: list[_ContainerSlotObserver] = []
         self._unconfirmed_transfer_slots: set[int] = set()
@@ -195,6 +197,8 @@ class Containers:
         )
 
     def _set_window(self, window: ContainerWindow | None) -> None:
+        for stop in tuple(self._transfer_block_watches):
+            stop()
         self.window = window
         self._slot_observers.clear()
         self._furnace_progress_observers.clear()
@@ -220,11 +224,49 @@ class Containers:
             return None
         if self._window_block_name is None:
             # The first known primary layer describes this server-opened window.
-            block = self._blocks.observed_block(window.position)
-            state = None if block is None else self._blocks._vanilla_state(block.runtime_id)
-            if state is not None:
-                self._window_block_name = state.name
+            self._window_block_name = self._current_window_block_name(window)
         return self._window_block_name
+
+    def _current_window_block_name(self, window: ContainerWindow) -> str | None:
+        if self._blocks is None or window.position is None:
+            return None
+        return self._block_name(self._blocks.observed_block(window.position))
+
+    def _block_name(self, block: BlockObservation | None) -> str | None:
+        state = None if block is None else self._blocks._vanilla_state(block.runtime_id)
+        return None if state is None else state.name
+
+    def _watch_transfer_block(
+        self, position: tuple[int, int, int], observe: Callable[[str | None], None],
+    ) -> Callable[[], None]:
+        blocks = self._blocks
+        b = self.packets.protocol.binding
+        snapshots = (b.SubChunkPacket.ID, b.LevelChunkPacket.ID)
+
+        def observe_block(block):
+            observe("minecraft:air" if block is not None and block.is_air is True else self._block_name(block))
+
+        stop_updates = blocks.subscribe_block_changes(
+            lambda change: observe_block(change.after),
+            position=position, layer=0, dimension_id=blocks.dimension_id,
+        )
+
+        def observe_snapshot(raw):
+            if raw.packet_id in snapshots:
+                # The terrain reader applies full sections before this observer.
+                observe_block(blocks.observed_block(position))
+
+        stop_snapshots = self.packets.subscribe_raw(observe_snapshot)
+
+        def stop():
+            if stop not in self._transfer_block_watches:
+                return
+            self._transfer_block_watches.remove(stop)
+            stop_updates()
+            stop_snapshots()
+
+        self._transfer_block_watches.add(stop)
+        return stop
 
     def _observed_window_block_state(self, window: ContainerWindow) -> BlockStateObservation | None:
         """Read the current primary block state for this active window."""
@@ -1264,7 +1306,47 @@ class Containers:
         b = self.packets.protocol.binding
         cereal = b.ItemStackRequestCereal
         player_name = _PLAYER_CONTAINERS[0]
-        container_name = block_container or self._container_slot_name(window, chest_slot)
+        exact_block = (block_container is None and _expected_slots is None and self._blocks is not None
+                       and window.container_type == "CONTAINER" and window.entity_unique_id == -1
+                       and window.position is not None and self.packets.protocol.number == 2225)
+        target_name = None
+        shulker = False
+        if exact_block:
+            # The open packet uses the same type as an ordinary chest. Bound
+            # the distinct item-stack address to the observed block and its window layout.
+            name = self._observed_window_block_name(window)
+            target_name = self._current_window_block_name(window)
+            current_shulker = target_name == _UNDYED_SHULKER_BOX
+            shulker = name == _UNDYED_SHULKER_BOX or current_shulker
+            if shulker:
+                if name != _UNDYED_SHULKER_BOX or not current_shulker:
+                    raise RuntimeError("the shulker box no longer matches the active window")
+                if not 0 <= chest_slot < 27:
+                    raise ValueError("the shulker box slot must be in range(27)")
+                if observed_slot_count != 27:
+                    raise RuntimeError("the active shulker box has an unsupported slot count")
+
+        if shulker:
+            container_name = "SHULKER_BOX_CONTAINER"
+            strict_slot_count = 27
+        else:
+            container_name = block_container or self._container_slot_name(window, chest_slot)
+        target_replaced = False
+        stop_watching = None
+
+        def observe_target(name: str | None):
+            nonlocal target_name, target_replaced
+            if name is None:
+                return
+            if target_name is None:
+                # A first observation can establish a legacy window's target.
+                # A different address or air invalidates the prepared request.
+                target_name = name
+                target_replaced = (name in ("minecraft:air", _UNDYED_SHULKER_BOX)
+                                   or (name == "minecraft:barrel" and container_name != "BARREL_CONTAINER"))
+            elif name != target_name:
+                target_replaced = True
+
         slot_names = _WINDOW_SLOT_NAMES.get(window.container_type)
         brewing = window.container_type == "BREWING_STAND"
         player_endpoint = (None, player_slot)
@@ -1521,9 +1603,19 @@ class Containers:
         def before_write():
             nonlocal original_chest, original_player
             if _range_window_current is None:
-                entity_container.require_visible()
-                if not window_is_current():
-                    raise RuntimeError("container transfer endpoint changed before submission")
+                try:
+                    if entity_container is not None:
+                        entity_container.require_visible()
+                    if not window_is_current():
+                        raise RuntimeError("container transfer endpoint changed before submission")
+                    if exact_block:
+                        name = self._current_window_block_name(window)
+                        observe_target(name)
+                        if target_replaced or (shulker and name != _UNDYED_SHULKER_BOX):
+                            raise RuntimeError("the target block no longer matches the active window")
+                finally:
+                    if stop_watching is not None:
+                        stop_watching()
                 return
             check_range_window()
             if _before_range_write is not None:
@@ -1553,13 +1645,20 @@ class Containers:
             if _expected_slots is not None and _range_window_current is None:
                 original_chest, original_player = expected_endpoints()
 
-        return await self.inventory._request_item_stack(
-            request, apply, timeout=timeout, queued=_queued, before_send=before_send,
-            _endpoints=endpoints, _range_step=_expected_slots is not None,
-            _wait_for=blockers, _on_unconfirmed=_on_unconfirmed,
-            _on_slot_observed=observe_pending_slot if brewing or _on_unconfirmed is not None else None,
-            _at_write=before_write if _range_window_current is not None or strict_slot_count is not None else None,
-        )
+        if exact_block and not _queued:
+            stop_watching = self._watch_transfer_block(window.position, observe_target)
+        check_at_write = stop_watching is not None or _range_window_current is not None or strict_slot_count is not None
+        try:
+            return await self.inventory._request_item_stack(
+                request, apply, timeout=timeout, queued=_queued, before_send=before_send,
+                _endpoints=endpoints, _range_step=_expected_slots is not None,
+                _wait_for=blockers, _on_unconfirmed=_on_unconfirmed,
+                _on_slot_observed=observe_pending_slot if brewing or _on_unconfirmed is not None else None,
+                _at_write=before_write if check_at_write else None,
+            )
+        finally:
+            if stop_watching is not None:
+                stop_watching()
 
     def close(self) -> None:
         if self._unsubscribe is None:

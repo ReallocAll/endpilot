@@ -151,8 +151,8 @@ class RangeTransferTests(unittest.IsolatedAsyncioTestCase):
         pending = asyncio.Queue()
         original = self.stream.send
 
-        async def send(packet):
-            await original(packet)
+        async def send(packet, **kwargs):
+            await original(packet, **kwargs)
             if isinstance(packet, self.b.ItemStackRequestPacket):
                 request, = packet.requests
                 pending.put_nowait(request)
