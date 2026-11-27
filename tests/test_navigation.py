@@ -1881,6 +1881,28 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(any(self.up in frame.input_data for frame in after[6:]))
                 self.assertEqual(self.jump_input(), [])
 
+    async def test_drop_three_after_flat_walk_needs_no_upper_echo_but_still_needs_a_landing(self):
+        self.prepare_stone_drop(height=3)
+        self.set_block((-1, 99, 0), self.STONE)
+        self.set_position(-0.5, 0.5, teleport=True, on_ground=True)
+        rules = NavigationRules(search_radius=4, vertical_radius=3)
+        goal = FootGoal((2, 97, 0))
+        result = await self.bot.navigate(goal, rules=rules, ticks=40)
+        self.assertEqual((result.status, result.stand_position), ("budget", None))
+        self.assertTrue(any(frame.pos.x > 1.0 for frame in self.moving_input()))
+
+    async def test_drop_three_does_not_inherit_a_previous_actions_predicted_approach(self):
+        self.prepare_stone_drop(height=3)
+        self.set_block((-1, 99, 0), self.STONE)
+        self.set_position(-0.5, 0.5, teleport=True, on_ground=True)
+        rules = NavigationRules(search_radius=4, vertical_radius=3)
+        approach = await self.bot.navigate(FootGoal((0, 100, 0)), rules=rules, ticks=40)
+        self.assertEqual(approach.status, "reached")
+        self.stream.sent.clear()
+        result = await self.bot.navigate(FootGoal((2, 97, 0)), rules=rules, ticks=40)
+        self.assertEqual((result.status, result.frames), ("unknown", 0))
+        self.assertFalse(self.stream.sent)
+
     async def test_drop_three_does_not_walk_on_low_stone_without_a_matched_ground_correction(self):
         result, step, ground = await self.run_drop_three(same_batch=False, matched_ground=False)
         self.assertIsNotNone(step)

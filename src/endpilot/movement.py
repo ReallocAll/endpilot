@@ -2938,8 +2938,12 @@ class Movement:
                                 or (deadline is not None and loop.time() + _STONE_DROP_MIN_TICKS * 0.05 > deadline)):
                             return outcome("budget")
                         observed = self.position
+                        # Stock BDS need not echo ordinary flat walking. A replan or any new
+                        # server position discards the previous walk's authority at the lip.
+                        walked_here = source != plan.nodes[0] and observed is walk_origin
                         if (not self._at_standing_height(sy) or self._observed_ground is False or observed is None
-                                or not at_center(source, x, z) or not at_center(source, observed[0], observed[2])
+                                or not at_center(source, x, z)
+                                or (not walked_here and not at_center(source, observed[0], observed[2]))
                                 or max(abs(self._velocity[0]), abs(self._velocity[2])) >= _REST_SPEED
                                 or y != observed[1]
                                 or (self._ground_correction_tick is None and abs(y - wire_eye) > wire_step)):
@@ -3895,6 +3899,8 @@ class Movement:
                             if not legacy and remaining < 0:
                                 return outcome("budget")
                             anchor = current
+                            walk_origin = (self.position if self._observed_ground is True
+                                           and start_eye == self.position else None)
                             route = deque(plan.nodes)
                             notify_plan = on_plan is not None and adopted
                             if notify_plan:
