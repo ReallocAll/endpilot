@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import endpilot
 from endpilot.blocks import BlockChange, BlockObservation, BlockUpdate
 from endpilot.inventory import HeldItemStack
+from endpilot.login import SessionEnd, _SessionEndState
 from endpilot.mcp_server import MCPPlayer
 from endpilot.navigation import BlockInteractionGoal, BlockInteractionMatch, NavigationPlan, NavigationResult, NavigationRules
 from endpilot.placement import PlacementInventoryChange, PlacementResult
@@ -20,6 +21,7 @@ from test_placement import PLACED_ID, SUPPORT, TARGET, _PlacementHarness
 class FakeBot:
     def __init__(self, name):
         self.player_id = 17
+        self._session_end = _SessionEndState()
         self.updated = asyncio.Event()
         self.closed = False
         self.placed = []
@@ -69,6 +71,14 @@ class FakeBot:
 
     async def close(self):
         self.closed = True
+        self._session_end.finish(SessionEnd("local_close"))
+
+    @property
+    def session_end(self):
+        return self._session_end.result
+
+    async def wait_for_session_end(self, timeout=15):
+        return await self._session_end.wait(timeout)
 
 
 class MCPPlayerTests(unittest.IsolatedAsyncioTestCase):
@@ -691,6 +701,7 @@ class MCPPlacementHandoffTests(_PlacementHarness):
             self.bot, "join_nethernet", new=AsyncMock(),
         ):
             self.bot._session = Mock(player_id=17)
+            self.bot._session_end_state = _SessionEndState()
             await controller.connect("http://localhost:19132")
 
         started, release, sent = asyncio.Event(), asyncio.Event(), asyncio.Event()
@@ -802,10 +813,10 @@ async def dial(url, **kwargs):
     return Transport(42)
 
 class Player(MCPPlayer):
-    async def connect(self, url: str, name: str = "EndPilot") -> dict:
+    async def connect(self, url: str, name: str = "EndPilot", *args, **kwargs) -> dict:
         if url.endswith("/second"):
             reconnecting.set()
-        return await super().connect(url, name)
+        return await super().connect(url, name, *args, **kwargs)
 
     async def disconnect(self):
         try:
@@ -874,6 +885,8 @@ with patch("endpilot.mcp_server.MCPPlayer", Player), patch("endpilot.transport.n
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import stdio_client
 
+        from endpilot.mcp_server import create_server
+
         source = Path(endpilot.__file__).resolve().parents[1]
         params = StdioServerParameters(command=sys.executable, args=["-B", "-m", "endpilot.mcp_server"],
                                        env={"PYTHONPATH": str(source)})
@@ -881,9 +894,23 @@ with patch("endpilot.mcp_server.MCPPlayer", Player), patch("endpilot.transport.n
             async with ClientSession(incoming, outgoing, read_timeout_seconds=5) as session:
                 await session.initialize()
                 tools = {tool.name: tool for tool in (await session.list_tools()).tools}
-                self.assertEqual(set(tools), {"connect", "watch_block", "read_block", "place_against", "start_walk",
+                self.assertEqual(set(tools), {"connect", "session_status", "reconnect", "switch_account",
+                                              "watch_block", "read_block", "place_against", "start_walk",
                                               "observe_walk", "stop_walk", "disconnect", "observed_block", "place_block",
-                                              "plan_block_interaction", "start_block_interaction", "request_sub_chunk"})
+                                              "plan_block_interaction", "start_block_interaction", "request_sub_chunk",
+                                              "account_list", "account_add", "account_forget", "account_skin_set",
+                                              "account_skin_clear", "account_authorization_status",
+                                              "account_authorization_cancel", "run_script", "observe_script",
+                                              "stop_script", "shutdown"})
+                self.assertEqual({tool.name for tool in await create_server().list_tools()}, set(tools) - {"shutdown"})
+                self.assertIs(tools["shutdown"].output_schema["properties"]["shutdown"]["const"], True)
+                connect = tools["connect"].input_schema
+                self.assertEqual(set(connect["required"]), {"url"})
+                self.assertEqual(connect["properties"]["accept_resource_packs"]["type"], "boolean")
+                self.assertIs(connect["properties"]["accept_resource_packs"]["default"], False)
+                rejected = await session.call_tool("connect", {"url": "invalid", "accept_resource_packs": "true"})
+                self.assertTrue(rejected.is_error)
+                self.assertIn("accept_resource_packs", rejected.content[0].text)
                 self.assertEqual(set(tools["observed_block"].output_schema["required"]),
                                  {"position", "layer", "observed", "runtime_id", "is_air"})
                 placement = tools["place_block"]

@@ -11,6 +11,7 @@ from tempfile import TemporaryFile
 from unittest.mock import patch
 
 import endpilot
+from endpilot.login import SessionEnd, _SessionEndState
 from endpilot.mcp_server import MCPPlayer
 from endpilot.protocol import Protocol, read_batch, write_batch
 from endpilot_form_extension.mcp_server import FormPlayer, register_tools
@@ -33,6 +34,7 @@ class FakePackets:
 class FakeBot:
     def __init__(self, name):
         self.player_id = 17
+        self._session_end = _SessionEndState()
         self.protocol = Protocol(2193)
         self.packets = FakePackets()
         self.chat = []
@@ -59,6 +61,14 @@ class FakeBot:
 
     async def close(self):
         self.closed = True
+        self._session_end.finish(SessionEnd("local_close"))
+
+    @property
+    def session_end(self):
+        return self._session_end.result
+
+    async def wait_for_session_end(self, timeout=15):
+        return await self._session_end.wait(timeout)
 
 
 class FormMCPTests(unittest.IsolatedAsyncioTestCase):

@@ -1,20 +1,72 @@
 """Stdio MCP tools over the same player actions used by ordinary Python scripts."""
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, nullcontext
-from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING, TypedDict
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
+from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager, nullcontext
+from dataclasses import asdict, dataclass, replace
+from enum import Enum
+from functools import wraps
+import logging
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 from urllib.parse import urlsplit
 
 from ._join_address import _parse_join_address
+from ._mcp_accounts import AccountError, MCPAccounts
 from .blocks import BlockChange, BlockUpdate
 from .bot import Bot
 from .inventory import HeldItemStack
+from .login import LoginRefused, SessionEnd
 from .navigation import BlockInteractionGoal, BlockInteractionMatch, NavigationResult, NavigationRules
+from .resource_packs import ResourcePackDecision, ResourcePackError
 
 if TYPE_CHECKING:
     from mcp.server.mcpserver import MCPServer
+
+
+_LOGGER = logging.getLogger(__name__)
+_PACK_HASH_MISMATCH = "resource-pack SHA-256 does not match the received archive"
+
+
+class _JoinError(RuntimeError):
+    """A join failure with a message safe for the caller."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ConnectionTarget:
+    url: str
+    name: str
+    xuid: str | None = None
+    accept_resource_packs: bool = False
+
+    def __post_init__(self) -> None:
+        if self.xuid is not None:
+            try:
+                from .xbox._cache import _valid_xuid
+            except ImportError:
+                raise AccountError("Install endpilot[xbox] to join with a remembered Xbox account.") from None
+
+            if not _valid_xuid(self.xuid):
+                raise ValueError("use an Xbox XUID from account_list")
+
+
+class _JoinFailure(TypedDict):
+    error_type: str
+    reason_name: str | None
+    message: str | None
+
+
+class _ShutdownReply(TypedDict):
+    shutdown: Literal[True]
+
+
+class _SessionStatus(TypedDict):
+    state: Literal["idle", "joining", "connected", "disconnecting", "disconnected", "join_failed"]
+    server: str | None
+    name: str | None
+    xuid: str | None
+    player_id: int | None
+    last_end: SessionEnd | None
+    last_join_failure: _JoinFailure | None
 
 
 class _BlockSnapshot(TypedDict):
@@ -101,11 +153,18 @@ class MCPPlayer:
         self._actions: set[asyncio.Future[None]] = set()
         self._lifecycle = asyncio.Lock()
         self._transferring = False
+        self._target: _ConnectionTarget | None = None
+        self._joining = False
+        self._join_generation = 0
+        self._session_watch: asyncio.Task[None] | None = None
+        self._last_end: SessionEnd | None = None
+        self._join_failure: _JoinFailure | None = None
         self._connection_cleanups: list[Callable[[], Awaitable[None]]] = []
+        self._accounts = MCPAccounts()
 
     def connected_bot(self) -> Bot:
         """Borrow the current Bot for a tool call without taking ownership."""
-        if self.bot is None or self._transferring:
+        if self.bot is None or self._transferring or self.bot.session_end is not None:
             raise RuntimeError("connect a player first")
         return self.bot
 
@@ -133,37 +192,157 @@ class MCPPlayer:
             yield
         finally:
             with CancelScope(shield=True):
-                await self.disconnect()
+                account_close = asyncio.create_task(self._accounts.close())
+                try:
+                    await self.disconnect()
+                finally:
+                    await account_close
 
-    async def connect(self, url: str, name: str = "EndPilot") -> dict:
+    async def session_status(self) -> _SessionStatus:
+        """Observe the current connection and the latest end or join failure."""
+        bot, target = self.bot, self._target
+        end = None if bot is None else bot.session_end
+        if self._joining:
+            state = "joining"
+        elif self._transferring or end is not None:
+            state = "disconnecting"
+        elif bot is not None:
+            state = "connected"
+        elif self._join_failure is not None:
+            state = "join_failed"
+        elif target is not None:
+            state = "disconnected"
+        else:
+            state = "idle"
+        server = None
+        if target is not None:
+            url = urlsplit(target.url)
+            server = f"{url.scheme}://{url.netloc.rsplit('@', 1)[-1]}"
+        name = None if target is None else target.name
+        if state == "connected" and target is not None and target.xuid is not None:
+            name = bot.identity.name
+        return {"state": state, "server": server, "name": name,
+                "xuid": None if target is None else target.xuid,
+                "player_id": bot.player_id if state == "connected" else None,
+                "last_end": end or self._last_end, "last_join_failure": self._join_failure}
+
+    async def connect(self, url: str, name: str = "EndPilot", xuid: str | None = None, *,
+                      accept_resource_packs: bool = False) -> dict:
+        """Join a server explicitly, optionally accepting its resource packs."""
+        if type(accept_resource_packs) is not bool:
+            raise TypeError("accept_resource_packs must be a boolean")
         async with self._lifecycle:
-            if self.bot is not None:
+            if self.bot is not None and self.bot.session_end is None:
                 raise RuntimeError("a player is already connected")
+            if self.bot is not None:
+                await self._disconnect_owned(self.bot)
+            return await self._join(_ConnectionTarget(url, name, xuid, accept_resource_packs=accept_resource_packs))
+
+    async def reconnect(self) -> dict:
+        """Explicitly open a fresh connection using the last requested server and identity."""
+        async with self._admit_target() as target:
+            return await self._replace_connection(target)
+
+    async def switch_account(self, xuid: str | None = None, name: str | None = None) -> dict:
+        """Join the last server as a remembered Xbox account or as an offline name."""
+        if xuid is None and name is None:
+            raise ValueError("select a remembered Xbox XUID or provide an offline name")
+        async with self._admit_target() as target:
+            return await self._replace_connection(replace(target, xuid=xuid, name=target.name if name is None else name))
+
+    @asynccontextmanager
+    async def _admit_target(self) -> AsyncIterator[_ConnectionTarget]:
+        target, generation = self._target, self._join_generation
+        if self._joining:
+            raise _JoinError("player connection is changing; retry after the join completes")
+        if target is None:
+            raise _JoinError("connect a player first")
+        async with self._lifecycle:
+            if self._target is not target or self._join_generation != generation:
+                raise _JoinError("player connection changed while this request was waiting; retry explicitly")
+            yield target
+
+    async def _replace_connection(self, target: _ConnectionTarget) -> dict:
+        if self.bot is not None:
+            await self._disconnect_owned(self.bot)
+        return await self._join(target)
+
+    async def _join(self, target: _ConnectionTarget) -> dict:
+        self._join_generation += 1
+        self._joining = True
+        self._join_failure = None
+        bot = None
+        try:
+            url = target.url
             # urlsplit strips tabs and line breaks before exposing the hostname.
-            if any(ord(char) < 32 or ord(char) == 127 for char in url):
-                raise ValueError("invalid server address")
-            target = urlsplit(url)
-            if target.scheme == "raknet":
-                raknet_address = _parse_join_address(url)
-            elif target.scheme in ("http", "https"):
-                raknet_address = None
-                host = target.hostname
-                if not host or target.port == 0 or any(char.isspace() for char in host):
-                    raise ValueError("invalid server address")
-            else:
-                raise ValueError("use a NetherNet signaling URL or raknet://host:port")
-            bot = Bot(name)
             try:
-                if raknet_address is not None:
-                    await bot.join_raknet(raknet_address.host, raknet_address.port)
+                if any(ord(char) < 32 or ord(char) == 127 for char in url):
+                    raise ValueError
+                address = urlsplit(url)
+                if address.scheme == "raknet":
+                    raknet_address = _parse_join_address(url)
+                elif address.scheme in ("http", "https"):
+                    raknet_address = None
+                    host = address.hostname
+                    if not host or address.port == 0 or any(char.isspace() for char in host):
+                        raise ValueError
                 else:
-                    await bot.join_nethernet(url)
-            except BaseException:
-                await bot.close()
+                    raise ValueError
+            except ValueError:
+                self._join_failure = {"error_type": "ValueError", "reason_name": "INVALID_ADDRESS", "message": None}
+                raise ValueError("use a valid NetherNet signaling URL or raknet://host:port") from None
+
+            self._target = target
+            try:
+                bot = Bot(target.name)
+                options = {}
+                if target.xuid is not None:
+                    options["credential_provider"] = self._accounts.credential_provider(bot, xuid=target.xuid)
+                if target.accept_resource_packs:
+                    options["on_resource_packs"] = lambda _offer: ResourcePackDecision.ACCEPT
+                if raknet_address is not None:
+                    await bot.join_raknet(raknet_address.host, raknet_address.port, **options)
+                else:
+                    await bot.join_nethernet(url, **options)
+            except asyncio.CancelledError:
+                if bot is not None:
+                    await self._finish_cleanup(bot.close())
                 raise
+            except Exception as error:
+                reason = getattr(error, "error", None)
+                reason_name = reason.name if isinstance(reason, Enum) else None
+                message = None
+                if isinstance(error, LoginRefused):
+                    reason_name = error.reason_name
+                    message = error.server_message
+                elif isinstance(error, AccountError):
+                    message = str(error)
+                elif isinstance(error, ResourcePackError) and str(error) == _PACK_HASH_MISMATCH:
+                    message = _PACK_HASH_MISMATCH
+                self._join_failure = {"error_type": type(error).__name__, "reason_name": reason_name,
+                                      "message": message}
+                if bot is not None:
+                    try:
+                        await self._finish_cleanup(bot.close())
+                    except Exception as cleanup_error:
+                        _LOGGER.error("Failed to close unjoined player (%s)", type(cleanup_error).__name__)
+                detail = ": ".join(part for part in (type(error).__name__, reason_name, message) if part)
+                raise _JoinError(f"Join failed ({detail})") from None
             self.bot = bot
             self._actions = set()
-            return {"name": name, "player_id": bot.player_id}
+            self._session_watch = asyncio.create_task(self._watch_session_end(bot))
+            return {"name": target.name if target.xuid is None else bot.identity.name, "player_id": bot.player_id}
+        finally:
+            self._joining = False
+
+    async def _watch_session_end(self, bot: Bot) -> None:
+        try:
+            await bot.wait_for_session_end(timeout=None)
+            async with self._lifecycle:
+                if self.bot is bot:
+                    await self._disconnect_owned(bot)
+        except Exception as error:
+            _LOGGER.error("Player session cleanup failed (%s)", type(error).__name__)
 
     async def watch_block(self, x: int, y: int, z: int, layer: int = 0, timeout: float = 15) -> dict:
         """Arm a server UpdateBlock watcher before causing a world change."""
@@ -356,7 +535,10 @@ class MCPPlayer:
 
     async def _close_bot(self, bot: Bot) -> None:
         self.bot = None
-        await bot.close()
+        try:
+            await bot.close()
+        finally:
+            self._last_end = bot.session_end
 
     async def _drain_connection(self, bot: Bot, *, disconnect: bool) -> None:
         async with AsyncExitStack() as stack:
@@ -370,8 +552,9 @@ class MCPPlayer:
             for cleanup in reversed(self._connection_cleanups):
                 stack.push_async_callback(cleanup)
 
-    async def _finish_disconnect(self, bot: Bot) -> None:
-        cleanup = asyncio.create_task(self._drain_connection(bot, disconnect=True))
+    @staticmethod
+    async def _finish_cleanup(operation: Coroutine[Any, Any, None]) -> None:
+        cleanup = asyncio.create_task(operation)
         try:
             await asyncio.shield(cleanup)
         except asyncio.CancelledError as cancellation:
@@ -393,6 +576,19 @@ class MCPPlayer:
                 raise cancellation from failure
             raise
 
+    def _stop_session_watch(self) -> None:
+        watcher, self._session_watch = self._session_watch, None
+        if watcher is not None and watcher is not asyncio.current_task():
+            watcher.cancel()
+
+    async def _disconnect_owned(self, bot: Bot) -> None:
+        self._transferring = True
+        self._stop_session_watch()
+        try:
+            await self._finish_cleanup(self._drain_connection(bot, disconnect=True))
+        finally:
+            self._transferring = False
+
     async def handoff(self) -> Bot:
         """Return the live Bot to Python code in this process, without reconnecting.
 
@@ -404,38 +600,67 @@ class MCPPlayer:
         if bot is None:
             raise RuntimeError("connect a player first")
         async with self._lifecycle:
-            if self.bot is not bot:
+            if self.bot is not bot or bot.session_end is not None:
                 raise RuntimeError("player connection changed before handoff")
             self._transferring = True
             try:
                 await self._drain_connection(bot, disconnect=False)
                 if self._actions:
                     await asyncio.wait(tuple(self._actions))
+                if bot.session_end is not None:
+                    raise RuntimeError("player connection ended before handoff")
+                self._stop_session_watch()
                 self.bot = None
+                self._target = None
                 return bot
             finally:
                 self._transferring = False
 
     async def disconnect(self) -> dict:
+        """Leave the current player session and keep the stdio server available."""
         bot = self.bot
         async with self._lifecycle:
             if bot is None or self.bot is not bot:
                 return {"disconnected": False}
-            self._transferring = True
-            try:
-                await self._finish_disconnect(bot)
-                return {"disconnected": True}
-            finally:
-                self._transferring = False
+            await self._disconnect_owned(bot)
+            return {"disconnected": True}
 
 
 def create_server(*extensions: Callable[["MCPServer", MCPPlayer], None]) -> "MCPServer":
     """Register extra tools against the same player as the built-in tools."""
     from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
+    from pydantic import StrictBool
+
+    from ._mcp_scripts import MCPScripts
 
     player = MCPPlayer()
+    scripts = MCPScripts(player)
+    player.add_connection_cleanup(scripts.close)
     server = MCPServer("EndPilot", lifespan=player.lifespan)
-    server.tool()(player.connect)
+
+    async def connect(url: str, name: str = "EndPilot", xuid: str | None = None, *,
+                      accept_resource_packs: StrictBool = False) -> dict:
+        """Join a server explicitly. Use xuid for a remembered Xbox account.
+
+        Set accept_resource_packs to true to download and verify the server's resource packs.
+        """
+        return await player.connect(url, name, xuid, accept_resource_packs=accept_resource_packs)
+
+    def register_join(tool):
+        @wraps(tool)
+        async def report_failure(*args, **kwargs):
+            try:
+                return await tool(*args, **kwargs)
+            except (_JoinError, AccountError) as error:
+                raise ToolError(str(error)) from None
+
+        server.tool()(report_failure)
+
+    register_join(connect)
+    server.tool()(player.session_status)
+    register_join(player.reconnect)
+    register_join(player.switch_account)
     server.tool()(player.watch_block)
     server.tool()(player.read_block)
     server.tool()(player.place_against)
@@ -448,10 +673,92 @@ def create_server(*extensions: Callable[["MCPServer", MCPPlayer], None]) -> "MCP
     server.tool()(player.plan_block_interaction)
     server.tool()(player.start_block_interaction)
     server.tool()(player.request_sub_chunk)
+    player._accounts.register(server)
+    scripts.register(server)
     for register_tools in extensions:
         register_tools(server, player)
     return server
 
 
+async def _run_stdio() -> None:
+    import sys
+
+    from anyio import wrap_file
+    from mcp.server import stdio
+    from mcp.server.mcpserver import Context
+    from mcp.server.mcpserver.exceptions import ToolError
+    from mcp_types import JSONRPCError, JSONRPCRequest, JSONRPCResponse, jsonrpc_message_adapter
+    from pydantic import ValidationError
+
+    class Stdio:
+        def __init__(self, stdin, stdout):
+            self.stdin = stdin
+            self.stdout = stdout
+            self.pending_id: int | str | None = None
+            self.flushing: bool | None = None
+            self.flushed = asyncio.Event()
+            self.stopping = False
+
+        async def __aiter__(self) -> AsyncIterator[str]:
+            async for line in self.stdin:
+                try:
+                    request = jsonrpc_message_adapter.validate_json(line, by_name=False)
+                except ValidationError:
+                    request = None  # Leave parse errors to the SDK.
+                if (isinstance(request, JSONRPCRequest) and request.method == "tools/call"
+                        and (request.params or {}).get("name") == "shutdown"):
+                    self.pending_id = request.id
+                yield line
+                if self.pending_id is not None:
+                    # A pending physical readline cannot be interrupted by an MCP reply.
+                    await self.flushed.wait()
+                    if self.stopping:
+                        return  # Let the SDK handle normal input EOF and run its lifespan cleanup.
+                    self.pending_id = None
+                    self.flushed.clear()
+
+        async def write(self, line: str) -> int:
+            if self.pending_id is not None:
+                reply = jsonrpc_message_adapter.validate_json(line, by_name=False)
+                if isinstance(reply, (JSONRPCResponse, JSONRPCError)) and reply.id == self.pending_id:
+                    result = reply.result if isinstance(reply, JSONRPCResponse) else {}
+                    structured = result.get("structuredContent")
+                    self.flushing = (not result.get("isError") and isinstance(structured, dict)
+                                     and structured.get("shutdown") is True)
+            return await self.stdout.write(line)
+
+        async def flush(self) -> None:
+            await self.stdout.flush()
+            if self.flushing is not None:
+                self.stopping = self.flushing
+                self.flushing = None
+                self.flushed.set()
+
+    server = create_server()
+
+    @server.tool()
+    async def shutdown(ctx: Context) -> _ShutdownReply:
+        """Close this stdio server and release the player, scripts and pending authorization."""
+        if (ctx.request_context.params or {}).get("arguments"):
+            raise ToolError("shutdown does not accept arguments")
+        return {"shutdown": True}
+
+    # The SDK claims both descriptors so unrelated reads and prints cannot reach the wire.
+    with ExitStack() as claims:
+        raw_input, restore_input = stdio._claim_fd(0, sys.stdin, "rb", stdio._open_stdin_diversion)
+        if restore_input is not None:
+            claims.callback(restore_input)
+        raw_output, restore_output = stdio._claim_fd(1, sys.stdout, "wb", stdio._open_stdout_diversion)
+        if restore_output is not None:
+            claims.callback(restore_output)
+        streams = Stdio(
+            wrap_file(stdio._UnownedTextWrapper(raw_input, encoding="utf-8", errors="replace")),
+            wrap_file(stdio._UnownedTextWrapper(raw_output, encoding="utf-8")),
+        )
+        kernel = server._lowlevel_server
+        async with stdio.stdio_server(stdin=streams, stdout=streams) as (incoming, outgoing):
+            await kernel.run(incoming, outgoing, kernel.create_initialization_options())
+
+
 if __name__ == "__main__":
-    create_server().run(transport="stdio")
+    asyncio.run(_run_stdio())
