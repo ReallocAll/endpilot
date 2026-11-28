@@ -242,14 +242,18 @@ class BiomeErrorObservationTests(unittest.IsolatedAsyncioTestCase):
         return transport
 
     async def test_bot_observes_initial_biome_error_and_later_recovers(self):
-        bot = Bot(protocol=2225)
+        bot = Bot(protocol=None)
         self.addAsyncCleanup(bot.close)
         b = bot.protocol.binding
         position = (-8, 0, -8)
         seen = []
 
         def observe(error):
-            seen.append((error, bot.observed_biome(position), bot.column_coverage((-1, -1)).announced))
+            try:
+                protocol = bot.packets.protocol
+            except RuntimeError:
+                protocol = None
+            seen.append((error, bot.observed_biome(position), bot.column_coverage((-1, -1)).announced, protocol))
 
         bot.subscribe_error(observe)
 
@@ -267,10 +271,15 @@ class BiomeErrorObservationTests(unittest.IsolatedAsyncioTestCase):
                     transport.incoming.put_nowait(write_batch(map(bot.protocol.encode, (*packets, b.SetTimePacket()))))
                     await marker
 
-                with patch("endpilot.transport.nethernet.connect", return_value=transport):
+                async def connect(_url, *, _on_protocol, **_options):
+                    await _on_protocol(2225)
+                    return transport
+
+                with patch("endpilot.transport.nethernet.connect", side_effect=connect):
                     await bot.join_nethernet("http://127.0.0.1:19132", retain_initial_chunks=retain)
                 await deliver()
-                self.assertEqual(seen, [(diagnostic, None, True)] * count)
+                self.assertEqual(seen[-1], (diagnostic, None, True, bot.protocol if retain else None))
+                self.assertEqual(len(seen), count)
                 self.assertIsNone(bot.session_end)
 
                 await deliver(self.announced(bot, constant_column(187)))

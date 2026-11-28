@@ -10,6 +10,7 @@ import raknet.asyncio
 from raknet import _peer
 
 from endpilot import Bot
+from endpilot.protocol import Protocol, read_batch, write_batch
 from endpilot.transport.raknet import RakNetTransport, advertised_protocol, connect
 
 
@@ -146,6 +147,104 @@ class RakNetTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await client.close()
             self.assert_peer_released(peer, port)
+
+    async def test_repeated_join_cancellation_releases_unpublished_session(self):
+        bot = Bot(protocol=None)
+        loop = asyncio.get_running_loop()
+        installed = []
+        cancellations = []
+        spawns = []
+        ends = []
+        peer_done = asyncio.Event()
+        tail_read = asyncio.Event()
+
+        async def serve(server, number):
+            protocol = Protocol(number)
+            binding = protocol.binding
+            async with await server.accept() as connection:
+                wire = RakNetTransport(connection)
+                raw, = read_batch(await wire.recv())
+                request = protocol.decode(raw)
+                self.assertIsInstance(request, binding.RequestNetworkSettingsPacket)
+                self.assertEqual(request.client_network_version, number)
+                settings = binding.NetworkSettingsPacket(compression_algorithm=binding.PacketCompressionAlgorithm.NONE)
+                await wire.send(write_batch([protocol.encode(settings)]))
+                raw, = read_batch(await wire.recv())
+                login = protocol.decode(raw)
+                self.assertIsInstance(login, binding.LoginPacket)
+                self.assertEqual(login.client_network_version, number)
+                start = binding.StartGamePacket(runtime_id=13, entity_id=27)
+                spawn = binding.PlayStatusPacket(status=binding.PlayStatus.PLAYER_SPAWN)
+                tail = binding.SetHealthPacket(health=17)
+                await wire.send(write_batch(protocol.encode(packet) for packet in (start, spawn, tail)))
+                await peer_done.wait()
+
+        def observe_spawn(kind):
+            packets = bot.packets
+            spawns.append((kind, bot.protocol, packets.protocol))
+            health_id = packets.protocol.binding.SetHealthPacket.ID
+
+            def observe_tail(raw):
+                if raw.packet_id == health_id:
+                    spawns.append(("tail", packets.protocol.decode(raw).health))
+                    tail_read.set()
+
+            packets.subscribe_raw(observe_tail)
+
+        start_session = bot._start_session
+
+        def cancel(message):
+            cancellations.append(joining.cancel(message))
+
+        def cancel_before_publish(session, **options):
+            start_session(session, **options)
+            with self.assertRaisesRegex(RuntimeError, "player has not joined"):
+                _ = bot.packets
+            packets = session.packets
+            peer = packets.transport._peer
+            tasks = (packets._reader_task, bot._movement._ticker, session.clock._task)
+            installed.append((bot.protocol.number, packets.protocol.number, peer, peer.local_address[1],
+                              tasks))
+            loop.call_soon(cancel, "first cancellation")
+            loop.call_soon(loop.call_soon, cancel, "second cancellation")
+
+        async with asyncio.timeout(12), await raknet.asyncio.create_server(
+            ("127.0.0.1", 0), offline_ping_response=b"MCPE;Loopback;2225;1.26.66",
+        ) as server, asyncio.TaskGroup() as tasks:
+            try:
+                tasks.create_task(serve(server, 2225))
+                await bot.join_raknet(*server.local_address)
+                published = bot.protocol
+                await bot.close()
+                bot.subscribe_spawns(observe_spawn)
+                bot.subscribe_session_end(ends.append)
+                server.raw.set_offline_ping_response(b"MCPE;Loopback;2193;1.26.52")
+                tasks.create_task(serve(server, 2193))
+                with patch.object(bot, "_start_session", side_effect=cancel_before_publish):
+                    joining = asyncio.create_task(bot.join_raknet(*server.local_address))
+                    with self.assertRaises(asyncio.CancelledError) as caught:
+                        await joining
+
+                (before, selected, peer, port, background), = installed
+                self.assertEqual((before, selected), (2225, 2193))
+                self.assertEqual(cancellations, [True, True])
+                self.assert_peer_released(peer, port)
+                self.assertTrue(all(task.done() for task in background))
+                self.assertEqual(caught.exception.args, ("first cancellation",))
+                self.assertIs(bot.protocol, published)
+                self.assertEqual(spawns, [])
+                self.assertEqual(ends, [])
+                with self.assertRaisesRegex(RuntimeError, "player has not joined"):
+                    _ = bot.packets
+
+                tasks.create_task(serve(server, 2193))
+                await bot.join_raknet(*server.local_address)
+                await tail_read.wait()
+                self.assertEqual(bot.protocol.number, 2193)
+                self.assertEqual(spawns, [("initial", bot.protocol, bot.protocol), ("tail", 17)])
+            finally:
+                peer_done.set()
+                await bot.close()
 
     async def test_game_frame_and_post_handshake_cipher(self):
         # Simulate two endpoints with the same Bedrock session key and opposite counters.

@@ -108,6 +108,12 @@ def _validate_plugin(plugin: object) -> None:
         raise TypeError("plugin must be synchronous")
 
 
+class _PendingBotJoin(_PendingOnlineJoin):
+    """Track teardown if close claims a join before its caller can publish it."""
+
+    close_complete: asyncio.Event | None = None
+
+
 class Bot:
     def __init__(self, name: str = "EndPilot", protocol: int | None = DEFAULT_PROTOCOL, *,
                  input_source: Callable[[], ForwardInput] | None = None,
@@ -138,7 +144,7 @@ class Bot:
         self._input_source = input_source
         self._on_input_sent = on_input_sent
         self._clock: ClientClock | None = None
-        self._online_join: _PendingOnlineJoin | None = None
+        self._online_join: _PendingBotJoin | None = None
         self._session: JoinSession | None = None
         self._error_observers: dict[object, Callable[[RecoverableError], None]] = {}
         self._session_end_state: _SessionEndState | None = None
@@ -355,7 +361,7 @@ class Bot:
         self._clock = clock
         start_complete = asyncio.Event()
 
-        async def connect_and_start() -> None:
+        async def connect_and_start() -> JoinSession:
             identity = self._offline_identity
             if credential_provider is not None:
                 identity = await acquire_online_identity(credential_provider)
@@ -381,37 +387,43 @@ class Bot:
                 self._start_session(session, locale=locale, load_announced_terrain=load_announced_terrain,
                                     terrain_storage=terrain_storage)
             except BaseException as error:
-                await _close_after_failed_join(self, error, "session cleanup after failed join")
+                if self._session is session:
+                    await _close_after_failed_join(self, error, "session cleanup after failed join")
+                elif self._clock is clock:
+                    await _close_after_failed_join(session, error, "session cleanup after failed join")
                 raise
             if self._session is not session:
                 raise ConnectionError("player closed while joining")
+            return session
 
-        def finish_join() -> None:
-            session = self._session
+        def finish_join(session: JoinSession) -> None:
+            if self._session is not session or self._clock is not session.clock:
+                raise ConnectionError("player closed while joining")
             if self._auto_protocol:
                 self.protocol = session.packets.protocol
             self._session_end_state = session._end_state
             if session.spawned:
                 self._player_state._start_spawn_observation(self._publish_spawn)
-            session._set_session_end_observer(self._publish_session_end)
-            start_complete.set()
+            if self._session_end_state is session._end_state:
+                session._set_session_end_observer(self._publish_session_end)
+            if self._session is session:
+                start_complete.set()
 
         try:
             if credential_provider is None and not (_track_join or self._auto_protocol):
-                await connect_and_start()
-                finish_join()
+                finish_join(await connect_and_start())
                 return
-            pending = self._online_join = _PendingOnlineJoin()
+            pending = self._online_join = _PendingBotJoin()
             kwargs["_online_join"] = pending
             task = pending.task = asyncio.create_task(connect_and_start())
-            try:
-                # Waiting independently lets close and caller cancellation share one cancellation.
-                await asyncio.wait((task,))
-            except asyncio.CancelledError as error:
-                clock.stop()
-                if not task.cancelling():
-                    task.cancel()
-                await asyncio.wait((task,))
+
+            async def cancel_join(error: asyncio.CancelledError) -> None:
+                if not task.done():
+                    close_complete = pending.close_complete
+                    if not task.cancelling() and (close_complete is None or close_complete.is_set()):
+                        clock.stop()
+                        task.cancel()
+                    await asyncio.wait((task,))
                 try:
                     task.result()
                 except BaseException as stopped:
@@ -419,14 +431,29 @@ class Bot:
                         error.add_note(note)
                 if self._clock is clock:
                     await _close_after_failed_join(self, error, "session cleanup after cancelled join")
+                elif pending.close_complete is not None:
+                    await pending.close_complete.wait()
+
+            try:
+                # Waiting independently lets close and caller cancellation share one cancellation.
+                await asyncio.wait((task,))
+            except asyncio.CancelledError as error:
+                cleanup = asyncio.create_task(cancel_join(error))
+                # Repeated caller cancellations must leave the cleanup task running.
+                while not cleanup.done():
+                    try:
+                        await asyncio.wait((cleanup,))
+                    except asyncio.CancelledError:
+                        continue
+                cleanup.result()
                 raise
             finally:
                 if self._online_join is pending:
                     self._online_join = None
-            task.result()
+            session = task.result()
             if self._clock is not clock:
                 raise ConnectionError("player closed while joining")
-            finish_join()
+            finish_join(session)
         except BaseException:
             if self._clock is clock:
                 self._clock = None
@@ -4033,12 +4060,24 @@ class Bot:
     @property
     def packets(self):
         """Expose typed and raw packet I/O for external extensions."""
-        if self._session is None:
+        session = self._session
+        if session is None or (self._auto_protocol and self._session_end_state is not session._end_state):
             raise RuntimeError("player has not joined")
-        return self._session.packets
+        return session.packets
 
     async def close(self, *, reason: str | None = None) -> None:
         """Close the connection, using reason as the message if local close ends the session."""
+        pending = self._online_join
+        if pending is None:
+            await self._close_session(reason)
+            return
+        complete = pending.close_complete = asyncio.Event()
+        try:
+            await self._close_session(reason)
+        finally:
+            complete.set()
+
+    async def _close_session(self, reason: str | None) -> None:
         session = self._session
         state = self._session_end_state
         if state is not None and state.result is None and session is not None:

@@ -539,6 +539,60 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(joining, return_exceptions=True)
                 await bot.close()
 
+    async def test_cancelled_join_waits_for_concurrent_close_without_touching_replacement(self):
+        bot = Bot(protocol=None)
+        transport_closing, release_close = asyncio.Event(), asyncio.Event()
+        first = _spawn_transport(Protocol(2193), 41)
+        replacement = _spawn_transport(Protocol(2225), 42)
+        start_session = bot._start_session
+        close_first = first.close
+        closing = None
+
+        async def delay_close():
+            transport_closing.set()
+            await release_close.wait()
+            await close_first()
+
+        def close_and_cancel():
+            nonlocal closing
+            closing = asyncio.create_task(bot.close())
+            joining.cancel("first join cancelled")
+
+        def close_after_install(session, **options):
+            start_session(session, **options)
+            if session.packets.transport is first:
+                asyncio.get_running_loop().call_soon(close_and_cancel)
+
+        with (
+            patch("endpilot.transport.raknet.advertised_protocol", side_effect=[2193, 2225]),
+            patch("endpilot.transport.raknet.connect", side_effect=[first, replacement]),
+            patch.object(first, "close", side_effect=delay_close) as old_close,
+            patch.object(replacement, "close", wraps=replacement.close) as new_close,
+            patch.object(bot, "_start_session", side_effect=close_after_install),
+        ):
+            joining = asyncio.create_task(bot.join_raknet("127.0.0.1"))
+            try:
+                async with asyncio.timeout(4):
+                    await transport_closing.wait()
+                    await bot.join_raknet("127.0.0.1")
+                    self.assertFalse(joining.done())
+                    joining.cancel("second join cancelled")
+                    release_close.set()
+                    await closing
+                    with self.assertRaisesRegex(asyncio.CancelledError, "first join cancelled"):
+                        await joining
+                    self.assertIs(bot.packets.transport, replacement)
+                    self.assertEqual(bot.player_id, 42)
+                    old_close.assert_awaited_once()
+                    new_close.assert_not_awaited()
+            finally:
+                release_close.set()
+                joining.cancel()
+                await asyncio.gather(joining, return_exceptions=True)
+                if closing is not None:
+                    await asyncio.gather(closing, return_exceptions=True)
+                await bot.close()
+
     async def test_offline_login_signs_game_version_for_selected_protocol(self):
         for options, number, game_version in (({}, 2225, "1.26.66"), ({"protocol": 2193}, 2193, "1.26.52")):
             with self.subTest(protocol=number):

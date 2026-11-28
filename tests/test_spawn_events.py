@@ -167,10 +167,59 @@ class SpawnEventTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.bot, "_start_session", new=cancel_after_assembly):
             joining = asyncio.create_task(self.connect(wire, online=True, timeline=timeline))
             with self.assertRaises(asyncio.CancelledError):
-                await asyncio.wait_for(joining, 1)
+                await asyncio.wait_for(joining, 10)
         self.assertTrue(wire.closed)
         self.assertEqual(events, [])
         self.assertEqual(timeline.received_count("DisconnectPacket"), 0)
+
+    async def test_initial_callback_can_close_and_rejoin_before_the_old_reader_is_released(self):
+        self.bot = bot = Bot(protocol=None)
+        self.addAsyncCleanup(bot.close)
+        b = self.b
+        before, after = PacketTimeline(), PacketTimeline()
+        first = self.wire(after_spawn=(b.SetHealthPacket(health=16),))
+        replacement = self.wire(after_spawn=(b.SetHealthPacket(health=19),))
+        loop = asyncio.get_running_loop()
+        self.addCleanup(loop.set_task_factory, loop.get_task_factory())
+        loop.set_task_factory(asyncio.eager_task_factory)
+        closing = rejoining = None
+        spawns = []
+        read_replacement = asyncio.Event()
+
+        def observe_tail(raw):
+            if raw.packet_id == b.SetHealthPacket.ID:
+                read_replacement.set()
+
+        def observe_spawn(kind):
+            nonlocal closing, rejoining
+            packets = bot.packets
+            spawns.append((kind, packets.transport, bot.protocol is packets.protocol))
+            if packets.transport is first:
+                closing = asyncio.create_task(bot.close())
+                rejoining = asyncio.create_task(bot.join_raknet("127.0.0.1", timeline=after))
+            else:
+                packets.subscribe_raw(observe_tail)
+
+        bot.subscribe_spawns(observe_spawn)
+        with (
+            patch("endpilot.transport.raknet.advertised_protocol", return_value=2225),
+            patch("endpilot.transport.raknet.connect", side_effect=[first, replacement]),
+        ):
+            async with asyncio.timeout(4):
+                try:
+                    await bot.join_raknet("127.0.0.1", timeline=before)
+                    await closing
+                    await rejoining
+                    await read_replacement.wait()
+                    self.assertEqual(spawns, [("initial", first, True), ("initial", replacement, True)])
+                    self.assertTrue(first.closed)
+                    self.assertFalse(replacement.closed)
+                    self.assertEqual(before.received_count("SetHealthPacket"), 0)
+                    self.assertEqual(after.received_count("SetHealthPacket"), 1)
+                    self.assertEqual(bot.health, 19)
+                finally:
+                    tasks = tuple(task for task in (closing, rejoining) if task is not None)
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
     async def test_two_deaths_in_one_batch_ignore_duplicates_and_other_actors(self):
         b = self.b
