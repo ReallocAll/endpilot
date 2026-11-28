@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable, Literal
@@ -17,6 +18,7 @@ from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from ._join_address import _JoinAddress
 from .authentication import DEFAULT_LOCALE, _OnlineIdentity, _validate_locale
 from .beds import invalidates_bed_respawn
+from .biome_data import BiomeDefinition, _read_biome_definitions
 from .block_data import matches_vanilla_palette
 from .client_clock import ClientClock
 from .compression import PacketConnection
@@ -194,7 +196,10 @@ class JoinSession:
         self.item_registry: ItemRegistrySnapshot | None = None
         self._item_registry_subscriptions = ()
         self.entity_registry: EntityRegistrySnapshot | None = None
-        self._entity_registry_subscriptions = ()
+        self.biome_definitions: Mapping[str, BiomeDefinition] | None = None
+        self._biome_definition_packet_id = (packets.protocol.binding.BiomeDefinitionListPacket.ID
+                                            if packets.protocol.number == 2225 else None)
+        self._definition_subscriptions = ()
         self._end_state = _SessionEndState()
         self._end_subscriptions = ()
         self._end_observer: Callable[[SessionEnd], None] | None = None
@@ -366,9 +371,9 @@ class JoinSession:
                 packets.subscribe_raw(session._on_item_registry),
                 packets.subscribe_reader_end(session._clear_item_registry),
             )
-            session._entity_registry_subscriptions = (
-                packets.subscribe_raw(session._on_entity_registry),
-                packets.subscribe_reader_end(session._clear_entity_registry),
+            session._definition_subscriptions = (
+                packets.subscribe_raw(session._on_definitions),
+                packets.subscribe_reader_end(session._clear_definitions),
             )
             return session
         except BaseException as error:
@@ -576,6 +581,8 @@ class JoinSession:
                 self.entity_packets.append(raw)
             elif raw.packet_id == binding.AvailableActorIdentifiersPacket.ID:
                 self._replace_entity_registry(raw)
+            elif raw.packet_id == self._biome_definition_packet_id:
+                self._replace_biome_definitions(raw)
             elif raw.packet_id == binding.ChunkRadiusUpdatedPacket.ID:
                 self._on_chunk_radius(raw)
                 self.chunk_radius = self.accepted_chunk_radius
@@ -659,18 +666,30 @@ class JoinSession:
         if snapshot is not None:
             self.entity_registry = snapshot
 
-    def _on_entity_registry(self, raw: RawPacket) -> None:
+    def _replace_biome_definitions(self, raw: RawPacket) -> None:
+        try:
+            packet = self.packets.protocol.decode(raw)
+        except DecodeError:
+            return
+        snapshot = _read_biome_definitions(packet)
+        if snapshot is not None:
+            self.biome_definitions = snapshot
+
+    def _on_definitions(self, raw: RawPacket) -> None:
         binding = self.packets.protocol.binding
         if raw.packet_id == binding.AvailableActorIdentifiersPacket.ID:
             self._replace_entity_registry(raw)
+        elif raw.packet_id == self._biome_definition_packet_id:
+            self._replace_biome_definitions(raw)
         elif raw.packet_id == binding.DisconnectPacket.ID:
-            self._clear_entity_registry()
+            self._clear_definitions()
 
-    def _clear_entity_registry(self, _cause=None) -> None:
-        for unsubscribe in self._entity_registry_subscriptions:
+    def _clear_definitions(self, _cause=None) -> None:
+        for unsubscribe in self._definition_subscriptions:
             unsubscribe()
-        self._entity_registry_subscriptions = ()
+        self._definition_subscriptions = ()
         self.entity_registry = None
+        self.biome_definitions = None
 
     def _on_chunk_radius(self, raw):
         protocol = self.packets.protocol
@@ -770,7 +789,7 @@ class JoinSession:
         if isinstance(self.identity, _OnlineIdentity):
             self.identity = None
         self._clear_item_registry()
-        self._clear_entity_registry()
+        self._clear_definitions()
         if self._unsubscribe_chunk_radius is not None:
             self._unsubscribe_chunk_radius()
             self._unsubscribe_chunk_radius = None

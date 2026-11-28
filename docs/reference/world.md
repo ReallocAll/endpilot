@@ -238,6 +238,22 @@ rain flag, and tags. Use the server's own IDs for custom worlds. To regenerate
 the catalog, pass the pinned EndstoneMC/bedrock-data checkout to
 `python scripts/generate_biome_data.py ../bedrock-data`. [Pinned data and setup](block-data.md)
 
+## Read advertised biome definitions
+
+On protocol 2225, `bot.biome_definitions` is a read-only mapping keyed by the
+exact names advertised by the current server, such as `"minecraft:ocean"`.
+Each `BiomeDefinition` gives its name, temperature, downfall, rain flag, and
+ordered tags. The property sends no packets. It returns `None` until the
+current session receives a valid advertisement and an empty mapping for an
+explicitly empty advertisement. A later valid advertisement replaces the
+mapping. Malformed advertisements leave the last valid mapping available.
+Previously saved snapshots remain readable after a new advertisement or
+disconnect.
+
+Use `bot.weather` for current weather and `bot.observed_biome(position)` for a
+coordinate's numeric biome ID. The advertisement's string indices do not map
+those numeric IDs to names.
+
 ## Check whether the world is hardcore
 
 `bot.world_hardcore` is the flag advertised when joining. `True` means

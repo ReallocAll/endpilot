@@ -3,7 +3,7 @@
 from .anvil import AnvilPreview
 from .authentication import BedrockCredentialProvider, BedrockCredentials
 from .beds import BedObservation, PlayerRespawnPoint, SleepRejected
-from .biome_data import VanillaBiome, vanilla_biomes
+from .biome_data import BiomeDefinition, VanillaBiome, vanilla_biomes
 from .block_catalog import VanillaBlock, VanillaBlockToolProperties, vanilla_blocks
 from .block_raycast import BlockRaycastResult, MiningFaceResult
 from .blocks import (
@@ -68,6 +68,7 @@ __all__ = [
     "BedrockCredentialProvider",
     "BedrockCredentials",
     "BedObservation",
+    "BiomeDefinition",
     "BlockApproach",
     "BlockChange",
     "BlockCollection",

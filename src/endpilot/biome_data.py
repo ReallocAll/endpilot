@@ -1,4 +1,4 @@
-"""Versioned vanilla biome definitions, independent of any live session."""
+"""Versioned vanilla biome definitions and server-advertised session values."""
 
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -18,6 +18,35 @@ class VanillaBiome:
     downfall: float
     rain: bool
     tags: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class BiomeDefinition:
+    """Climate and tags advertised for a named biome in this session."""
+
+    name: str
+    temperature: float
+    downfall: float
+    rain: bool
+    tags: tuple[str, ...]
+
+
+def _read_biome_definitions(packet) -> Mapping[str, BiomeDefinition] | None:
+    strings = packet.string_list.strings
+    definitions = {}
+    for name_index, data in packet.biome_data.items():
+        if not 0 <= name_index < len(strings):
+            return None
+        name = strings[name_index]
+        if not name or name in definitions:
+            return None
+        tag_indices = () if data.tags is None else data.tags.tags
+        if any(not 0 <= index < len(strings) for index in tag_indices):
+            return None
+        definitions[name] = BiomeDefinition(
+            name, data.temperature, data.downfall, data.rain, tuple(strings[index] for index in tag_indices),
+        )
+    return MappingProxyType(definitions)
 
 
 @cache

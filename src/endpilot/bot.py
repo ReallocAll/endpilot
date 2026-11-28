@@ -20,6 +20,7 @@ from .authentication import (
     BedrockCredentialProvider, DEFAULT_LOCALE, OfflineIdentity, _OnlineIdentity, acquire_online_identity,
 )
 from .beds import BedObservation, Beds, PlayerRespawnPoint, _BedEvent
+from .biome_data import BiomeDefinition
 from .block_raycast import BlockRaycastResult, MiningFaceResult
 from .blocks import (
     Blocks, BlockChange, BlockEntityUpdate, BlockMatch, BlockObservation, BlockSearchResult, BlockStateObservation,
@@ -307,6 +308,12 @@ class Bot:
         """Return the active session's latest entity type advertisement, if received."""
         session = self._session
         return None if session is None or self.session_end is not None else session.entity_registry
+
+    @property
+    def biome_definitions(self) -> Mapping[str, BiomeDefinition] | None:
+        """Return the current session's read-only biome definitions by advertised name."""
+        session = self._session
+        return None if session is None or self.session_end is not None else session.biome_definitions
 
     async def _join_session(
         self, connect, *endpoint, timeout: float, credential_provider: BedrockCredentialProvider | None,
