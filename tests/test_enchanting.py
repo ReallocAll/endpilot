@@ -6,6 +6,7 @@ from endpilot import Bot, Enchantment
 from endpilot.authentication import OfflineIdentity
 from endpilot.compression import PacketConnection
 from endpilot.containers import Containers
+from endpilot.creative_inventory import CreativeInventory
 from endpilot.enchanting import Enchanting
 from endpilot.inventory import Inventory
 from endpilot.login import JoinSession
@@ -33,7 +34,12 @@ class EnchantingTests(unittest.IsolatedAsyncioTestCase):
         self.bot = Bot("EnchantmentTest", protocol=2225)
         self.bot._inventory = Inventory(self.wire, 1)
         self.bot._containers = Containers(self.wire, None, self.bot._inventory)
-        self.bot._enchanting = Enchanting(self.wire, self.bot._containers, self.bot._inventory, NAMES)
+        creative = self.bot._creative = CreativeInventory(
+            self.wire, self.bot._inventory, self.bot._containers, 1, NAMES, (),
+        )
+        self.bot._enchanting = Enchanting(
+            self.wire, self.bot._containers, self.bot._inventory, NAMES, game_mode=lambda: creative.game_mode,
+        )
         self.bot._player_state = PlayerState(self.wire, 1)
         self.addAsyncCleanup(self.bot.close)
 
@@ -107,6 +113,14 @@ class EnchantingTests(unittest.IsolatedAsyncioTestCase):
         self.slot(124, 14, input_id, 1, 11, metadata=b"old item metadata")
         self.slot(124, 15, 417, 10, 12)
         self.choices()
+
+    def mode(self, value):
+        self.emit(self.b.SetPlayerGameTypePacket(player_game_type=value))
+
+    async def queued_selection(self):
+        request_id = await self.bot._enchanting.select(0, timeout=1, queued=True)
+        self.assertEqual((await self.submitted()).client_request_id.raw_id, request_id)
+        return request_id
 
     async def test_current_offers_keep_button_order_unavailable_entry_and_three_groups(self):
         self.choices()
@@ -215,15 +229,93 @@ class EnchantingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.inventory_slots[0].id, 316)
         self.assertEqual(self.bot.inventory_slots[0].user_data_buffer, b"")
 
+    async def test_creative_select_third_button_with_or_without_staged_lapis(self):
+        b = self.b
+        for lapis in (False, True):
+            with self.subTest(lapis=lapis):
+                self.mode(b.GameType.CREATIVE)
+                self.fill_ui()
+                if not lapis:
+                    self.slot(124, 15, 0, 0, None)
+                level = b.AttributeData(name="minecraft:player.level", current_value=1)
+                self.emit(b.UpdateAttributesPacket(runtime_id=1, attribute_data=[level], tick=1))
+                selection = asyncio.create_task(self.bot.enchant(2))
+                request = await self.submitted()
+                craft, consume, place = request.actions
+                request_id = int(request.client_request_id.raw_id)
+                self.assertEqual((craft.recipe_net_id, craft.num_crafts), (91, 1))
+                self.assertEqual((consume.amount, consume.source.slot, consume.source.net_id_variant), (1, 14, 11))
+                self.assertEqual((place.source.slot, place.source.net_id_variant, place.destination.slot),
+                                 (50, request_id, 14))
+                if lapis:
+                    self.mode(b.GameType.SURVIVAL)
+                self.reply(request_id, [(INPUT, 14, 1, 20)])
+                self.assertEqual((await selection).result.name, "SUCCESS")
+                self.assertEqual(self.bot.enchanting_slots[14].net_id_variant, 20)
+                self.assertIsNone(self.bot.enchant_options)
+                self.assertEqual(self.bot.experience_level, 1)
+                if lapis:
+                    self.assertEqual(self.bot.enchanting_slots[15].stack_size, 10)
+                else:
+                    self.assertNotIn(15, self.bot.enchanting_slots)
+
+    async def test_unknown_mode_still_requires_lapis(self):
+        self.fill_ui()
+        self.slot(124, 15, 0, 0, None)
+        self.assertIsNone(self.bot.game_mode)
+        with self.assertRaisesRegex(ValueError, "insufficient observed enchanting material"):
+            await self.bot.enchant(2)
+        self.assertEqual(self.wire.sent, [])
+
+    async def test_selection_checks_live_mode_window_choices_and_inputs_at_write(self):
+        b = self.b
+        creative, survival = b.GameType.CREATIVE, b.GameType.SURVIVAL
+        scenarios = (
+            (creative, lambda: self.mode(survival), "game mode changed"),
+            (survival, lambda: self.mode(creative), "game mode changed"),
+            (creative, lambda: self.mode(b.GameType.UNDEFINED), "game mode changed"),
+            (creative, self.open_table, "enchanting table window changed"),
+            (creative, lambda: self.choices(net_id_offset=100), "enchant options changed"),
+            (survival, lambda: self.slot(124, 15, 417, 2, 12), "enchanting inputs changed"),
+        )
+        for mode, change, message in scenarios:
+            with self.subTest(mode=mode.name, message=message):
+                self.mode(mode)
+                self.fill_ui()
+                started = asyncio.get_running_loop().create_future()
+                release = asyncio.Event()
+                send = self.wire.send
+
+                async def wait_to_write(packet, *, _before_send=None):
+                    started.set_result(packet.requests[0])
+                    await release.wait()
+                    await send(packet, _before_send=_before_send)
+
+                with patch.object(self.wire, "send", wait_to_write):
+                    task = asyncio.create_task(self.bot.enchant(2, timeout=1))
+                    try:
+                        request = await asyncio.wait_for(started, 1)
+                        self.reply(int(request.client_request_id.raw_id), [(INPUT, 14, 1, 20)])
+                        self.assertFalse(task.done())
+                        self.assertEqual(self.bot.enchanting_slots[14].net_id_variant, 11)
+                        change()
+                        release.set()
+                        with self.assertRaisesRegex(RuntimeError, message):
+                            await task
+                        self.assertEqual(self.wire.sent, [])
+                    finally:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+
     async def test_rejected_enchant_can_retry_and_authoritative_replacement_wins(self):
         self.fill_ui()
-        first = await self.bot._enchanting.select(0, timeout=1, queued=True)
+        first = await self.queued_selection()
         self.assertIsNone(self.bot._inventory._qa_response(first))
         self.reply(first, result="FAILED_TO_ENCHANT")
         self.assertEqual(self.bot._inventory._qa_response(first).result.name, "FAILED_TO_ENCHANT")
         self.assertEqual(self.bot.enchanting_slots[15].stack_size, 10)
         self.assertEqual(len(self.bot.enchant_options), 3)
-        second = await self.bot._enchanting.select(0, timeout=1, queued=True)
+        second = await self.queued_selection()
         self.reply(second, [(INPUT, 14, 1, 20), (MATERIAL, 15, 9, 12)])
         self.slot(124, 14, 320, 1, 20, metadata=b"server replacement")
         result = self.bot.enchanting_slots[14]
@@ -232,14 +324,14 @@ class EnchantingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_plain_book_uses_enchanted_book_type_without_presuming_enchants(self):
         self.fill_ui(input_id=386)
-        request = await self.bot._enchanting.select(0, timeout=1, queued=True)
+        request = await self.queued_selection()
         self.reply(request, [(INPUT, 14, 1, 20)])
         result = self.bot.enchanting_slots[14]
         self.assertEqual((result.id, result.user_data_buffer), (595, b""))
 
     async def test_old_window_verdict_cannot_change_reopened_same_id_slots(self):
         self.fill_ui()
-        first = await self.bot._enchanting.select(0, timeout=1, queued=True)
+        first = await self.queued_selection()
         self.open_table()
         self.assertIsNone(self.bot.enchant_options)
         self.slot(124, 14, 320, 1, 22, metadata=b"new window")
@@ -349,7 +441,7 @@ class EnchantingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_retransmitted_input_is_not_the_enchanted_result(self):
         self.fill_ui()
-        request = await self.bot._enchanting.select(0, timeout=1, queued=True)
+        request = await self.queued_selection()
         self.slot(124, 14, 316, 1, 11, metadata=b"old item metadata")
         self.reply(request, [(MATERIAL, 15, 9, 12)])
         self.assertEqual(self.bot._inventory._qa_response(request).result.name, "SUCCESS")
@@ -357,7 +449,7 @@ class EnchantingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_disconnect_ends_wait_and_unconfirmed_enchant(self):
         self.fill_ui()
-        request = await self.bot._enchanting.select(0, timeout=1, queued=True)
+        request = await self.queued_selection()
         self.open_table()
         waiting = asyncio.create_task(self.bot.wait_for_enchant_options())
         await asyncio.sleep(0)

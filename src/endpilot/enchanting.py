@@ -1,7 +1,10 @@
 """The observed enchanting table window and its server-issued choices."""
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+
+from bedrock_protocol import GameType
 
 from .inventory import _correct_observed_item, _response_item
 
@@ -43,11 +46,13 @@ class _TableStack:
 
 
 class Enchanting:
-    def __init__(self, packets, containers, inventory, item_names):
+    def __init__(self, packets, containers, inventory, item_names, *,
+                 game_mode: Callable[[], GameType | None] | None = None):
         self.packets = packets
         self.containers = containers
         self.inventory = inventory
         self._item_names = item_names
+        self._game_mode = game_mode
         self._window = None
         self._options: tuple[EnchantOption, ...] | None = None
         self._options_input: object | None = None
@@ -191,13 +196,15 @@ class Enchanting:
             slot=index, net_id_variant=net_id or 0,
         )
 
-    async def _request(self, request_id, actions, apply, *, timeout, queued):
+    async def _request(self, request_id, actions, apply, *, timeout, queued, at_write=None):
         b = self.packets.protocol.binding
         request = b.ItemStackRequestPacketData.RequestData(
             client_request_id=b.ItemStackRequestId(raw_id=request_id), actions=actions,
             strings_to_filter=[], strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
         )
-        return await self.inventory._request_item_stack(request, apply, timeout=timeout, queued=queued)
+        return await self.inventory._request_item_stack(
+            request, apply, timeout=timeout, queued=queued, _at_write=at_write,
+        )
 
     def _correct_table_slot(self, index, original, correction, *, fallback=None, output_changed=False):
         current = self._slots.get(index)
@@ -292,30 +299,52 @@ class Enchanting:
         return await self._request(request_id, [action], apply, timeout=timeout, queued=queued)
 
     async def select(self, option: int, *, timeout: float, queued: bool = False):
-        """Submit a survival enchant for a button from the active table's observed options."""
+        """Submit the active table's observed button and await its verdict."""
         window = self._require_window()
-        options = self._options
+        b = self.packets.protocol.binding
+        mode = None if self._game_mode is None else self._game_mode()
+        creative = mode == b.GameType.CREATIVE
+        options = self._current_choices() if creative else self._options
         if options is None or not 0 <= option < len(options):
             raise ValueError("enchant option has not been observed")
         chosen = options[option]
-        if not chosen.cost or not chosen.net_id:
+        if chosen.cost <= 0 or chosen.net_id <= 0:
             raise ValueError("the selected enchant option is unavailable")
         inputs = {index: self._slots.get(index) for index in ENCHANTING_SLOTS}
         item, lapis = inputs[14], inputs[15]
         if item is None or not item.amount or item.net_id is None:
             raise ValueError("enchanting input is unobserved or empty")
-        if lapis is None or lapis.amount < option + 1 or lapis.net_id is None:
+        if not creative and (lapis is None or lapis.amount < option + 1 or lapis.net_id is None):
             raise ValueError("insufficient observed enchanting material")
-        b = self.packets.protocol.binding
         cereal = b.ItemStackRequestCereal
         request_id = self.inventory._allocate_request_id()
         actions = [
             cereal.CraftRecipeActionData(recipe_net_id=chosen.net_id, num_crafts=1),
             cereal.ConsumeActionData(amount=1, source=self._slot_info(ENCHANTING_SLOTS[14], 14, item.net_id)),
-            cereal.ConsumeActionData(amount=option + 1, source=self._slot_info(ENCHANTING_SLOTS[15], 15, lapis.net_id)),
-            cereal.PlaceActionData(amount=1, source=self._slot_info("CREATED_OUTPUT_CONTAINER", 50, request_id),
-                                   destination=self._slot_info(ENCHANTING_SLOTS[14], 14, 0)),
         ]
+        if not creative:
+            actions.append(cereal.ConsumeActionData(
+                amount=option + 1, source=self._slot_info(ENCHANTING_SLOTS[15], 15, lapis.net_id),
+            ))
+        actions.append(cereal.PlaceActionData(
+            amount=1, source=self._slot_info("CREATED_OUTPUT_CONTAINER", 50, request_id),
+            destination=self._slot_info(ENCHANTING_SLOTS[14], 14, 0),
+        ))
+
+        def still_available(index, original, count):
+            current = self._slots.get(index)
+            return (current is not None and current.origin is original.origin
+                    and current.identity == original.identity and current.amount >= count)
+
+        def at_write():
+            if self._game_mode is not None and self._game_mode() != mode:
+                raise RuntimeError("game mode changed before enchanting submission")
+            if self._sync_window() is not window:
+                raise RuntimeError("enchanting table window changed before submission")
+            if self._options is not options or (creative and self._current_choices() is not options):
+                raise RuntimeError("enchant options changed before submission")
+            if not still_available(14, item, 1) or not creative and not still_available(15, lapis, option + 1):
+                raise RuntimeError("enchanting inputs changed before submission")
 
         def apply(response):
             if self._sync_window() is not window:
@@ -334,7 +363,7 @@ class Enchanting:
                 if self._options is options:
                     self._set_options(None)
 
-        return await self._request(request_id, actions, apply, timeout=timeout, queued=queued)
+        return await self._request(request_id, actions, apply, timeout=timeout, queued=queued, at_write=at_write)
 
     def close(self) -> None:
         if self._closed:

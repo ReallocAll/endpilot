@@ -217,10 +217,13 @@ in-progress wait.
 
 `bot.enchant_options` exposes the latest observed list, or `None` before a
 list arrives. `wait_for_enchant_options()` can return an explicitly empty
-list as `()`. To enchant, stage the necessary lapis and use the zero-based
-button index from the current choices with `await bot.enchant(button)`. Use
-the verdict and subsequent item observations to confirm the result. The
-verdict can omit item metadata.
+list as `()`. Use the zero-based button index from the current choices
+with `await bot.enchant(button)`. In server-confirmed Creative mode, stage
+the item alone. The request leaves any staged lapis in place. Stage the
+required lapis in other modes and when the mode is still unknown.
+The SDK rechecks the observed mode, window, choices, and required inputs
+before sending. Use the verdict and subsequent item observations to
+confirm the result. The verdict can omit item metadata.
 
 ## Preview anvil costs
 

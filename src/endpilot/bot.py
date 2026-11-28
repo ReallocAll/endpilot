@@ -489,7 +489,9 @@ class Bot:
             session.item_names, session.creative_packets, on_game_mode=observe_game_mode,
         )
         session.creative_packets.clear()
-        self._enchanting = Enchanting(session.packets, self._containers, self._inventory, session.item_names)
+        self._enchanting = Enchanting(
+            session.packets, self._containers, self._inventory, session.item_names, game_mode=lambda: creative.game_mode,
+        )
         self._beds = Beds(session.packets, self._blocks, self._movement, self._inventory,
                           session.player_id, session.bed_packets)
         session.bed_packets.clear()
@@ -2140,7 +2142,11 @@ class Bot:
         )
 
     async def enchant(self, option: int, *, timeout: float = 15):
-        """Select a survival button. The verdict can omit the result's item metadata."""
+        """Select an observed enchanting button and await the server's verdict.
+
+        Confirmed Creative mode uses only the staged input. Other modes
+        require observed lapis. The verdict can omit the result's metadata.
+        """
         return await self._require_enchanting().select(option, timeout=timeout)
 
     async def wait_for_container_slots(self, *, timeout: float = 15) -> dict[int, object]:
