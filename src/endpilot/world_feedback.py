@@ -19,6 +19,7 @@ SoundKind = Literal["play", "stop", "level", "update"]
 _Position = tuple[float, float, float]
 _Cell = tuple[int, int, int]
 _CRACK_EVENTS = {3600: "crack_start", 3601: "crack_end", 3602: "crack_progress"}
+_BLOCK_PARTICLE_EVENTS_2225 = frozenset((2001, 3603, 3604, 3605, 3606, 3607, 3608))
 _PISTON_STATES = {0: "piston_retracted", 1: "piston_extending", 2: "piston_extended", 3: "piston_retracting"}
 _CHEST_ROOT_TAGS = {"id": nbt.StringTag, "x": nbt.IntTag, "y": nbt.IntTag, "z": nbt.IntTag,
                     "pairx": nbt.IntTag, "pairz": nbt.IntTag, "pairlead": nbt.ByteTag}
@@ -324,10 +325,24 @@ class WorldFeedback:
             return None
         return BlockEvent(kind, dimension, position, packet, chest_partner, piston_face, piston_attached_blocks)
 
+    @staticmethod
+    def _block_particle(packet, dimension: int) -> BlockEvent | None:
+        if packet.event_id in _BLOCK_PARTICLE_EVENTS_2225:
+            return BlockEvent("block_particle", dimension, _xyz(packet.pos), packet)
+        return None
+
+    def _block_event_source(self, kind: str | None):
+        if kind == "block_particle":
+            packet_ids = (self.binding.LevelEventPacket.ID,) if self._is_2225 else ()
+            return packet_ids, self._block_particle
+        return self._block_ids, self._block
+
     async def wait_for_block_event(self, position: _Position | None, kind: str | None, timeout: float) -> BlockEvent:
-        return await self._wait(self._block_ids, self._block, timeout, position=position, kind=kind)
+        packet_ids, project = self._block_event_source(kind)
+        return await self._wait(packet_ids, project, timeout, position=position, kind=kind)
 
     def subscribe_block_events(
         self, callback: Callable[[BlockEvent], None], *, position: _Position | None = None, kind: str | None = None,
     ) -> Callable[[], None]:
-        return self._subscribe(self._block_ids, self._block, callback, position=position, kind=kind)
+        packet_ids, project = self._block_event_source(kind)
+        return self._subscribe(packet_ids, project, callback, position=position, kind=kind)

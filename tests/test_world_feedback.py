@@ -99,6 +99,51 @@ class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((event.dimension_id, event.position), (1, (-1.375, 221.25, 3.75)))
         self.assertEqual(event.packet, particle)
 
+    async def test_block_particles_are_opt_in_and_keep_wire_fields(self):
+        b = self.b
+        position = (-1.5, 220.5, 3.75)
+        pos = b.Vec3(x=position[0], y=position[1], z=position[2])
+        native = [b.LevelEventPacket(event_id=event_id, pos=pos, data=-2108756090)
+                  for event_id in (3603, 3604, 3605, 3606, 3607, 3608, 2001)]
+        other_position = b.LevelEventPacket(event_id=3604, pos=b.Vec3(x=-2, y=220.5, z=3.75), data=-1)
+        unrelated = b.LevelEventPacket(event_id=3609, pos=pos, data=65)
+        crack = b.LevelEventPacket(event_id=3602, pos=pos, data=4369)
+        stop = b.LevelEventPacket(event_id=3601, pos=b.Vec3(x=0, y=0, z=0))
+        flame = b.SpawnParticleEffectPacket(pos=pos, effect_name="minecraft:basic_flame_particle")
+        hit = b.LevelSoundEventPacket(pos=pos, sound_event="hit", data=-2108756090)
+        opted_in, ordinary, particles, sounds = [], [], [], []
+        self.bot.subscribe_block_events(opted_in.append, position=position, kind="block_particle")
+        self.bot.subscribe_block_events(ordinary.append)
+        self.bot.subscribe_particle(particles.append)
+        self.bot.subscribe_sound(sounds.append)
+        async with asyncio.TaskGroup() as group:
+            first = group.create_task(self.bot.wait_for_block_event(position, kind="block_particle", timeout=1))
+            legacy = group.create_task(self.bot.wait_for_block_event(timeout=1))
+            named = group.create_task(self.bot.wait_for_particle(flame.effect_name, timeout=1))
+            await asyncio.sleep(0)
+            self.push(other_position, unrelated, flame, b.ChangeDimensionPacket(dimension_id=1, pos=pos),
+                      *native, crack, hit, stop, b.ChangeDimensionPacket(dimension_id=2, pos=pos))
+
+        self.assertEqual([event.packet for event in opted_in], native)
+        self.assertEqual([(event.kind, event.dimension_id, event.position) for event in opted_in],
+                         [("block_particle", 1, position)] * len(native))
+        self.assertEqual(first.result(), opted_in[0])
+        self.assertEqual([(event.kind, event.position, event.packet) for event in ordinary],
+                         [("crack_progress", position, crack), ("crack_end", None, stop)])
+        self.assertEqual(legacy.result(), ordinary[0])
+        self.assertEqual([event.packet for event in particles], [flame])
+        self.assertEqual(named.result(), particles[0])
+        self.assertEqual([event.packet for event in sounds], [hit])
+
+    async def test_block_particle_wait_only_decodes_level_event_packets(self):
+        b = self.b
+        event = b.LevelEventPacket(event_id=2001, pos=b.Vec3(x=0, y=0, z=0), data=-5)
+        pending = asyncio.create_task(self.bot.wait_for_block_event(kind="block_particle", timeout=1))
+        await asyncio.sleep(0)
+        self.incoming.put_nowait(write_batch((RawPacket(b.BlockEventPacket.ID, b""), self.bot.protocol.encode(event))))
+        observed = await pending
+        self.assertEqual((observed.position, observed.packet), ((0, 0, 0), event))
+
     async def test_subscriptions_deliver_every_matching_packet_in_dispatch_order(self):
         b = self.b
         cell = (3, 220, 7)

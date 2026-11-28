@@ -322,6 +322,15 @@ protocol numbers raise `ValueError`.
 A crack-end packet with an all-zero position has `event.position` set to
 `None`. Its native `packet.pos` remains available.
 
+For protocol 2225, pass `kind="block_particle"` to `wait_for_block_event` or
+`subscribe_block_events` to observe the native `LevelEvent` packets for
+block-mining particles (`3603`–`3608`) and block-breaking particles (`2001`).
+The event keeps the floating-point position and the bot's dimension at receipt.
+`event.packet.event_id` and `event.packet.data` expose the native event ID and
+signed data. In MCP scripts these are `event.event_id` and `event.data`.
+Omitting `kind` preserves the usual block-feedback stream. Named particle
+spawns continue to use `wait_for_particle` and `subscribe_particle`.
+
 Use `bot.subscribe_sound(callback, name=..., kind=...)`,
 `bot.subscribe_particle(callback, name=...)`, or
 `bot.subscribe_block_events(callback, position=..., kind=...)` to receive
