@@ -374,6 +374,34 @@ session has lost its connection.
 
 Use `await bot.wait_for_player_equipment_change(runtime_id)` for one change.
 
+## Observe non-player actor equipment
+
+`bot.observed_actor_equipment(runtime_id)` reads the latest immutable
+`ActorEquipmentSnapshot` for the current tracked non-player actor. The
+snapshot carries its runtime ID, entity ID, and actor type. A server armor
+packet updates `head`, `chest`, `legs`, `feet`, and `body` together.
+On protocol 2225, an `INVENTORY` equipment packet with both slot selectors
+equal to zero reports `main_hand` for a non-player actor.
+The query returns `None` until the first equipment report and after the actor
+leaves view. Each slot starts as `None` until its descriptor is reported.
+A reported empty slot has item ID and count zero. A missing stack network ID
+is represented by `None`.
+
+`bot.subscribe_actor_equipment_changes(callback, runtime_id=runtime_id)`
+calls a synchronous callback for each future snapshot change and returns an
+idempotent unsubscribe function. Query the current snapshot separately.
+`await bot.wait_for_actor_equipment_change(runtime_id, timeout=15)` returns
+the next changed snapshot. Both may start before the first equipment report
+for an already tracked actor. These methods send no packets.
+
+Removal, instance replacement, or a dimension change ends the subscription
+and raises `LookupError` in a pending wait. Register again for the new
+instance, even when it uses the same runtime ID. Registration raises
+`LookupError` for a player or an untracked target, `RuntimeError` before
+joining, and `ConnectionError` when the joined connection ends. A connection
+ending also closes existing subscriptions and raises `ConnectionError` in
+pending waits.
+
 ## Observe remote player crouching
 
 `EntityState.sneaking` in `bot.observed_entities` holds the last valid server

@@ -44,8 +44,8 @@ from .dimension_transition import DimensionTransition
 from .enchanting import Enchanting, EnchantOption
 from .entity_registry import EntityRegistrySnapshot
 from .entities import (
-    Entities, EntityActorEvent, EntityAttributeUpdate, EntityCriticalEffect, EntityCriticalEffectKind,
-    EntityCursorResult, EntityEffectUpdate, EntityHealthEvent, EntityHealthEventKind, EntityLifecycleEvent,
+    ActorEquipmentSnapshot, Entities, EntityActorEvent, EntityAttributeUpdate, EntityCriticalEffect,
+    EntityCriticalEffectKind, EntityCursorResult, EntityEffectUpdate, EntityHealthEvent, EntityHealthEventKind, EntityLifecycleEvent,
     EntityMovement, EntityMovementUpdate, EntitySpawn, EntityState, EntitySwing, EntityVisibleEffectUpdate, ItemPickup,
     PlayerEquipmentSnapshot, PlayerListChange, PlayerListEntry, ShieldBlockEvent, VehicleLink, VehicleLinkChange,
 )
@@ -3320,6 +3320,33 @@ class Bot:
         if self._entities is None:
             raise RuntimeError("player has not joined")
         return self._entities.subscribe_player_equipment_changes(callback, runtime_id=runtime_id)
+
+    def observed_actor_equipment(self, runtime_id: int) -> ActorEquipmentSnapshot | None:
+        """Read the latest equipment snapshot for a tracked non-player actor, if reported."""
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return self._entities.actor_equipment(runtime_id)
+
+    async def wait_for_actor_equipment_change(
+        self, runtime_id: int, *, timeout: float | None = 15,
+    ) -> ActorEquipmentSnapshot:
+        """Wait for the next equipment report that changes the current non-player actor's snapshot."""
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return await self._entities.wait_for_actor_equipment_change(runtime_id, timeout=timeout)
+
+    def subscribe_actor_equipment_changes(
+        self, callback: Callable[[ActorEquipmentSnapshot], None], *, runtime_id: int,
+    ) -> Callable[[], None]:
+        """Observe future equipment changes via a synchronous callback.
+
+        The subscription can start before the first report. It ends when this
+        non-player instance leaves view or is replaced, the dimension changes,
+        or the connection ends. Returns an idempotent unsubscribe function.
+        """
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return self._entities.subscribe_actor_equipment_changes(callback, runtime_id=runtime_id)
 
     async def wait_for_player_list_update(
         self, *, action: Literal["add", "remove"] | None = None,

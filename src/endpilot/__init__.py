@@ -30,9 +30,9 @@ from .creative_inventory import (
 from .dimension_transition import DimensionTransition
 from .enchanting import EnchantOption, Enchantment
 from .entities import (
-    EntityActorEvent, EntityAttribute, EntityAttributeModifier, EntityAttributeUpdate, EntityCriticalEffect,
-    EntityCursorResult, EntityEffectUpdate, EntityHealthEvent, EntityLifecycleEvent, EntityMovementUpdate,
-    EntitySwing, EntityVisibleEffectUpdate, ItemPickup, PaintingSnapshot, PlayerEquipmentSnapshot,
+    ActorEquipmentSnapshot, EntityActorEvent, EntityAttribute, EntityAttributeModifier, EntityAttributeUpdate,
+    EntityCriticalEffect, EntityCursorResult, EntityEffectUpdate, EntityHealthEvent, EntityLifecycleEvent,
+    EntityMovementUpdate, EntitySwing, EntityVisibleEffectUpdate, ItemPickup, PaintingSnapshot, PlayerEquipmentSnapshot,
     PlayerListChange, PlayerListEntry, ShieldBlockEvent, VehicleLink, VehicleLinkChange,
 )
 from .entity_registry import (
@@ -74,6 +74,7 @@ from .world_environment import Weather, WorldClock, WorldRule, WorldSpawn, World
 from .world_feedback import BlockEvent, ParticleEvent, SoundEvent, SoundKind, vanilla_note_instruments
 
 __all__ = [
+    "ActorEquipmentSnapshot",
     "AllGoal",
     "AnyGoal",
     "AnvilPreview",

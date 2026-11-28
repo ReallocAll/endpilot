@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 from uuid import UUID
 
-from endpilot import Bot
+from endpilot import ActorEquipmentSnapshot, Bot
 from endpilot.compression import PacketConnection
 from endpilot.entities import Entities
 from endpilot.inventory import HeldItemStack
@@ -59,6 +59,12 @@ class RemoteEquipmentTests(unittest.IsolatedAsyncioTestCase):
 
     async def wait(self, runtime=8):
         pending = asyncio.create_task(self.entities.wait_for_player_equipment_change(runtime, timeout=None))
+        self.addAsyncCleanup(self.cancel, pending)
+        await asyncio.sleep(0)
+        return pending
+
+    async def wait_for_actor(self, runtime=8):
+        pending = asyncio.create_task(self.entities.wait_for_actor_equipment_change(runtime, timeout=None))
         self.addAsyncCleanup(self.cancel, pending)
         await asyncio.sleep(0)
         return pending
@@ -347,6 +353,145 @@ class RemoteEquipmentTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ConnectionError):
             self.entities.subscribe_player_equipment_changes(snapshots.append, runtime_id=8)
 
+    async def test_actor_armor_is_atomic_and_repeat_reports_are_silent(self):
+        b = self.b
+        actor = b.AddActorPacket(runtime_id=8, entity_id=108, actor_type="minecraft:armor_stand")
+        await self.deliver(self.armor(head=1), actor, self.player(runtime=9, uuid=9, unique=109))
+        self.assertIsNone(self.entities.actor_equipment(8))
+        state = self.entities.get(8)
+        for target in (7, 9, 10):
+            self.assertIsNone(self.entities.actor_equipment(target))
+            with self.subTest(target=target), self.assertRaises(LookupError):
+                self.entities.subscribe_actor_equipment_changes(self.fail, runtime_id=target)
+        with self.assertRaises(LookupError):
+            await self.entities.wait_for_actor_equipment_change(9)
+
+        observed, reentrant = [], []
+
+        def observe(snapshot):
+            observed.append((snapshot, self.entities.actor_equipment(8)))
+            unsubscribe()
+            self.entities.subscribe_actor_equipment_changes(reentrant.append, runtime_id=8)
+
+        unsubscribe = self.entities.subscribe_actor_equipment_changes(observe, runtime_id=8)
+        first_wait = await self.wait_for_actor()
+        armor = self.armor(head=10, chest=11, legs=12, feet=13, body=14)
+        await self.deliver(self.armor(runtime=7, body=20), self.armor(runtime=9, head=6),
+                           self.armor(runtime=10, head=7), armor)
+        first = await first_wait
+        self.assertIsInstance(first, ActorEquipmentSnapshot)
+        self.assertEqual((first.runtime_id, first.entity_id, first.actor_type), (8, 108, "minecraft:armor_stand"))
+        self.assertEqual((first.head.item_id, first.chest.item_id, first.legs.item_id, first.feet.item_id,
+                          first.body.item_id), (10, 11, 12, 13, 14))
+        self.assertIsNone(first.main_hand)
+        self.assertEqual(observed, [(first, first)])
+        self.assertEqual(reentrant, [])
+        self.assertIs(self.entities.get(8), state)
+        self.assertEqual(self.entities.player_equipment(9).head.item_id, 6)
+        for target in (7, 9, 10):
+            self.assertIsNone(self.entities.actor_equipment(target))
+
+        next_wait = await self.wait_for_actor()
+        await self.deliver(armor)
+        self.assertFalse(next_wait.done())
+        self.assertEqual(reentrant, [])
+        await self.deliver(self.armor(chest=11))
+        second = await next_wait
+        self.assertEqual(second.head, HeldItemStack(0, 0, 0, None, 0, b""))
+        self.assertEqual(second.chest, first.chest)
+        self.assertEqual(second.body, second.head)
+        self.assertEqual(first.body.item_id, 14)
+        self.assertEqual(reentrant, [second])
+        with self.assertRaises(FrozenInstanceError):
+            first.head = None
+        with self.assertRaises(FrozenInstanceError):
+            first.body.count = 0
+        unsubscribe()
+        self.assertEqual(self.wire.sent, [])
+
+    async def test_actor_main_hand_uses_only_zero_inventory_selectors(self):
+        b = self.b
+        actor = b.AddActorPacket(runtime_id=8, entity_id=108, actor_type="minecraft:zombie")
+        await self.deliver(self.held(12, 0), actor)
+        self.assertIsNone(self.entities.actor_equipment(8))
+        changes = []
+        unsubscribe = self.entities.subscribe_actor_equipment_changes(changes.append, runtime_id=8)
+        initial = await self.wait_for_actor()
+        await self.deliver(self.held(15, 0, container=b.ContainerID.OFFHAND), self.held(15, 1),
+                           b.MobEquipmentPacket(runtime_id=8, slot=1, selected_slot=0,
+                                                item=self.stack(15), container_id=b.ContainerID.INVENTORY),
+                           b.MobEquipmentPacket(runtime_id=8, slot=0, selected_slot=1,
+                                                item=self.stack(15), container_id=b.ContainerID.INVENTORY))
+        self.assertIsNone(self.entities.actor_equipment(8))
+        self.assertFalse(initial.done())
+        self.assertEqual(changes, [])
+
+        await self.deliver(self.held(0, 0), self.held(0, 0))
+        empty = await initial
+        self.assertEqual(empty.main_hand, HeldItemStack(0, 0, 0, None, 0, b""))
+        self.assertIsNone(empty.head)
+        self.assertEqual(changes, [empty])
+        await self.deliver(self.held(309, 0), self.armor(head=346), self.held(0, 0))
+        drawn, armored, cleared = changes[1:]
+        self.assertEqual(drawn.main_hand.item_id, 309)
+        self.assertIsNone(drawn.head)
+        self.assertEqual(armored.main_hand, drawn.main_hand)
+        self.assertEqual(armored.head.item_id, 346)
+        self.assertEqual(cleared.head, armored.head)
+        self.assertEqual(cleared.main_hand, empty.main_hand)
+        self.assertIsNone(self.entities.get(8).last_observed_offhand)
+        self.assertIsNone(self.entities.player_equipment(8))
+        unsubscribe()
+        self.assertEqual(self.wire.sent, [])
+
+    async def test_actor_equipment_subscriptions_end_on_remove_replace_and_dimension_change(self):
+        b = self.b
+        actor = b.AddActorPacket(runtime_id=8, entity_id=108, actor_type="minecraft:horse")
+        for transition in (b.RemoveActorPacket(entity_id=108), actor, b.ChangeDimensionPacket(dimension_id=1)):
+            with self.subTest(transition=type(transition).__name__):
+                await self.deliver(actor, self.armor(body=14))
+                old = self.entities.actor_equipment(8)
+                snapshots = []
+                unsubscribe = self.entities.subscribe_actor_equipment_changes(snapshots.append, runtime_id=8)
+                pending = await self.wait_for_actor()
+                await self.deliver(transition)
+                with self.assertRaises(LookupError):
+                    await pending
+                self.assertIsNone(self.entities.actor_equipment(8))
+                if transition is not actor:
+                    await self.deliver(self.armor(body=21), actor)
+                    self.assertIsNone(self.entities.actor_equipment(8))
+                replacement = self.entities.subscribe_actor_equipment_changes(snapshots.append, runtime_id=8)
+                unsubscribe()
+                await self.deliver(self.armor(body=15))
+                self.assertEqual([snapshot.body.item_id for snapshot in snapshots], [15])
+                self.assertEqual(old.body.item_id, 14)
+                replacement()
+
+    async def test_actor_equipment_timeout_cancel_and_reader_end(self):
+        await self.deliver(self.b.AddActorPacket(runtime_id=8, entity_id=108, actor_type="minecraft:horse"))
+        with self.assertRaises(TimeoutError):
+            await self.entities.wait_for_actor_equipment_change(8, timeout=0)
+        cancelled = await self.wait_for_actor()
+        retained = await self.wait_for_actor()
+        cancelled.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled
+        await self.deliver(self.armor(body=14))
+        self.assertEqual((await retained).body.item_id, 14)
+
+        snapshots = []
+        unsubscribe = self.entities.subscribe_actor_equipment_changes(snapshots.append, runtime_id=8)
+        pending = await self.wait_for_actor()
+        await self.packets.close()
+        with self.assertRaises(ConnectionError):
+            await asyncio.wait_for(pending, 1)
+        self.assertIsNone(self.entities.actor_equipment(8))
+        self.assertEqual(snapshots, [])
+        unsubscribe()
+        with self.assertRaises(ConnectionError):
+            self.entities.subscribe_actor_equipment_changes(snapshots.append, runtime_id=8)
+
 
 class RemoteEquipmentStartupTests(unittest.IsolatedAsyncioTestCase):
     async def test_login_packets_preserve_wire_order_and_own_hotbar(self):
@@ -355,6 +500,8 @@ class RemoteEquipmentStartupTests(unittest.IsolatedAsyncioTestCase):
         snapshots = []
         with self.assertRaises(RuntimeError):
             bot.subscribe_player_equipment_changes(snapshots.append, runtime_id=1)
+        with self.assertRaises(RuntimeError):
+            bot.observed_actor_equipment(8)
         protocol = bot.protocol
         b = protocol.binding
         wire = Wire(protocol)
@@ -378,6 +525,9 @@ class RemoteEquipmentStartupTests(unittest.IsolatedAsyncioTestCase):
             "77012f010500000108000a0000000000000000000000000000000000000000"
         ))
         deliver(b.NetworkSettingsPacket(compression_algorithm=b.PacketCompressionAlgorithm.NONE))
+        deliver(b.AddActorPacket(runtime_id=8, entity_id=208, actor_type="minecraft:horse"),
+                held(8, 0, 0),
+                b.MobArmorEquipmentPacket(runtime_id=8, body=stack(19)))
         deliver(b.StartGamePacket(entity_id=107, runtime_id=7), held(7, 2, 1), held(1, 19, 0),
                 b.AddPlayerPacket(uuid=UUID(int=8), runtime_id=1, name="Remote8", carried_item=stack(3)),
                 b.MobArmorEquipmentPacket(runtime_id=1, head=stack(4), torso=stack(0), legs=stack(0), feet=stack(0)),
@@ -396,6 +546,9 @@ class RemoteEquipmentStartupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((remote.entity_id, remote.selected_slot, remote.main_hand.item_id, remote.head.item_id),
                          (108, 2, 5, 4))
         self.assertIsNone(bot.observed_player_equipment(7))
+        equipment = bot.observed_actor_equipment(8)
+        self.assertEqual((equipment.main_hand.item_id, equipment.body.item_id), (0, 19))
+        self.assertIsNone(bot.observed_actor_equipment(1))
         actor = next(state for state in bot.observed_entities if state.runtime_id == 1)
         self.assertEqual(actor.last_observed_offhand, HeldItemStack(
             358, 1, 0, None, 0,
@@ -410,4 +563,16 @@ class RemoteEquipmentStartupTests(unittest.IsolatedAsyncioTestCase):
         changed = await pending
         self.assertEqual((changed.selected_slot, changed.main_hand.item_id), (4, 6))
         self.assertEqual(snapshots, [changed])
+        unsubscribe()
+
+        actor_snapshots = []
+        unsubscribe = bot.subscribe_actor_equipment_changes(actor_snapshots.append, runtime_id=8)
+        self.assertEqual(actor_snapshots, [])
+        actor_pending = asyncio.create_task(bot.wait_for_actor_equipment_change(8, timeout=1))
+        await asyncio.sleep(0)
+        deliver(b.MobArmorEquipmentPacket(runtime_id=8, body=stack(19)),
+                b.MobArmorEquipmentPacket(runtime_id=8, body=stack(20)))
+        actor_changed = await actor_pending
+        self.assertEqual(actor_changed.body.item_id, 20)
+        self.assertEqual(actor_snapshots, [actor_changed])
         unsubscribe()

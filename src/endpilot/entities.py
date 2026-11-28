@@ -340,6 +340,21 @@ class PlayerEquipmentSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ActorEquipmentSnapshot:
+    """Equipment reported by the server for one observed non-player actor."""
+
+    runtime_id: int
+    entity_id: int
+    actor_type: str
+    main_hand: HeldItemStack | None = None
+    head: HeldItemStack | None = None
+    chest: HeldItemStack | None = None
+    legs: HeldItemStack | None = None
+    feet: HeldItemStack | None = None
+    body: HeldItemStack | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ItemPickup:
     """A server-named pickup with identities and a drop snapshot when observed."""
 
@@ -419,6 +434,7 @@ _EXPLICIT_GAME_MODES = frozenset((GameType.SURVIVAL, GameType.CREATIVE, GameType
 class _ActorInstance:
     feet_known: bool
     unlisted_game_mode: tuple[int, GameType] | None = None
+    equipment: ActorEquipmentSnapshot | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -639,6 +655,7 @@ class Entities:
         self._player_equipment: dict[int, PlayerEquipmentSnapshot] = {}
         self._equipment_waiters: dict[int, set[asyncio.Future[PlayerEquipmentSnapshot]]] = {}
         self._equipment_observers: list[_EntityObserver[PlayerEquipmentSnapshot]] = []
+        self._actor_equipment_observers: list[_EntityObserver[ActorEquipmentSnapshot]] = []
         self._swing_observers: list[_EntityObserver[EntitySwing]] = []
         self._critical_effect_observers: list[_EntityObserver[EntityCriticalEffect]] = []
         self._health_observers: list[_EntityObserver[EntityHealthEvent]] = []
@@ -699,7 +716,8 @@ class Entities:
                           self._actor_event_observers, self._attribute_observers, self._effect_observers,
                           self._crouch_observers, self._sleep_observers, self._name_tag_observers,
                           self._attached_firework_observers,
-                          self._shield_block_observers, self._visible_effect_observers):
+                          self._shield_block_observers, self._visible_effect_observers,
+                          self._actor_equipment_observers):
             self._end_entity_observers(observers, lambda _: True, ConnectionError, "entity session is closed", _cause)
         self._shield_block_asserted.clear()
         self._glide_observers.clear()
@@ -1318,6 +1336,49 @@ class Entities:
         for runtime_id in tuple(self._equipment_waiters):
             self._fail_equipment_waiters(runtime_id, error_type, message, cause)
 
+    def _nonplayer_actor(self, runtime_id: int) -> _ActorInstance | None:
+        state = self._by_runtime.get(runtime_id)
+        if runtime_id == self._own_runtime_id or state is None or state.actor_type == _PLAYER:
+            return None
+        return self._actor_instances.get(runtime_id)
+
+    def actor_equipment(self, runtime_id: int) -> ActorEquipmentSnapshot | None:
+        self._sync_reader_end()
+        instance = self._nonplayer_actor(runtime_id)
+        return None if instance is None else instance.equipment
+
+    def _require_actor_equipment_target(self, runtime_id: int) -> None:
+        self._require_live()
+        if self._nonplayer_actor(runtime_id) is None:
+            raise LookupError("non-player actor is not currently observed")
+
+    def subscribe_actor_equipment_changes(
+        self, callback: Callable[[ActorEquipmentSnapshot], None], *, runtime_id: int,
+    ) -> Callable[[], None]:
+        self._require_actor_equipment_target(runtime_id)
+        return self.packets._subscribe(self._actor_equipment_observers, _EntityObserver(runtime_id, callback))
+
+    async def wait_for_actor_equipment_change(
+        self, runtime_id: int, *, timeout: float | None = 15,
+    ) -> ActorEquipmentSnapshot:
+        self._require_actor_equipment_target(runtime_id)
+        return await self._wait_for_entity_event(self._actor_equipment_observers, runtime_id, timeout)
+
+    def _publish_actor_equipment(
+        self, runtime_id: int, instance: _ActorInstance, *, startup: bool, **slots: HeldItemStack | None,
+    ) -> None:
+        previous = instance.equipment
+        if previous is None:
+            state = self._by_runtime[runtime_id]
+            current = ActorEquipmentSnapshot(runtime_id, state.entity_id, state.actor_type, **slots)
+        else:
+            current = replace(previous, **slots)
+        if current != previous:
+            instance.equipment = current
+            if not startup:
+                self._notify_entity_observers(self._actor_equipment_observers, current, runtime_id,
+                                              "actor equipment observer failed")
+
     def _equipment_removal_cursor(self):
         return self._equipment_removals[-1][0] if self._equipment_removals else 0
 
@@ -1700,6 +1761,7 @@ class Entities:
                 self._runtime_by_id[entity_id] = runtime_id
         if replaced:
             # Link callbacks can register observers while the previous actor is still visible.
+            self._forget_entity_observers(self._actor_equipment_observers, runtime_id)
             self._forget_entity_observers(self._critical_effect_observers, runtime_id)
             self._forget_entity_observers(self._health_observers, runtime_id)
             self._forget_entity_observers(self._actor_event_observers, runtime_id)
@@ -1743,6 +1805,7 @@ class Entities:
         reason: _EntityLifecycleReason = "identity_invalidated",
     ) -> None:
         self._end_movement_waiters(LookupError, "entity is no longer observed", runtime_id=runtime_id)
+        self._forget_entity_observers(self._actor_equipment_observers, runtime_id)
         self._forget_entity_observers(self._swing_observers, runtime_id)
         self._forget_entity_observers(self._critical_effect_observers, runtime_id)
         self._forget_entity_observers(self._health_observers, runtime_id)
@@ -2048,6 +2111,12 @@ class Entities:
             runtime_id = int(packet.runtime_id)
             current = self._player_equipment.get(runtime_id)
             if current is None:
+                # Protocol 2225 uses the zero selectors in INVENTORY for the actor's main hand.
+                if (self.packets.protocol.number == 2225 and packet.container_id == b.ContainerID.INVENTORY
+                        and packet.slot == packet.selected_slot == 0
+                        and (instance := self._nonplayer_actor(runtime_id)) is not None):
+                    self._publish_actor_equipment(runtime_id, instance, startup=startup,
+                                                  main_hand=_equipment_stack(packet.item))
                 return
             if packet.container_id == b.ContainerID.INVENTORY:
                 self._publish_player_equipment(current, replace(
@@ -2060,12 +2129,20 @@ class Entities:
                     self._by_runtime[runtime_id] = replace(state, last_observed_offhand=offhand)
         elif packet_id == b.MobArmorEquipmentPacket.ID:
             packet = self.packets.protocol.decode(raw)
-            current = self._player_equipment.get(int(packet.runtime_id))
+            runtime_id = int(packet.runtime_id)
+            current = self._player_equipment.get(runtime_id)
             if current is not None:
                 self._publish_player_equipment(current, replace(
                     current, head=_equipment_stack(packet.head), chest=_equipment_stack(packet.torso),
                     legs=_equipment_stack(packet.legs), feet=_equipment_stack(packet.feet),
                 ))
+            elif (instance := self._nonplayer_actor(runtime_id)) is not None:
+                self._publish_actor_equipment(
+                    runtime_id, instance, startup=startup,
+                    head=_equipment_stack(packet.head), chest=_equipment_stack(packet.torso),
+                    legs=_equipment_stack(packet.legs), feet=_equipment_stack(packet.feet),
+                    body=_equipment_stack(getattr(packet, "body", None)),
+                )
         elif packet_id == b.AddActorPacket.ID:
             actor = self.packets.protocol.decode(raw)
             runtime_id = int(actor.runtime_id)
@@ -2165,6 +2242,8 @@ class Entities:
                                        RuntimeError, "dimension changed while waiting for an entity swing")
             self._clear_player_equipment(LookupError, "remote player is no longer observed")
             self._clear_links()
+            self._end_entity_observers(self._actor_equipment_observers, dimension_bound,
+                                       LookupError, "entity is no longer observed")
             self._end_entity_observers(self._critical_effect_observers, dimension_bound,
                                        RuntimeError, "dimension changed while waiting for an entity critical effect")
             self._end_entity_observers(self._health_observers, dimension_bound,
