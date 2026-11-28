@@ -76,6 +76,25 @@ Accessing it can raise `json.JSONDecodeError` for a malformed text object.
 Translation keys and arguments are preserved for the client's locale. Command
 feedback can arrive as a text object whose source field is absent.
 
+Use `TextTranslations.from_lang(locale="fr_FR", vanilla_lang=lang_bytes,
+resource_pack_index=index)` to resolve native translation packets and rawtext
+using a locally supplied Bedrock `.lang` file. Pass the effective `index`
+from the session that received the event, or omit it to use the base file.
+The resolver parses both files once and can resolve each subsequent
+`TextEvent` with `translations.resolve(event)`. No language files are
+downloaded or included with the SDK. Resolution preserves the event fields
+and sends no packets.
+
+A valid pack file overrides base keys, including empty values. Keys absent
+from that file use the supplied base for the same locale. An invalid effective
+file leaves translations unavailable. This resolver accepts a UTF-8 BOM and
+spaces or tabs before `=` in both files. It skips malformed and ambiguous
+entries in the base file. The resolver supports `%s` and `%N$s`
+templates, and `%%N` in rawtext. It preserves the yellow formatting in the
+server's `§e%` join and leave keys. A missing key, argument, or unsupported
+node leaves the entire message unresolved. Existing event and display pattern
+methods continue to use their resource-pack-only resolution rules.
+
 `await bot.send_whisper("Player One", "See you soon")` submits a `/tell` command
 to a single quoted player name, including names with spaces or punctuation.
 The message body is submitted verbatim. Emails such as `user@example.com`,

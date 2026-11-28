@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from endpilot import ResourcePackIndex, TextEvent, TextPacketType
+from endpilot import ResourcePackIndex, TextEvent, TextPacketType, TextTranslations
 
 
 def text_object(node, *, kind=TextPacketType.TEXT_OBJECT_WHISPER, localize=False):
@@ -124,6 +124,7 @@ class PackTextResolutionTests(unittest.TestCase):
             b"fixture.word=valid\nfixture.other=\xff",
             b"\xef\xbb\xbffixture.word=valid",
             b"fixture.word=valid\nmissing delimiter",
+            b"fixture.word=valid\nfixture.other = padded key",
             b"fixture.word=valid\nfixture.word=duplicate",
             b"fixture.word=valid\nfixture.word=valid",
         ):
@@ -142,3 +143,79 @@ class PackTextResolutionTests(unittest.TestCase):
             repeat = {"translate": "fixture.repeat", "with": {"rawtext": [repeat]}}
         index = ResourcePackIndex((), {"texts/en_US.lang": b"fixture.repeat=" + b"%%1" * 100})
         self.assertIsNone(text_object(repeat).resolve_text(locale="en_US", resource_pack_index=index))
+
+
+class NativeTextTranslationsTests(unittest.TestCase):
+    @staticmethod
+    def native(key, *args, localize=True):
+        return TextEvent(TextPacketType.TRANSLATE, key, localize, params=args)
+
+    def test_formats_native_and_nested_rawtext_in_one_pass(self):
+        translations = TextTranslations.from_lang(locale="en_US", vanilla_lang=(
+            b"death.attack.lava=%1$s tried to swim in lava\n"
+            b"multiplayer.player.left=%s left the game\n"
+            b"record=%2$s / %1$s / %2$s\nraw=%%2 / %%1\n"
+        ))
+        death = self.native("death.attack.lava", "Pilot %2$s")
+        self.assertEqual(translations.resolve(death), "Pilot %2$s tried to swim in lava")
+        self.assertIsNone(death.resolve_text(locale="en_US", resource_pack_index=None))
+        self.assertEqual((death.message, death.params), ("death.attack.lava", ("Pilot %2$s",)))
+        self.assertEqual(translations.resolve(self.native("record", "one", "two")), "two / one / two")
+        leave = text_object({"translate": "§e%multiplayer.player.left", "with": {"rawtext": [{"text": "Pilot"}]}})
+        self.assertEqual(translations.resolve(leave), "§ePilot left the game")
+        self.assertEqual(translations.resolve(self.native("§e%multiplayer.player.left", "Pilot")), "§ePilot left the game")
+        self.assertEqual(translations.resolve(text_object({"translate": "raw", "with": ["one", "%s"]})), "%s / one")
+        self.assertIsNone(translations.resolve(self.native("raw", "one", "two")))
+        self.assertIsNone(translations.resolve(self.native("record", "one")))
+        self.assertIsNone(translations.resolve(self.native("record", "one", "two", localize=False)))
+        self.assertEqual(translations.resolve(TextEvent(TextPacketType.CHAT, " hi ", False, author="Peer§r")),
+                         "<Peer>  hi ")
+
+    def test_base_bom_and_unrelated_bad_entries_with_locale_overlay(self):
+        base = (b"\xef\xbb\xbf\r\nkey=Base %s\r\nkept=100% done\r\nbad=\xff\n"
+                b"dup=first\ndup=second\nmissing delimiter\nambiguous=valid\nambiguous=\xff\n")
+        event = self.native("key", "Pilot")
+        pack = ResourcePackIndex((), {"texts/fr_FR.lang": b"key=\n"})
+        base_only = TextTranslations.from_lang(locale="en_US", vanilla_lang=base, resource_pack_index=pack)
+        merged = TextTranslations.from_lang(locale="fr_FR", vanilla_lang=base, resource_pack_index=pack)
+        self.assertEqual(base_only.resolve(event), "Base Pilot")
+        self.assertEqual(merged.resolve(event), "")
+        self.assertEqual(merged.resolve(self.native("kept")), "100% done")
+        for key in ("bad", "dup", "ambiguous", "unlisted"):
+            with self.subTest(key=key):
+                self.assertIsNone(merged.resolve(self.native(key)))
+        invalid = ResourcePackIndex((), {"texts/fr_FR.lang": b"key=Overlay %s\ndup=one\ndup=two"})
+        unresolved = TextTranslations.from_lang(locale="fr_FR", vanilla_lang=base, resource_pack_index=invalid)
+        self.assertIsNone(unresolved.resolve(event))
+        self.assertIsNone(unresolved.resolve(self.native("kept")))
+        self.assertEqual(unresolved.resolve(text_object({"text": "literal"})), "literal")
+        self.assertEqual(merged.resolve(event), "")
+
+    def test_official_language_layout_applies_to_base_and_overlay(self):
+        base = b"\xef\xbb\xbf\r\nbase = kept\r\nbase.duplicate=one\r\nbase.duplicate =two\r\n"
+        overlay = b"\xef\xbb\xbf\r\noverlay \t= padded value \t# comment\r\n"
+        index = ResourcePackIndex((), {"texts/fr_FR.lang": overlay})
+        translations = TextTranslations.from_lang(locale="fr_FR", vanilla_lang=base, resource_pack_index=index)
+        self.assertEqual(translations.resolve(self.native("base")), " kept")
+        self.assertIsNone(translations.resolve(self.native("base.duplicate")))
+        event = text_object({"translate": "overlay"})
+        self.assertEqual(translations.resolve(event), " padded value ")
+        self.assertIsNone(event.resolve_text(locale="fr_FR", resource_pack_index=index))
+
+        duplicate = ResourcePackIndex((), {"texts/fr_FR.lang": overlay + b"overlay=conflict\n"})
+        translations = TextTranslations.from_lang(locale="fr_FR", vanilla_lang=base, resource_pack_index=duplicate)
+        self.assertIsNone(translations.resolve(event))
+        self.assertIsNone(translations.resolve(self.native("base")))
+
+    def test_unresolved_template_or_rawtext_node_rejects_entire_message(self):
+        translations = TextTranslations.from_lang(locale="en_US", vanilla_lang=(
+            b"bad.printf=%2$d\nbad.mixed=%s %1$s\nbad.zero=%%0\nrequired=%2$s\n"
+        ))
+        for child in ({"translate": "bad.printf", "with": ["one", "two"]},
+                      {"translate": "bad.mixed", "with": ["one"]},
+                      {"translate": "bad.zero", "with": ["one"]},
+                      {"translate": "required", "with": ["one"]},
+                      {"translate": "missing"}, {"selector": "@s"}):
+            with self.subTest(child=child):
+                self.assertIsNone(translations.resolve(text_object({"rawtext": [{"text": "prefix"}, child]})))
+        self.assertIsNone(translations.resolve(self.native("required", "one", "x" * (128 * 1024))))

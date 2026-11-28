@@ -14,7 +14,7 @@ from .blocks import (
 from .books import BookSnapshot
 from .boss_bars import BossBar, BossBarEvent, BossBarEventKind
 from .bot import Bot
-from .chat import ChatMatch, ChatMessage, DisplayMatch, TextEvent, TextPacketType
+from .chat import ChatMatch, ChatMessage, DisplayMatch, TextEvent, TextPacketType, TextTranslations
 from .collection import BlockCollection, BlockCollectionBatch, CountedBlockCollection, DropCollection, MixedCollectionBatch
 from .collection_storage import CollectionStorage, CollectionStorageResult
 from .commands import CommandCatalog, CommandCatalogEntry
@@ -205,6 +205,7 @@ __all__ = [
     "SoundEvent",
     "SoundKind",
     "TextEvent",
+    "TextTranslations",
     "TextPacketType",
     "TitleEvent",
     "TitleKind",

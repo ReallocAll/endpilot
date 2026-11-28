@@ -3,9 +3,11 @@
 import asyncio
 import json
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import count
+from types import MappingProxyType
+from typing import Literal
 from uuid import UUID, uuid4
 
 from bedrock_protocol import TextPacketType
@@ -31,6 +33,9 @@ _TEXT_OBJECT_KINDS = (
 )
 _LITERAL_TEXT_KINDS = (TextPacketType.RAW, TextPacketType.SYSTEM_MESSAGE, TextPacketType.TIP)
 _TRANSLATION_SLOT = re.compile(r"%%[0-9]*|%[A-Za-z0-9]")
+_NATIVE_TRANSLATION_SLOT = re.compile(
+    r"%(?:s|(?P<position>[1-9][0-9]*)\$s|%(?:[1-9][0-9]*)|(?=[%A-Za-z0-9.$+\-#]))",
+)
 _MAX_LANG_BYTES = 2 * 1024 * 1024
 _MAX_RAWTEXT_CHARS = 128 * 1024
 _MAX_RAWTEXT_DEPTH = 32
@@ -84,6 +89,49 @@ class TextEvent:
         return _text_content(self)
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class TextTranslations:
+    """A local language table with an optional receiving session's effective overlay."""
+
+    _templates: Mapping[str, str] = field(repr=False)
+
+    @classmethod
+    def from_lang(cls, *, locale: str, vanilla_lang: bytes,
+                  resource_pack_index: ResourcePackIndex | None = None) -> "TextTranslations":
+        """Parse caller-supplied base bytes and any effective pack file for this locale."""
+        _validate_locale(locale)
+        templates = _read_vanilla_translations(vanilla_lang)
+        if resource_pack_index is not None:
+            try:
+                templates.update(_read_translations(locale, resource_pack_index, vanilla_syntax=True))
+            except KeyError:
+                pass  # The effective stack has no language file for this locale.
+            except ValueError:
+                templates.clear()  # An invalid effective file leaves translation precedence unknown.
+        return cls(MappingProxyType(templates))
+
+    def _template(self, key: str) -> str:
+        if key.startswith("§e%"):
+            return "§e" + self._templates[key[3:]]
+        return self._templates[key]
+
+    def resolve(self, event: TextEvent) -> str | None:
+        """Format the entire observed event when its text and arguments are available."""
+        if event.kind in _TEXT_OBJECT_KINDS and not event.localize:
+            return _render_rawtext(event.message, self._template, syntax="rawtext")
+        if event.kind == TextPacketType.TRANSLATE and event.localize:
+            try:
+                template = self._template(event.message)
+                args = event.params or ()
+                budget = _MAX_RAWTEXT_CHARS - sum(map(len, args), len(template))
+                if budget >= 0:
+                    return _fill_translation(template, args, budget, syntax="native")
+            except (KeyError, ValueError):
+                pass
+            return None
+        return _text_content(event)
+
+
 def _text_content(event: TextEvent, *, include_text_objects: bool = False) -> str | None:
     if event.localize:
         return None
@@ -122,41 +170,74 @@ def _literal_rawtext(message: str) -> str | None:
     return "".join(parts)
 
 
-def _read_translations(locale: str, index: ResourcePackIndex | None) -> dict[str, str]:
+def _read_translations(locale: str, index: ResourcePackIndex | None, *, vanilla_syntax: bool = False) -> dict[str, str]:
     _validate_locale(locale)
     if index is None:
         raise ValueError("resource-pack translations are unavailable")
     data = index.read(f"texts/{locale}.lang")
-    if len(data) > _MAX_LANG_BYTES or data.startswith(b"\xef\xbb\xbf"):
+    if len(data) > _MAX_LANG_BYTES or (not vanilla_syntax and data.startswith(b"\xef\xbb\xbf")):
         raise ValueError("unsupported language file")
     translations = {}
-    for line in data.decode("utf-8").split("\n"):
+    encoding = "utf-8-sig" if vanilla_syntax else "utf-8"
+    for line in data.decode(encoding).split("\n"):
         line = line.removesuffix("\r")
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         key, separator, value = line.partition("=")
+        if vanilla_syntax:
+            key = key.rstrip(" \t")
         if not separator or not key or key != key.strip() or key in translations:
             raise ValueError("invalid or duplicate language key")
         translations[key] = value.partition("\t#")[0]
     return translations
 
 
-def _fill_translation(template: str, args: list[str], budget: int) -> str:
+def _read_vanilla_translations(data: bytes) -> dict[str, str]:
+    if len(data) > _MAX_LANG_BYTES:
+        raise ValueError("unsupported language file size")
+    translations: dict[str, str] = {}
+    seen = set()
+    for line in data.removeprefix(b"\xef\xbb\xbf").split(b"\n"):
+        raw_key, separator, value = line.removesuffix(b"\r").partition(b"=")
+        raw_key = raw_key.rstrip(b" \t")
+        if not separator or not raw_key or raw_key != raw_key.strip() or raw_key.startswith(b"#"):
+            continue
+        try:
+            key = raw_key.decode("utf-8")
+            if key != key.strip():
+                continue
+            if key in seen:
+                translations.pop(key, None)
+                continue
+            seen.add(key)
+            translations[key] = value.partition(b"\t#")[0].decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+    return translations
+
+
+def _fill_translation(template: str, args: Sequence[str], budget: int, *,
+                      syntax: Literal["pack", "rawtext", "native"] = "pack") -> str:
     parts = []
     numbered = None
     sequential_index = 0
     end = 0
-    for match in _TRANSLATION_SLOT.finditer(template):
+    slots = _TRANSLATION_SLOT if syntax == "pack" else _NATIVE_TRANSLATION_SLOT
+    for match in slots.finditer(template):
         slot = match.group()
-        is_numbered = slot.startswith("%%")
+        is_numbered = slot != "%s"
         if numbered is not None and numbered != is_numbered:
             raise ValueError("mixed translation slot formats")
         numbered = is_numbered
         if slot == "%s":
             index = sequential_index
             sequential_index += 1
-        elif is_numbered and len(slot) == 3 and slot[-1] in "123456789":
+        elif syntax == "pack" and slot.startswith("%%") and len(slot) == 3 and slot[-1] in "123456789":
             index = int(slot[-1]) - 1
+        elif syntax != "pack" and match["position"] is not None:
+            index = int(match["position"]) - 1
+        elif syntax == "rawtext" and slot.startswith("%%"):
+            index = int(slot[2:]) - 1
         else:
             raise ValueError("unsupported translation slot")
         if index >= len(args):
@@ -167,7 +248,7 @@ def _fill_translation(template: str, args: list[str], budget: int) -> str:
             raise ValueError("expanded translation exceeds the text limit")
         parts.extend((template[end:match.start()], value))
         end = match.end()
-    if not numbered and sequential_index != len(args):
+    if syntax == "pack" and not numbered and sequential_index != len(args):
         raise ValueError("extra sequential translation argument")
     if len(template) - end > budget:
         raise ValueError("expanded translation exceeds the text limit")
@@ -176,9 +257,21 @@ def _fill_translation(template: str, args: list[str], budget: int) -> str:
 
 
 def _resolve_rawtext(message: str, locale: str, index: ResourcePackIndex | None) -> str | None:
+    translations = None
+
+    def template_for(key):
+        nonlocal translations
+        if translations is None:
+            translations = _read_translations(locale, index)
+        return translations[key]
+
+    return _render_rawtext(message, template_for)
+
+
+def _render_rawtext(message: str, template_for: Callable[[str], str], *,
+                    syntax: Literal["pack", "rawtext"] = "pack") -> str | None:
     if len(message) > _MAX_RAWTEXT_CHARS:
         return None
-    translations = None
     # Count templates and intermediate strings so nested substitutions have
     # bounded work even when a slot is repeated or unused.
     budget = _MAX_RAWTEXT_CHARS
@@ -190,7 +283,6 @@ def _resolve_rawtext(message: str, locale: str, index: ResourcePackIndex | None)
             raise ValueError("rawtext exceeds the text limit")
 
     def resolve(node: object, depth: int) -> str:
-        nonlocal translations
         if depth > _MAX_RAWTEXT_DEPTH or not isinstance(node, dict):
             raise ValueError("invalid rawtext node")
         if node.keys() == {"text"} and isinstance(value := node["text"], str):
@@ -202,9 +294,7 @@ def _resolve_rawtext(message: str, locale: str, index: ResourcePackIndex | None)
             key := node["translate"], str,
         ):
             raise ValueError("unresolved rawtext node")
-        if translations is None:
-            translations = _read_translations(locale, index)
-        template = translations[key]
+        template = template_for(key)
         spend(len(template))
         with_value = node.get("with", [])
         if isinstance(with_value, list) and all(isinstance(arg, str) for arg in with_value):
@@ -214,7 +304,7 @@ def _resolve_rawtext(message: str, locale: str, index: ResourcePackIndex | None)
             args = [resolve(child, depth + 1) for child in children]
         else:
             raise ValueError("invalid translate arguments")
-        value = _fill_translation(template, args, budget)
+        value = _fill_translation(template, args, budget, syntax=syntax)
         spend(len(value))
         return value
 
