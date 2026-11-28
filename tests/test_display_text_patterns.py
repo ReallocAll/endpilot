@@ -5,7 +5,7 @@ import re
 import unittest
 from unittest.mock import patch
 
-from endpilot import Bot, ChatMessage, DisplayMatch, TextPacketType
+from endpilot import Bot, ChatMessage, DisplayMatch, TextPacketType, TextTranslations
 from endpilot.protocol import write_batch
 
 from test_scheduled_input import ManualClock, Wire
@@ -42,6 +42,11 @@ class DisplayTextPatternTests(unittest.IsolatedAsyncioTestCase):
 
     def rawtext(self, *nodes, kind=TextPacketType.TEXT_OBJECT_WHISPER):
         return self.message(kind, json.dumps({"rawtext": nodes}, ensure_ascii=False) + "\n")
+
+    def translated(self, key, *params):
+        return self.text(localize=True, body=self.text.MessageAndParams(
+            type=TextPacketType.TRANSLATE, message=key, params=params,
+        ))
 
     async def deliver(self, *packets):
         marker = self.b.SetTimePacket()
@@ -171,6 +176,112 @@ class DisplayTextPatternTests(unittest.IsolatedAsyncioTestCase):
                     await self.bot.wait_for_message("ready", locale=invalid, timeout=0)
         self.assertEqual(self.bot.remove_display_pattern("invalid"), 0)
         self.assertEqual(self.bot.add_display_pattern("next", "ready", locale="fr_FR"), first + 1)
+        self.assertFalse(self.bot._chat._text_observers)
+        self.assertFalse(self.bot._chat._content_waits)
+
+    async def test_translated_wait_and_ordered_pattern_share_full_event_rendering(self):
+        translations = TextTranslations.from_lang(locale="fr_FR", vanilla_lang=(
+            "fixture.death=%1$s est tombé\nfixture.ready=Prêt %s\n".encode()
+        ))
+        first = "Pilot est tombé"
+        second = "Prêt Pilot"
+        third = "<玩家> continue"
+        pattern = self.bot.add_display_pattern("rescue", tuple(f"^{text}$" for text in (first, second, third)),
+                                               translations=translations)
+        completed, observed = [], []
+        self.bot.subscribe_display_match(pattern, completed.append)
+        self.bot.subscribe_text(observed.append)
+        content = await self.arm(self.bot.wait_for_message(first, translations=translations, timeout=1))
+        legacy = await self.arm(self.bot.wait_for_message(first, third, timeout=1))
+        raw = await self.arm(self.bot.wait_for_text(message="fixture.death", timeout=1))
+        display = await self.arm(self.bot.wait_for_display_match(pattern, timeout=1))
+        resolve = TextTranslations.resolve
+
+        with patch.object(TextTranslations, "resolve", autospec=True, side_effect=resolve) as reads:
+            await self.deliver(self.translated("fixture.death", "Pilot"))
+            death_event = await raw
+            reads.assert_called_once_with(translations, death_event)
+            self.assertEqual(death_event.message, "fixture.death")
+            self.assertEqual(await content, first)
+            self.assertFalse(legacy.done())
+            self.assertFalse(completed)
+
+            await self.deliver(self.translated("fixture.unknown", "Pilot"), self.chat("continue"))
+            self.assertFalse(display.done())
+            self.assertFalse(completed)
+            content = await self.arm(self.bot.wait_for_message(second, translations=translations, timeout=1))
+            await self.deliver(self.rawtext({"translate": "fixture.ready", "with": ["Pilot"]}))
+            self.assertEqual(await content, second)
+            self.assertFalse(completed)
+            await self.deliver(self.chat("continue"))
+            self.assertEqual(await legacy, third)
+
+        match, = completed
+        self.assertIs(await display, match)
+        self.assertEqual(match.events[0], death_event)
+        self.assertIs(match.events[0], observed[0])
+        self.assertEqual(tuple(capture.string for capture in match.matches), (first, second, third))
+
+    async def test_distinct_resolvers_with_the_same_locale_match_independently(self):
+        first = TextTranslations.from_lang(locale="fr_FR", vanilla_lang=b"fixture.key=one\n")
+        second = TextTranslations.from_lang(locale="fr_FR", vanilla_lang=b"fixture.key=two\n")
+        a = self.bot.add_display_pattern("first", "^one$", translations=first)
+        b = self.bot.add_display_pattern("second", "^two$", translations=second)
+        wait_a = await self.arm(self.bot.wait_for_display_match(a, timeout=1))
+        wait_b = await self.arm(self.bot.wait_for_display_match(b, timeout=1))
+        await self.deliver(self.translated("fixture.key"))
+        self.assertEqual((await wait_a).matches[0].string, "one")
+        self.assertEqual((await wait_b).matches[0].string, "two")
+
+    async def test_explicit_resolver_matches_announcement_and_whisper_bodies(self):
+        translations = TextTranslations.from_lang(locale="fr_FR", vanilla_lang=b"")
+        for kind, author, body in (
+            (TextPacketType.ANNOUNCEMENT, "Server", "[Server] checkpoint"),
+            (TextPacketType.WHISPER, "Peer", " keep my trailing space "),
+        ):
+            with self.subTest(kind=kind):
+                pattern = f"^{re.escape(body)}$"
+                selected = self.bot.add_display_pattern("explicit", pattern, repeat=False, translations=translations)
+                legacy = self.bot.add_display_pattern("legacy", pattern, locale="fr_FR")
+                matches, skipped = [], []
+                stop = self.bot.subscribe_display_match(selected, matches.append)
+                stop_skipped = self.bot.subscribe_display_match(legacy, skipped.append)
+                content = await self.arm(self.bot.wait_for_message(body, translations=translations, timeout=1))
+                prior = await self.arm(self.bot.wait_for_message(body, "done", timeout=1))
+                packet_body = self.text.AuthorAndMessage(type=kind, author=author, message=body)
+                await self.deliver(self.text(localize=True, body=packet_body))
+                self.assertFalse(content.done())
+                self.assertFalse(matches)
+                raw = await self.arm(self.bot.wait_for_text(kind=kind, message=body, timeout=1))
+                await self.deliver(self.text(localize=False, body=packet_body))
+                self.assertEqual(await content, body)
+                match, = matches
+                event = await raw
+                self.assertEqual(match.matches[0].string, body)
+                self.assertEqual(match.events, (event,))
+                self.assertEqual(event.author, author)
+                self.assertIsNone(event.resolve_text(locale="fr_FR", resource_pack_index=None))
+                self.assertFalse(skipped)
+                self.assertFalse(prior.done())
+                await self.deliver(self.message(TextPacketType.RAW, "done"))
+                self.assertEqual(await prior, "done")
+                stop()
+                stop_skipped()
+                self.bot.remove_display_pattern(legacy)
+
+    async def test_invalid_translation_source_rejects_before_registration(self):
+        translations = TextTranslations.from_lang(locale="fr_FR", vanilla_lang=b"")
+        first = self.bot.add_display_pattern("first", "ready")
+        for error, options in (
+            (ValueError, {"locale": "fr_FR", "translations": translations}),
+            (TypeError, {"translations": {}}),
+        ):
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(error, "translations"):
+                    self.bot.add_display_pattern("invalid", "ready", **options)
+                with self.assertRaisesRegex(error, "translations"):
+                    await self.bot.wait_for_message("ready", timeout=0, **options)
+        self.assertEqual(self.bot.add_display_pattern("next", "ready", translations=translations), first + 1)
         self.assertFalse(self.bot._chat._text_observers)
         self.assertFalse(self.bot._chat._content_waits)
 

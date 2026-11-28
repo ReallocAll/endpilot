@@ -29,7 +29,7 @@ from .blocks import (
 )
 from .books import BookEdit, BookSnapshot, Books
 from .boss_bars import BossBar, BossBarEvent, BossBarEventKind, BossBars
-from .chat import Chat, ChatMatch, ChatMessage, ChatPatterns, DisplayMatch, TextEvent, TextPacketType
+from .chat import Chat, ChatMatch, ChatMessage, ChatPatterns, DisplayMatch, TextEvent, TextPacketType, TextTranslations
 from .client_clock import ClientClock
 from .collection import BlockCollection, BlockCollectionBatch, CountedBlockCollection, MixedCollectionBatch, _BlockCollector
 from .collection_storage import CollectionStorage
@@ -2720,7 +2720,7 @@ class Bot:
 
     async def wait_for_message(
         self, *matchers: str | Pattern[str] | Sequence[str | Pattern[str]], timeout: float = 15,
-        include_text_objects: bool = False, locale: str | None = None,
+        include_text_objects: bool = False, locale: str | None = None, translations: TextTranslations | None = None,
     ) -> str:
         """Wait for the first matching incoming text with a supported format.
 
@@ -2728,12 +2728,13 @@ class Bot:
         A sequence supplies alternative matchers.
         Set include_text_objects to include fully literal rawtext objects.
         An explicit Bedrock locale also includes rawtext resolved in full from
-        this connection's resource packs.
+        this connection's resource packs. Supply translations instead of locale
+        to match supported text resolved by an explicit TextTranslations instance.
         """
         if self._chat is None:
             raise RuntimeError("player has not joined")
         return await self._chat.wait_for_content(
-            *matchers, timeout=timeout, include_text_objects=include_text_objects, locale=locale,
+            *matchers, timeout=timeout, include_text_objects=include_text_objects, locale=locale, translations=translations,
         )
 
     def subscribe_text(
@@ -2775,16 +2776,18 @@ class Bot:
 
     def add_display_pattern(
         self, name: str, pattern: ChatPatterns, *, repeat: bool = True, locale: str | None = None,
+        translations: TextTranslations | None = None,
     ) -> int:
         """Register an ordered pattern over incoming display text.
 
         Chat uses the same <author> message format as wait_for_message.
         By default, text objects must be entirely literal. An explicit Bedrock
         locale also includes rawtext resolved in full from this connection's packs.
+        Supply translations instead of locale to use an explicit TextTranslations.
         """
         if self._chat is None:
             raise RuntimeError("player has not joined")
-        return self._chat.add_display_pattern(name, pattern, repeat=repeat, locale=locale)
+        return self._chat.add_display_pattern(name, pattern, repeat=repeat, locale=locale, translations=translations)
 
     def remove_display_pattern(self, name_or_id: str | int) -> int:
         """Remove display patterns by name or ID and return the number removed."""

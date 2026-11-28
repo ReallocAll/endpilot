@@ -129,6 +129,8 @@ class TextTranslations:
             except (KeyError, ValueError):
                 pass
             return None
+        if not event.localize and event.kind in (TextPacketType.ANNOUNCEMENT, TextPacketType.WHISPER):
+            return event.message
         return _text_content(event)
 
 
@@ -334,23 +336,41 @@ class DisplayMatch:
     matches: tuple[re.Match[str], ...]
 
 
+type _DisplayTextSource = str | TextTranslations | None
+
+
+def _display_text_source(locale: str | None, translations: TextTranslations | None) -> _DisplayTextSource:
+    if translations is not None:
+        if locale is not None:
+            raise ValueError("locale and translations are mutually exclusive")
+        if not isinstance(translations, TextTranslations):
+            raise TypeError("translations must be a TextTranslations resolver")
+        return translations
+    if locale is not None:
+        _validate_locale(locale)
+    return locale
+
+
 @dataclass(slots=True)
 class _IncomingText:
     """Share one packet's content across display patterns and content waits."""
 
     event: TextEvent
     resource_pack_index: ResourcePackIndex | None
-    _contents: dict[str | None, str | None] = field(default_factory=dict)
+    _contents: dict[_DisplayTextSource, str | None] = field(default_factory=dict)
 
-    def content(self, locale: str | None, *, include_text_objects: bool = True) -> str | None:
-        if locale is None and not include_text_objects:
+    def content(self, source: _DisplayTextSource, *, include_text_objects: bool = True) -> str | None:
+        if source is None and not include_text_objects:
             return _text_content(self.event)
-        if locale not in self._contents:
-            self._contents[locale] = (
-                _text_content(self.event, include_text_objects=True) if locale is None
-                else self.event.resolve_text(locale=locale, resource_pack_index=self.resource_pack_index)
-            )
-        return self._contents[locale]
+        if source not in self._contents:
+            if isinstance(source, TextTranslations):
+                content = source.resolve(self.event)
+            elif source is None:
+                content = _text_content(self.event, include_text_objects=True)
+            else:
+                content = self.event.resolve_text(locale=source, resource_pack_index=self.resource_pack_index)
+            self._contents[source] = content
+        return self._contents[source]
 
 
 @dataclass(slots=True)
@@ -358,7 +378,7 @@ class _RegisteredPattern[T]:
     name: str
     patterns: tuple[re.Pattern[str], ...]
     repeat: bool
-    locale: str | None = None
+    text_source: _DisplayTextSource = None
     events: list[T] = field(default_factory=list)
     matches: list[re.Match[str]] = field(default_factory=list)
 
@@ -470,11 +490,10 @@ class Chat:
 
     async def wait_for_content(
         self, *matchers: str | re.Pattern[str] | Sequence[str | re.Pattern[str]], timeout: float = 15,
-        include_text_objects: bool = False, locale: str | None = None,
+        include_text_objects: bool = False, locale: str | None = None, translations: TextTranslations | None = None,
     ) -> str:
-        """Return the first matching text, resolving pack translations for an explicit locale."""
-        if locale is not None:
-            _validate_locale(locale)
+        """Return the first matching text using the selected translation source."""
+        source = _display_text_source(locale, translations)
         alternatives = tuple(
             item for matcher in matchers
             for item in (matcher if isinstance(matcher, Sequence)
@@ -493,7 +512,7 @@ class Chat:
         def observe(incoming: _IncomingText) -> None:
             if received.done():
                 return
-            content = incoming.content(locale, include_text_objects=include_text_objects)
+            content = incoming.content(source, include_text_objects=include_text_objects)
             if content is not None and any(
                 content == item if isinstance(item, str) else item.search(content)
                 for item in alternatives
@@ -516,15 +535,15 @@ class Chat:
 
     def add_display_pattern(
         self, name: str, pattern: ChatPatterns, *, repeat: bool = True, locale: str | None = None,
+        translations: TextTranslations | None = None,
     ) -> int:
-        if locale is not None:
-            _validate_locale(locale)
+        source = _display_text_source(locale, translations)
         self._require_subscription_stream()
-        return self._add_pattern(self._display_patterns, name, pattern, repeat=repeat, locale=locale)
+        return self._add_pattern(self._display_patterns, name, pattern, repeat=repeat, text_source=source)
 
     def _add_pattern[T](
         self, registrations: dict[int, _RegisteredPattern[T]], name: str, pattern: ChatPatterns, *, repeat: bool,
-        locale: str | None = None,
+        text_source: _DisplayTextSource = None,
     ) -> int:
         if isinstance(pattern, (str, re.Pattern)):
             pattern = (pattern,)
@@ -536,7 +555,7 @@ class Chat:
         if any(not isinstance(regex.pattern, str) for regex in patterns):
             raise TypeError("chat patterns must match strings")
         pattern_id = next(self._pattern_ids)
-        registrations[pattern_id] = _RegisteredPattern(name, patterns, repeat, locale=locale)
+        registrations[pattern_id] = _RegisteredPattern(name, patterns, repeat, text_source=text_source)
         return pattern_id
 
     def remove_pattern(self, name_or_id: str | int) -> int:
@@ -731,11 +750,11 @@ class Chat:
     @staticmethod
     def _advance_patterns[T, M](
         registrations: dict[int, _RegisteredPattern[T]], completions: list[M], event: T,
-        content_for: Callable[[str | None], str | None],
+        content_for: Callable[[_DisplayTextSource], str | None],
         make_match: Callable[[int, str, tuple[T, ...], tuple[re.Match[str], ...]], M],
     ) -> None:
         for pattern_id, pattern in tuple(registrations.items()):
-            content = content_for(pattern.locale)
+            content = content_for(pattern.text_source)
             if content is None:
                 continue
             match = pattern.patterns[len(pattern.matches)].search(content)

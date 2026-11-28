@@ -57,6 +57,13 @@ Each wait or registration can select its own locale. For literal objects only,
 use `wait_for_message(..., include_text_objects=True)` or the default display
 pattern behavior.
 
+Pass `translations=` to either API to match the full text rendered by an
+explicit `TextTranslations` instance. This includes supported native
+translation packets, rawtext, and ordinary chat. Each wait or pattern uses
+the supplied instance for its lifetime on the current connection. Passing
+both `locale` and `translations` raises `ValueError`. A supplied resolver
+includes its supported text objects automatically.
+
 ## Observe server text and send private chat
 
 `await bot.wait_for_text(kind=TextPacketType.WHISPER, author="Player One")`
@@ -85,6 +92,10 @@ The resolver parses both files once and can resolve each subsequent
 downloaded or included with the SDK. Resolution preserves the event fields
 and sends no packets.
 
+For non-localized `ANNOUNCEMENT` and `WHISPER` packets, `resolve()` returns
+the received `message` verbatim. This includes any prefix already in the
+message and preserves the packet's separate `author` field on the event.
+
 A valid pack file overrides base keys, including empty values. Keys absent
 from that file use the supplied base for the same locale. An invalid effective
 file leaves translations unavailable. This resolver accepts a UTF-8 BOM and
@@ -92,8 +103,9 @@ spaces or tabs before `=` in both files. It skips malformed and ambiguous
 entries in the base file. The resolver supports `%s` and `%N$s`
 templates, and `%%N` in rawtext. It preserves the yellow formatting in the
 server's `§e%` join and leave keys. A missing key, argument, or unsupported
-node leaves the entire message unresolved. Existing event and display pattern
-methods continue to use their resource-pack-only resolution rules.
+node leaves the entire message unresolved. `TextEvent.resolve_text()` still
+uses its resource-pack-only rules. `wait_for_text()` continues to match the
+original message field.
 
 `await bot.send_whisper("Player One", "See you soon")` submits a `/tell` command
 to a single quoted player name, including names with spaces or punctuation.
