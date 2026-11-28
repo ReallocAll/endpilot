@@ -2578,8 +2578,9 @@ class Bot:
         for its contents. A horse opened through this method supports single-item
         transfers of a saddle in slot 0 or horse armor in slot 1. Equipment transfers
         use take_from_container() or put_into_container().
-        Donkey windows are read-only. Full server contents report slot 0 for
-        the saddle and slots 1–15 when the donkey has a chest.
+        Donkey slot 0 reports the saddle. A chested donkey's full 16-slot
+        contents allow whole-stack transfers between cargo slots 1–15 and
+        main inventory. The destination must be confirmed empty.
         Chest watercraft and hopper minecart transfers require matching
         27-slot and 5-slot windows, respectively.
         """

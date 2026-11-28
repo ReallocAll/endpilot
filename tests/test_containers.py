@@ -743,17 +743,17 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.set_sneaking(True)
         await self.deliver(self.sneak_pose(True))
 
-    def donkey_equipment(self):
+    def donkey_equipment(self, *, window_id=2):
         b = self.b
         return b.UpdateEquipPacket(
-            container_id=2, type=b.ContainerType.HORSE, size=0, entity_unique_id=-206,
+            container_id=window_id, type=b.ContainerType.HORSE, size=0, entity_unique_id=-206,
             data=nbt.CompoundTag({"slots": nbt.ListTag([nbt.CompoundTag({
                 "slotNumber": nbt.IntTag(0),
                 "item": nbt.CompoundTag({"Name": nbt.StringTag("minecraft:saddle")}),
             })])}),
         )
 
-    async def test_donkey_window_reads_only_the_current_full_layout_and_rejects_transfers(self):
+    async def test_donkey_window_reads_only_the_current_full_layout_and_restricts_transfers(self):
         b = self.b
         await self.prepare_donkey()
         empty = b.SerializedNetworkItemStackDescriptor()
@@ -775,15 +775,20 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
                            self.horse_content(), terminal)
         self.assertIsNone(self.bot.container_slots)
         self.assertFalse(waiting.done())
+        sent = list(self.wire.sent)
+        with self.assertRaisesRegex(RuntimeError, "server-reported slots are unavailable"):
+            await self.bot.take_from_container(15, 0, 7)
+        self.assertEqual(self.wire.sent, sent)
         await self.deliver(chested)
         slots = await waiting
         self.assertEqual(set(slots), set(range(16)))
         self.assertEqual((slots[15].id, slots[15].stack_size), (523, 7))
 
         sent = list(self.wire.sent)
-        for operation in (self.bot.take_from_container(15, 0), self.bot.take_from_container(0, 0),
-                          self.bot.put_into_container(1, 0), self.bot.put_into_container(1, 14)):
-            with self.assertRaisesRegex(RuntimeError, "read-only"):
+        for operation in (self.bot.take_from_container(0, 0), self.bot.take_from_container(16, 0),
+                          self.bot.put_into_container(1, 0), self.bot.put_into_container(1, 16),
+                          self.bot.take_from_container(15, 36, 7)):
+            with self.assertRaisesRegex(ValueError, "cargo slot within 1..15 and a main inventory slot"):
                 await operation
         with self.assertRaisesRegex(RuntimeError, "supported storage container"):
             await transfer_range(self.bot, direction="take", item="minecraft:emerald", count=1,
@@ -807,6 +812,136 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.bot.container_slots)
         await self.deliver(plain, terminal)
         self.assertEqual([(i, item.id) for i, item in (await self.bot.wait_for_container_slots()).items()], [(0, 0)])
+        sent = list(self.wire.sent)
+        with self.assertRaisesRegex(RuntimeError, "unsupported slot count"):
+            await self.bot.take_from_container(15, 0, 7)
+        self.assertEqual(self.wire.sent, sent)
+
+    async def test_donkey_cargo_whole_stack_round_trip_distinguishes_same_numbered_slots(self):
+        b = self.b
+        await self.prepare_donkey()
+        emeralds = b.SerializedNetworkItemStackDescriptor(id=523, stack_size=7, net_id_variant=13,
+                                                           user_data_buffer=b"cargo metadata")
+        saddle, paper = self.saddle(), self.storage_item(5, 12)
+        await self.deliver(self.main_slot(15))
+        opening = await self.start_open(36)
+        await self.deliver(self.donkey_equipment(), self.storage_content(16, (14, 5, 12)))
+        window = await opening
+        await self.deliver(*(b.InventorySlotPacket(inventory_id=window.container_id, slot=index, item=item)
+                             for index, item in ((0, saddle), (15, emeralds))))
+        cargo, player = "LEVEL_ENTITY_CONTAINER", "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER"
+
+        for putting in (False, True):
+            with self.subTest(putting=putting):
+                source, destination = (player, cargo) if putting else (cargo, player)
+                operation = self.bot.put_into_container(15, 15, 7) if putting else self.bot.take_from_container(15, 15, 7)
+                task, request = await self.submit_stack(operation)
+                action, = request.actions
+                self.assertEqual(type(action).__name__, "PlaceActionData" if putting else "TakeActionData")
+                self.assertEqual(action.amount, 7)
+                self.assertEqual([(end.full_container_name.name.name, end.full_container_name.dynamic_id,
+                                   end.slot, end.net_id_variant) for end in (action.source, action.destination)],
+                                 [(source, None, 15, 13), (destination, None, 15, 0)])
+                cargo_item = emeralds if putting else self.main_slot().item
+                await self.deliver(b.InventorySlotPacket(inventory_id=window.container_id, slot=15, item=cargo_item))
+                await self.reply_stack(request, (source, 15, 0, 0), (destination, 15, 7, 13))
+                response = await task
+                self.assertEqual(response.client_request_id.raw_id, request.client_request_id.raw_id)
+                self.assertEqual(response.result.name, "SUCCESS")
+                observed_cargo, observed_player = self.bot.container_slots[15], self.bot.inventory_slots[15]
+                filled, empty = (observed_cargo, observed_player) if putting else (observed_player, observed_cargo)
+                self.assertEqual((filled.id, filled.stack_size, filled.net_id_variant, filled.user_data_buffer),
+                                 (523, 7, 13, emeralds.user_data_buffer))
+                self.assertEqual((empty.id, empty.stack_size), (0, 0))
+                self.assertEqual((self.bot.container_slots[0].id, self.bot.container_slots[0].net_id_variant),
+                                 (saddle.id, saddle.net_id_variant))
+                self.assertEqual((self.bot.container_slots[14].id, self.bot.container_slots[14].stack_size,
+                                  self.bot.container_slots[14].net_id_variant),
+                                 (paper.id, paper.stack_size, paper.net_id_variant))
+
+    async def test_donkey_cargo_requires_an_observed_whole_stack_and_empty_destination(self):
+        await self.prepare_donkey()
+        opening = await self.start_open(36)
+        await self.deliver(self.donkey_equipment(), self.storage_content(16, (15, 7, 13)))
+        await opening
+        sent = list(self.wire.sent)
+        with self.assertRaisesRegex(RuntimeError, "observed donkey equipment and main inventory slots"):
+            await self.bot.take_from_container(15, 9, 7)
+        await self.deliver(self.main_slot(9))
+        with self.assertRaisesRegex(ValueError, "entire observed source stack"):
+            await self.bot.take_from_container(15, 9, 3)
+        await self.deliver(self.main_slot(9, self.storage_item(1, 72)))
+        with self.assertRaisesRegex(ValueError, "observed empty slot"):
+            await self.bot.put_into_container(9, 15, 1)
+        with self.assertRaisesRegex(ValueError, "observed empty slot"):
+            await self.bot.take_from_container(15, 9, 7)
+        self.assertEqual(self.wire.sent, sent)
+
+    async def test_donkey_cargo_rejects_duplicate_pending_slot_and_conflicting_receipt_identity(self):
+        await self.prepare_donkey()
+        await self.deliver(self.main_slot(9), self.main_slot(10))
+        opening = await self.start_open(36)
+        await self.deliver(self.donkey_equipment(), self.storage_content(16, (15, 7, 13)))
+        await opening
+        take, request = await self.submit_stack(self.bot.take_from_container(15, 9, 7))
+        sent = list(self.wire.sent)
+        with self.assertRaisesRegex(RuntimeError, "no pending item request"):
+            await self.bot.take_from_container(15, 10, 7)
+        await self.reply_stack(request, ("LEVEL_ENTITY_CONTAINER", 15, 0, 0),
+                               ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 9, 7, 66),
+                               ("LEVEL_ENTITY_CONTAINER", 14, 1, 88))
+        self.assertEqual((await take).result.name, "SUCCESS")
+        self.assertEqual((self.bot.container_slots[15].net_id_variant, self.bot.inventory_slots[9].id,
+                          self.bot.container_slots[14].id), (13, 0, 0))
+        with self.assertRaisesRegex(RuntimeError, "fresh server observation"):
+            await self.bot.take_from_container(15, 9, 7)
+        self.assertEqual(self.wire.sent, sent)
+
+    async def test_donkey_cargo_receipt_cannot_replace_a_slot_that_changed_and_returned(self):
+        b = self.b
+        await self.prepare_donkey()
+        await self.deliver(self.main_slot(9))
+        opening = await self.start_open(36)
+        contents = self.storage_content(16, (15, 7, 13))
+        await self.deliver(self.donkey_equipment(), contents)
+        await opening
+        take, request = await self.submit_stack(self.bot.take_from_container(15, 9, 7))
+        await self.deliver(*(b.InventorySlotPacket(inventory_id=2, slot=15, item=contents.slots[index])
+                             for index in (0, 15)))
+        await self.reply_stack(request, ("LEVEL_ENTITY_CONTAINER", 15, 0, 0),
+                               ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 9, 7, 13))
+        self.assertEqual((await take).result.name, "SUCCESS")
+        self.assertEqual((self.bot.container_slots[15].net_id_variant, self.bot.inventory_slots[9].id), (13, 0))
+
+    async def test_late_donkey_cargo_verdict_cannot_populate_replaced_window_or_inventory(self):
+        b = self.b
+        for replacement in ("window", "actor"):
+            with self.subTest(replacement=replacement):
+                if self.bot.open_window is not None:
+                    await self.deliver(self.horse_closed())
+                await self.prepare_donkey()
+                await self.deliver(self.main_slot(9))
+                opening = await self.start_open(36)
+                await self.deliver(self.donkey_equipment(), self.storage_content(16, (15, 7, 13)))
+                original = await opening
+                take, request = await self.submit_stack(self.bot.take_from_container(15, 9, 7))
+                if replacement == "window":
+                    await self.deliver(self.donkey_equipment(), self.storage_content(16, (15, 7, 23)))
+                    self.assertEqual(self.bot.open_window, original)
+                    self.assertIsNot(self.bot.open_window, original)
+                else:
+                    await self.deliver(b.RemoveActorPacket(entity_id=-206))
+                    await self.prepare_donkey()
+                    self.assertIs(self.bot.open_window, original)
+                await self.reply_stack(request, ("LEVEL_ENTITY_CONTAINER", 15, 0, 0),
+                                       ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 9, 7, 13))
+                self.assertEqual((await take).result.name, "SUCCESS")
+                self.assertEqual((self.bot.container_slots[15].net_id_variant, self.bot.inventory_slots[9].id),
+                                 (23 if replacement == "window" else 13, 0))
+                sent = list(self.wire.sent)
+                with self.assertRaisesRegex(RuntimeError, "fresh server observation|no longer observed"):
+                    await self.bot.take_from_container(15, 9, 7)
+                self.assertEqual(self.wire.sent, sent)
 
     async def test_donkey_open_requires_empty_hand_and_a_matching_equipment_window(self):
         await self.prepare_donkey(held_item=self.saddle())

@@ -135,8 +135,16 @@ Stand near a tamed donkey on foot with an empty main hand and submit
 and wait for `await bot.wait_for_container_slots()`. The server reports both
 forms as a `HORSE` window. The full contents have only the saddle slot `0`
 on a donkey without a chest, or the saddle slot and storage slots `1`–`15`
-on a donkey with a chest. Contents are unknown until the current window's
-full snapshot arrives, including after reopening. Donkey windows are read-only.
+on a donkey with a chest. Wait for the current window's full snapshot each
+time it opens.
+
+For a chested donkey, pass the entire observed stack count to
+`await bot.take_from_container(cargo_slot, player_slot, count)` or
+`await bot.put_into_container(player_slot, cargo_slot, count)`. Cargo slots
+are `1`–`15`, and the other endpoint is a main inventory slot (`0`–`35`).
+The destination must be confirmed empty. Slot `0` is available for observation.
+Both calls return the matching server verdict.
+
 Use `await bot.close_container()` to wait for the server to confirm closure.
 
 ## Unequip armor

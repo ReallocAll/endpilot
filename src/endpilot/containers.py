@@ -82,6 +82,7 @@ _CHEST_BOAT = "minecraft:chest_boat"
 _HORSE = "minecraft:horse"
 _DONKEY = "minecraft:donkey"
 _HORSE_SLOT_COUNT = 2
+_DONKEY_CARGO_SLOT_COUNT = 16
 _HORSE_EQUIP_CONTAINER = "HORSE_EQUIP_CONTAINER"
 # Canonical item registry names from the stock protocol 2225 horse slot declarations.
 _HORSE_SLOT_ITEMS = {
@@ -664,7 +665,9 @@ class Containers:
             return
         entity = self._entity_container
         if entity is not None:
-            if entity.actor_type == _DONKEY:
+            if entity.actor_type == _DONKEY and (
+                self._window_slot_count != _DONKEY_CARGO_SLOT_COUNT or not 1 <= index < _DONKEY_CARGO_SLOT_COUNT
+            ):
                 return
             if entity.actor_type == _HORSE and (
                 self._window_slot_count != _HORSE_SLOT_COUNT or index not in _HORSE_SLOT_ITEMS
@@ -781,7 +784,7 @@ class Containers:
                 count = len(packet.slots)
                 # The native equipment announcement has size zero for both donkey layouts.
                 if (self._entity_container is not None and self._entity_container.actor_type == _DONKEY
-                        and count not in (1, 16)):
+                        and count not in (1, _DONKEY_CARGO_SLOT_COUNT)):
                     return
                 before = (self._slots or {}) if self._slot_observers else None
                 if self._window_slot_count != count:
@@ -1735,14 +1738,17 @@ class Containers:
         _before_range_write: Callable[[int], None] | None = None,
     ):
         window = self.window
-        horse = window is not None and window.container_type == "HORSE"
+        equipment = window is not None and window.container_type == "HORSE"
         entity_container = self._entity_container
-        if horse and (
-            entity_container is None or entity_container.actor_type != _HORSE
+        if equipment and (
+            entity_container is None or entity_container.actor_type not in (_HORSE, _DONKEY)
             or window.entity_unique_id != entity_container.entity_id or self.packets.protocol.number != 2225
             or block_container is not None or _expected_slots is not None or _range_window_current is not None
         ):
             raise RuntimeError("this horse equipment window is read-only")
+        donkey = equipment and entity_container.actor_type == _DONKEY
+        horse = equipment and not donkey
+        animal = "donkey" if donkey else "horse"
         if window is None or self._slots is None:
             raise RuntimeError("container window or its server-reported slots are unavailable")
         layout = self._layout_token
@@ -1779,6 +1785,12 @@ class Containers:
                     or not 0 <= player_slot < _MAIN_INVENTORY_SIZE):
                 raise ValueError("horse transfers require one item between equipment slot 0 or 1 and a main inventory slot")
             strict_slot_count = _HORSE_SLOT_COUNT
+        elif donkey:
+            if (type(chest_slot) is not int or not 1 <= chest_slot < _DONKEY_CARGO_SLOT_COUNT
+                    or type(amount) is not int or type(player_slot) is not int
+                    or not 0 <= player_slot < _MAIN_INVENTORY_SIZE):
+                raise ValueError("donkey transfers require a cargo slot within 1..15 and a main inventory slot")
+            strict_slot_count = _DONKEY_CARGO_SLOT_COUNT
         if strict_slot_count is not None:
             if not 0 <= chest_slot < strict_slot_count:
                 raise ValueError(f"the entity container slot must be in range({strict_slot_count})")
@@ -1814,6 +1826,8 @@ class Containers:
 
         if horse:
             container_name = _HORSE_EQUIP_CONTAINER
+        elif donkey:
+            container_name = "LEVEL_ENTITY_CONTAINER"
         elif shulker:
             container_name = "SHULKER_BOX_CONTAINER"
             strict_slot_count = 27
@@ -1867,8 +1881,8 @@ class Containers:
             return (self.inventory._main_transfer_slot_is_unconfirmed(player_slot)
                     or self._transfer_slot_is_unconfirmed(chest_slot, block_endpoint))
 
-        if horse and (pending or slots_unconfirmed()):
-            raise RuntimeError("horse transfer slots need a fresh server observation and no pending item request")
+        if equipment and (pending or slots_unconfirmed()):
+            raise RuntimeError(f"{animal} transfer slots need a fresh server observation and no pending item request")
         if _expected_slots is not None and (pending or slots_unconfirmed()):
             return None
         if has_pending_ender_overlap(pending):
@@ -1900,9 +1914,11 @@ class Containers:
         )
         source = original_chest = original_player = original_horse_item_name = None
 
-        def horse_layout_is_known():
-            return (self._window_slot_count == _HORSE_SLOT_COUNT and self._slots is not None
-                    and self._slots.keys() == {0, 1} and all(item is not None for item in self._slots.values()))
+        def equipment_layout_is_known():
+            return (self._window_slot_count == strict_slot_count and self._slots is not None
+                    and self._slots.keys() == set(range(strict_slot_count))
+                    and all(item is not None for item in self._slots.values())
+                    and (not donkey or not self._window_close_requested))
 
         def horse_source_name(item):
             if item is not None and int(item.id) != 0 and int(item.stack_size) == 1 and item.net_id_variant:
@@ -1910,11 +1926,11 @@ class Containers:
                 if name in _HORSE_SLOT_ITEMS[chest_slot]:
                     return name
 
-        def horse_player_slot_is_known(item, *, correction=None):
-            equipment = self.inventory._damage_descriptors.get(player_endpoint)
+        def equipment_player_slot_is_known(item, *, correction=None):
+            held = self.inventory._damage_descriptors.get(player_endpoint)
             return (item is not None and player_slot not in self.inventory._count_observation_gaps
                     and _same_slot(item, self.inventory.item_or_empty(player_slot))
-                    and (equipment is None or _same_slot(item, equipment) or _same_slot(correction, equipment)))
+                    and (held is None or _same_slot(item, held) or _same_slot(correction, held)))
 
         def prepare_request():
             nonlocal source, original_chest, original_player, original_horse_item_name
@@ -1930,17 +1946,21 @@ class Containers:
                 not _same_slot(source, _expected_slots[0]) or not _same_slot(destination, _expected_slots[1])
             ):
                 raise RuntimeError("container transfer slots changed before submission")
-            if horse:
+            if equipment:
                 observed_destination = original_chest if into_container else original_player
-                if not horse_layout_is_known() or not horse_player_slot_is_known(original_player):
-                    raise RuntimeError("horse transfer requires observed horse equipment and main inventory slots")
-                original_horse_item_name = horse_source_name(source)
-                if original_horse_item_name is None:
-                    equipment = "saddle" if chest_slot == 0 else "piece of horse armor"
-                    raise ValueError(f"horse transfer source must be one server-registered {equipment}")
+                if not equipment_layout_is_known() or not equipment_player_slot_is_known(original_player):
+                    raise RuntimeError(f"{animal} transfer requires observed {animal} equipment and main inventory slots")
+                if donkey:
+                    if not _valid_transfer_stack(source) or not source.id or source.stack_size != amount:
+                        raise ValueError("donkey transfers require the entire observed source stack")
+                else:
+                    original_horse_item_name = horse_source_name(source)
+                    if original_horse_item_name is None:
+                        item_kind = "saddle" if chest_slot == 0 else "piece of horse armor"
+                        raise ValueError(f"horse transfer source must be one server-registered {item_kind}")
                 if observed_destination is None or (observed_destination.id or observed_destination.stack_size
                                                     or observed_destination.net_id_variant):
-                    raise ValueError("horse transfer destination must be an observed empty slot")
+                    raise ValueError(f"{animal} transfer destination must be an observed empty slot")
             if source is None or int(source.id) == 0:
                 raise ValueError("source slot has no observed item")
             request.actions = [action_type(
@@ -1958,19 +1978,19 @@ class Containers:
         entity_changes: dict[_TransferEndpoint, object] = {}
         entity_range = _range_window_current is not None and entity_container is not None
         brewing_slot_changed = False
-        horse_overlap = False
+        equipment_overlap = False
 
-        def mark_horse_overlap():
-            nonlocal horse_overlap
-            horse_overlap = True
+        def mark_equipment_overlap():
+            nonlocal equipment_overlap
+            equipment_overlap = True
 
         def observe_pending_slot(endpoint, current):
             nonlocal brewing_slot_changed
             original = original_player if endpoint == player_endpoint else original_chest
-            if horse:
+            if equipment:
                 if endpoint in entity_changes:
                     if not _same_slot(entity_changes[endpoint], current):
-                        mark_horse_overlap()
+                        mark_equipment_overlap()
                 elif not _same_slot(original, current):
                     entity_changes[endpoint] = current
                 return
@@ -2024,43 +2044,48 @@ class Containers:
                     and (entity_container is None or
                          (self._entity_container is entity_container and entity_container.is_visible())))
 
-        def apply_horse(response):
+        def apply_equipment(response):
             if response.result.name != "SUCCESS":
                 return
 
             current_player = self.inventory.slots.get(player_slot)
-            if not window_is_current() or not horse_layout_is_known():
+            if not window_is_current() or not equipment_layout_is_known():
                 # A submitted success can change the player slot even when the
                 # response omits that correction. Preserve any newer observation.
                 if current_player is original_player:
                     self.inventory._unconfirmed_transfer_slots.add(player_slot)
                 return
 
-            wanted = {container_name: (chest_slot, int(into_container)),
-                      player_name: (player_slot, int(not into_container))}
-            receipts = {name: [] for name in wanted}
-            for container in response.containers or ():
-                address = container.full_container_name
-                name = address.name.name
-                if address.dynamic_id is None and name in wanted:
-                    index, _ = wanted[name]
-                    receipts[name].extend(slot for slot in container.slots if int(slot.slot) == index)
-
-            def receipt_matches(name):
-                index, count = wanted[name]
-                slots = receipts[name]
-                return (len(slots) == 1 and int(slots[0].requested_slot) == index
-                        and int(slots[0].amount) == count
-                        and (not count or (slots[0].item_stack_net_id is not None
-                                           and int(slots[0].item_stack_net_id.raw_id) != 0)))
-
             known = (self._slots[chest_slot], current_player)
             originals = (original_chest, original_player)
-            if (all(map(receipt_matches, wanted)) and not horse_overlap
-                    and horse_source_name(source) == original_horse_item_name):
+            if donkey:
+                receipts = (_exchange_receipt(response, (container_name,), chest_slot),
+                            _exchange_receipt(response, (player_name,), player_slot))
+            else:
+                def horse_receipt(name, index):
+                    slots = [slot for container in response.containers or ()
+                             if container.full_container_name.dynamic_id is None
+                             and container.full_container_name.name.name == name
+                             for slot in container.slots if int(slot.slot) == index]
+                    return slots[0] if len(slots) == 1 else None
+
+                receipts = (horse_receipt(container_name, chest_slot), horse_receipt(player_name, player_slot))
+
+            def receipt_matches(receipt, index, count):
+                if receipt is None or int(receipt.requested_slot) != index or int(receipt.amount) != count:
+                    return False
+                if not count:
+                    return True
+                net_id = receipt.item_stack_net_id
+                return (net_id is not None and int(net_id.raw_id) != 0
+                        and (not donkey or int(net_id.raw_id) == int(source.net_id_variant)))
+
+            if (not equipment_overlap and (not horse or horse_source_name(source) == original_horse_item_name)
+                    and receipt_matches(receipts[0], chest_slot, amount if into_container else 0)
+                    and receipt_matches(receipts[1], player_slot, 0 if into_container else amount)):
                 corrected = tuple(
-                    _response_item(b, original, source, receipts[name][0])
-                    for name, original in zip(wanted, originals)
+                    _response_item(b, original, source, receipt)
+                    for original, receipt in zip(originals, receipts, strict=True)
                 )
                 # BDS can send an authoritative slot echo before the response.
                 # Keep newer observations and apply only the two matched corrections.
@@ -2070,7 +2095,7 @@ class Containers:
                         (chest_endpoint, player_endpoint), known, corrected, originals, strict=True
                     )
                 )
-                if endpoints_match and horse_player_slot_is_known(known[1], correction=corrected[1]):
+                if endpoints_match and equipment_player_slot_is_known(known[1], correction=corrected[1]):
                     before = {} if self._slot_observers else None
                     if not _same_slot(known[0], corrected[0]):
                         self._record_slot_before(chest_slot, before)
@@ -2223,17 +2248,17 @@ class Containers:
                         own = self.inventory._pending_requests[request_id]
                         if has_pending_ender_overlap(self.inventory._requests_for_endpoints((block_endpoint,)), own=own):
                             raise RuntimeError("ender chest slot has an unsettled item-stack request")
-                    if horse:
+                    if equipment:
                         own_request = self.inventory._pending_requests[request_id]
                         current_player = self.inventory.slots.get(player_slot)
-                        if (not horse_layout_is_known() or slots_unconfirmed()
-                                or horse_source_name(source) != original_horse_item_name
+                        if (not equipment_layout_is_known() or slots_unconfirmed()
+                                or (horse and horse_source_name(source) != original_horse_item_name)
                                 or not _same_slot(original_chest, self._slots.get(chest_slot))
                                 or not _same_slot(original_player, current_player)
-                                or not horse_player_slot_is_known(current_player)
+                                or not equipment_player_slot_is_known(current_player)
                                 or any(request is not own_request for request in
                                        self.inventory._requests_for_endpoints(endpoints))):
-                            raise RuntimeError("horse transfer slots changed before submission")
+                            raise RuntimeError(f"{animal} transfer slots changed before submission")
                         original_player = current_player
                     if exact_block:
                         name = self._current_window_block_name(window)
@@ -2282,10 +2307,10 @@ class Containers:
                           or (block_endpoint is not None and block_endpoint.ender_session is not None))
         try:
             return await self.inventory._request_item_stack(
-                request, apply_horse if horse else apply, timeout=timeout, queued=_queued, before_send=before_send,
+                request, apply_equipment if equipment else apply, timeout=timeout, queued=_queued, before_send=before_send,
                 _endpoints=endpoints, _range_step=_expected_slots is not None,
-                _wait_for=blockers, _on_unconfirmed=mark_horse_overlap if horse else _on_unconfirmed,
-                _on_slot_observed=observe_pending_slot if horse or brewing or _on_unconfirmed is not None else None,
+                _wait_for=blockers, _on_unconfirmed=mark_equipment_overlap if equipment else _on_unconfirmed,
+                _on_slot_observed=observe_pending_slot if equipment or brewing or _on_unconfirmed is not None else None,
                 _at_write=before_write if check_at_write else None,
             )
         finally:
