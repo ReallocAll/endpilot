@@ -1234,6 +1234,74 @@ async def main(bot):
         self.assertEqual(final["result"], [4, 1])
         self.assertTrue(sent.empty())
 
+    async def test_chest_cursor_take_and_return_cross_the_worker(self):
+        from endpilot.block_data import _catalog
+
+        b = self.bot.protocol.binding
+        item_id = 883
+        position = (1, 100, 2)
+        chest_id = next(index for index, state in enumerate(_catalog()[0])
+                        if state is not None and state.name == "minecraft:chest")
+        await self.update_block(position, chest_id)
+        self.bot._session._replace_item_registry(b.ItemRegistryPacket(items=[
+            b.ItemData(id=item_id, name="minecraft:apple"),
+        ]))
+        slots = [b.SerializedNetworkItemStackDescriptor() for _ in range(27)]
+        slots[12] = b.SerializedNetworkItemStackDescriptor(id=item_id, stack_size=5, net_id_variant=3)
+        for packet in (
+            b.ContainerOpenPacket(container_id=2, type=b.ContainerType.CONTAINER,
+                                  pos=b.BlockPos(x=1, y=100, z=2), entity_unique_id=-1),
+            b.InventoryContentPacket(inventory_id=2, slots=slots),
+            b.InventoryContentPacket(inventory_id=b.ContainerID.PLAYER_ONLY_UI, slots=[slots[0]]),
+        ):
+            await test_scheduled_input.ScheduledInputTests().observe(self.bot, self.wire, packet)
+
+        run = await self.start("""
+async def main(bot):
+    assert len(await bot.wait_for_container_slots()) == 27
+    take = await bot.take_container_to_cursor(12, half=True)
+    assert take.stop_reason == 'complete' and take.confirmed_count == 3
+    for invalid in ([14], range(27, 28)):
+        try:
+            await bot.return_cursor_to_container(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('invalid destination accepted')
+    returned = await bot.return_cursor_to_container(range(14, 15))
+    assert returned.stop_reason == 'complete' and returned.confirmed_count == 3
+    return [bot.container_slots[12].count, bot.container_slots[14].count,
+            bot.last_cursor_observation.count, returned.steps[0].request_id]
+""")
+
+        def requests():
+            return [packet.requests[0] for packet in self.wire.sent if isinstance(packet, b.ItemStackRequestPacket)]
+
+        for index, kind, source, destination, peer, peer_count, net_id, cursor_count in (
+            (0, "TakeActionData", 12, 0, 12, 2, 3, 3),
+            (1, "PlaceActionData", 0, 14, 14, 3, 5, 0),
+        ):
+            await self.wait_for(run, lambda _: len(requests()) > index)
+            request = requests()[index]
+            action, = request.actions
+            self.assertEqual((type(action).__name__, action.source.slot, action.destination.slot, action.amount),
+                             (kind, source, destination, 3))
+            corrections = [b.ItemStackResponseContainerInfo(
+                full_container_name=b.FullContainerName(name=b.ContainerEnumName[domain]),
+                slots=[b.ItemStackResponseSlotInfo(slot=slot, requested_slot=slot, amount=count,
+                                                   item_stack_net_id=b.ItemStackNetId(raw_id=stack_id))],
+            ) for domain, slot, count, stack_id in (
+                ("LEVEL_ENTITY_CONTAINER", peer, peer_count, net_id),
+                ("CURSOR_CONTAINER", 0, cursor_count, 4 if cursor_count else 0),
+            )]
+            self.wire.push(b.ItemStackResponsePacket(responses=[b.ItemStackResponseInfo(
+                client_request_id=request.client_request_id, result=b.ItemStackNetResult.SUCCESS, containers=corrections,
+            )]))
+        final = await self.completed(run)
+        self.assertEqual(final["state"], "succeeded", final)
+        self.assertEqual(final["result"], [2, 3, 0, -3])
+        self.assertEqual(len(requests()), 2)
+
     async def test_stalled_pipe_does_not_block_stop_and_reports_overflow(self):
         offered = []
         released = []

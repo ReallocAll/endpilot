@@ -49,7 +49,10 @@ _RANGE_TRANSFERS = {
     "transfer_container_range": transfer_container_range,
     "transfer_inventory_range": transfer_inventory_range,
 }
-_CURSOR_TRANSFERS = ("take_inventory_to_cursor", "place_one_from_cursor", "return_cursor_to_inventory")
+_CURSOR_TRANSFERS = (
+    "take_inventory_to_cursor", "take_container_to_cursor", "place_one_from_cursor",
+    "return_cursor_to_inventory", "return_cursor_to_container",
+)
 _COLLECTION_STORAGE_CALLS = frozenset({"collect_targets", "collect_by_count", "collect_vein_by_count"})
 
 # The bridge owns this allowlist independently of the worker. Listed methods

@@ -128,9 +128,12 @@ or ending the connection invalidates cursor state for writes.
 `bot.last_cursor_observation` retains the latest historical report during the
 connection and can still show a previously confirmed quantity.
 
-In MCP scripts, open the crafting table with `await bot.open_container(position)`.
-The script Bot exposes the main inventory cursor actions, `bot.inventory_slots`, and the
-read-only `bot.last_cursor_observation`. Check each action's `confirmed_count`
+In MCP scripts, open the crafting table or chest with `await bot.open_container(position)`.
+For a chest, use `await bot.wait_for_container_slots()` to read its slot snapshot.
+The script Bot exposes the cursor actions above for the main inventory and chest,
+including `destination_area="container"` on `place_one_from_cursor`. Read
+`bot.inventory_slots`, `bot.container_slots`, and the read-only
+`bot.last_cursor_observation`. Check each action's `confirmed_count`
 and step records to see what moved. A cursor report can outlive the window.
 The SDK checks the current window and slots before every write. The same
 [`transfer_progress` rules](#move-ranges-from-mcp-scripts) apply to timeouts
