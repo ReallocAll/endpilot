@@ -2391,11 +2391,12 @@ class Bot:
         self, container_slot: int, other_slot: int, *,
         other_area: Literal["container", "inventory"] = "container", timeout: float = 15,
     ):
-        """Swap two occupied, different stacks in an observed ordinary single chest window.
+        """Swap two occupied, different stacks in an observed ordinary chest window.
 
-        The second slot can be in the chest or main inventory. Return the
-        matching BDS verdict. Matched corrections to both endpoints update
-        the observed slots when they corroborate the exchange.
+        Both slots can be in a single chest or a verified double chest.
+        A single chest slot can also be swapped with a main inventory slot.
+        Return the matching BDS verdict. Matched corrections to both endpoints
+        update the observed slots when they corroborate the exchange.
         """
         if self._containers is None:
             raise RuntimeError("player has not joined")

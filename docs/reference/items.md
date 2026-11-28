@@ -71,14 +71,17 @@ to terminate the worker and drain its actions on the resident connection.
 
 ## Swap occupied slots in an ordinary chest window
 
-On protocol 2225, observe the ordinary single chest before opening it and
-wait for its 27-slot contents with `await bot.wait_for_container_slots()`.
+On protocol 2225, observe the ordinary chest before opening it and use
+`await bot.wait_for_container_slots()` to wait for all 27 single chest slots
+or all 54 slots of a double chest with both halves verified.
 Both endpoints need observed, occupied stacks of different items with valid
 stack network IDs.
 
-- `await bot.swap_container_items(3, 20)` swaps two chest slots.
+- `await bot.swap_container_items(3, 20)` swaps two chest slots. For a double
+  chest, `await bot.swap_container_items(12, 40)` swaps slots across the two
+  halves. Opening either half uses the same slot ordering.
 - `await bot.swap_container_items(12, 12, other_area="inventory")` swaps chest
-  slot 12 with main inventory slot 12.
+  slot 12 with main inventory slot 12 in a single chest.
 
 The call sends one whole-stack exchange and returns the matching BDS verdict.
 The SDK publishes exchanged slot descriptions when both corrections corroborate

@@ -370,7 +370,7 @@ class Containers:
     def _observed_window_slot_count(self, window: ContainerWindow) -> int | None:
         return self._window_slot_count if self.window is window else None
 
-    def _cursor_chest_width(self, window: ContainerWindow) -> int | None:
+    def _ordinary_chest_width(self, window: ContainerWindow) -> int | None:
         if (self.window is not window or self._window_close_requested
                 or self._window_open_block_name != "minecraft:chest" or self._ordinary_chest_replaced()
                 or self._current_window_block_name(window) != "minecraft:chest" or self._window_chest_pair_changed):
@@ -1474,9 +1474,13 @@ class Containers:
         if other_area not in ("container", "inventory"):
             raise ValueError("other_area must be 'container' or 'inventory'")
         other_is_container = other_area == "container"
-        other_size = 27 if other_is_container else _MAIN_INVENTORY_SIZE
-        if type(container_slot) is not int or not 0 <= container_slot < 27:
-            raise ValueError("container_slot must be a single chest slot within 0..26")
+        window = self.window
+        width = self._ordinary_chest_width(window) if window is not None else None
+        chest_size = 54 if other_is_container and width != 27 else 27
+        other_size = chest_size if other_is_container else _MAIN_INVENTORY_SIZE
+        if type(container_slot) is not int or not 0 <= container_slot < chest_size:
+            chest = "single chest" if chest_size == 27 else "chest"
+            raise ValueError(f"container_slot must be a {chest} slot within 0..{chest_size - 1}")
         if type(other_slot) is not int or not 0 <= other_slot < other_size:
             raise ValueError(f"other_slot must be within 0..{other_size - 1} for {other_area}")
         if other_is_container and container_slot == other_slot:
@@ -1484,19 +1488,13 @@ class Containers:
         if not isfinite(timeout) or timeout < 0:
             raise ValueError("timeout must be finite and nonnegative")
 
-        window = self.window
+        if (self.packets.protocol.number != 2225 or width is None or not other_is_container and width != 27):
+            available = " or a verified double chest with all 54 slots" if other_is_container else ""
+            raise RuntimeError(f"open an observed ordinary single chest with all 27 slots{available} before swapping")
         layout = self._layout_token
 
         def window_is_current():
-            return (window is not None and self.window is window and self._layout_token is layout
-                    and not self._window_close_requested and self.packets.protocol.number == 2225
-                    and self._window_open_block_name == "minecraft:chest"
-                    and self._current_window_block_name(window) == "minecraft:chest"
-                    and self._storage_block_replaced is False and self._window_slot_count == 27
-                    and self._window_chest_halves is None and not self._window_chest_pair_changed)
-
-        if not window_is_current():
-            raise RuntimeError("open an observed ordinary single chest and wait for all 27 slots before swapping")
+            return self._layout_token is layout and self._ordinary_chest_width(window) == width
 
         inventory = self.inventory
         chest_domain = "LEVEL_ENTITY_CONTAINER"

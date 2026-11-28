@@ -17,6 +17,8 @@ DIAMOND = range_tests.DIAMOND
 class ContainerSwapTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = range_tests.RangeTransferTests.asyncSetUp
     observe_block = range_tests.RangeTransferTests.observe_block
+    observe_chest_pair = range_tests.RangeTransferTests.observe_chest_pair
+    observe_chest_pair_root = range_tests.RangeTransferTests.observe_chest_pair_root
     emit = range_tests.RangeTransferTests.emit
     stack = range_tests.RangeTransferTests.stack
     open_chest = range_tests.RangeTransferTests.open_chest
@@ -32,6 +34,12 @@ class ContainerSwapTests(unittest.IsolatedAsyncioTestCase):
     def occupied_chest(self, *, width=27):
         self.open_chest(self.stack(PAPER, 5, 31), self.stack(STICK, 7, 39),
                         self.stack(DIAMOND, 2, 44), width=width)
+
+    def occupied_double_chest(self, *, position=range_tests.POSITION, paper_id=52, stick_id=80):
+        cells = [self.stack() for _ in range(41)]
+        cells[12] = self.stack(PAPER, 5, paper_id, user_data=b"paper")
+        cells[40] = self.stack(STICK, 7, stick_id, user_data=b"stick")
+        self.open_chest(*cells, position=position, width=54)
 
     @staticmethod
     def descriptor(item):
@@ -66,6 +74,79 @@ class ContainerSwapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({slot: self.descriptor(item) for slot, item in self.bot.container_slots.items()}, expected)
         self.assertEqual(events, [(0, (expected[0], expected[1])), (1, (expected[0], expected[1]))])
         self.assertEqual(len(self.outgoing()), 1)
+
+    async def test_verified_double_swaps_cross_half_slots_from_either_side(self):
+        self.observe_chest_pair()
+        pending = self.hold_requests()
+        for position in (range_tests.POSITION, range_tests.EAST):
+            with self.subTest(position=position):
+                self.occupied_double_chest(position=position)
+                swap = self.start(self.bot.swap_container_items(12, 40))
+                request = await asyncio.wait_for(pending.get(), 1)
+                self.assert_action(request, (CHEST, 12, 52), (CHEST, 40, 80))
+                self.reply(request, [(CHEST, 12, 7, 80), (CHEST, 40, 5, 52)])
+                self.assertEqual((await swap).result.name, "SUCCESS")
+                self.assertEqual(self.descriptor(self.bot.container_slots[12]), (STICK, 7, 80, b"stick"))
+                self.assertEqual(self.descriptor(self.bot.container_slots[40]), (PAPER, 5, 52, b"paper"))
+
+    async def test_verified_double_rejects_out_of_range_and_mixed_swap(self):
+        self.observe_chest_pair()
+        self.occupied_double_chest()
+        self.player_slot(12, self.stack(DIAMOND, 1, 81))
+        for first, second in ((12, 54), (54, 40), (40, 40), (-1, 40), (12, True)):
+            with self.subTest(first=first, second=second), self.assertRaises(ValueError):
+                await self.bot.swap_container_items(first, second)
+        with self.assertRaisesRegex(RuntimeError, "ordinary single chest"):
+            await self.bot.swap_container_items(12, 12, other_area="inventory")
+        self.assertEqual(self.outgoing(), [])
+
+    async def test_double_pair_change_before_write_requires_a_fresh_window(self):
+        self.observe_chest_pair()
+        self.occupied_double_chest()
+        original = self.stream.send
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def gated(packet, **kwargs):
+            if isinstance(packet, self.b.ItemStackRequestPacket):
+                entered.set()
+                await release.wait()
+            await original(packet, **kwargs)
+
+        self.stream.send = gated
+        swapping = self.start(self.bot.swap_container_items(12, 40))
+        await asyncio.wait_for(entered.wait(), 1)
+        self.observe_chest_pair_root(range_tests.EAST)
+        self.observe_chest_pair()
+        release.set()
+        with self.assertRaisesRegex(RuntimeError, "window changed"):
+            await swapping
+        with self.assertRaisesRegex(RuntimeError, "verified double chest"):
+            await self.bot.swap_container_items(12, 40)
+        self.assertEqual(self.outgoing(), [])
+
+    async def test_double_cancelled_swap_reserves_physical_slots_through_reopen_and_ignores_late_receipt(self):
+        self.observe_chest_pair()
+        self.occupied_double_chest()
+        pending = self.hold_requests()
+        old = self.start(self.bot.swap_container_items(12, 40))
+        old_request = await asyncio.wait_for(pending.get(), 1)
+        old.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await old
+        self.emit(self.b.ContainerClosePacket(container_id=2, container_type=self.b.ContainerType.CONTAINER))
+        self.occupied_double_chest(position=range_tests.EAST, paper_id=64, stick_id=88)
+        with self.assertRaisesRegex(RuntimeError, "unsettled"):
+            await self.bot.swap_container_items(40, 12)
+        self.assertEqual(len(self.outgoing()), 1)
+        self.reply(old_request, [(CHEST, 12, 7, 80), (CHEST, 40, 5, 52)])
+        self.assertEqual(self.descriptor(self.bot.container_slots[12]), (PAPER, 5, 64, b"paper"))
+        self.assertEqual(self.descriptor(self.bot.container_slots[40]), (STICK, 7, 88, b"stick"))
+
+        current = self.start(self.bot.swap_container_items(40, 12))
+        request = await asyncio.wait_for(pending.get(), 1)
+        self.assert_action(request, (CHEST, 40, 88), (CHEST, 12, 64))
+        self.reply(request, [(CHEST, 12, 7, 88), (CHEST, 40, 5, 64)])
+        self.assertEqual((await current).result.name, "SUCCESS")
 
     async def test_mixed_same_number_swap_uses_distinct_domains_and_observer_views(self):
         self.occupied_chest()

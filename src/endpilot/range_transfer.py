@@ -186,7 +186,7 @@ async def _transfer_cursor(
     if (inventory is None or not (chest or workbench)
             or window.position is None or window.entity_unique_id != -1 or bot.protocol.number != 2225):
         raise RuntimeError("open a protocol 2225 workbench or observed ordinary chest for cursor transfers")
-    chest_width = containers._cursor_chest_width(window) if chest else None
+    chest_width = containers._ordinary_chest_width(window) if chest else None
     layout = containers._layout_token if chest else None
     if to_chest_slot and chest_width is not None:
         if take and slots >= chest_width:
@@ -196,7 +196,7 @@ async def _transfer_cursor(
 
     def window_is_current():
         return (inventory._cursor_window is window and (not chest or (
-            containers._layout_token is layout and containers._cursor_chest_width(window) == chest_width
+            containers._layout_token is layout and containers._ordinary_chest_width(window) == chest_width
             and chest_width is not None
         )))
 
