@@ -3396,6 +3396,26 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._entities.wait_for_entity_sleep_change(runtime_id=runtime_id, timeout=timeout)
 
+    def subscribe_entity_name_tag_changes(
+        self, callback: Callable[[EntityState], None], *, runtime_id: int | None = None,
+    ) -> Callable[[], None]:
+        """Observe live name tag reports that change a visible remote entity's snapshot.
+
+        The callback receives the updated immutable snapshot. A runtime filter
+        binds the current entity instance. The returned unsubscribe is idempotent.
+        """
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return self._entities.subscribe_entity_name_tag_changes(callback, runtime_id=runtime_id)
+
+    async def wait_for_entity_name_tag_change(
+        self, *, runtime_id: int | None = None, timeout: float | None = 15,
+    ) -> EntityState:
+        """Wait for the next live name tag report that changes the snapshot."""
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return await self._entities.wait_for_entity_name_tag_change(runtime_id=runtime_id, timeout=timeout)
+
     def entity_at_cursor(self, *, max_distance: float = 3.5) -> EntityCursorResult:
         """Read the first supported target on the ordinary player's current view ray.
 

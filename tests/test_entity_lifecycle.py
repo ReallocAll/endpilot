@@ -70,6 +70,122 @@ class EntityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         return b.AddItemActorPacket(id=109, runtime_id=9, pos=b.Vec3(x=2, y=3, z=4),
                                     item=b.SerializedNetworkItemStackDescriptor(id=5, stack_size=2))
 
+    def name_metadata(self, label=None, *, filtered=None, other=()):
+        b = self.b
+        entries = list(other)
+        for field, value in ((b.ActorDataIDs.NAME, label), (b.ActorDataIDs.FILTERED_NAME, filtered)):
+            if value is not None:
+                entries.append(b.DataItemEntry(id=int(field), payload=b.DataItemStringPayload(value=value)))
+        return b.SynchedActorData.CopyableDataList(data=entries)
+
+    def name_update(self, runtime_id, label=None, **fields):
+        return self.b.SetActorDataPacket(id=runtime_id, packed_items=self.name_metadata(label, **fields))
+
+    async def test_name_tag_edits_apply_to_the_complete_snapshot_and_preserve_sparse_values(self):
+        b = self.b
+        cow = self.actor(actor_type="minecraft:cow")
+        cow.data = self.name_metadata("First", filtered="filtered on spawn")
+        await self.join(cow)
+        initial, = self.bot.observed_entities
+        self.assertEqual((initial.name_tag, initial.name), ("First", None))
+        seen = []
+
+        def observe(state):
+            current, = self.bot.observed_entities
+            self.assertIs(state, current)
+            seen.append(state)
+
+        before = tuple(self.wire.sent)
+        stop = self.bot.subscribe_entity_name_tag_changes(observe, runtime_id=8)
+        waiting = asyncio.create_task(self.bot.wait_for_entity_name_tag_change(runtime_id=8, timeout=1))
+        await asyncio.sleep(0)
+        effects = b.DataItemEntry(id=int(b.ActorDataIDs.VISIBLE_MOB_EFFECTS), payload=b.DataItemInt64Payload(value=2))
+        await self.deliver(self.name_update(8, "Meadow Birch", filtered="ignored", other=(effects,)))
+        changed, = seen
+        self.assertIs(await waiting, changed)
+        self.assertEqual((changed.name_tag, changed.name, changed.visible_effects_value), ("Meadow Birch", None, 2))
+
+        malformed = b.DataItemEntry(id=int(b.ActorDataIDs.NAME), payload=b.DataItemIntPayload(value=5))
+        await self.deliver(self.name_update(8, "Meadow Birch"), self.name_update(8, filtered="alternate"),
+                           self.name_update(8, other=(malformed,)))
+        self.assertEqual(seen, [changed])
+        self.assertEqual(self.bot.observed_entities, (changed,))
+
+        await self.deliver(self.name_update(8, ""))
+        self.assertEqual([event.name_tag for event in seen], ["Meadow Birch", ""])
+        self.assertEqual(self.bot.observed_entities[0].name_tag, "")
+        self.assertEqual(initial.name_tag, "First")
+        with self.assertRaises(FrozenInstanceError):
+            initial.name_tag = "new"
+        self.assertEqual(tuple(self.wire.sent), before)
+        stop()
+        stop()
+        await self.deliver(self.name_update(8, "After unsubscribe"))
+        self.assertEqual(self.bot.observed_entities[0].name_tag, "After unsubscribe")
+        self.assertEqual(len(seen), 2)
+
+    async def test_player_name_tag_is_separate_from_identity_roster_and_filtered_labels(self):
+        b = self.b
+        uuid = UUID(int=8)
+        player = self.player(uuid, 8, 108)
+        player.unpack = self.name_metadata("Custom name", filtered="Filtered source")
+        roster = b.PlayerListPacket(entries=[b.PlayerListPacket.AddEntry(
+            action=b.PlayerListPacketType.ADD, uuid=uuid, id=108, name="Roster name",
+        )])
+        await self.join(roster, player)
+        current, = self.bot.observed_entities
+        self.assertEqual((current.name, current.name_tag), ("Peer", "Custom name"))
+        self.assertEqual(self.bot.observed_players[0].name, "Roster name")
+        seen = []
+        self.bot.subscribe_entity_name_tag_changes(seen.append)
+        await self.deliver(self.name_update(8, filtered="Changed filter"), self.name_update(8, "New custom name"))
+        changed, = seen
+        self.assertEqual((changed.name, changed.name_tag), ("Peer", "New custom name"))
+        self.assertEqual(self.bot.observed_players[0].name, "Roster name")
+
+    async def test_name_tag_subscriptions_follow_visibility_and_instance_lifetime(self):
+        b = self.b
+        old = self.actor()
+        old.data = self.name_metadata("Old instance")
+        with self.assertRaisesRegex(RuntimeError, "player has not joined"):
+            self.bot.subscribe_entity_name_tag_changes(lambda _: None)
+        await self.join(old)
+        for invalid in (7, 999):
+            with self.assertRaisesRegex(LookupError, "remote entity is not currently observed"):
+                self.bot.subscribe_entity_name_tag_changes(lambda _: None, runtime_id=invalid)
+        broad, scoped = [], []
+        self.bot.subscribe_entity_name_tag_changes(broad.append)
+        off = self.bot.subscribe_entity_name_tag_changes(scoped.append, runtime_id=8)
+        original = self.bot.observed_entities[0]
+        pending = asyncio.create_task(self.bot.wait_for_entity_name_tag_change(runtime_id=8, timeout=1))
+        await asyncio.sleep(0)
+        await self.deliver(b.RemoveActorPacket(entity_id=108), self.name_update(8, "Discarded"), self.actor(entity_id=208))
+        with self.assertRaisesRegex(LookupError, "entity is no longer observed"):
+            await pending
+        current, = self.bot.observed_entities
+        self.assertIsNone(current.name_tag)
+        self.assertEqual(original.name_tag, "Old instance")
+        self.assertEqual((broad, scoped), ([], []))
+        off()
+
+        self.bot.subscribe_entity_name_tag_changes(scoped.append, runtime_id=8)
+        await self.deliver(self.name_update(8, ""))
+        self.assertEqual([(event.entity_id, event.name_tag) for event in scoped], [(208, "")])
+        self.assertEqual(broad, scoped)
+        pending = asyncio.create_task(self.bot.wait_for_entity_name_tag_change(runtime_id=8, timeout=1))
+        await asyncio.sleep(0)
+        await self.deliver(b.ChangeDimensionPacket(dimension_id=1), self.actor(entity_id=308), self.name_update(8, "Third"))
+        with self.assertRaisesRegex(RuntimeError, "dimension changed"):
+            await pending
+        self.assertEqual(len(scoped), 1)
+        self.assertEqual([(event.entity_id, event.name_tag) for event in broad], [(208, ""), (308, "Third")])
+        ending = asyncio.create_task(self.bot.wait_for_entity_name_tag_change(timeout=1))
+        await asyncio.sleep(0)
+        await self.deliver(b.DisconnectPacket(), self.name_update(8, "Discarded"))
+        with self.assertRaisesRegex(ConnectionError, "entity session is closed"):
+            await ending
+        self.assertEqual(len(broad), 2)
+
     def owner_metadata(self, owner, *, tamed=True, owner_type=None, sitting=False):
         b = self.b
         flags = (1 << int(b.ActorFlags.TAMED)) if tamed else 0

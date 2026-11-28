@@ -111,6 +111,10 @@ class EntityState:
 
     ``pitch``, ``yaw``, and ``head_yaw`` hold the last observed angle in
     degrees on each axis. Each is ``None`` until observed for this instance.
+
+    ``name_tag`` holds the last custom label from actor metadata. ``None``
+    means unobserved. An empty string is a reported empty label. ``name``
+    retains the identity name from AddPlayer.
     """
 
     entity_id: int
@@ -140,6 +144,7 @@ class EntityState:
     pitch: float | None = None
     yaw: float | None = None
     head_yaw: float | None = None
+    name_tag: str | None = None
 
     @property
     def visible_effect_ids(self) -> tuple[int, ...] | None:
@@ -487,6 +492,11 @@ def _player_sleeping(metadata, binding) -> bool | None:
     return sleeping
 
 
+def _actor_name_tag(metadata, binding) -> str | None:
+    return next((entry.payload.value for entry in reversed(metadata)
+                 if entry.id == binding.ActorDataIDs.NAME and isinstance(entry.payload, binding.DataItemStringPayload)), None)
+
+
 def _visible_effects_value(metadata, binding) -> int | None:
     return next((int(entry.payload.value) for entry in reversed(metadata)
                  if entry.id == binding.ActorDataIDs.VISIBLE_MOB_EFFECTS
@@ -639,6 +649,7 @@ class Entities:
         self._glide_observers: list[Callable[[EntityState], None]] = []
         self._crouch_observers: list[_EntityObserver[EntityState]] = []
         self._sleep_observers: list[_EntityObserver[EntityState]] = []
+        self._name_tag_observers: list[_EntityObserver[EntityState]] = []
         self._attached_firework_observers: list[_EntityObserver[EntityState]] = []
         self._shield_block_observers: list[_EntityObserver[ShieldBlockEvent]] = []
         self._shield_block_asserted: set[int] = set()
@@ -686,7 +697,8 @@ class Entities:
         self._clear_player_equipment(ConnectionError, "entity session is closed", _cause)
         for observers in (self._swing_observers, self._critical_effect_observers, self._health_observers,
                           self._actor_event_observers, self._attribute_observers, self._effect_observers,
-                          self._crouch_observers, self._sleep_observers, self._attached_firework_observers,
+                          self._crouch_observers, self._sleep_observers, self._name_tag_observers,
+                          self._attached_firework_observers,
                           self._shield_block_observers, self._visible_effect_observers):
             self._end_entity_observers(observers, lambda _: True, ConnectionError, "entity session is closed", _cause)
         self._shield_block_asserted.clear()
@@ -875,6 +887,23 @@ class Entities:
     ) -> EntityState:
         self._require_remote_player_target(runtime_id)
         return await self._wait_for_entity_event(self._sleep_observers, runtime_id, timeout)
+
+    def _require_name_tag_target(self, runtime_id: int | None) -> None:
+        self._require_live()
+        if runtime_id is not None and (runtime_id == self._own_runtime_id or runtime_id not in self._by_runtime):
+            raise LookupError("remote entity is not currently observed")
+
+    def subscribe_entity_name_tag_changes(
+        self, callback: Callable[[EntityState], None], *, runtime_id: int | None = None,
+    ) -> Callable[[], None]:
+        self._require_name_tag_target(runtime_id)
+        return self.packets._subscribe(self._name_tag_observers, _EntityObserver(runtime_id, callback))
+
+    async def wait_for_entity_name_tag_change(
+        self, *, runtime_id: int | None = None, timeout: float | None = 15,
+    ) -> EntityState:
+        self._require_name_tag_target(runtime_id)
+        return await self._wait_for_entity_event(self._name_tag_observers, runtime_id, timeout)
 
     def subscribe_attached_fireworks(self, callback: Callable[[EntityState], None]) -> Callable[[], None]:
         self._require_live()
@@ -1684,12 +1713,13 @@ class Entities:
             self._forget_entity_observers(self._visible_effect_observers, runtime_id)
             self._forget_entity_observers(self._crouch_observers, runtime_id)
             self._forget_entity_observers(self._sleep_observers, runtime_id)
+            self._forget_entity_observers(self._name_tag_observers, runtime_id)
             self._forget_entity_observers(self._shield_block_observers, runtime_id)
             self._shield_block_asserted.discard(runtime_id)
             if not new_instance:
                 # A conflicting roster identity must not inherit the previous actor's reports.
                 state = replace(state, attributes=(), status_effects=(), visible_effects_value=None,
-                                pitch=None, yaw=None, head_yaw=None)
+                                pitch=None, yaw=None, head_yaw=None, name_tag=None)
         if lifecycle_events is not None and new_instance:
             outgoing = self._by_runtime.get(runtime_id)
             if outgoing is not None:
@@ -1727,6 +1757,7 @@ class Entities:
         self._forget_entity_observers(self._visible_effect_observers, runtime_id)
         self._forget_entity_observers(self._crouch_observers, runtime_id)
         self._forget_entity_observers(self._sleep_observers, runtime_id)
+        self._forget_entity_observers(self._name_tag_observers, runtime_id)
         self._forget_entity_observers(self._shield_block_observers, runtime_id)
         self._shield_block_asserted.discard(runtime_id)
         self._forget_player_equipment(runtime_id)
@@ -1752,6 +1783,7 @@ class Entities:
             self._item_names.get(network_id, f"#{network_id}"),
             int(item.stack_size), network_id,
             is_from_fishing=bool(getattr(packet, "is_from_fishing", False)),
+            name_tag=_actor_name_tag(getattr(getattr(packet, "data", None), "data", ()), self.packets.protocol.binding),
         )
 
     def _on_packet(self, raw, *, startup: bool = False) -> None:
@@ -1891,6 +1923,7 @@ class Entities:
                 sleeping=sleeping,
                 visible_effects_value=_visible_effects_value(metadata, b) if identity_matches else None,
                 pitch=pitch, yaw=yaw, head_yaw=head_yaw,
+                name_tag=_actor_name_tag(metadata, b) if identity_matches else None,
             ), player_uuid=player_uuid, player_feet=feet,
                 unlisted_entity_id=entity_id if entity_id and not listed_id else None,
                 identity_matches=identity_matches, lifecycle_events=lifecycle_events)
@@ -1930,6 +1963,13 @@ class Entities:
                 shield_observers = tuple(self._shield_block_observers)
                 shield_block = ShieldBlockEvent(runtime_id, self._animation_entity_id(runtime_id), int(packet.tick))
             state = self._by_runtime.get(runtime_id)
+            name_tag_observers = ()
+            if state is not None and runtime_id != self._own_runtime_id:
+                name_tag = _actor_name_tag(metadata, b)
+                if name_tag is not None and name_tag != state.name_tag:
+                    state = self._by_runtime[runtime_id] = replace(state, name_tag=name_tag)
+                    if not startup:
+                        name_tag_observers = tuple(self._name_tag_observers)
             if state is not None and state.actor_type == _WOLF:
                 owner = _owner_entity_id(metadata, b, state.owner_entity_id)
                 sitting = _wolf_sitting(metadata, b, state.sitting)
@@ -2005,6 +2045,8 @@ class Entities:
             if visible_observers and not self._closed:
                 event = EntityVisibleEffectUpdate(state, int(packet.tick))
                 self._notify_entity_observers(visible_observers, event, runtime_id, "visible effect observer failed")
+            if name_tag_observers and not self._closed:
+                self._notify_entity_observers(name_tag_observers, state, runtime_id, "entity name tag observer failed")
         elif packet_id == b.MobEquipmentPacket.ID:
             packet = self.packets.protocol.decode(raw)
             runtime_id = int(packet.runtime_id)
@@ -2067,6 +2109,7 @@ class Entities:
                 trade_tier=trade_tier,
                 trade_experience=trade_experience,
                 pitch=pitch, yaw=yaw, head_yaw=head_yaw,
+                name_tag=_actor_name_tag(getattr(getattr(actor, "data", None), "data", ()), b),
             )
             if (not startup and self._attached_firework_observers and self._own_entity_id
                     and runtime_id != self._own_runtime_id and state.firework_attached_entity_id == self._own_entity_id):
@@ -2142,6 +2185,8 @@ class Entities:
                                        RuntimeError, "dimension changed while waiting for an entity crouch change")
             self._end_entity_observers(self._sleep_observers, dimension_bound,
                                        RuntimeError, "dimension changed while waiting for an entity sleep change")
+            self._end_entity_observers(self._name_tag_observers, dimension_bound,
+                                       RuntimeError, "dimension changed while waiting for an entity name tag change")
             self._end_entity_observers(self._attached_firework_observers, dimension_bound,
                                        RuntimeError, "dimension changed while waiting for an attached firework")
             self._end_entity_observers(self._shield_block_observers, dimension_bound,

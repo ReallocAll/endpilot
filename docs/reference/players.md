@@ -429,6 +429,33 @@ unsubscribe function is idempotent. A deadline raises `TimeoutError`.
 Use `timeout=None` to wait without a deadline. When the connection ends,
 subscriptions close and pending waits raise `ConnectionError`.
 
+## Observe entity name tags
+
+`EntityState.name_tag` in `bot.observed_entities` holds the last string
+reported in the visible entity's Bedrock `NAME` metadata. `None` means no
+valid label has been observed. `""` means the server reported an empty label.
+This field is separate from the player identity in `EntityState.name`, player
+list names, and the server's filtered-name metadata.
+
+`bot.subscribe_entity_name_tag_changes(callback, runtime_id=...)` calls a
+synchronous callback with the immutable `EntityState` after applying the whole
+packet. The first valid live report for an unknown label and later changes
+produce one notification each. Spawns and startup replay establish the initial
+value silently. Repeated labels and metadata that omits the label or carries a
+different payload type leave the last valid value in place without notifying.
+Use `await bot.wait_for_entity_name_tag_change(runtime_id=..., timeout=15)` for
+the next report that would notify a subscriber. These observations send no
+packets.
+
+Omit `runtime_id` to observe every visible remote entity. A runtime filter
+binds to the current actor instance. An untracked runtime ID or the local
+player raises `LookupError`, as does a filtered wait whose target leaves view
+or is replaced. The subscription returns an idempotent unsubscribe function.
+A dimension change ends filtered subscriptions and raises `RuntimeError` in
+pending waits. Unfiltered subscriptions continue across dimensions. A
+deadline raises `TimeoutError`. Use `timeout=None` to wait without a deadline.
+Disconnection ends subscriptions and raises `ConnectionError` in pending waits.
+
 ## Observe attached fireworks
 
 An observed firework rocket's `EntityState.firework_attached_entity_id`
