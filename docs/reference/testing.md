@@ -208,6 +208,16 @@ disconnect. If the caller cancels after the action starts, the original
 `CancelledError` carries the partial result in `placement_progress`.
 [Placement tests](../../tests/test_placement.py)
 
+Call `bot.subscribe_entity_placement_completions(callback)` in a joined
+session to observe complete local `place_entity` and `place_oak_boat` calls.
+The synchronous callback receives the same immutable result once, immediately
+before the call returns. `place_oak_boat` still delivers a `BoatPlacementResult`.
+Call the returned function to unsubscribe. Registrations also expire when the
+session ends. Partial, failed, and cancelled calls produce no completion.
+Use `subscribe_entity_lifecycle` for other observed spawns. Concurrent calls
+can match the same server observations, which carry no actor attribution to
+the local placement request.
+
 ## Place an oak boat
 
 `await bot.place_oak_boat(position, timeout=15)` uses the same source-water

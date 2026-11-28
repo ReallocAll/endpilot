@@ -7,8 +7,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bedrock_protocol import TextPacketType
-from endpilot import BlockObservation, Bot, LoginRefused, PlacementResult, SessionEnd
+from endpilot import BlockObservation, BoatPlacementResult, Bot, LoginRefused, PlacementResult, SessionEnd
 from endpilot.blocks import HASHED_AIR_RUNTIME_ID
+from endpilot.bot import observe_entity_placement
 from endpilot.movement import Movement
 from endpilot.protocol import RawPacket, write_batch
 from test_join import _online_identity
@@ -502,6 +503,140 @@ class SessionTerminationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(removed, [])
         self.assertEqual([type(report["exception"]) for report in reports], [ValueError, asyncio.CancelledError])
         self.assertEqual([report["callback"] for report in reports], [failing, cancelled])
+
+    async def join_for_entity_placement(self, player_id=41):
+        b = self.b
+        wire = self.wire(
+            b.ItemRegistryPacket(items=[b.ItemData(id=496, name="minecraft:oak_boat")]),
+            self.placement_block(SUPPORT, 0x483B8B2A),
+            self.boat_slot(2),
+            b.MovePlayerPacket(player_id=player_id, pos=b.Vec3(x=3.5, y=92.62, z=7.5),
+                               reset_position=2, on_ground=True),
+            player_id=player_id, entity_game_type=b.GameType.SURVIVAL, block_network_ids_are_hashes=True,
+        )
+        await self.connect(wire)
+        await self.bot.wait_for_position_sync(timeout=1)
+        return wire
+
+    def boat_slot(self, count):
+        b = self.b
+        return b.InventorySlotPacket(
+            inventory_id=b.ContainerID.INVENTORY, slot=0,
+            item=b.SerializedNetworkItemStackDescriptor(id=496, stack_size=count, net_id_variant=21),
+        )
+
+    def boat_spawn(self, entity_id):
+        b = self.b
+        x, y, z = SUPPORT
+        return b.AddActorPacket(
+            entity_id=entity_id, runtime_id=-entity_id, actor_type="minecraft:boat",
+            pos=b.Vec3(x=x + .5, y=y + .875, z=z + .5),
+        )
+
+    async def start_boat_placement(self):
+        sent = asyncio.Event()
+        unsubscribe = self.bot.packets.subscribe_sent(
+            lambda packet_id: sent.set() if packet_id == self.b.InventoryTransactionPacket.ID else None,
+        )
+        placing = asyncio.create_task(self.bot.place_oak_boat(SUPPORT, timeout=1))
+
+        async def drain():
+            placing.cancel()
+            await asyncio.gather(placing, return_exceptions=True)
+
+        self.addAsyncCleanup(drain)
+        try:
+            await asyncio.wait_for(sent.wait(), 1)
+        finally:
+            unsubscribe()
+        return placing
+
+    async def test_entity_placement_completion_keeps_callback_order_and_isolates_errors(self):
+        wire = await self.join_for_entity_placement()
+        delivered, late, removed, reports, blocks = [], [], [], [], []
+        loop = asyncio.get_running_loop()
+        self.addCleanup(loop.set_exception_handler, loop.get_exception_handler())
+        loop.set_exception_handler(lambda _, context: reports.append(context))
+
+        def failing(result):
+            delivered.append(("first", result))
+            remove()
+            self.bot.subscribe_entity_placement_completions(late.append)
+            raise ValueError("observer failed")
+
+        def cancelled(result):
+            delivered.append(("cancelled", result))
+            raise asyncio.CancelledError("observer cancelled")
+
+        self.bot.subscribe_entity_placement_completions(failing)
+        remove = self.bot.subscribe_entity_placement_completions(removed.append)
+        self.bot.subscribe_entity_placement_completions(cancelled)
+        self.bot.subscribe_entity_placement_completions(lambda result: delivered.append(("last", result)))
+        self.bot.subscribe_placement_completions(blocks.append)
+        placing = await self.start_boat_placement()
+        wire.incoming.put_nowait(write_batch(map(self.bot.protocol.encode, (
+            self.boat_slot(1), self.boat_spawn(-50), self.boat_slot(1), self.boat_spawn(-50),
+        ))))
+        result = await placing
+        self.assertIsInstance(result, BoatPlacementResult)
+        self.assertEqual(result.reason, "observations_complete")
+        self.assertEqual([label for label, _ in delivered], ["first", "cancelled", "last"])
+        self.assertTrue(all(value is result for _, value in delivered))
+        self.assertEqual((removed, late, blocks), ([], [], []))
+        self.assertEqual([type(report["exception"]) for report in reports], [ValueError, asyncio.CancelledError])
+        self.assertEqual([report["callback"] for report in reports], [failing, cancelled])
+
+    async def test_entity_placement_completion_suppressed_if_reader_ends_before_return(self):
+        wire = await self.join_for_entity_placement()
+        delivered = []
+        self.bot.subscribe_entity_placement_completions(delivered.append)
+        placing = await self.start_boat_placement()
+        wire.incoming.put_nowait(write_batch(map(self.bot.protocol.encode, (
+            self.boat_spawn(-50), self.boat_slot(1), self.disconnect(),
+        ))))
+        result = await placing
+        self.assertEqual(result.reason, "observations_complete")
+        self.assertEqual(delivered, [])
+        self.assertEqual((await self.bot.wait_for_session_end(timeout=1)).kind, "server_disconnect")
+        with self.assertRaisesRegex(ConnectionError, "placement completion subscription stream is closed"):
+            self.bot.subscribe_entity_placement_completions(delivered.append)
+
+    async def test_old_entity_placement_result_cannot_notify_a_rejoined_session(self):
+        previous, current = [], []
+        with self.assertRaisesRegex(RuntimeError, "player has not joined"):
+            self.bot.subscribe_entity_placement_completions(previous.append)
+        wire = await self.join_for_entity_placement()
+        remove = self.bot.subscribe_entity_placement_completions(previous.append)
+        observed, resume = asyncio.Event(), asyncio.Event()
+
+        async def hold_after_observation(*args, **kwargs):
+            result = await observe_entity_placement(*args, **kwargs)
+            observed.set()
+            await resume.wait()
+            return result
+
+        with patch("endpilot.bot.observe_entity_placement", side_effect=hold_after_observation):
+            previous_action = await self.start_boat_placement()
+            wire.push(self.boat_spawn(-50))
+            wire.push(self.boat_slot(1))
+            await asyncio.wait_for(observed.wait(), 1)
+        await self.bot.close()
+        wire = await self.join_for_entity_placement(player_id=42)
+        self.bot.subscribe_entity_placement_completions(current.append)
+        remove()
+        remove()
+        resume.set()
+        self.assertEqual((await previous_action).reason, "observations_complete")
+        self.assertEqual((previous, current), ([], []))
+
+        placing = await self.start_boat_placement()
+        wire.push(self.boat_slot(1))
+        wire.push(self.boat_spawn(-51))
+        result = await placing
+        self.assertEqual(result.reason, "observations_complete")
+        self.assertEqual(previous, [])
+        self.assertEqual(len(current), 1)
+        self.assertIs(current[0], result)
 
     async def test_placement_completion_ignores_sparse_world_updates_and_partial_timeout(self):
         wire = await self.join_for_placement()

@@ -581,6 +581,7 @@ class _EntityPlacementHarness(_PlacementHarness):
         self.bot._entities.start()
         self.addCleanup(self.bot._entities.close)
         session = self.bot._session = JoinSession(self.packets, None, "placement fixture")
+        self.bot._session_end_state = session._end_state
         session._item_registry_subscriptions = (
             self.packets.subscribe_raw(session._on_item_registry),
             self.packets.subscribe_reader_end(session._clear_item_registry),
@@ -589,6 +590,8 @@ class _EntityPlacementHarness(_PlacementHarness):
         await self.deliver(self.registry_packet("minecraft:oak_boat"),
                            self.block(SUPPORT, WATER), self.boat_slot(2), self.select(BOAT_SLOT))
         self.registry = self.bot.item_registry
+        self.completions = []
+        self.bot.subscribe_entity_placement_completions(self.completions.append)
         self.subscribers = tuple(map(tuple, (
             self.inventory._slot_observers, self.packets._subscribers, self.packets._reader_end_subscribers,
         )))
@@ -623,6 +626,19 @@ class _EntityPlacementHarness(_PlacementHarness):
 
 
 class BoatPlacementTests(_EntityPlacementHarness):
+    async def test_concurrent_calls_each_emit_once_for_matching_observations(self):
+        first = await self.arm_click(self.place_boat())
+        second = await self.arm_click(self.place_boat())
+        self.assertEqual(len(self.wire.sent), 2)
+        self.assertEqual(self.completions, [])
+
+        await self.deliver(self.spawn(-42), self.boat_slot(1), self.spawn(-42), self.boat_slot(1))
+        first_result, second_result = await asyncio.gather(first, second)
+        self.assertEqual(first_result.reason, "observations_complete")
+        self.assertEqual(first_result, second_result)
+        self.assertIsNot(first_result, second_result)
+        self.assertCountEqual(map(id, self.completions), (id(first_result), id(second_result)))
+
     async def test_exact_click_and_two_independent_observations(self):
         for spawn_first, count, entity_id in ((True, 2, -40), (False, 1, -41)):
             with self.subTest(spawn_first=spawn_first):
@@ -646,9 +662,12 @@ class BoatPlacementTests(_EntityPlacementHarness):
                 first, second = (actor, inventory) if spawn_first else (inventory, actor)
                 await self.deliver(first)
                 self.assertFalse(pending.done())
-                await self.deliver(second)
+                self.assertEqual(len(self.completions), 2 - count)
+                await self.deliver(second, actor, inventory)
                 result = await pending
                 self.assertIsInstance(result, BoatPlacementResult)
+                self.assertEqual(len(self.completions), 3 - count)
+                self.assertIs(self.completions[-1], result)
                 self.assertEqual((result.dimension_id, result.position, result.slot), (0, SUPPORT, BOAT_SLOT))
                 self.assertEqual((result.submitted, result.reason), (True, "observations_complete"))
                 self.assertEqual(result.spawn, EntitySpawn(entity_id, -entity_id, "minecraft:boat", BOAT_POSITION))
@@ -675,6 +694,7 @@ class BoatPlacementTests(_EntityPlacementHarness):
         result = await self.place_boat()
         self.assertEqual((result.submitted, result.reason), (False, "precondition_failed"))
         self.assertEqual(self.wire.sent, [])
+        self.assertEqual(self.completions, [])
 
     async def test_requires_survival_catalog_and_an_observed_nonpredicted_selected_stack(self):
         for registry in (None, ItemRegistrySnapshot({}), ItemRegistrySnapshot({BOAT_ITEM: "minecraft:birch_boat"})):
@@ -764,6 +784,7 @@ class BoatPlacementTests(_EntityPlacementHarness):
         result = await pending
         self.assertEqual((result.submitted, result.reason, result.spawn.entity_id), (True, "timed_out", -42))
         self.assertIsNone(result.inventory_change)
+        self.assertEqual(self.completions, [])
         self.assert_observers_restored()
 
     async def test_timeout_covers_position_sync_and_transport_send(self):
@@ -795,6 +816,7 @@ class BoatPlacementTests(_EntityPlacementHarness):
         self.assertEqual((result.submitted, result.reason), (None, "send_failed"))
         self.assertIsNone(result.spawn)
         self.assertIsNone(result.inventory_change)
+        self.assertEqual(self.completions, [])
         self.assert_observers_restored()
 
     async def test_cancellation_preserves_the_original_error_and_partial_evidence(self):
@@ -808,6 +830,8 @@ class BoatPlacementTests(_EntityPlacementHarness):
         self.assertEqual((result.submitted, result.reason), (True, "cancelled"))
         self.assertEqual(result.inventory_change.after.count, 1)
         self.assertIsNone(result.spawn)
+        await self.deliver(self.spawn(-42))
+        self.assertEqual(self.completions, [])
         self.assert_observers_restored()
 
     async def test_dimension_change_keeps_partial_evidence_and_excludes_later_spawns(self):
@@ -817,6 +841,7 @@ class BoatPlacementTests(_EntityPlacementHarness):
         self.assertEqual((result.dimension_id, result.submitted, result.reason), (0, True, "dimension_changed"))
         self.assertEqual(result.inventory_change.after.count, 1)
         self.assertIsNone(result.spawn)
+        self.assertEqual(self.completions, [])
         self.assert_observers_restored()
 
     async def test_reader_end_keeps_partial_evidence(self):
@@ -850,16 +875,28 @@ class EntityPlacementTests(_EntityPlacementHarness):
         result = await self.bot.place_entity(SUPPORT, timeout=0.1)
         self.assertEqual((result.submitted, result.reason), (False, "precondition_failed"))
         self.assertEqual(self.wire.sent, [])
+        self.assertEqual(self.completions, [])
 
     def assert_entity_placement_completed(self, result, spawn):
         self.assertIsInstance(result, EntityPlacementResult)
         self.assertEqual((result.position, result.slot), (SUPPORT, BOAT_SLOT))
         self.assertEqual((result.submitted, result.reason), (True, "observations_complete"))
         self.assertEqual(result.spawn, spawn)
+        self.assertEqual(len(self.completions), 1)
+        self.assertIs(self.completions[0], result)
         before, after = result.inventory_change.before, result.inventory_change.after
         self.assertEqual((before.item_id, before.count, after.item_id, after.count), (BOAT_ITEM, 1, 0, 0))
         self.assertEqual(len(self.wire.sent), 1)
         self.assert_observers_restored()
+
+    async def test_unsolicited_entity_is_visible_without_a_placement_completion(self):
+        events = []
+        unsubscribe = self.bot.subscribe_entity_lifecycle(events.append)
+        await self.deliver(self.spawn(-40), self.boat_slot(1))
+        unsubscribe()
+        self.assertEqual([(event.kind, event.entity.entity_id) for event in events], [("entered", -40)])
+        self.assertEqual(self.completions, [])
+        self.assertEqual(self.wire.sent, [])
 
     def spawn_with_variant(self, entity_id, payload, *, actor_type="minecraft:boat"):
         b = self.b

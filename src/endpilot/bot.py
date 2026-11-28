@@ -137,6 +137,7 @@ class Bot:
         self._enchanting: Enchanting | None = None
         self._blocks: Blocks | None = None
         self._placement_completion_observers: dict[object, Callable[[PlacementResult], None]] = {}
+        self._entity_placement_completion_observers: dict[object, Callable[[EntityPlacementResult], None]] = {}
         self._terrain: _TerrainObserver | None = None
         self._beds: Beds | None = None
         self._block_collector: _BlockCollector | None = None
@@ -2227,13 +2228,20 @@ class Bot:
             face=face, expected_runtime_id=expected_runtime_id, expected_block_name=expected_block_name,
             replace=replace, click_pos=click_pos, timeout=timeout,
         )
-        observers = self._placement_completion_observers
-        if result.reason != "observations_complete" or self._blocks is not blocks or not observers:
-            return result
+        if self._blocks is blocks:
+            self._notify_placement_completion(result, self._placement_completion_observers,
+                                              "placement completion observer failed")
+        return result
+
+    def _notify_placement_completion[Result: PlacementResult | EntityPlacementResult](
+        self, result: Result, observers: dict[object, Callable[[Result], None]], error_message: str,
+    ) -> None:
+        if result.reason != "observations_complete" or not observers:
+            return
         # The reader can finish before its done callback clears the observers.
         state = self._get_session_end_state()
         if state is None or state.result is not None:
-            return result
+            return
         for key, callback in tuple(observers.items()):
             if key not in observers:
                 continue
@@ -2241,9 +2249,8 @@ class Bot:
                 callback(result)
             except (Exception, asyncio.CancelledError) as error:
                 asyncio.get_running_loop().call_exception_handler({
-                    "message": "placement completion observer failed", "exception": error, "callback": callback,
+                    "message": error_message, "exception": error, "callback": callback,
                 })
-        return result
 
     def subscribe_placement_completions(self, callback: Callable[[PlacementResult], None]) -> Callable[[], None]:
         """Observe future complete results from this Bot's ``place_block`` in the joined session.
@@ -2254,19 +2261,24 @@ class Bot:
         no server attribution. The returned function unsubscribes and can be
         called repeatedly. Registrations end with the session.
         """
+        return self._subscribe_placement_completion(callback, lambda bot: bot._placement_completion_observers)
+
+    def _subscribe_placement_completion[Result](
+        self, callback: Callable[[Result], None], observers: Callable[["Bot"], dict[object, Callable[[Result], None]]],
+    ) -> Callable[[], None]:
         state = self._get_session_end_state()
         if self._session is None or state is None:
             raise RuntimeError("player has not joined")
         if state.result is not None:
             raise ConnectionError("placement completion subscription stream is closed")
         key = object()
-        self._placement_completion_observers[key] = callback
+        observers(self)[key] = callback
         owner_ref = ref(self)
 
         def unsubscribe() -> None:
             owner = owner_ref()
             if owner is not None:
-                owner._placement_completion_observers.pop(key, None)
+                observers(owner).pop(key, None)
 
         return unsubscribe
 
@@ -2318,10 +2330,27 @@ class Bot:
         containers, blocks, creative, entities = self._containers, self._blocks, self._creative, self._entities
         if session is None or containers is None or blocks is None or creative is None or entities is None:
             raise RuntimeError("player has not joined")
-        return await observe_entity_placement(
+        result = await observe_entity_placement(
             containers, blocks, creative, entities, lambda: session.item_registry, position,
             result_type=result_type, timeout=timeout,
         )
+        if self._session is session:
+            self._notify_placement_completion(result, self._entity_placement_completion_observers,
+                                              "entity placement completion observer failed")
+        return result
+
+    def subscribe_entity_placement_completions(
+        self, callback: Callable[[EntityPlacementResult], None],
+    ) -> Callable[[], None]:
+        """Observe complete results from this Bot's entity placements in the joined session.
+
+        The synchronous callback receives the same immutable result once before
+        a ``place_entity`` or ``place_oak_boat`` call returns with both observations.
+        The matching spawn and selected slot decrease carry no server attribution.
+        The returned unsubscriber can be called repeatedly. Registrations end
+        with the session.
+        """
+        return self._subscribe_placement_completion(callback, lambda bot: bot._entity_placement_completion_observers)
 
     async def open_container(
         self, position: tuple[int, int, int], *, face: int = 1, timeout: float = 15
@@ -3649,6 +3678,7 @@ class Bot:
 
     def _publish_session_end(self, result: SessionEnd) -> None:
         self._placement_completion_observers.clear()
+        self._entity_placement_completion_observers.clear()
         for callback in tuple(self._session_end_observers.values()):
             try:
                 callback(result)
