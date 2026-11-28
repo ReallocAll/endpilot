@@ -384,7 +384,7 @@ class Commands:
         async with asyncio.timeout_at(deadline):
             return await self._request_feedback(
                 packet, binding.CommandOutputPacket.ID, matches, timeout=None, deadline=deadline,
-                on_response=self._on_chat_output,
+                on_response=self._on_chat_output if origin_uuid != self.player_uuid else None,
             )
 
     async def _request_feedback(self, packet, packet_id, matches, *, timeout, deadline=None, on_response=None):

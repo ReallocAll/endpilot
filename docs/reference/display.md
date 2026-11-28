@@ -41,14 +41,17 @@ base language bytes using `Bot(chat_languages={"en_US": lang_bytes})`. The bot
 selects the locale of each login and applies the effective `.lang` file from
 that connection's resource pack stack. When a translation cannot be resolved,
 the callback still receives the entry with `message=None`. Compound rawtext
-keeps its original JSON in `raw_message`.
+keeps its original JSON in `raw_message`, which also carries original literal
+command output where available.
 Use `subscribe_text()` for the original wire fields, including text objects.
 
-Stock `/list` chat feedback carries the player count and player names as
-separate entries in their received order. The SDK observes the corresponding
-text objects and the visible `ALL_OUTPUT` responses to this session's
-`execute_command_output()` calls. `SILENT` responses remain available to the
-command caller through the existing typed API.
+On protocol 2225, a player command response addressed to this session can
+contribute one chat entry per message in its received order. An empty message
+list contributes zero entries. The typed `execute_command_output()` method
+also returns the original response. The `/list` count and player names are
+two separate entries. Localized output keeps the original key and parameters.
+For example, `/help` preserves the green formatting of the page header and
+footer. An unsuccessful command record uses the red `§c` formatting prefix.
 
 ## Match display text
 
@@ -129,10 +132,10 @@ A valid pack file overrides base keys, including empty values. Keys absent
 from that file use the supplied base for the same locale. An invalid effective
 file leaves translations unavailable. This resolver accepts a UTF-8 BOM and
 spaces or tabs before `=` in both files. It skips malformed and ambiguous
-entries in the base file. The resolver supports `%s` and `%N$s`
-templates, and `%%N` in rawtext. It preserves the yellow formatting in the
-server's `§e%` join and leave keys. A missing key, argument, or unsupported
-node leaves the entire message unresolved. `TextEvent.resolve_text()` still
+entries in the base file. The resolver supports `%s`, `%N$s`, and numbered
+decimal templates such as `%1$d`, as well as `%%N` in rawtext. It preserves
+formatting on decorated server keys such as `§e%` and `§2%`. A missing key,
+argument, or unsupported node leaves the entire message unresolved. `TextEvent.resolve_text()` still
 uses its resource-pack-only rules. `wait_for_text()` continues to match the
 original message field.
 

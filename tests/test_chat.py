@@ -5,6 +5,7 @@ import zlib
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from uuid import UUID
 
 from bedrock_protocol import TextPacketType
 from endpilot import Bot, ResourcePackIndex, TextEvent
@@ -577,7 +578,7 @@ class PublicChatPatternTests(unittest.IsolatedAsyncioTestCase):
                                       ChatMessage(None, "first A second B", "server", raw_message=multiple),
                                       ChatMessage("Player", "after")])
 
-    async def test_list_history_projects_only_the_matched_visible_native_output(self):
+    async def test_command_history_projects_all_records_from_the_matched_player_output(self):
         b = self.protocol.binding
         history, texts = [], []
         self.bot.subscribe_chat(history.append)
@@ -585,7 +586,7 @@ class PublicChatPatternTests(unittest.IsolatedAsyncioTestCase):
         keys = ("commands.players.list", "commands.players.list.names")
         messages = [b.CommandOutputMessage(message_id=key, successful=True, params=params)
                     for key, params in zip(keys, (["2", "4"], ["Other, Player"]))]
-        previous = self.bot.identity.uuid
+        previous = UUID(int=9)
 
         def response(origin_uuid, origin_type, output_type, rows):
             return b.CommandOutputPacket(
@@ -618,8 +619,44 @@ class PublicChatPatternTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.execute_command_output("/list", timeout=2)
 
         self.assertEqual(history, [ChatMessage(None, None, "command", keys[0], ("2", "4")),
-                                   ChatMessage(None, None, "command", keys[1], ("Other, Player",))] * 2)
+                                   ChatMessage(None, None, "command", keys[1], ("Other, Player",))] * 3)
         self.assertEqual(texts, [])
+
+    async def test_identity_command_history_preserves_formatted_literal_and_failed_records(self):
+        await self.bot.close()
+        self.bot = Bot("PatternObserver", chat_languages={"en_US": (
+            b"commands.help.header=Page %1$d/%2$d\ncommands.help.footer=Finish\n"
+            b"commands.generic.disabled=Commands disabled\n"
+        )})
+        self.addAsyncCleanup(self.bot.close)
+        await self.join()
+        b = self.protocol.binding
+        history = []
+        self.bot.subscribe_chat(history.append)
+        header, footer = "§2%commands.help.header", "§2%commands.help.footer"
+        literal = "/help <page: int>\n/list"
+        rows = [(header, True, ["1", "2"]), (literal, True, []), (footer, True, []),
+                ("§2%commands.unavailable", True, []), ("commands.generic.disabled", False, [])]
+        messages = [b.CommandOutputMessage(message_id=key, successful=success, params=params)
+                    for key, success, params in rows]
+        own = self.bot.identity.uuid
+
+        def output(player_uuid, origin_type):
+            return b.CommandOutputPacket(
+                origin_data=b.CommandOriginData(type=origin_type, uuid=player_uuid),
+                output=b.CommandOutput(type=b.CommandOutputType.SILENT, success_count=0, messages=messages),
+            )
+
+        await self.bot.send_command("help 1")
+        packets = [output(UUID(int=9), b.CommandOriginType.PLAYER),
+                   output(own, b.CommandOriginType.DEDICATED_SERVER), output(own, b.CommandOriginType.PLAYER)]
+        self.incoming.put_nowait(b"\xff" + write_batch(self.protocol.encode(packet) for packet in packets))
+        await asyncio.sleep(0)
+        self.assertEqual(history, [ChatMessage(None, "§2Page 1/2", "command", header, ("1", "2")),
+                                   ChatMessage(None, literal, "command", params=(), raw_message=literal),
+                                   ChatMessage(None, "§2Finish", "command", footer, ()),
+                                   ChatMessage(None, None, "command", "§2%commands.unavailable", ()),
+                                   ChatMessage(None, "§cCommands disabled", "command", "commands.generic.disabled", ())])
 
     async def test_callback_exceptions_do_not_interrupt_other_callbacks_or_waiters(self):
         pattern = self.bot.add_chat_pattern("signal", "^signal")

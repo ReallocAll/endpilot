@@ -118,7 +118,10 @@ Pass `locale="zh_CN"` to `connect` to use that language for the player.
 `reconnect` and `switch_account` retain the connection locale. File paths are
 configured in the host launch arguments. `subscribe_chat` keeps ordinary text
 and the original translation keys and parameters when no translation is
-available. Inspect untranslated compound text through `raw_message`.
+available. Inspect compound or preformatted text through `raw_message`. Player
+command output is delivered one record at a time in the order received,
+including repeated records and errors. Formatted messages retain Bedrock
+formatting codes.
 [MCP tests](../../tests/test_mcp.py)
 
 ## Place a block

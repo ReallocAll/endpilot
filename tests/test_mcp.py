@@ -791,14 +791,28 @@ class MCPStdioTests(unittest.IsolatedAsyncioTestCase):
         source = Path(endpilot.__file__).resolve().parents[1]
         peer = """
 import asyncio
-import json
 import runpy
+from types import SimpleNamespace
 from unittest.mock import patch
+from uuid import UUID
 
+from endpilot import commands
 from endpilot.protocol import Protocol, RawPacket, read_batch, write_batch
 
 protocol = Protocol(2225)
 b = protocol.binding
+# Request and SILENT reply from the stock run with sendCommandFeedback=false.
+request = RawPacket(b.CommandRequestPacket.ID, bytes.fromhex(
+    '052f6c69737406706c61796572e7412d4b3ab36e540acbbc33829e0ba420613736303965653531353331346230'
+    '306164386336303136613863326238623812000000ffffffff00066c6174657374'
+))
+silent = RawPacket(b.CommandOutputPacket.ID, bytes.fromhex(
+    '06706c61796572e7412d4b3ab36e540acbbc33829e0ba40000000000000000000673696c656e74010000000215'
+    '636f6d6d616e64732e706c61796572732e6c6973740102013201341b636f6d6d616e64732e706c61796572732e'
+    '6c6973742e6e616d657301011e436861744c6973745769746e6573732c20436861744c6973744163746f7200'
+))
+origin = protocol.decode(request).origin
+nonces = iter((origin.uuid, UUID(hex=origin.request_id)))
 # A compound /tellraw TEXT_OBJECT_WHISPER from the stock resource-pack test.
 compound = RawPacket(b.TextPacket.ID, bytes.fromhex(
     '0000099b017b2272617774657874223a5b7b2274657874223a22455054582d73657175656e7469616c7c227d2c'
@@ -811,7 +825,7 @@ class Transport:
     def __init__(self):
         self.incoming = asyncio.Queue()
         self.deliver(b.NetworkSettingsPacket(compression_algorithm=b.PacketCompressionAlgorithm.NONE))
-        self.deliver(b.StartGamePacket(runtime_id=41, entity_id=41),
+        self.deliver(b.StartGamePacket(runtime_id=41, entity_id=origin.player_id),
                      b.PlayStatusPacket(status=b.PlayStatus.PLAYER_SPAWN))
 
     def deliver(self, *packets):
@@ -821,12 +835,9 @@ class Transport:
     async def send(self, data):
         for raw in read_batch(data):
             if raw.packet_id == b.CommandRequestPacket.ID:
-                assert protocol.decode(raw).command == '/list'
-                contents = {'rawtext': [{'translate': 'commands.players.list',
-                                         'with': ['1', '4']}]}
+                assert raw == request
                 self.deliver(
-                    b.TextPacket(body=b.TextPacket.MessageOnly(type=b.TextPacketType.TEXT_OBJECT,
-                                                               message=json.dumps(contents))),
+                    silent,
                     compound,
                     b.TextPacket(body=b.TextPacket.AuthorAndMessage(type=b.TextPacketType.CHAT,
                                                                     author='Player', message='barrier')),
@@ -841,7 +852,9 @@ class Transport:
 async def dial(url, **kwargs):
     return Transport()
 
-with patch('endpilot.transport.nethernet.connect', dial):
+with patch('endpilot.transport.nethernet.connect', dial), patch.object(commands, 'uuid', SimpleNamespace(
+    uuid4=lambda: next(nonces),
+)):
     runpy.run_module('endpilot.mcp_server', run_name='__main__')
 """
         worker = """
@@ -856,7 +869,8 @@ async def main(bot):
             barrier.set()
     unsubscribe = bot.subscribe_chat(record)
     try:
-        await bot.send_command('/list')
+        reply = await bot.execute_command_output('/list', timeout=5)
+        assert reply.output.type == 'SILENT'
         await asyncio.wait_for(barrier.wait(), 5)
         return rows
     finally:
@@ -865,12 +879,14 @@ async def main(bot):
         with TemporaryDirectory() as folder:
             language = Path(folder) / "local.zh_CN.lang"
             language.write_text("commands.players.list=目前有 %1$d/%2$d 个玩家在线：\n"
+                                "commands.players.list.names=%s\n"
                                 "endpilot.packtext.sequence=%s 获得 %s\n", encoding="utf-8")
             raw_message = (
                 '{"rawtext":[{"text":"EPTX-sequential|"},{"translate":"endpilot.packtext.sequence",'
                 '"with":{"rawtext":[{"text":"Alice"},{"text":"snow"}]}},{"text":"|end"}]}\n'
             )
-            for configured, message in ((False, None), (True, "目前有 1/4 个玩家在线：")):
+            players = "ChatListWitness, ChatListActor"
+            for configured, message in ((False, None), (True, "目前有 2/4 个玩家在线：")):
                 with self.subTest(configured=configured):
                     args = ["-B", "-c", peer]
                     if configured:
@@ -894,7 +910,8 @@ async def main(bot):
                                 await asyncio.sleep(0.01)
                         self.assertEqual(report["state"], "succeeded", report)
                         self.assertEqual(report["result"], [
-                            [message, "command", "commands.players.list", ["1", "4"], None],
+                            [message, "command", "commands.players.list", ["2", "4"], None],
+                            [players if configured else None, "command", "commands.players.list.names", [players], None],
                             ["EPTX-sequential|Alice 获得 snow|end" if configured else None,
                              "whisper", None, None, raw_message],
                             ["barrier", "chat", None, None, None],

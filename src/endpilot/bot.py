@@ -517,7 +517,7 @@ class Bot:
             translations = TextTranslations.from_lang(locale=locale, vanilla_lang=base_language or b"",
                                                        resource_pack_index=pack_index)
         self._chat = Chat(session.packets, identity.name, resource_pack_index=pack_index,
-                          translations=translations, _xuid=xuid)
+                          translations=translations, player_uuid=identity.uuid, _xuid=xuid)
         self._titles = Titles(session.packets, session._end_state, _publish_error=publish_error)
         self._commands = Commands(
             session.packets, session.identity.uuid, session.player_unique_id,

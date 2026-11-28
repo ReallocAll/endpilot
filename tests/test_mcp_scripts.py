@@ -126,6 +126,9 @@ async def main(bot):
             ("/packstack bogus verbose", b.CommandOutputType.DATA_SET, 0, data, "応答",
              [("commands.generic.syntax", False, ["", "猫", "e\u0301", "🌱", " verbose"]),
               ("commands.generic.unknown", False, [])]),
+            ("/help", b.CommandOutputType.SILENT, 1, None, "",
+             [("commands.help.header", True, ["1", "3"]),
+              ("commands.help.header", True, ["1", "3"])]),
             ("/help", b.CommandOutputType.NONE, 0, None, "", []),
         ]
         requests = []
@@ -147,9 +150,25 @@ async def main(bot):
                     for message_id, successful, params in messages
                 ]),
             ))
+            if len(requests) == len(cases):
+                self.wire.push(b.TextPacket(body=b.TextPacket.AuthorAndMessage(
+                    type=b.TextPacketType.CHAT, author="Fixture", message="command output barrier",
+                )))
 
         script = """
+import asyncio
+
 async def main(bot):
+    seen = []
+    barrier = asyncio.Event()
+
+    def record(event):
+        if event.kind == "command":
+            seen.append([event.author, event.translation_key, event.params])
+        elif event.message == "command output barrier":
+            barrier.set()
+
+    unsubscribe = bot.subscribe_chat(record)
     try:
         await bot.execute_command_output("expired", timeout=0)
     except TimeoutError:
@@ -157,13 +176,15 @@ async def main(bot):
     else:
         raise AssertionError("nonpositive timeout should fail")
     replies = []
-    for command in ("list", "/packstack bogus verbose", "help"):
+    for command in ("list", "/packstack bogus verbose", "help", "help"):
         reply = await bot.execute_command_output(command, timeout=3)
         assert isinstance(reply.origin_data.uuid, str)
         assert not hasattr(reply, "ID")
         assert all(not hasattr(message, "raw_message") for message in reply.output.messages)
         replies.append(reply)
-    return replies
+    await asyncio.wait_for(barrier.wait(), 3)
+    unsubscribe()
+    return {"typed": replies, "chat": seen}
 """
         with patch.object(self.wire, "send", side_effect=respond):
             observed = await self.completed(await self.start(script))
@@ -179,7 +200,10 @@ async def main(bot):
                                      for message_id, successful, params in messages]}}
             for request, (_, kind, success_count, opaque_data, request_id, messages) in zip(requests, cases, strict=True)
         ]
-        self.assertEqual(observed["result"], expected)
+        self.assertEqual(observed["result"], {
+            "typed": expected,
+            "chat": [[None, key, params] for *_, messages in cases for key, _, params in messages],
+        })
 
     async def test_form_reply_encoding_failure_leaves_the_script_usable(self):
         b = self.bot.protocol.binding

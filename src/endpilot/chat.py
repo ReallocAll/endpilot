@@ -32,7 +32,7 @@ _TEXT_OBJECT_KINDS = (
     TextPacketType.TEXT_OBJECT_ANNOUNCEMENT,
 )
 _LITERAL_TEXT_KINDS = (TextPacketType.RAW, TextPacketType.SYSTEM_MESSAGE, TextPacketType.TIP)
-_LIST_COMMAND_TEXT_KEYS = frozenset({"commands.players.list", "commands.players.list.names"})
+_LOCALIZED_KEY_PREFIX = re.compile(r"((?:§[0-9A-Za-z])*)%")
 _TRANSLATION_SLOT = re.compile(r"%%[0-9]*|%[A-Za-z0-9]")
 _NATIVE_TRANSLATION_SLOT = re.compile(
     r"%(?:s|(?P<position>[1-9][0-9]*)\$(?P<format>[sd])|%(?:[1-9][0-9]*)|(?=[%A-Za-z0-9.$+\-#]))",
@@ -119,8 +119,8 @@ class TextTranslations:
         return cls(MappingProxyType(templates))
 
     def _template(self, key: str) -> str:
-        if key.startswith("§e%"):
-            return "§e" + self._templates[key[3:]]
+        if prefix := _LOCALIZED_KEY_PREFIX.match(key):
+            return prefix[1] + self._templates[key[prefix.end():]]
         return self._templates[key]
 
     def resolve(self, event: TextEvent) -> str | None:
@@ -130,13 +130,9 @@ class TextTranslations:
         if event.kind == TextPacketType.TRANSLATE and event.localize:
             try:
                 template = self._template(event.message)
-                args = event.params or ()
-                budget = _MAX_RAWTEXT_CHARS - sum(map(len, args), len(template))
-                if budget >= 0:
-                    return _fill_translation(template, args, budget, syntax="native")
-            except (KeyError, ValueError):
-                pass
-            return None
+            except KeyError:
+                return None
+            return _format_native_translation(template, event.params or ())
         if not event.localize and event.kind in (TextPacketType.ANNOUNCEMENT, TextPacketType.WHISPER):
             return event.message
         return _text_content(event)
@@ -192,19 +188,13 @@ def _chat_rawtext(message: str) -> dict | None:
         value = json.loads(message, object_pairs_hook=_rawtext_object)
     except (ValueError, RecursionError):
         return None
-    if not isinstance(value, dict):
-        return None
-    if (value.keys() == {"rawtext"} and isinstance(value["rawtext"], list)
-            or value.keys() == {"text"} and isinstance(value["text"], str)
-            or value.keys() in ({"translate"}, {"translate", "with"}) and isinstance(value["translate"], str)):
-        return value
-    return None
+    return value if isinstance(value, dict) else None
 
 
 def _rawtext_translation(value: dict) -> tuple[str, tuple[str, ...]] | None:
     if value.keys() == {"rawtext"}:
         nodes = value["rawtext"]
-        if len(nodes) != 1:
+        if not isinstance(nodes, list) or len(nodes) != 1:
             return None
         node = nodes[0]
     else:
@@ -309,6 +299,16 @@ def _fill_translation(template: str, args: Sequence[str], budget: int, *,
         raise ValueError("expanded translation exceeds the text limit")
     parts.append(template[end:])
     return "".join(parts)
+
+
+def _format_native_translation(template: str, args: tuple[str, ...]) -> str | None:
+    budget = _MAX_RAWTEXT_CHARS - sum(map(len, args), len(template))
+    if budget < 0:
+        return None
+    try:
+        return _fill_translation(template, args, budget, syntax="native")
+    except ValueError:
+        return None
 
 
 def _resolve_rawtext(message: str, locale: str, index: ResourcePackIndex | None) -> str | None:
@@ -430,33 +430,38 @@ class _IncomingText:
         author = _author_without_reset(event.author) if event.author is not None else None
         if event.kind == TextPacketType.CHAT:
             return ChatMessage(author, event.message)
-        if event.kind == TextPacketType.WHISPER and not event.localize:
-            return ChatMessage(author, event.message, "whisper")
-        if event.kind in (TextPacketType.RAW, TextPacketType.SYSTEM_MESSAGE, TextPacketType.ANNOUNCEMENT):
+        if event.kind in (TextPacketType.RAW, TextPacketType.SYSTEM_MESSAGE,
+                          TextPacketType.WHISPER, TextPacketType.ANNOUNCEMENT):
+            kind = "whisper" if event.kind == TextPacketType.WHISPER else "server"
             if not event.localize:
-                return ChatMessage(author, event.message, "server")
-            return None
-        if event.kind == TextPacketType.TRANSLATE and event.localize:
+                return ChatMessage(author, event.message, kind)
+            text = TextEvent(TextPacketType.TRANSLATE, event.message, localize=True, params=event.params)
+            message = translations.resolve(text) if translations is not None else None
+            return ChatMessage(author, message, kind, event.message, event.params)
+        if event.kind == TextPacketType.TRANSLATE:
             translation = (event.message, event.params or ())
-        elif event.kind in _TEXT_OBJECT_KINDS and not event.localize:
+            rendered = self.content(translations) if event.localize else event.message
+        elif event.kind in _TEXT_OBJECT_KINDS:
             value = _chat_rawtext(event.message)
             if value is None:
                 return None
             translation = _rawtext_translation(value)
+            rendered = self.content(translations)
+            if event.localize and translations is not None:
+                rendered = _render_rawtext(event.message, translations._template, syntax="rawtext")
             if translation is None:
                 kind = "whisper" if event.kind == TextPacketType.TEXT_OBJECT_WHISPER else "server"
                 literal = _literal_rawtext_value(value)
                 if literal is not None:
                     return ChatMessage(author, literal, kind)
-                return ChatMessage(author, self.content(translations), kind, raw_message=event.message)
+                return ChatMessage(author, rendered, kind, raw_message=event.message)
         else:
             return None
         key, params = translation
-        normalized_key = key.removeprefix("§e%").removeprefix("%")
-        if event.kind == TextPacketType.TEXT_OBJECT and key in _LIST_COMMAND_TEXT_KEYS:
+        prefix = _LOCALIZED_KEY_PREFIX.match(key)
+        normalized_key = key if prefix is None else key[prefix.end():]
+        if event.kind == TextPacketType.TEXT_OBJECT and normalized_key.startswith("commands."):
             kind = "command"
-        elif normalized_key.startswith("commands."):
-            return None  # Only command feedback known to enter chat history is projected.
         elif normalized_key == "multiplayer.player.joined":
             kind = "join"
         elif normalized_key == "multiplayer.player.left":
@@ -465,7 +470,7 @@ class _IncomingText:
             kind = "death"
         else:
             kind = "whisper" if event.kind == TextPacketType.TEXT_OBJECT_WHISPER else "server"
-        return ChatMessage(author, self.content(translations), kind, key, params)
+        return ChatMessage(author, rendered, kind, key, params)
 
 
 @dataclass(slots=True)
@@ -481,13 +486,14 @@ class _RegisteredPattern[T]:
 class Chat:
     def __init__(
         self, packets, name: str, *, resource_pack_index: ResourcePackIndex | None = None,
-        translations: TextTranslations | None = None, _xuid: str = "",
+        translations: TextTranslations | None = None, player_uuid: UUID | None = None, _xuid: str = "",
     ):
         self.packets = packets
         self.name = name
         self._xuid = _xuid
         self._resource_pack_index = resource_pack_index
         self._translations = translations
+        self._player_uuid = player_uuid
         self._text = packets.protocol.binding.packets[9]
         self._pattern_ids = count(1)
         self._patterns: dict[int, _RegisteredPattern[ChatMessage]] = {}
@@ -801,17 +807,29 @@ class Chat:
                          xuid=packet.xuid, platform_id=packet.platform_id, filtered_message=packet.filtered_message)
 
     def _on_command_output(self, packet) -> None:
-        output = packet.output
-        if not self._message_observers or output.type != self.packets.protocol.binding.CommandOutputType.ALL_OUTPUT:
+        if not self._message_observers:
             return
-        for item in output.messages:
-            key = item.message_id
-            if key not in _LIST_COMMAND_TEXT_KEYS or not item.successful:
-                continue
+        for item in packet.output.messages:
+            original = item.message_id
             params = tuple(item.params)
-            text = TextEvent(TextPacketType.TRANSLATE, key, localize=True, params=params)
-            message = None if self._translations is None else self._translations.resolve(text)
-            self._notify(self._message_observers, ChatMessage(None, message, "command", key, params))
+            template = None
+            if self._translations is not None:
+                try:
+                    template = self._translations._template(original)
+                except KeyError:
+                    pass
+            key, raw_message = original, None
+            if template is not None:
+                message = _format_native_translation(template, params)
+            elif not _LOCALIZED_KEY_PREFIX.match(original) and any(character.isspace() for character in original):
+                # Stock BDS sends preformatted text through the same field
+                # as symbolic language keys.
+                key, raw_message, message = None, original, original
+            else:
+                message = None
+            if message is not None and not item.successful:
+                message = "§c" + message
+            self._notify(self._message_observers, ChatMessage(None, message, "command", key, params, raw_message))
 
     @staticmethod
     def _matches_text(
@@ -831,8 +849,17 @@ class Chat:
                 })
 
     def _on_packet(self, raw: RawPacket) -> None:
-        if raw.packet_id == self.packets.protocol.binding.DisconnectPacket.ID:
+        protocol = self.packets.protocol
+        binding = protocol.binding
+        if raw.packet_id == binding.DisconnectPacket.ID:
             self._end_subscriptions()
+            return
+        if (self._message_observers and self._player_uuid is not None and protocol.number == 2225
+                and raw.packet_id == binding.CommandOutputPacket.ID):
+            packet = protocol.decode(raw)
+            origin = packet.origin_data
+            if origin.type == binding.CommandOriginType.PLAYER and origin.uuid == self._player_uuid:
+                self._on_command_output(packet)
             return
         if raw.packet_id != self._text.ID:
             return
@@ -840,7 +867,7 @@ class Chat:
         self._display_completed.clear()
         if not (self._patterns or self._display_patterns or self._text_observers or self._message_observers):
             return
-        packet = self.packets.protocol.decode(raw)
+        packet = protocol.decode(raw)
         message = self._chat_message(packet.body)
         if message is not None and self._patterns:
             self._advance_patterns(self._patterns, self._completed, message, lambda _: message.message, ChatMatch)
