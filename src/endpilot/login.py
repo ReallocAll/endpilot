@@ -460,6 +460,9 @@ class JoinSession:
                 else:
                     # Game modes and abilities must be replayed in the same order.
                     self.player_state_packets.append(packet)
+                    if raw.packet_id == binding.UpdatePlayerGameTypePacket.ID:
+                        # Remote reports must also stay in order with roster and spawn packets.
+                        self.entity_packets.append(raw)
             elif self.player_id is not None and raw.packet_id == binding.SetHealthPacket.ID:
                 self.player_state_packets.append(raw)
             elif raw.packet_id == binding.UpdateAbilitiesPacket.ID:

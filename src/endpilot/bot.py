@@ -412,7 +412,7 @@ class Bot:
 
         self._entities = Entities(
             session.packets, item_names=session.item_names if session.item_registry is None else None,
-            own_runtime_id=session.player_id, own_entity_id=session.player_unique_id,
+            own_runtime_id=session.player_id, own_entity_id=session.player_unique_id, own_uuid=session.player_uuid,
         )
         # Capture the player state assembled later for this session.
         player_state: PlayerState | None = None

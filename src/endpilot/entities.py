@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from typing import Literal
 from uuid import UUID
 
-from bedrock_protocol import ActorSwingSource, DecodeError, HandSlot, PlayerListPacketType
+from bedrock_protocol import ActorSwingSource, DecodeError, GameType, HandSlot, PlayerListPacketType
 
 from .entity_cursor import Box, expanded_box, trace_entities
 from .expression import animation
@@ -336,7 +336,7 @@ class ItemPickup:
 
 @dataclass(frozen=True, slots=True)
 class PlayerListEntry:
-    """Player-list identity and metadata with the latest reported skin."""
+    """Player-list identity, skin, and last explicit remote game mode."""
 
     uuid: UUID
     name: str
@@ -350,6 +350,7 @@ class PlayerListEntry:
     is_sub_client: bool
     color: int
     skin: PlayerSkinSnapshot | None = None
+    game_mode: GameType | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,11 +396,13 @@ _WOLF = "minecraft:wolf"
 _ACTOR_SPAWN_FEET_TYPES = frozenset((_COW, _SHEEP, _VILLAGER))
 _CURSOR_BODY_TYPES = frozenset((_COW, _SHEEP))
 _UNBOUNDED_BOX: Box = ((-math.inf,) * 3, (math.inf,) * 3)
+_EXPLICIT_GAME_MODES = frozenset((GameType.SURVIVAL, GameType.CREATIVE, GameType.ADVENTURE, GameType.SPECTATOR))
 
 
 @dataclass(eq=False, slots=True)
 class _ActorInstance:
     feet_known: bool
+    unlisted_game_mode: tuple[int, GameType] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -565,10 +568,12 @@ def _player_list_change(entry) -> PlayerListChange:
 
 class Entities:
     def __init__(self, packets, *, item_names: dict[int, str] | None = None,
-                 own_runtime_id: int | None = None, own_entity_id: int | None = None):
+                 own_runtime_id: int | None = None, own_entity_id: int | None = None,
+                 own_uuid: UUID | None = None):
         self.packets = packets
         self._own_runtime_id = own_runtime_id
         self._own_entity_id = own_entity_id
+        self._own_uuid = own_uuid
         self._players_by_uuid: dict[UUID, PlayerListEntry] = {}
         self._player_list_observers: list[Callable[[tuple[PlayerListChange, ...]], None]] = []
         self._player_skin_observers: list[Callable[[PlayerListEntry], None]] = []
@@ -663,6 +668,20 @@ class Entities:
 
     def player_list(self) -> tuple[PlayerListEntry, ...]:
         return tuple(self._players_by_uuid.values())
+
+    def _record_player_list_add(self, player: PlayerListEntry, runtime_id: int | None) -> None:
+        previous = self._players_by_uuid.get(player.uuid)
+        instance = self._actor_instances.get(runtime_id)
+        pending = None
+        if instance is not None:
+            # A spawn before the first roster entry can only seed that entry once.
+            pending, instance.unlisted_game_mode = instance.unlisted_game_mode, None
+        mode = None
+        if previous is not None and previous.entity_id == player.entity_id:
+            mode = previous.game_mode
+        elif previous is None and pending is not None and pending[0] == player.entity_id:
+            mode = pending[1]
+        self._players_by_uuid[player.uuid] = replace(player, game_mode=mode) if mode is not None else player
 
     async def wait_for_player_list_update(
         self, *, action: Literal["add", "remove"] | None, player_uuid: UUID | None, timeout: float,
@@ -1710,7 +1729,7 @@ class Entities:
                     observed_changes.append(change)
                 runtime_id = self._player_runtime_by_uuid.get(change.uuid)
                 if change.player is not None:
-                    self._players_by_uuid[change.uuid] = change.player
+                    self._record_player_list_add(change.player, runtime_id)
                     state = self._by_runtime.get(runtime_id)
                     if state is not None:
                         entity_id = change.player.entity_id
@@ -1758,6 +1777,16 @@ class Entities:
                         self._forget_runtime(runtime_id, lifecycle_events=lifecycle_events, reason="roster_removed")
             if observed_changes:
                 self.packets._notify(observers, tuple(observed_changes))
+        elif packet_id == b.UpdatePlayerGameTypePacket.ID:
+            packet = self.packets.protocol.decode(raw)
+            entity_id = int(packet.target_player)
+            mode = packet.player_game_type
+            if entity_id and entity_id != self._own_entity_id and mode in _EXPLICIT_GAME_MODES:
+                players = [player for player in self._players_by_uuid.values() if player.entity_id == entity_id]
+                if len(players) == 1 and players[0].uuid != self._own_uuid:
+                    player = players[0]
+                    if player.game_mode != mode:
+                        self._players_by_uuid[player.uuid] = replace(player, game_mode=mode)
         elif packet_id == b.PlayerSkinPacket.ID:
             packet = self.packets.protocol.decode(raw)
             listed = self._players_by_uuid.get(packet.uuid)
@@ -1795,6 +1824,13 @@ class Entities:
             ), player_uuid=player_uuid, player_feet=feet,
                 unlisted_entity_id=entity_id if entity_id and not listed_id else None,
                 identity_matches=identity_matches, lifecycle_events=lifecycle_events)
+            mode = getattr(player, "player_game_type", None)
+            if (entity_id and entity_id != self._own_entity_id and player_uuid != self._own_uuid
+                    and mode in _EXPLICIT_GAME_MODES):
+                if listed is None:
+                    self._actor_instances[runtime_id].unlisted_game_mode = entity_id, mode
+                elif listed_id == entity_id and listed.game_mode != mode:
+                    self._players_by_uuid[player_uuid] = replace(listed, game_mode=mode)
             if getattr(self.packets.protocol, "number", None) == 2225:
                 self._cursor_bodies[runtime_id] = _cursor_body(metadata, b)
             if identity_matches:
@@ -1810,7 +1846,7 @@ class Entities:
                     rotation = _player_rotation(player)
                 self._player_views[runtime_id] = _PlayerView(
                     spawn_entity_id, rotation, words,
-                    ordinary_move=feet is not None and getattr(player, "player_game_type", None) != b.GameType.SPECTATOR,
+                    ordinary_move=feet is not None and mode != b.GameType.SPECTATOR,
                     riding_block=riding_block,
                 )
                 if _player_flag(words, b.ActorFlags.BLOCKED_USING_SHIELD):

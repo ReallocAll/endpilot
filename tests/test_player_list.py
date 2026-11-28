@@ -9,7 +9,7 @@ import weakref
 from bedrock_protocol import DecodeError
 
 from endpilot import Bot, PlayerCapeSnapshot, PlayerListChange, PlayerListEntry, PlayerSkinSnapshot
-from endpilot.protocol import Protocol, RawPacket, write_batch
+from endpilot.protocol import Protocol, RawPacket, read_batch, write_batch
 from endpilot.skin import _player_skin_snapshot
 
 
@@ -106,6 +106,167 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
                      binding.PlayStatusPacket(status=binding.PlayStatus.PLAYER_SPAWN), *queued)
         with patch("endpilot.transport.nethernet.connect", return_value=self.transport):
             await self.bot.join_nethernet("http://127.0.0.1:19142")
+
+    def player_spawn(self, uuid, runtime_id, entity_id, mode):
+        binding = self.binding
+        return binding.AddPlayerPacket(
+            uuid=uuid, name="Peer", runtime_id=runtime_id, player_game_type=mode,
+            abilities_data=binding.SerializedAbilitiesData(target_player=entity_id),
+        )
+
+    def mode_update(self, entity_id, mode, *, tick=10):
+        return self.binding.UpdatePlayerGameTypePacket(target_player=entity_id, player_game_type=mode, tick=tick)
+
+    def player_modes(self):
+        return {player.uuid: player.game_mode for player in self.bot.observed_players}
+
+    async def test_startup_game_modes_follow_roster_and_spawn_wire_order(self):
+        mode = self.binding.GameType
+        before, after, updated = (UUID(int=index) for index in (110, 111, 112))
+        await self.join(
+            self.player_spawn(before, 201, 301, mode.CREATIVE),
+            self.mode_update(301, mode.SURVIVAL),
+            self.roster(entries=[self.add(before, "Before", id=301), self.add(after, "After", id=302),
+                                 self.add(updated, "Updated", id=303)]),
+            self.mode_update(302, mode.CREATIVE),
+            self.player_spawn(after, 202, 302, mode.SURVIVAL),
+            self.player_spawn(updated, 203, 303, mode.CREATIVE),
+            self.mode_update(303, mode.ADVENTURE),
+        )
+        self.assertEqual(self.player_modes(), {before: mode.CREATIVE, after: mode.SURVIVAL, updated: mode.ADVENTURE})
+
+    async def test_spawn_mode_requires_matching_nonzero_identity_and_an_explicit_mode(self):
+        mode = self.binding.GameType
+        peer = UUID(int=110)
+        await self.join(self.roster(entries=[self.add(peer, "Peer", id=301)]))
+        self.assertEqual(self.player_modes(), {peer: None})
+        await self.deliver_through(self.player_spawn(peer, 201, 301, mode.CREATIVE))
+        self.assertEqual(self.player_modes(), {peer: mode.CREATIVE})
+        for entity_id, offered in ((302, mode.SURVIVAL), (0, mode.SURVIVAL), (301, mode.DEFAULT),
+                                   (301, mode.UNDEFINED), (301, 101)):
+            with self.subTest(entity_id=entity_id, offered=offered):
+                await self.deliver_through(self.player_spawn(peer, 201, entity_id, offered))
+                self.assertEqual(self.player_modes(), {peer: mode.CREATIVE})
+        await self.deliver_through(self.mode_update(301, mode.DEFAULT), self.mode_update(301, 101))
+        self.assertEqual(self.player_modes(), {peer: mode.CREATIVE})
+        await self.deliver_through(self.player_spawn(peer, 201, 301, mode.SURVIVAL))
+        self.assertEqual(self.player_modes(), {peer: mode.SURVIVAL})
+
+    async def test_unlisted_spawn_mode_expires_with_instance_or_first_roster_add(self):
+        binding = self.binding
+        await self.join()
+        for index, cause in enumerate(("remove", "dimension", "runtime_reuse", "appearance_replaced", "id_reuse",
+                                       "unmatched_add", "zero_add", "roster_remove"), 1):
+            with self.subTest(cause=cause):
+                peer, other = UUID(int=index), UUID(int=index + 100)
+                runtime_id, entity_id = index + 200, index + 300
+                await self.deliver_through(self.player_spawn(peer, runtime_id, entity_id, binding.GameType.CREATIVE))
+                match cause:
+                    case "remove":
+                        invalidation = binding.RemoveActorPacket(entity_id=entity_id)
+                    case "dimension":
+                        invalidation = binding.ChangeDimensionPacket(dimension_id=1)
+                    case "runtime_reuse":
+                        invalidation = self.player_spawn(other, runtime_id, 400, binding.GameType.DEFAULT)
+                    case "appearance_replaced":
+                        invalidation = self.player_spawn(peer, 500, entity_id, binding.GameType.DEFAULT)
+                    case "id_reuse":
+                        invalidation = self.player_spawn(other, 500, entity_id, binding.GameType.DEFAULT)
+                    case "unmatched_add":
+                        invalidation = self.roster(entries=[self.add(peer, "Peer", id=400)])
+                    case "zero_add":
+                        invalidation = self.roster(entries=[self.add(peer, "Peer", id=0)])
+                    case "roster_remove":
+                        invalidation = self.roster(entries=[self.remove(peer)])
+                await self.deliver_through(invalidation, self.roster(entries=[self.add(peer, "Peer", id=entity_id)]))
+                self.assertIsNone(self.player_modes()[peer])
+
+    async def test_listed_game_mode_survives_visibility_changes_and_expires_with_membership(self):
+        binding = self.binding
+        mode = binding.GameType
+        peer = UUID(int=110)
+        initial = self.roster(entries=[self.add(peer, "Peer", id=301)])
+        await self.join(initial, self.player_spawn(peer, 201, 301, mode.CREATIVE))
+        saved, = self.bot.observed_players
+        self.assertEqual(saved.game_mode, mode.CREATIVE)
+        await self.deliver_through(binding.RemoveActorPacket(entity_id=301), self.mode_update(301, mode.ADVENTURE, tick=100))
+        self.assertEqual(self.player_modes(), {peer: mode.ADVENTURE})
+        self.assertEqual(self.bot.observed_entities, ())
+        await self.deliver_through(binding.ChangeDimensionPacket(dimension_id=1))
+        self.assertEqual(self.player_modes(), {peer: mode.ADVENTURE})
+        await self.deliver_through(self.mode_update(301, mode.SURVIVAL, tick=1),
+                                   self.roster(entries=[self.add(peer, "Renamed", id=301)]))
+        current, = self.bot.observed_players
+        self.assertEqual((current.name, current.game_mode), ("Renamed", mode.SURVIVAL))
+        self.assertEqual((saved.name, saved.game_mode), ("Peer", mode.CREATIVE))
+        await self.deliver_through(self.roster(entries=[self.remove(peer)]))
+        self.assertEqual(self.bot.observed_players, ())
+        await self.deliver_through(self.mode_update(301, mode.CREATIVE), initial)
+        self.assertEqual(self.player_modes(), {peer: None})
+        await self.deliver_through(self.mode_update(301, mode.CREATIVE))
+        self.assertEqual(self.player_modes(), {peer: mode.CREATIVE})
+        await self.bot.close()
+        await self.join(initial)
+        self.assertEqual(self.player_modes(), {peer: None})
+
+    async def test_mode_update_requires_a_single_current_remote_target(self):
+        mode = self.binding.GameType
+        local, peer, other, without_id = self.bot.identity.uuid, UUID(int=110), UUID(int=111), UUID(int=112)
+        await self.join(self.roster(entries=[self.add(local, "Self", id=17), self.add(peer, "Peer", id=301),
+                                             self.add(other, "Other", id=301), self.add(without_id, "Zero", id=0)]),
+                        self.player_spawn(peer, 201, 301, mode.CREATIVE))
+        own_changes = []
+        roster_changes = []
+        self.bot.subscribe_game_mode(own_changes.append)
+        self.bot.subscribe_player_list_updates(roster_changes.append)
+        await self.deliver_through(self.mode_update(301, mode.SURVIVAL), self.mode_update(0, mode.SURVIVAL))
+        self.assertEqual(self.player_modes(), {local: None, peer: mode.CREATIVE, other: None, without_id: None})
+        self.assertEqual(roster_changes, [])
+        self.assertEqual(own_changes, [])
+
+        await self.deliver_through(self.roster(entries=[self.add(peer, "Peer", id=302)]),
+                                   self.mode_update(301, mode.SURVIVAL))
+        self.assertEqual(self.player_modes(), {local: None, peer: None, other: mode.SURVIVAL, without_id: None})
+        await self.deliver_through(self.player_spawn(local, 205, 17, mode.CREATIVE), self.mode_update(17, mode.CREATIVE))
+        self.assertEqual(own_changes, [mode.CREATIVE])
+        self.assertEqual(self.bot.game_mode, mode.CREATIVE)
+        self.assertIsNone(self.player_modes()[local])
+        await self.deliver_through(self.roster(entries=[self.add(local, "Self", id=303)]),
+                                   self.player_spawn(local, 206, 303, mode.CREATIVE), self.mode_update(303, mode.SURVIVAL))
+        self.assertEqual(own_changes, [mode.CREATIVE])
+        self.assertIsNone(self.player_modes()[local])
+
+    async def test_roster_modes_use_login_uuid_after_configured_identity_changes(self):
+        binding = self.binding
+        mode = binding.GameType
+        identity = self.bot.identity
+        login_uuid = identity.uuid
+        next_uuid = UUID(int=110)
+        login_sent = asyncio.Event()
+
+        async def observe_send(data):
+            if any(raw.packet_id == binding.LoginPacket.ID for raw in read_batch(data)):
+                login_sent.set()
+
+        self.transport = BatchTransport()
+        self.deliver(binding.NetworkSettingsPacket(compression_algorithm=binding.PacketCompressionAlgorithm.NONE))
+        with (patch("endpilot.transport.nethernet.connect", return_value=self.transport),
+              patch.object(self.transport, "send", side_effect=observe_send)):
+            async with asyncio.TaskGroup() as tasks:
+                tasks.create_task(self.bot.join_nethernet("http://127.0.0.1:19142"))
+                await asyncio.wait_for(login_sent.wait(), timeout=1)
+                identity.uuid = next_uuid
+                self.deliver(
+                    binding.StartGamePacket(entity_id=17, runtime_id=72),
+                    self.roster(entries=[self.add(login_uuid, "Self", id=301), self.add(next_uuid, "Peer", id=302)]),
+                    self.player_spawn(login_uuid, 201, 301, mode.CREATIVE),
+                    self.player_spawn(next_uuid, 202, 302, mode.CREATIVE),
+                    binding.PlayStatusPacket(status=binding.PlayStatus.PLAYER_SPAWN),
+                )
+
+        self.assertEqual(self.player_modes(), {login_uuid: None, next_uuid: mode.CREATIVE})
+        await self.deliver_through(self.mode_update(301, mode.ADVENTURE), self.mode_update(302, mode.SURVIVAL))
+        self.assertEqual(self.player_modes(), {login_uuid: None, next_uuid: mode.SURVIVAL})
 
     async def test_login_roster_survives_actor_removal_and_dimension_change(self):
         uuid = UUID(int=110)

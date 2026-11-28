@@ -125,6 +125,16 @@ across updates. Other fields include the build platform code, packed color and
 player flags. `xuid`, `platform_online_id`, and `play_fab_id` are `None` when
 unavailable.
 
+On `bot.observed_players`, `entry.game_mode` holds the last explicit game mode
+reported for that remote roster member. It starts as `None`. The server can
+report it when the player becomes visible or sends a mode update, including
+while the player is outside entity visibility. Leaving visibility or changing
+dimension preserves the value while the same identity is listed. A roster
+removal, a changed unique actor ID, or a new session ends that observation.
+Use `bot.game_mode` for the local player. The local player's roster field is
+`None`. Player-list callbacks and waits describe roster packets, so read
+`bot.observed_players` for the latest combined state.
+
 Each entry's `skin` is an immutable `PlayerSkinSnapshot` with `skin_id`,
 `width`, `height`, `rgba` bytes, `model` (`"wide"`, `"slim"`, or `None`), and
 `resource_patch`. It is `None` when the server reports no skin or sends a
