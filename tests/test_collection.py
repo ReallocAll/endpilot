@@ -1047,11 +1047,11 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
     async def start_storage_collection(
         self, positions=(TARGET, SECOND_TARGET), *, dirt_count=64, slots=36, empty_slot=False, vein=False,
         chest=REFILL_CHEST, additional_positions=(), terrain=(), ticks=0, search_radius=0, timeout=1, other_drops=(),
-        additions=None,
+        additions=None, items="minecraft:dirt", sources=range(2, 3),
     ):
         bot = await self.storage_bot(dirt_count=dirt_count, slots=slots, empty_slot=empty_slot, chest=chest,
                                      additional_positions=additional_positions, terrain=terrain)
-        storage = CollectionStorage(chest, "minecraft:dirt", inventory_slots=range(2, 3),
+        storage = CollectionStorage(chest, items, inventory_slots=sources,
                                     chest_slots=range(4, 5), additional_positions=additional_positions)
         options = dict(storage=storage, ticks=ticks, search_radius=search_radius, timeout=timeout)
         action = (bot.collect_vein_by_count(TARGET, item_id=DIRT, count=2, **options) if vein
@@ -1097,12 +1097,12 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def start_preflight(
         self, *, method="targets", sources=range(2, 3), chest=REFILL_CHEST, additional_positions=(),
-        destinations=range(4, 6), foreign_window=False, **inventory,
+        destinations=range(4, 6), foreign_window=False, items="minecraft:dirt", **inventory,
     ):
         bot = await self.storage_bot(chest=chest, additional_positions=additional_positions, **inventory)
         if foreign_window:
             await self.emit(*self.refill_window(position=chest, count=0))
-        storage = CollectionStorage(chest, "minecraft:dirt", inventory_slots=sources, chest_slots=destinations,
+        storage = CollectionStorage(chest, items, inventory_slots=sources, chest_slots=destinations,
                                     additional_positions=additional_positions, before_dig_when_full=True)
         options = dict(storage=storage, ticks=0, search_radius=0, timeout=2)
         if method == "vein":
@@ -1144,6 +1144,107 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", source, remaining, 15 if remaining else None),
             ("LEVEL_ENTITY_CONTAINER", destination, stored, 21 + destination - 4),
         ])
+
+    async def test_storage_items_validate_shape_and_allow_a_registered_negative_id(self):
+        bot = await self.storage_bot()
+        options = dict(inventory_slots=range(2, 4), chest_slots=range(4, 6))
+        for invalid in ((), (DIRT, (OAK_LOG_ITEM,)), (DIRT, True), (DIRT, 0), (DIRT, ""), [DIRT], False):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                CollectionStorage(REFILL_CHEST, invalid, **options)
+        self.assertEqual(CollectionStorage(REFILL_CHEST, DIRT, **options).item, DIRT)
+        bot._session.item_registry = ItemRegistrySnapshot({**bot.item_registry.by_id, -300: "minecraft:deepslate"})
+        storage = CollectionStorage(REFILL_CHEST, (-300, "minecraft:dirt"), **options)
+        self.assertEqual(storage.item, (-300, "minecraft:dirt"))
+        self.assertEqual((await bot.collect_targets([], storage=storage)).positions, ())
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_storage_items_reject_invalid_tail_before_any_batch_sends(self):
+        bot = await self.storage_bot()
+        for invalid in ("minecraft:not_a_registered_item", -400):
+            storage = CollectionStorage(REFILL_CHEST, (DIRT, invalid), inventory_slots=range(2, 4),
+                                        chest_slots=range(4, 6), before_dig_when_full=True)
+            for collect, target in ((bot.collect_targets, [TARGET]), (bot.collect_by_count, ORE),
+                                    (bot.collect_vein_by_count, TARGET)):
+                options = {"storage": storage} if collect == bot.collect_targets else {
+                    "storage": storage, "item_id": DIRT, "count": 1,
+                }
+                with self.subTest(invalid=invalid, collect=collect.__name__), self.assertRaisesRegex(ValueError, "exact registered"):
+                    await collect(target, **options)
+                self.assertTrue(self.wire.outgoing.empty())
+        self.assertEqual(bot.observed_block(TARGET).runtime_id, ORE)
+
+    async def test_storage_items_preflight_uses_source_order_with_duplicate_id_selectors(self):
+        bot, task = await self.start_preflight(items=("minecraft:oak_log", DIRT, "minecraft:dirt"), sources=range(2, 4))
+        await self.preflight_window((0, 0))
+        first = await self.preflight_request((2, 4, 64))
+        await self.emit(self.preflight_receipt(first, source=2, destination=4, remaining=0, stored=64))
+        self.assertEqual(bot.container_slots[4].id, DIRT)
+        await self.refill_close()
+
+        await self.preflight_window((64, 0))
+        second = await self.preflight_request((3, 5, 64))
+        await self.emit(self.preflight_receipt(second, source=3, destination=5, remaining=0, stored=64))
+        self.assertEqual(bot.container_slots[5].id, OAK_LOG_ITEM)
+        close = await self.refill_close(confirm=False)
+        self.assertTrue(self.wire.outgoing.empty())
+        await self.emit(close)
+        await self.expect_batch_start(TARGET)
+        await self.finish_batch_break(TARGET, runtime_id=101, total=1, net_id=25)
+
+        (result,) = (await task).results
+        self.assertEqual((result.status, result.inventory_delta), ("collected", 1))
+        self.assertEqual([(attempt.transfer.steps[0].source_slot, attempt.transfer.confirmed_count)
+                          for _, attempt in result.storage_attempts], [(2, 64), (3, 64)])
+        self.assertEqual((bot.inventory_slots[1].id, bot.inventory_slots[1].stack_size), (OAK_LOG_ITEM, 64))
+        self.assertEqual((bot.inventory_slots[12].id, bot.inventory_slots[12].stack_size), (DIRT, 64))
+        self.assert_no_storage_followup()
+
+    async def test_storage_items_post_break_uses_one_source_and_its_id_for_pickup_gain(self):
+        bot, task = await self.start_storage_collection((TARGET,), items=(OAK_LOG_ITEM, "minecraft:dirt"),
+                                                        sources=range(2, 4), timeout=2)
+        request = await self.assert_storage_deposit(64)
+        await self.emit(self.storage_receipt(request, player_count=0, chest_count=64))
+        await self.refill_close()
+        await self.next_mixed_move()
+        await self.emit(self.take(), self.slot(2, DIRT, 1, net_id=25))
+
+        (result,) = (await task).results
+        self.assertEqual((result.status, result.inventory_delta, result.collector_id), ("collected", 1, PLAYER))
+        self.assertEqual(result.storage_attempt.transfer.confirmed_count, 64)
+        self.assertEqual((bot.inventory_slots[3].id, bot.inventory_slots[3].stack_size), (OAK_LOG_ITEM, 64))
+        self.assert_no_storage_followup()
+
+    async def test_storage_items_post_break_does_not_add_a_different_stored_item_to_pickup_gain(self):
+        bot, task = await self.start_storage_collection((TARGET,), items=("minecraft:dirt", OAK_LOG_ITEM),
+                                                        sources=range(1, 3), timeout=2)
+        await self.preflight_window((0,))
+        request = await self.preflight_request((1, 4, 64))
+        await self.emit(self.preflight_receipt(request, source=1, destination=4, remaining=0, stored=64))
+        self.assertEqual(bot.container_slots[4].id, OAK_LOG_ITEM)
+        await self.refill_close()
+        await self.next_mixed_move()
+        await self.emit(self.take(), self.slot(1, DIRT, 1, net_id=25))
+
+        (result,) = (await task).results
+        self.assertEqual((result.status, result.inventory_delta, result.collector_id), ("collected", 1, PLAYER))
+        self.assertEqual(result.storage_attempt.transfer.confirmed_count, 64)
+        self.assertEqual((bot.inventory_slots[2].id, bot.inventory_slots[2].stack_size), (DIRT, 64))
+        self.assert_no_storage_followup()
+
+    async def test_storage_items_rechecks_the_unselected_mapping_before_write(self):
+        bot, task = await self.start_preflight(items=(DIRT, "minecraft:oak_log"), sources=range(2, 4))
+        await self.refill_click()
+        registry = {item_id: name for item_id, name in bot.item_registry.by_id.items() if item_id != OAK_LOG_ITEM}
+        bot._session.item_registry = ItemRegistrySnapshot({**registry, 1999: "minecraft:oak_log"})
+        await self.emit(*self.refill_window(count=0))
+        await self.refill_close()
+
+        (result,) = (await task).results
+        self.assertEqual((result.status, result.storage_attempt.stop_reason), ("storage_unconfirmed", "item_registry_changed"))
+        self.assertEqual(result.storage_attempt.transfer.steps, ())
+        self.assertEqual(bot.inventory_slots[2].stack_size, 64)
+        self.assertEqual(bot.observed_block(TARGET).runtime_id, ORE)
+        self.assert_no_storage_followup()
 
     def hold_preflight_before_planning(self, bot):
         ready, release = asyncio.Event(), asyncio.Event()
@@ -1321,14 +1422,14 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assert_no_storage_followup()
 
     async def test_preflight_cancellation_retains_confirmed_stack_and_pending_second_stack(self):
-        bot, task = await self.start_preflight(method="vein", sources=range(2, 13))
+        bot, task = await self.start_preflight(method="vein", sources=range(2, 4), items=(OAK_LOG_ITEM, DIRT))
         await self.preflight_window((0, 0))
         first = await self.preflight_request((2, 4, 64))
         await self.emit(self.preflight_receipt(first, source=2, destination=4, remaining=0, stored=64))
         await self.refill_close()
 
         await self.preflight_window((64, 0))
-        second = await self.preflight_request((12, 5, 64))
+        second = await self.preflight_request((3, 5, 64))
         task.cancel()
         await self.refill_close()
         with self.assertRaises(asyncio.CancelledError) as cancelled:
@@ -1373,7 +1474,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assert_no_storage_followup()
 
     async def test_preflight_with_unknown_main_slot_stops_without_chest_or_start(self):
-        bot, task = await self.start_preflight(slots=35)
+        bot, task = await self.start_preflight(slots=35, items=(OAK_LOG_ITEM, DIRT))
         result, = (await task).results
         self.assertEqual((result.status, result.storage_attempt.stop_reason), ("storage_unconfirmed", "unobserved"))
         self.assertEqual(bot.observed_block(TARGET).runtime_id, ORE)

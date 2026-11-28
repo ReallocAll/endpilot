@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import PropertyMock, patch
 
-from endpilot import Bot, CollectionStorage, RangeTransferResult, RangeTransferStep, collection
+from endpilot import Bot, CollectionStorage, RangeTransferResult, RangeTransferStep, _mcp_scripts
 from endpilot._mcp_scripts import MCPScripts, _MAX_FRAME
 from endpilot.beds import SleepRejected
 from endpilot.blocks import MiningFaceUnavailable
@@ -321,17 +321,22 @@ async def main(bot):
                                           "attributes": {"translation_key": "tile.bed.notSafe"}})
 
     async def test_collection_storage_preflight_flag_crosses_the_worker_for_each_collection_method(self):
+        self.enterContext(test_scheduled_input.ManualClock().patch_scheduler())
+        before = len(self.wire.sent)
         b = self.bot.protocol.binding
         dirt = 13
-        self.bot._session._replace_item_registry(b.ItemRegistryPacket(items=[b.ItemData(id=dirt, name="minecraft:dirt")]))
-        validate = collection._storage_item_id
+        self.bot._session._replace_item_registry(b.ItemRegistryPacket(items=[
+            b.ItemData(id=dirt, name="minecraft:dirt"), b.ItemData(id=4, name="minecraft:cobblestone"),
+        ]))
+        decode = _mcp_scripts._collection_storage
         received = []
 
-        def observe_storage(bot, storage, timeout):
-            received.append(storage)
-            return validate(bot, storage, timeout)
+        def observe_storage(value):
+            storage = decode(value)
+            received.append((value["fields"]["item"], storage))
+            return storage
 
-        with patch.object(collection, "_storage_item_id", observe_storage):
+        with patch.object(_mcp_scripts, "_collection_storage", observe_storage):
             run = await self.start("""
 from endpilot import CollectionStorage
 
@@ -342,11 +347,21 @@ async def main(bot, item_id):
         lambda storage: bot.collect_vein_by_count((70, 100, 70), item_id=item_id, count=1, storage=storage),
     )
     chest, backup = (1, 100, 4), (1, 100, 5)
+
+    def authorization(item, **options):
+        return CollectionStorage(chest, item, inventory_slots=range(2, 4), chest_slots=range(0, 2),
+                                 additional_positions=(backup,), **options)
+
     for entry in entries:
-        for extra in ({}, {'before_dig_when_full': True}):
-            storage = CollectionStorage(chest, item_id, inventory_slots=range(2, 4), chest_slots=range(0, 2),
-                                        additional_positions=(backup,), **extra)
-            assert not (await entry(storage)).results
+        for item in (item_id, 'minecraft:dirt', ('minecraft:cobblestone', item_id)):
+            assert not (await entry(authorization(item))).results
+            assert not (await entry(authorization(item, before_dig_when_full=True))).results
+        try:
+            await entry(authorization((item_id, 'not:a_registered_item'), before_dig_when_full=True))
+        except ValueError as error:
+            assert 'exact registered' in str(error), str(error)
+        else:
+            raise AssertionError('storage accepted an unregistered tail member')
 
     def bounds(start, stop):
         return {'$endpilot': 'range', 'start': start, 'stop': stop, 'step': 1}
@@ -355,6 +370,13 @@ async def main(bot, item_id):
     def record(fields):
         return {'$endpilot': 'record', 'type': 'CollectionStorage', 'fields': fields}
     assert not (await entries[0](record(legacy))).results
+    for entry in entries:
+        try:
+            await entry(record(legacy | {'item': [item_id, True]}))
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError('storage accepted a boolean tail member')
     for invalid in (1, 0, 'true', None, []):
         for entry in entries:
             try:
@@ -368,14 +390,21 @@ async def main(bot, item_id):
             finished = await self.completed(run)
         self.assertEqual(finished["state"], "succeeded", finished)
         self.assertEqual(finished["result"], "validated")
-        self.assertEqual(received, [
-            CollectionStorage((1, 100, 4), dirt, inventory_slots=range(2, 4), chest_slots=range(0, 2),
+        per_entry = [
+            (item, flag)
+            for item in (dirt, "minecraft:dirt", ("minecraft:cobblestone", dirt))
+            for flag in (False, True)
+        ] + [((dirt, "not:a_registered_item"), True)]
+        expected = per_entry * 3 + [(dirt, False)]
+        self.assertEqual([raw for raw, _ in received],
+                         [list(item) if type(item) is tuple else item for item, _ in expected])
+        self.assertEqual([storage for _, storage in received], [
+            CollectionStorage((1, 100, 4), item, inventory_slots=range(2, 4), chest_slots=range(0, 2),
                               additional_positions=((1, 100, 5),), before_dig_when_full=flag)
-            for flag in [False, True] * 3 + [False]
+            for item, flag in expected
         ])
         self.assertIsNone(self.bot.open_window)
-        self.assertFalse(any(isinstance(packet, (b.ItemStackRequestPacket, b.InventoryTransactionPacket))
-                             or getattr(packet, "player_block_actions", None) for packet in self.wire.sent))
+        self.assertEqual(self.wire.sent[before:], [])
 
     async def test_collection_storage_preflight_keeps_ordered_same_chest_attempts_in_worker_results(self):
         target, chest = (1, 100, 3), (1, 100, 4)

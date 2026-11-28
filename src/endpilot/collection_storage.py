@@ -22,10 +22,10 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class CollectionStorage:
-    """Authorize one registered item and explicit slots in ordinary chests."""
+    """Authorize registered items and explicit slots in ordinary chests."""
 
     position: tuple[int, int, int]
-    item: int | str
+    item: int | str | tuple[int | str, ...]
     inventory_slots: range = field(kw_only=True)
     chest_slots: range = field(kw_only=True)
     additional_positions: tuple[tuple[int, int, int], ...] = field(default=(), kw_only=True)
@@ -40,8 +40,9 @@ class CollectionStorage:
         object.__setattr__(self, "additional_positions", tuple(positions))
         if type(self.before_dig_when_full) is not bool:
             raise TypeError("before_dig_when_full must be a bool")
-        if not (type(self.item) is int and self.item != 0 or isinstance(self.item, str) and self.item):
-            raise ValueError("item must be a nonempty registered name or its transferable network ID")
+        items = self.item if isinstance(self.item, tuple) else (self.item,)
+        if not items or not all(type(item) is int and item != 0 or isinstance(item, str) and item for item in items):
+            raise ValueError("item must be a registered name, transferable network ID, or a nonempty tuple of those selectors")
         for name, limit in (("inventory_slots", _PLAYER_SIZE), ("chest_slots", _DOUBLE_CHEST_SIZE)):
             slots = getattr(self, name)
             _check_range(slots, limit, name)
@@ -65,6 +66,11 @@ def _registered_storage_item(registry, item: int | str) -> tuple[int, str]:
     if not item_id or (type(item) is int and item_id != item):
         raise ValueError("item must be an exact registered name or its transferable network ID")
     return item_id, item_name
+
+
+def _registered_storage_items(registry, item: int | str | tuple[int | str, ...]) -> dict[int, str]:
+    selectors = item if isinstance(item, tuple) else (item,)
+    return dict(_registered_storage_item(registry, selector) for selector in selectors)
 
 
 def _target_window(window: ContainerWindow, chest: tuple[int, int, int]) -> bool:
@@ -440,7 +446,8 @@ async def _put_whole_source(bot, item, count, source_slots, destination_slots, t
 
 
 async def _store_for_collection(
-    bot: Bot, storage: CollectionStorage, *, source_slot: int, count: int, dimension_id: int, epoch: int,
+    bot: Bot, storage: CollectionStorage, *, items: dict[int, str], item_id: int,
+    source_slot: int, count: int, dimension_id: int, epoch: int,
     ticks: int, search_radius: int, timeout: float, authorize: Callable[[int | None], None],
     record: Callable[[tuple[int, int, int] | None, CollectionStorageResult], None], whole_source: bool = False,
 ) -> CollectionStorageResult:
@@ -451,16 +458,36 @@ async def _store_for_collection(
     containers, blocks = bot._containers, bot._blocks
     if containers is None or blocks is None or bot._inventory is None:
         raise RuntimeError("player has not joined")
-    registry = bot.item_registry
-    item_id, item_name = _registered_storage_item(registry, storage.item)
+    registry = None
+    item_name = items[item_id]
     multiple = bool(storage.additional_positions)
+
+    def validate_items(request_id: int | None) -> None:
+        nonlocal registry
+        current = bot.item_registry
+        if current is None or current is not registry:
+            try:
+                same = _registered_storage_items(current, storage.item) == items
+            except (RuntimeError, ValueError):
+                same = False
+            if not same:
+                raise _InventoryMoveNotSubmitted("item_registry_changed")
+            registry = current
+        authorize(request_id)
+
+    try:
+        validate_items(None)
+    except _InventoryMoveNotSubmitted as stopped:
+        result = CollectionStorageResult(str(stopped))
+        record(None, result)
+        return result
 
     async def store(chest, time_left):
         return await _store_at_chest(
             bot, chest, count, containers=containers, blocks=blocks, registry=registry,
             item_id=item_id, item_name=item_name, epoch=epoch, inventory_slots=range(source_slot, source_slot + 1),
             chest_slots=storage.chest_slots, ticks=ticks, search_radius=search_radius, timeout=time_left,
-            dimension_id=dimension_id, authorize=authorize, multi_chest=multiple, whole_source=whole_source,
+            dimension_id=dimension_id, authorize=validate_items, multi_chest=multiple, whole_source=whole_source,
             record=lambda attempt: record(chest if multiple or whole_source else None, attempt),
         )
 
@@ -483,7 +510,7 @@ async def _store_for_collection(
             stop("timeout")
             raise TimeoutError("collection storage timed out before selecting another chest")
         try:
-            authorize(None)
+            validate_items(None)
         except _InventoryMoveNotSubmitted as stopped:
             return stop(str(stopped))
         feet = containers.movement.observed_feet_position

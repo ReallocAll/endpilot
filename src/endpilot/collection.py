@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from ._stack_limits_2225 import STACK_LIMITS
 from .blocks import BlockObservation, BlockSearchResult, Blocks, MiningFaceUnavailable, _ORDINARY_MINING_REACH
 from .collection_storage import (
-    CollectionStorage, CollectionStorageResult, _registered_storage_item, _store_for_collection,
+    CollectionStorage, CollectionStorageResult, _registered_storage_items, _store_for_collection,
 )
 from .entities import Entities, EntityState, ItemPickup
 from .harvest import HarvestTool, HarvestToolAcquisition, HarvestToolChest, HarvestTools
@@ -223,15 +223,15 @@ def _settled_refill_miss(acquisition: HarvestToolAcquisition | None) -> bool:
             or (acquisition.status == "chest_approach_unreachable" and acquisition.window is None))
 
 
-def _storage_item_id(bot: "Bot", storage: CollectionStorage | None, timeout: float) -> int | None:
+def _storage_items(bot: "Bot", storage: CollectionStorage | None, timeout: float) -> dict[int, str] | None:
+    """Validate the entire storage authorization and return exact names by network ID."""
     if storage is None:
         return None
     if not isinstance(storage, CollectionStorage):
         raise TypeError("storage must be a CollectionStorage")
     if timeout is None or not 0 < timeout < math.inf:
         raise ValueError("collection timeout must be finite and positive when storage is enabled")
-    item_id, _ = _registered_storage_item(bot.item_registry, storage.item)
-    return item_id
+    return _registered_storage_items(bot.item_registry, storage.item)
 
 
 def _confirmed_item_count(result: BlockCollection, item_id: int, *, item_name: str | None = None) -> int:
@@ -284,7 +284,7 @@ class _BlockCollector:
         if count is not None and (not isinstance(count, int) or count < 0):
             raise ValueError("collection count must be a nonnegative integer")
         tool_chests = _snapshot_tool_chests(tool_chest, tool_chests)
-        storage_item_id = _storage_item_id(bot, storage, timeout)
+        storage_items = _storage_items(bot, storage, timeout)
         positions = tuple(dict.fromkeys(map(_position, positions)))[:count]
         progress = _BatchProgress(self.blocks.dimension_id, positions)
         seal = None
@@ -346,7 +346,7 @@ class _BlockCollector:
                 try:
                     await self._collect_batch(
                         bot, progress, targets, epoch, ticks=ticks, search_radius=search_radius, timeout=timeout,
-                        tool_chest=tool_chest, tool_chests=tool_chests, storage=storage, storage_item_id=storage_item_id,
+                        tool_chest=tool_chest, tool_chests=tool_chests, storage=storage, storage_items=storage_items,
                         requested_drop_id=requested_drop_id,
                     )
                 finally:
@@ -408,7 +408,7 @@ class _BlockCollector:
         if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
             raise ValueError("collection count must be a positive integer")
         tool_chests = _snapshot_tool_chests(tool_chest, tool_chests)
-        storage_item_id = _storage_item_id(bot, storage, timeout)
+        storage_items = _storage_items(bot, storage, timeout)
         progress = _CountedProgress(self.blocks.dimension_id, item_id, count)
         seen: set[tuple[int, int, int]] = set()
 
@@ -447,7 +447,7 @@ class _BlockCollector:
                 await self._run(self._collect_batch(
                     bot, progress, targets(), epoch, ticks=ticks, search_radius=search_radius,
                     timeout=timeout, tool_chest=tool_chest, tool_chests=tool_chests,
-                    storage=storage, storage_item_id=storage_item_id, requested_drop_id=item_id,
+                    storage=storage, storage_items=storage_items, requested_drop_id=item_id,
                     refresh_candidates=refresh_candidates,
                 ))
         except (Exception, asyncio.CancelledError) as error:
@@ -532,7 +532,7 @@ class _BlockCollector:
         targets: Iterable[tuple[tuple[int, int, int], BlockObservation | None]], epoch: int, *,
         ticks: int, search_radius: int, timeout: float, tool_chest: HarvestToolChest | None,
         tool_chests: tuple[HarvestToolChest, ...] | None, storage: CollectionStorage | None,
-        storage_item_id: int | None, requested_drop_id: int | None, refresh_candidates: bool = False,
+        storage_items: dict[int, str] | None, requested_drop_id: int | None, refresh_candidates: bool = False,
     ) -> None:
         counted = progress if isinstance(progress, _CountedProgress) else None
         ordered_refill = tool_chests is not None
@@ -543,7 +543,7 @@ class _BlockCollector:
             requested_drop_id=requested_drop_id, refresh_candidates=refresh_candidates,
         )
         store = None if storage is None else partial(
-            self._store_for_drop, bot, storage, storage_item_id,
+            self._store_for_drop, bot, storage, storage_items,
             dimension=progress.dimension_id, ticks=ticks, search_radius=search_radius,
         )
         preflight = None if storage is None or not storage.before_dig_when_full else storage
@@ -557,7 +557,7 @@ class _BlockCollector:
                     timeout=timeout, epoch=epoch, progress=progress, refill=refill, refill_chests=chests,
                     ordered_refill=ordered_refill, store=store, settle_before_approach=settle_before_approach,
                     requested_drop_id=requested_drop_id, refresh_candidates=refresh_candidates,
-                    preflight=preflight, bot=bot,
+                    preflight=preflight, bot=bot, storage_items=storage_items,
                 )
                 progress.results.append(result)
                 progress.active = None
@@ -771,7 +771,7 @@ class _BlockCollector:
                 and self.harvest._inventory_is_observed(slots, submitting=submitting))
 
     async def _store_before_dig(
-        self, bot: "Bot", storage: CollectionStorage, *, epoch: int, dimension: int, ticks: int,
+        self, bot: "Bot", storage: CollectionStorage, items: dict[int, str], *, epoch: int, dimension: int, ticks: int,
         search_radius: int, timeout: float, check_target, record,
     ) -> bool:
         inventory = self.blocks.inventory
@@ -782,9 +782,8 @@ class _BlockCollector:
         if any(not slots[index].id for index in range(_MAIN_INVENTORY_SIZE)):
             return True
 
-        item_id, _ = _registered_storage_item(bot.item_registry, storage.item)
         expected = {index: _stack_snapshot(slots[index]) for index in storage.inventory_slots}
-        sources = [index for index, stack in expected.items() if stack.item_id == item_id]
+        sources = [index for index, stack in expected.items() if stack.item_id in items]
         if not sources:
             record(None, CollectionStorageResult("source_exhausted"), new_visit=False)
             return False
@@ -827,7 +826,8 @@ class _BlockCollector:
             try:
                 authorize(None)
                 attempt = await _store_for_collection(
-                    bot, storage, source_slot=source_slot, count=before.count, dimension_id=dimension, epoch=epoch,
+                    bot, storage, items=items, item_id=before.item_id,
+                    source_slot=source_slot, count=before.count, dimension_id=dimension, epoch=epoch,
                     ticks=ticks, search_radius=search_radius, timeout=time_left, authorize=authorize, record=remember,
                     whole_source=True,
                 )
@@ -847,7 +847,7 @@ class _BlockCollector:
         return True
 
     async def _store_for_drop(
-        self, bot: "Bot", storage: CollectionStorage, item_id: int, observation: "_CollectionObservation",
+        self, bot: "Bot", storage: CollectionStorage, items: dict[int, str], observation: "_CollectionObservation",
         timeout: float, record: Callable[[BlockCollection], None] | None, *,
         dimension: int, ticks: int, search_radius: int,
     ) -> None:
@@ -875,12 +875,12 @@ class _BlockCollector:
             if record is not None:
                 record(result)
 
-        source_slot = next((slot for slot in storage.inventory_slots if slots[slot].id == item_id), None)
+        source_slot = next((slot for slot in storage.inventory_slots if slots[slot].id in items), None)
         if source_slot is None:
             remember(None, CollectionStorageResult("source_exhausted"))
             return
         source = _stack_snapshot(slots[source_slot])
-        observation.storage_item_id = item_id
+        observation.storage_item_id = source.item_id
         # The original drop is still present, so its pickup cannot precede
         # this settled snapshot. Earlier unrelated inventory changes can.
         observation.inventory_feedback = _InventoryObservation(inventory, require_all_slots=True)
@@ -904,7 +904,7 @@ class _BlockCollector:
 
         try:
             attempt = await _store_for_collection(
-                bot, storage, source_slot=source_slot, count=source.count,
+                bot, storage, items=items, item_id=source.item_id, source_slot=source_slot, count=source.count,
                 dimension_id=dimension, epoch=observation.epoch, ticks=ticks, search_radius=search_radius,
                 timeout=timeout, authorize=authorize, record=remember,
             )
@@ -928,6 +928,7 @@ class _BlockCollector:
         refill_chests: tuple[HarvestToolChest, ...] = (), ordered_refill: bool = False,
         store: _StoreForDrop | None = None, settle_before_approach: bool = False, requested_drop_id: int | None = None,
         refresh_candidates: bool = False, preflight: CollectionStorage | None = None, bot: "Bot | None" = None,
+        storage_items: dict[int, str] | None = None,
     ) -> BlockCollection:
         if before is None or before.is_air is None:
             return BlockCollection(position, "target_unobserved", before)
@@ -976,7 +977,7 @@ class _BlockCollector:
                 remember(replace(evidence, storage_attempt=attempt, storage_attempts=attempts))
 
             succeeded = await self._store_before_dig(
-                bot, preflight, epoch=epoch, dimension=dimension, ticks=ticks, search_radius=search_radius,
+                bot, preflight, storage_items, epoch=epoch, dimension=dimension, ticks=ticks, search_radius=search_radius,
                 timeout=timeout, check_target=check_target, record=remember_storage,
             )
             if not succeeded:

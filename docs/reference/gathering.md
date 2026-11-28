@@ -250,7 +250,11 @@ storage = CollectionStorage(
 batch = await bot.collect_targets(positions, storage=storage)
 ```
 
-The item must be an exact registered name or its transferable network ID.
+Pass one exact registered name or transferable network ID, or a nonempty
+tuple of these selectors. The bot validates every selector against the current
+session before starting the batch. A name and ID for the same item authorize
+that item once. Inventory slot order determines which stack is selected.
+
 The bot considers storage after observing the break and a single new drop
 that is still present. Counted collection applies this check to its unique
 requested drop and uses the configured item for the chest transfer.
@@ -260,8 +264,8 @@ same-item stack with possible spare capacity keeps collection on its usual
 pickup path. The trip uses the remaining break and pickup timeout and the
 target's movement and search budgets.
 
-The bot chooses the first eligible stack of the configured item in
-`inventory_slots` and attempts to store that entire stack in `chest_slots`.
+For storage after a break the bot chooses the first eligible authorized stack
+in `inventory_slots` and attempts to store that entire stack in `chest_slots`.
 Omit `additional_positions` for a single chest. Every listed chest uses the
 same authorized item and slot ranges. When several chests are authorized,
 the bot chooses the nearest untried chest by straight-line distance from its
@@ -278,7 +282,9 @@ same item was stored during the detour.
 
 Set `before_dig_when_full=True` to check inventory before each target.
 All 36 main slots must have settled observations. If every slot is occupied,
-the bot stores each whole stack of the authorized item from `inventory_slots`.
+the bot stores each whole stack of an authorized item from `inventory_slots`,
+in slot order. Before each write it checks that the registered identities still
+match the batch authorization.
 One authorized chest must have room for the entire source stack. The bot
 prefers one destination slot and may use several authorized slots in the same
 chest. It can try the next authorized chest after confirming insufficient
