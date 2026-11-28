@@ -12,7 +12,7 @@ from typing import Literal
 from bedrock_protocol import DecodeError, nbt
 
 from .block_data import (
-    BlockCollisionBoxes, VanillaBlockState, _catalog, _vanilla_state_properties, vanilla_block_state,
+    BlockCollisionBoxes, VanillaBlockState, _catalog, _state_lookup, _vanilla_state_properties, vanilla_block_state,
 )
 from .block_raycast import (
     BlockRaycastResult, MiningFaceResult, OutlineObservation, _UNIT_BOX, trace_blocks, trace_blocks_towards,
@@ -22,6 +22,7 @@ from .compression import PacketConnection
 from .protocol import RawPacket
 from .recoverable_error import RecoverableError
 from .subchunks import SubChunk, _PalettedStorage, parse_biome_sections, parse_sub_chunk_prefix
+from .terrain_storage import TerrainSectionData, _TerrainEncoder, _TerrainWriter, _cell_key, _state_bytes
 
 # Network hash of minecraft:air.
 HASHED_AIR_RUNTIME_ID = 0xDBF44120
@@ -40,6 +41,11 @@ _EXPLOSION_COLLISION_SHAPES = {
     3317: ((0., 0., 0., 1., 1., 1.),),  # Stone.
     21904: ((0., 0.5, 0., 1., 1., 1.),),  # Top smooth stone slab.
 }
+
+def _prepare_terrain_palette() -> None:
+    _catalog()
+    _state_lookup()
+
 
 def _publisher_bounds(packet) -> tuple[int, int, int, int]:
     x, z, radius = packet.position.x, packet.position.z, packet.radius
@@ -292,7 +298,8 @@ class Blocks:
     def __init__(self, packets, movement, inventory, *, hashed_runtime_ids: bool = False,
                  custom_blocks: bool = False, dimension_id: int = 0,
                  player_game_type: str | None = None, player_unique_id: int | None = None,
-                 _publish_error: Callable[[RecoverableError], None] | None = None):
+                 _publish_error: Callable[[RecoverableError], None] | None = None,
+                 _terrain_storage: _TerrainWriter | None = None):
         self.packets = packets
         self.movement = movement
         self.inventory = inventory
@@ -317,6 +324,10 @@ class Blocks:
         self._replayed_dimension_data: deque[tuple[RawPacket, tuple[DimensionBounds, ...]]] = deque()
         self._updates: dict[tuple[int, int, int, int], int] = {}
         self._sub_chunks: dict[tuple[int, int, int], SubChunk | None] = {}
+        self._terrain_storage = _terrain_storage
+        self._terrain_epoch = 0
+        if _terrain_storage is not None:
+            self._terrain_encoder = _TerrainEncoder(_terrain_storage.session, self._terrain_value)
         self._block_entities: dict[tuple[int, int, int], dict[tuple[int, int, int], nbt.CompoundTag]] = {}
         self._decode_block_entity = getattr(nbt, "decode_network_compound", None)
         if self._decode_block_entity is None and packets.protocol.number == 2225:
@@ -406,6 +417,8 @@ class Blocks:
             previous_dimension = self.dimension_id
             new_dimension = int(self.packets.protocol.decode(raw).dimension_id)
             self.dimension_id = new_dimension
+            if self._terrain_storage is not None:
+                self._terrain_epoch += 1
             leave_callbacks = []
             if previous_dimension != new_dimension:
                 for observer, (dimension, on_leave) in tuple(self._block_observers.items()):
@@ -645,7 +658,11 @@ class Blocks:
         if not self._column_is_published(position[0] >> 4, position[2] >> 4):
             return
         before = self.observed_block(position, layer=layer) if self._block_observers else None
-        self._updates[(*position, layer)] = int(change.runtime_id)
+        runtime_id = int(change.runtime_id)
+        self._updates[(*position, layer)] = runtime_id
+        storage = self._terrain_storage
+        if storage is not None and storage.accepting:
+            storage.sparse(self.dimension_id, position, layer, self._terrain_encoder, runtime_id)
         if layer == 0:
             self._observe_mining_air(position)
             self._set_block_entity(position, None)
@@ -659,6 +676,9 @@ class Blocks:
         for pos in tuple(self._updates):
             if (pos[0] >> 4, pos[1] >> 4, pos[2] >> 4) == key:
                 del self._updates[pos]
+        storage = self._terrain_storage
+        if storage is not None and storage.accepting:
+            storage.full(self.dimension_id, key, self._terrain_encoder, chunk)
         attempt = self._mining_attempt
         target = self.mining_target if attempt is None else attempt.target
         if target is not None:
@@ -919,6 +939,32 @@ class Blocks:
             state = self._vanilla_state(runtime_id)
             is_air = None if state is None else state.is_air
         return BlockObservation(position, runtime_id, layer, is_air)
+
+    def _terrain_value(self, runtime_id: int) -> bytes:
+        state = self._vanilla_state(runtime_id)
+        if self.hashed_runtime_ids:
+            is_air = None if runtime_id == HASHED_UNKNOWN_RUNTIME_ID else runtime_id == HASHED_AIR_RUNTIME_ID
+        else:
+            is_air = None if state is None else state.is_air
+        if is_air:
+            return _state_bytes(runtime_id, True, "minecraft:air", {})
+        if state is None:
+            return _state_bytes(runtime_id, is_air, None, {})
+        properties = _vanilla_state_properties(state.name, runtime_id, hashed=self.hashed_runtime_ids)
+        return _state_bytes(runtime_id, is_air, state.name, properties)
+
+    def _current_terrain_column(self, column: tuple[int, int]) -> dict[int, TerrainSectionData]:
+        encoder = self._terrain_encoder
+        cx, cz = column
+        coverage = self._coverage.get(column)
+        bases = {} if coverage is None else {
+            y: encoder.base(self._sub_chunks[cx, y, cz]) for y in coverage.received
+        }
+        changes = {}
+        for (x, y, z, layer), runtime_id in self._updates.items():
+            if x >> 4 == cx and z >> 4 == cz:
+                changes.setdefault(y >> 4, {})[_cell_key(x, y, z, layer)] = encoder.cell(runtime_id)
+        return {y: TerrainSectionData._create(bases.get(y), changes.get(y, {})) for y in bases.keys() | changes.keys()}
 
     def observed_block_state(
         self, position: tuple[int, int, int], *, layer: int = 0,

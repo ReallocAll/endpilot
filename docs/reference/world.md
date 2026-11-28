@@ -207,6 +207,85 @@ exception with reason `"dimension_changed"`. An ended packet stream raises
 `ConnectionError`. The timeout applies to the entire wait and raises
 `TimeoutError`. Cancellation is local to the caller.
 
+## Store received terrain
+
+Pass a `TerrainStorage` to `join_address`, `join_raknet` or `join_nethernet`
+to record the block layers the bot receives in each dimension. Choose a stable
+`world_key` for the world and a new key when the world is replaced.
+
+```python
+from endpilot import Bot, TerrainStorage
+
+storage = TerrainStorage.sqlite("terrain.sqlite", world_key="survival")
+bot = Bot("Surveyor")
+await bot.join_raknet("127.0.0.1", terrain_storage=storage, load_announced_terrain=True)
+try:
+    column = await bot.terrain_column((0, 0))
+    if column is not None:
+        block = column.block((4, 100, 7), layer=0)
+        if block is not None:
+            print(block.name, block.source, block.session_id)
+finally:
+    await bot.close()
+
+# The database can also be opened from an independent process.
+column = await storage.load_column((0, 0), protocol=2225, dimension=0)
+```
+
+Recording starts with the terrain applied from the login buffer and includes
+complete sections and individual block updates anywhere the server sends
+them. A column announcement provides no block data. An unload clears the live
+cache and leaves its committed observations available in storage.
+
+`bot.terrain_column()` requires a joined session with storage. It waits for the
+terrain already applied at the start of the call to commit, then reads storage
+and takes a snapshot of the live column. A dimension change during the query
+raises `ColumnCoverageInvalidated`; a session end raises `ConnectionError`.
+`storage.load_column()` reads committed observations for the specified world,
+protocol and dimension and can be used independently of any bot. Both calls
+send no packets and return `None` when the column has no recorded or live data.
+`observed_block()` and `observed_block_state()` continue to read the live cache.
+
+The snapshot lists complete sections under `current_sections` and
+`stored_sections`, using section Y indices. Section `6` starts at block Y `96`.
+An individual block update covers only its cell and layer. A newly received
+complete section replaces the earlier section and its sparse updates, including
+layers omitted by the replacement. `column.block()` returns `None` for an
+undescribed cell or layer. A described cell can have `name=None` when its ID
+was unresolved. Known air has `is_air=True`, `is_air=None` means the air status
+was indeterminate, and `runtime_id=None` occurs for air described without an
+explicit runtime ID. Each returned cell has a `current` or `stored` source,
+the observing `session_id`, and the name and properties resolved at observation
+time. A reconnect uses its own palette for new observations. The column and its
+cells are immutable.
+
+One `TerrainStorage` can be reused for successive joins. It has one sequential
+writer, with one batch in flight and one pending batch merged by section and
+cell. The default pending budget is 16 MiB for packed data, including key
+charges. This budget measures the write backlog. If it fills, `storage.error`
+reports a `TerrainStorageError` with the first rejected `sequence` and its
+`session_id`. Recording stops for that join and attempts to drain the accepted
+prefix. The bot can continue playing. `await storage.flush()` waits for the
+prefix accepted when called and raises a recording failure, if any. `await
+bot.close()` closes the network and waits for storage to drain and close. It
+also reports a recording failure. A remote disconnect drains and closes the
+writer without a normal completion marker.
+
+For another backend, use `TerrainStorage(world_key, open_store,
+max_pending_bytes=...)`. The factory receives `(world_key, protocol, dimension)`
+and returns a new `TerrainStore` handle, either directly or through an
+awaitable. Independent read handles can overlap a writer or outlive a bot
+session. A handle provides async `load_column(column)`,
+`commit(session_id, through, sections, *, finished=False)` and `aclose()`.
+`load_column` returns a mapping of section Y to `TerrainSectionData`. The
+writer submits commits in order, with section keys `(chunk_x, section_y,
+chunk_z)`. `through` is the highest applied sequence in that commit's
+dimension. Commit the merged sections and the boundary together. Complete
+bases replace older data, and `older.merged_with(newer)` applies sparse changes
+to the existing section. `to_bytes()` and `TerrainSectionData.from_bytes()`
+provide the codec. A `finished=True` commit can carry no section data and
+repeat that dimension's last boundary.
+
 ## Observe dimension changes
 
 `bot.is_changing_dimension` reports whether the local player has an active

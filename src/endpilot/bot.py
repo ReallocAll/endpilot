@@ -25,7 +25,8 @@ from .block_data import BlockCollisionBoxes
 from .block_raycast import BlockRaycastResult, MiningFaceResult
 from .blocks import (
     Blocks, BlockChange, BlockEntityUpdate, BlockMatch, BlockObservation, BlockSearchResult, BlockStateObservation,
-    BlockUpdate, ColumnCoverage, ColumnCoverageEvent, DimensionBounds, MiningEvent, MiningTarget,
+    BlockUpdate, ColumnCoverage, ColumnCoverageEvent, ColumnCoverageInvalidated, DimensionBounds, MiningEvent,
+    MiningTarget, _prepare_terrain_palette,
 )
 from .books import BookEdit, BookSnapshot, Books
 from .boss_bars import BossBar, BossBarEvent, BossBarEventKind, BossBars
@@ -76,6 +77,7 @@ from .resource_packs import PackDecisionHandler, ResourcePackIndex
 from .scoreboard import Scoreboard, ScoreboardObserver, ScoreboardSnapshot
 from .signs import SignEditor, SignObservation, SignSide, Signs
 from .skin import PlayerSkinSnapshot, Skin
+from .terrain_storage import TerrainColumnSnapshot, TerrainStorage, _TerrainWriter, _validate_column
 from .titles import TitleEvent, TitleKind, Titles
 from .trading import TradeManyResult, TradeOffers, Trading
 from .protocol import DEFAULT_PROTOCOL, Protocol, RawPacket
@@ -144,6 +146,7 @@ class Bot:
         self._placement_completion_observers: dict[object, Callable[[PlacementResult], None]] = {}
         self._entity_placement_completion_observers: dict[object, Callable[[EntityPlacementResult], None]] = {}
         self._terrain: _TerrainObserver | None = None
+        self._terrain_writer: _TerrainWriter | None = None
         self._beds: Beds | None = None
         self._block_collector: _BlockCollector | None = None
         self._boss_bars: BossBars | None = None
@@ -218,6 +221,7 @@ class Bot:
         timeline: PacketTimeline | None = None, chunk_radius: int = 8, locale: str = DEFAULT_LOCALE,
         load_screen: bool = True,
         retain_initial_chunks: bool = False, load_announced_terrain: bool = False,
+        terrain_storage: TerrainStorage | None = None,
         on_resource_packs: PackDecisionHandler | None = None,
         credential_provider: BedrockCredentialProvider | None = None,
     ) -> None:
@@ -226,6 +230,7 @@ class Bot:
         The provider completes account authorization before the network timeout starts.
         Subscribe immediately after joining to observe retained raw chunks. Set
         load_announced_terrain to request missing sections from server-announced columns.
+        Pass terrain_storage to record the terrain this session receives.
         """
         await self._join_session(
             JoinSession.connect_nethernet,
@@ -234,6 +239,7 @@ class Bot:
             chunk_radius=chunk_radius, locale=locale, load_screen=load_screen,
             retain_initial_chunks=retain_initial_chunks,
             load_announced_terrain=load_announced_terrain,
+            terrain_storage=terrain_storage,
             on_resource_packs=on_resource_packs,
         )
 
@@ -241,18 +247,21 @@ class Bot:
         self, host: str, port: int = 19132, *, timeout: float = 30, timeline: PacketTimeline | None = None,
         chunk_radius: int = 8, locale: str = DEFAULT_LOCALE, retain_initial_chunks: bool = False,
         load_announced_terrain: bool = False,
+        terrain_storage: TerrainStorage | None = None,
         on_resource_packs: PackDecisionHandler | None = None,
         credential_provider: BedrockCredentialProvider | None = None,
     ) -> None:
         """Join a server with optional online credentials.
 
         The provider completes account authorization before the network timeout starts.
+        Pass terrain_storage to record the terrain this session receives.
         """
         await self._join_session(
             JoinSession.connect_raknet, host, port, timeout=timeout, credential_provider=credential_provider,
             timeline=timeline,
             chunk_radius=chunk_radius, locale=locale, retain_initial_chunks=retain_initial_chunks,
             load_announced_terrain=load_announced_terrain,
+            terrain_storage=terrain_storage,
             on_resource_packs=on_resource_packs,
         )
 
@@ -260,6 +269,7 @@ class Bot:
         self, address: str, *, timeout: float = 30, server_key_sha256: str | None = None,
         timeline: PacketTimeline | None = None, chunk_radius: int = 8, locale: str = DEFAULT_LOCALE,
         retain_initial_chunks: bool = False, load_announced_terrain: bool = False,
+        terrain_storage: TerrainStorage | None = None,
         on_resource_packs: PackDecisionHandler | None = None,
         credential_provider: BedrockCredentialProvider | None = None,
     ) -> None:
@@ -269,6 +279,7 @@ class Bot:
         timeout for each candidate. A NetherNet server key pin limits selection
         to NetherNet. Once a transport opens, the bot uses it to log in and
         spawn. Account authorization precedes the first connection timeout.
+        Pass terrain_storage to record the terrain this session receives.
         """
         target = _parse_join_address(address)
         if server_key_sha256 is not None and (
@@ -280,6 +291,7 @@ class Bot:
             JoinSession._connect_address, target, timeout=timeout, credential_provider=credential_provider,
             server_key_sha256=server_key_sha256, timeline=timeline, chunk_radius=chunk_radius, locale=locale,
             retain_initial_chunks=retain_initial_chunks, load_announced_terrain=load_announced_terrain,
+            terrain_storage=terrain_storage,
             on_resource_packs=on_resource_packs, _track_join=True,
         )
 
@@ -321,10 +333,13 @@ class Bot:
 
     async def _join_session(
         self, connect, *endpoint, timeout: float, credential_provider: BedrockCredentialProvider | None,
-        chunk_radius: int, locale: str, load_announced_terrain: bool = False, _track_join: bool = False, **kwargs,
+        chunk_radius: int, locale: str, load_announced_terrain: bool = False,
+        terrain_storage: TerrainStorage | None = None, _track_join: bool = False, **kwargs,
     ) -> None:
         if self._clock is not None:
             raise RuntimeError("player is already connecting or connected")
+        if terrain_storage is not None and not isinstance(terrain_storage, TerrainStorage):
+            raise TypeError("terrain_storage must be a TerrainStorage")
         _validate_join(self.protocol, chunk_radius, locale, timeout, online=credential_provider is not None)
         self._session_end_state = None
         clock = ClientClock()
@@ -339,6 +354,11 @@ class Bot:
                     raise ConnectionError("player closed while joining")
             if self._skin is not None:
                 identity = identity._with_skin(self._skin)
+            if terrain_storage is not None and self.protocol.number == 2225:
+                # Load the palette before terrain capture runs in the packet reader.
+                await asyncio.to_thread(_prepare_terrain_palette)
+                if self._clock is not clock:
+                    raise ConnectionError("player closed while joining")
             session = await connect(
                 *endpoint, identity, self.protocol, timeout, clock=clock, chunk_radius=chunk_radius, locale=locale,
                 **kwargs,
@@ -349,7 +369,8 @@ class Bot:
                 raise error
             try:
                 session.packets._defer_receiving_until(start_complete)
-                self._start_session(session, load_announced_terrain=load_announced_terrain)
+                self._start_session(session, load_announced_terrain=load_announced_terrain,
+                                    terrain_storage=terrain_storage)
             except BaseException as error:
                 await _close_after_failed_join(self, error, "session cleanup after failed join")
                 raise
@@ -407,9 +428,12 @@ class Bot:
         if self._terrain is None:
             self._terrain = _TerrainObserver(self._blocks)
 
-    def _start_session(self, session: JoinSession, *, load_announced_terrain: bool = False) -> None:
+    def _start_session(self, session: JoinSession, *, load_announced_terrain: bool = False,
+                       terrain_storage: TerrainStorage | None = None) -> None:
         self._clock = session.clock
         self._session = session
+        if terrain_storage is not None:
+            self._terrain_writer = terrain_storage._bind(self.protocol.number)
         identity = session.identity
         xuid = identity._xuid if isinstance(identity, _OnlineIdentity) else ""
         session._observe_session_end()
@@ -450,6 +474,7 @@ class Bot:
             dimension_id=session.dimension_id,
             player_game_type=session.player_game_type, player_unique_id=session.player_unique_id,
             _publish_error=publish_error,
+            _terrain_storage=self._terrain_writer,
         )
         self._containers = Containers(
             session.packets, self._movement, self._inventory, entities=self._entities, blocks=self._blocks,
@@ -1339,6 +1364,34 @@ class Bot:
         if self._blocks is None:
             raise RuntimeError("player has not joined")
         return self._blocks.observed_block_state(position, layer=layer)
+
+    async def terrain_column(self, column: tuple[int, int]) -> TerrainColumnSnapshot | None:
+        """Read current and stored block layers for a column in the active dimension.
+
+        Requires terrain_storage on this join. Waits for already observed
+        terrain to commit and sends no packets. A dimension change or ended
+        session during the read invalidates the query.
+        """
+        _validate_column(column)
+        blocks, writer = self._blocks, self._terrain_writer
+        if blocks is None or writer is None:
+            raise RuntimeError("terrain_column requires a joined session with terrain storage")
+        dimension, epoch = blocks.dimension_id, blocks._terrain_epoch
+
+        def require_current_world() -> None:
+            if self._blocks is not blocks or blocks._closed or self.session_end is not None:
+                raise ConnectionError("terrain session ended during the column query")
+            if blocks.dimension_id != dimension or blocks._terrain_epoch != epoch:
+                raise ColumnCoverageInvalidated("dimension_changed")
+
+        require_current_world()
+        await writer.wait_for_query()
+        require_current_world()
+        stored = await writer.storage._load(column, writer.protocol, dimension)
+        require_current_world()
+        return TerrainColumnSnapshot._create(
+            column, writer.storage.world_key, writer.protocol, dimension, blocks._current_terrain_column(column), stored,
+        )
 
     def observed_block_collision_boxes(
         self, position: tuple[int, int, int], *, layer: int = 0,
@@ -3792,6 +3845,8 @@ class Bot:
         return unsubscribe
 
     def _publish_session_end(self, result: SessionEnd) -> None:
+        if self._terrain_writer is not None:
+            self._terrain_writer.stop(finished=result.kind == "local_close")
         self._placement_completion_observers.clear()
         self._entity_placement_completion_observers.clear()
         if self._player_state is not None:
@@ -3866,6 +3921,9 @@ class Bot:
         state = self._session_end_state
         if state is not None and state.result is None and session is not None:
             session._on_local_close(reason)
+        terrain_writer, self._terrain_writer = self._terrain_writer, None
+        if terrain_writer is not None:
+            terrain_writer.stop(finished=False)
         component_errors: list[BaseException] = []
 
         @contextmanager
@@ -3967,6 +4025,9 @@ class Bot:
                 inventory.close()
             with cleanup_step(inventory_errors):
                 await inventory._wait_for_request_sends()
+        if terrain_writer is not None:
+            with cleanup_step(drain_errors):
+                await terrain_writer.aclose()
         # Keep the error precedence of the previous nested finally blocks.
         errors = component_errors + inventory_errors + session_errors + drain_errors
         if errors:

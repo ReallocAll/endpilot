@@ -58,6 +58,9 @@ from .resource_packs import (
 )
 from .signs import SignEditor, SignObservation, SignSide
 from .skin import PlayerCapeSnapshot, PlayerSkinSnapshot, Skin
+from .terrain_storage import (
+    TerrainBlockObservation, TerrainColumnSnapshot, TerrainSectionData, TerrainStorage, TerrainStorageError, TerrainStore,
+)
 from .titles import TitleEvent, TitleKind
 from .trading import TradeManyRequest, TradeManyResult
 from .world_environment import Weather, WorldClock, WorldRule, WorldSpawn, WorldTime
@@ -207,6 +210,12 @@ __all__ = [
     "TextEvent",
     "TextTranslations",
     "TextPacketType",
+    "TerrainBlockObservation",
+    "TerrainColumnSnapshot",
+    "TerrainSectionData",
+    "TerrainStorage",
+    "TerrainStorageError",
+    "TerrainStore",
     "TitleEvent",
     "TitleKind",
     "TradeManyRequest",
