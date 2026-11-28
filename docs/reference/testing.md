@@ -225,6 +225,23 @@ requirements and click point. It returns `BoatPlacementResult` and matches a
 new `minecraft:boat` at the exact spawn coordinates using its actor type and
 position. Use `place_entity` to require the oak `VARIANT` on that spawn.
 
+### Place entities from MCP scripts
+
+Connect a resident player over stdio and start an async `main(bot, ...)` with
+`run_script`. The worker's `bot` supports `await bot.place_entity(position)`,
+`await bot.place_oak_boat(position)`, and
+`bot.subscribe_entity_placement_completions(callback)`. Use `observe_script`
+to read the script result. The action reply and subscription callback receive
+separate snapshots with the placement reason, spawn and inventory observations.
+Snapshot fields are accessible by attribute. Byte fields such as
+`user_data_buffer` are represented as hex strings.
+
+Worker notifications are queued. Keep the script running for callbacks it
+needs to receive. A synchronous callback observes only completed local action
+calls. Use `subscribe_entity_lifecycle` to observe other spawns. Call the
+returned function to unsubscribe. Script stop and player reconnect also
+release the script's subscriptions.
+
 ## Observe and answer forms
 
 Use a server that sends the player a form through a plugin. Wait for

@@ -735,3 +735,38 @@ async def main(bot, support, target, runtime):
                 await asyncio.sleep(0.005)
         self.assertEqual(result["state"], "succeeded", result)
         self.assertEqual(result["result"], ["script cancellation", "cancelled", True, test_placement.PLACED_ID, None])
+
+
+class MCPScriptEntityPlacementTests(test_placement._EntityPlacementHarness):
+    async def test_stop_and_connection_cleanup_release_only_the_worker_completion_subscriptions(self):
+        scripts = MCPScripts(SimpleNamespace(connected_bot=lambda: self.bot))
+        self.addAsyncCleanup(scripts.close)
+        registered = self.bot._entity_placement_completion_observers
+        originals = registered.copy()
+
+        async def start_subscription():
+            run = (await scripts.run_script(source="""
+import asyncio
+
+async def main(bot):
+    bot.subscribe_entity_placement_completions(lambda event: None)
+    print('subscribed', flush=True)
+    await asyncio.Future()
+"""))["run_id"]
+            while True:
+                status = await scripts.observe_script(run)
+                self.assertEqual(status["state"], "running", status)
+                if any("subscribed" in row["text"] for row in status["output"]):
+                    break
+                await asyncio.sleep(.01)
+            self.assertEqual(len(registered), len(originals) + 1)
+            return run
+
+        async with asyncio.timeout(12):
+            stopped = await start_subscription()
+            self.assertEqual((await scripts.stop_script(stopped))["state"], "stopped")
+            self.assertEqual(registered, originals)
+            disconnected = await start_subscription()
+            await scripts.close()
+            self.assertEqual((await scripts.observe_script(disconnected))["state"], "stopped")
+            self.assertEqual(registered, originals)

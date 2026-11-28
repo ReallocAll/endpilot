@@ -21,7 +21,7 @@ from test_mcp import FakeBot
 from test_resource_packs import PackTransport, archive_bytes
 
 
-async def _accept_raknet(peer, player_id):
+async def _accept_raknet(peer, player_id, **start_game_options):
     protocol = Protocol(2225)
     binding = protocol.binding
     wire = await peer.accept()
@@ -38,7 +38,7 @@ async def _accept_raknet(peer, player_id):
     await receive(binding.RequestNetworkSettingsPacket.ID)
     await send(binding.NetworkSettingsPacket(compression_algorithm=binding.PacketCompressionAlgorithm.NONE))
     await receive(binding.LoginPacket.ID)
-    await send(binding.StartGamePacket(runtime_id=player_id, entity_id=player_id),
+    await send(binding.StartGamePacket(runtime_id=player_id, entity_id=player_id, **start_game_options),
                binding.PlayStatusPacket(status=binding.PlayStatus.PLAYER_SPAWN))
     return wire
 
@@ -423,6 +423,165 @@ async def main(bot):
                 self.assertEqual(peer.connections, [])
                 with socket.socket() as probe:
                     probe.bind(("127.0.0.1", port))
+
+    @unittest.skipUnless(find_spec("raknet"), "optional RakNet dependency unavailable")
+    async def test_entity_placement_and_events_cross_stdio_and_worker_as_independent_snapshots(self):
+        from raknet.asyncio import create_server
+
+        protocol = Protocol(2225)
+        b = protocol.binding
+        cart, boat = 373, 496
+        target = (4, 90, 7)
+        inventory = b.ContainerID.INVENTORY
+
+        def held(item_id, count, net_id):
+            return b.InventorySlotPacket(inventory_id=inventory, slot=0, item=b.SerializedNetworkItemStackDescriptor(
+                id=item_id, stack_size=count, net_id_variant=net_id, user_data_buffer=b"\x01\x02",
+            ))
+
+        def block(at, runtime_id):
+            return b.UpdateBlockPacket(pos=b.BlockPos(x=at[0], y=at[1], z=at[2]), runtime_id=runtime_id)
+
+        async def send(wire, *packets):
+            await wire.send(b"\xfe" + write_batch(map(protocol.encode, packets)))
+
+        async def next_click(wire):
+            async with asyncio.timeout(3):
+                while True:
+                    frame = await wire.recv()
+                    if frame.startswith(b"\xfe"):
+                        for raw in read_batch(frame[1:]):
+                            if raw.packet_id == b.InventoryTransactionPacket.ID:
+                                return protocol.decode(raw).variant_transaction
+
+        async def until_status(call, run_id, ready):
+            async with asyncio.timeout(6):
+                while True:
+                    status = await call("observe_script", run_id=run_id)
+                    if ready(status) or status["state"] != "running":
+                        return status
+                    await asyncio.sleep(.025)
+
+        place = """
+import asyncio
+import os
+
+async def main(bot, host_pid, method, position, complete):
+    assert os.getpid() != host_pid
+    events = []
+    lifecycle = []
+    observed = asyncio.Event()
+    bot.subscribe_entity_lifecycle(lifecycle.append)
+    def seen(event):
+        events.append(event)
+        observed.set()
+    bot.subscribe_entity_placement_completions(seen)
+    await bot.wait_for_position_sync(timeout=2)
+    result = await getattr(bot, method)(position, timeout=1 if complete else 0.5)
+    if complete:
+        await asyncio.wait_for(observed.wait(), 2)
+        await bot.wait_ticks(2)
+        (event,) = events
+        assert event == result and event is not result and event.spawn is not result.spawn
+        assert event.inventory_change.before is not result.inventory_change.before
+        event.inventory_change.before.count += 10
+        assert event.inventory_change.before.count != result.inventory_change.before.count
+        event.inventory_change.before.count -= 10
+    assert len(lifecycle) >= (1 if result.spawn is not None else 0)
+    return {'result': result, 'events': events, 'pid': os.getpid(), 'lifecycle': len(lifecycle)}
+"""
+        watch = """
+import asyncio
+
+async def main(bot):
+    received = []
+    bot.subscribe_entity_placement_completions(received.append)
+    seen = asyncio.Event()
+    bot.subscribe_entity_lifecycle(lambda event: seen.set() if event.kind == 'entered' else None)
+    print('subscribed', flush=True)
+    await asyncio.wait_for(seen.wait(), 4)
+    await bot.wait_ticks(2)
+    return received
+"""
+        idle = """
+import asyncio
+
+async def main(bot):
+    bot.subscribe_entity_placement_completions(lambda event: print('unexpected', flush=True))
+    print('subscribed', flush=True)
+    await asyncio.Future()
+"""
+
+        async def registered(call, source):
+            run = (await call("run_script", source=source))["run_id"]
+            status = await until_status(call, run, lambda value: any("subscribed" in row["text"] for row in value["output"]))
+            self.assertEqual(status["state"], "running", status)
+            return run
+
+        async with asyncio.timeout(40), await create_server(("127.0.0.1", 0)) as peer:
+            async with self.host("-m", "endpilot.mcp_server") as (process, call, _, _):
+                async with asyncio.TaskGroup() as tasks:
+                    first = tasks.create_task(_accept_raknet(peer, 71, entity_game_type=b.GameType.SURVIVAL,
+                                                           block_network_ids_are_hashes=True))
+                    url = f"raknet://127.0.0.1:{peer.local_address[1]}"
+                    self.assertEqual((await call("connect", url=url))["player_id"], 71)
+                wire = first.result()
+                await send(wire, b.ItemRegistryPacket(items=[b.ItemData(id=cart, name="minecraft:minecart"),
+                                                             b.ItemData(id=boat, name="minecraft:oak_boat")]),
+                           block((4, 89, 7), 2150698529),
+                           b.MovePlayerPacket(player_id=71, pos=b.Vec3(x=3.5, y=92.62, z=7.5),
+                                              reset_position=2, on_ground=True))
+
+                observer = await registered(call, watch)
+                await send(wire, b.AddActorPacket(entity_id=-70, runtime_id=70, actor_type="minecraft:minecart",
+                                                  pos=b.Vec3(x=4.5, y=90.5, z=7.5)))
+                status = await until_status(call, observer, lambda value: False)
+                self.assertEqual((status["state"], status["result"]), ("succeeded", []), status)
+
+                for index, (method, item_id, actor_type, surface, height, complete) in enumerate((
+                    ("place_entity", cart, "minecraft:minecart", 2560510590, .5, True),
+                    ("place_oak_boat", boat, "minecraft:boat", 1211861802, .875, True),
+                    ("place_entity", cart, "minecraft:minecart", 2560510590, .5, False),
+                )):
+                    await send(wire, block(target, surface), held(item_id, 2, 21))
+                    run = (await call("run_script", source=place, args=[process.pid, method, target, complete]))["run_id"]
+                    click = await next_click(wire)
+                    self.assertEqual((click.action_type.name, click.face, click.slot, click.target_block_id),
+                                     ("PLACE", 1, 0, surface))
+                    self.assertEqual((click.item.id, click.item.stack_size), (item_id, 2))
+                    actor = b.AddActorPacket(entity_id=-80-index, runtime_id=80+index, actor_type=actor_type,
+                                             pos=b.Vec3(x=4.5, y=90+height, z=7.5))
+                    debit = held(item_id, 1, 22)
+                    ordered = (actor, debit) if index else (debit, actor)
+                    packets = (*ordered, *ordered) if complete else (actor, actor)
+                    await send(wire, *packets)
+                    status = await until_status(call, run, lambda value: False)
+                    self.assertEqual(status["state"], "succeeded", status)
+                    response = status["result"]
+                    result = response["result"]
+                    self.assertNotEqual(response["pid"], process.pid)
+                    self.assertEqual(result["reason"], "observations_complete" if complete else "timed_out")
+                    self.assertEqual((result["dimension_id"], result["position"], result["slot"], result["submitted"]),
+                                     (0, list(target), 0, True))
+                    self.assertEqual(result["spawn"], {"entity_id": -80-index, "runtime_id": 80+index,
+                                                     "actor_type": actor_type, "position": [4.5, 90+height, 7.5]})
+                    self.assertEqual(response["events"], [result] if complete else [])
+                    expected = {name: {"item_id": item_id, "count": count, "aux_value": 0, "net_id": net_id,
+                                       "block_runtime_id": 0, "user_data_buffer": "0102"}
+                                for name, count, net_id in (("before", 2, 21), ("after", 1, 22))}
+                    self.assertEqual(result["inventory_change"], expected if complete else None)
+
+                stopped = await registered(call, idle)
+                self.assertEqual((await call("stop_script", run_id=stopped))["state"], "stopped")
+                displaced = await registered(call, idle)
+                async with asyncio.TaskGroup() as tasks:
+                    replacement = tasks.create_task(_accept_raknet(peer, 72))
+                    self.assertEqual((await call("reconnect"))["player_id"], 72)
+                self.assertIsNotNone(replacement.result())
+                self.assertEqual((await call("observe_script", run_id=displaced))["state"], "stopped")
+                self.assertEqual((await call("session_status"))["player_id"], 72)
+                self.assertEqual(await call("shutdown"), {"shutdown": True})
+                self.assertEqual(await asyncio.wait_for(process.wait(), 8), 0)
 
     @unittest.skipIf(os.name == "nt" and find_spec("pywintypes") is None, "optional Windows Xbox dependency unavailable")
     async def test_shutdown_drains_pending_device_authorization(self):

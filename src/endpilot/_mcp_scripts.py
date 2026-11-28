@@ -80,7 +80,8 @@ _MEMBERS = {
             drop_selected_item use_item consume release_using_item
             wait_for_container_slots wait_for_furnace_progress wait_for_brewing_progress take_from_container
             put_into_container open_inventory_screen close_container open_container open_entity_container
-            use_item_on place_block place_against start_mining continue_mining stop_mining finish_mining
+            use_item_on place_block place_against place_entity place_oak_boat
+            start_mining continue_mining stop_mining finish_mining
             mine_block collect_block collect_targets collect_by_count collect_vein_by_count equip_harvest_tool
             answer_form close_form send_chat send_whisper wait_for_chat wait_for_message send_command
             execute_command_output
@@ -95,6 +96,7 @@ _MEMBERS = {
             subscribe_column_coverage subscribe_block_changes subscribe_inventory_changes
             subscribe_container_slot_changes subscribe_furnace_progress subscribe_spawns
             subscribe_entity_lifecycle subscribe_entity_movement subscribe_vehicle_links
+            subscribe_entity_placement_completions
         """,
     }.items()
     for name in names.split()
