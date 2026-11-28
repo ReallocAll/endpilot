@@ -2336,15 +2336,18 @@ class Bot:
         return await self._containers.open(position, self._blocks, face=face, timeout=timeout, _observe_target=True)
 
     async def open_entity_container(self, runtime_id: int, *, timeout: float = 15) -> ContainerWindow:
-        """Open an observed chest minecart, hopper minecart, chest watercraft, or horse.
+        """Open an observed chest minecart, hopper minecart, chest watercraft, horse, or donkey.
 
-        For chest watercraft and horse equipment, submit set_sneaking(True)
-        and keep the observed main hand empty. Open horse equipment on foot.
+        For chest watercraft, horses, and donkeys, submit set_sneaking(True)
+        and keep the observed main hand empty.
+        Open horse and donkey equipment on foot.
         The click waits for server-reported sneaking within the same timeout.
         The method leaves your pose alone.
         Return the matching server-opened window. Use wait_for_container_slots
         for its contents. Exact saddle transfers use slot 0 on a horse opened
         through this method. Horse armor and range transfers are unsupported.
+        Donkey windows are read-only. Full server contents report slot 0 for
+        the saddle and slots 1–15 when the donkey has a chest.
         Chest watercraft and hopper minecart transfers require matching
         27-slot and 5-slot windows, respectively.
         """

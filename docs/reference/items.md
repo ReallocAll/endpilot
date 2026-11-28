@@ -23,6 +23,17 @@ Both actions require the server to have registered the source item as
 `minecraft:saddle`. Horse armor, range transfers and horse windows that
 arrive outside a matching `open_entity_container` call support observation only.
 
+## Read donkey equipment and storage
+
+Stand near a tamed donkey on foot with an empty main hand and submit
+`await bot.set_sneaking(True)`. Call `await bot.open_entity_container(donkey.runtime_id)`
+and wait for `await bot.wait_for_container_slots()`. The server reports both
+forms as a `HORSE` window. The full contents have only the saddle slot `0`
+on a donkey without a chest, or the saddle slot and storage slots `1`–`15`
+on a donkey with a chest. Contents are unknown until the current window's
+full snapshot arrives, including after reopening. Donkey windows are read-only.
+Use `await bot.close_container()` to wait for the server to confirm closure.
+
 ## Unequip armor
 
 Use the numeric armor slot (`0`–`3`) or its name (`head`, `chest`, `legs`,

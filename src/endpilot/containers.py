@@ -78,6 +78,7 @@ class _WindowChangedBeforeClose(RuntimeError):
 
 _CHEST_BOAT = "minecraft:chest_boat"
 _HORSE = "minecraft:horse"
+_DONKEY = "minecraft:donkey"
 _HORSE_SLOT_COUNT = 2
 _HORSE_SADDLE_SLOT = 0
 _HORSE_EQUIP_CONTAINER = "HORSE_EQUIP_CONTAINER"
@@ -427,10 +428,14 @@ class Containers:
             if logical is not None:
                 self._set_anvil_slot(logical, item, before)
         elif int(inventory_id) == self.window.container_id:
-            self._record_slot_before(int(index), before)
-            self._slots[int(index)] = item
-            self._unconfirmed_transfer_slots.discard(int(index))
-            self._observe_transfer_slot(int(index), item)
+            index = int(index)
+            if (self._entity_container is not None and self._entity_container.actor_type == _DONKEY
+                    and index not in self._slots):
+                return
+            self._record_slot_before(index, before)
+            self._slots[index] = item
+            self._unconfirmed_transfer_slots.discard(index)
+            self._observe_transfer_slot(index, item)
             self._slots_updated.set()
 
     def _chest_facing(self, position):
@@ -498,6 +503,8 @@ class Containers:
     def _observe_transfer_slot(self, index: int, item: object) -> None:
         entity = self._entity_container
         if entity is not None:
+            if entity.actor_type == _DONKEY:
+                return
             if entity.actor_type == _HORSE and (
                 self._window_slot_count != _HORSE_SLOT_COUNT or index != _HORSE_SADDLE_SLOT
             ):
@@ -545,7 +552,7 @@ class Containers:
                 if entity is not None and (
                     entity.actor_type == _CHEST_BOAT or entity.slot_count(window) is not None
                     or (window.container_type == "CONTAINER"
-                        and entity.actor_type not in ("minecraft:hopper_minecart", _HORSE))
+                        and entity.actor_type not in ("minecraft:hopper_minecart", _HORSE, _DONKEY))
                 ):
                     self._entity_container = entity
         elif raw.packet_id == b.UpdateTradePacket.ID:
@@ -564,9 +571,14 @@ class Containers:
         elif raw.packet_id == b.UpdateEquipPacket.ID:
             packet = self.packets.protocol.decode(raw)
             if packet.type == b.ContainerType.HORSE:
-                self._set_window(ContainerWindow(
+                window = ContainerWindow(
                     int(packet.container_id), "HORSE", None, int(packet.entity_unique_id),
-                ))
+                )
+                self._set_window(window)
+                if self._entities is not None:
+                    actor = self._entities._get_by_unique_id(window.entity_unique_id)
+                    if actor is not None and actor.actor_type == _DONKEY:
+                        self._entity_container = _observed_entity_container(self._entities, actor)
         elif raw.packet_id == b.InventoryContentPacket.ID:
             packet = self.packets.protocol.decode(raw)
             window = self.window
@@ -580,8 +592,12 @@ class Containers:
                     self._set_anvil_slot(logical, item, before)
                 self._notify_slot_changes(window, before)
             elif window is not None and int(packet.inventory_id) == window.container_id:
-                before = (self._slots or {}) if self._slot_observers else None
                 count = len(packet.slots)
+                # The native equipment announcement has size zero for both donkey layouts.
+                if (self._entity_container is not None and self._entity_container.actor_type == _DONKEY
+                        and count not in (1, 16)):
+                    return
+                before = (self._slots or {}) if self._slot_observers else None
                 if self._window_slot_count != count:
                     self._layout_token = object()
                     self._window_slot_count = count
@@ -922,18 +938,22 @@ class Containers:
                 pending.exception()
 
     async def open_entity(self, runtime_id: int, entities: Entities, *, timeout: float = 15) -> ContainerWindow:
-        """Open an observed storage entity or horse and return its active server window."""
+        """Open an observed storage or equipment window and return the active server window."""
         if self._unsubscribe is None:
             raise ConnectionError("container session is closed")
         if self.window is not None or self._entity_opening:
             raise RuntimeError("a container window is open or opening")
         actor = entities.get(runtime_id)
         target = _observed_entity_container(entities, actor)
-        if target is None or (target.actor_type not in _ENTITY_CONTAINER_LAYOUTS and target.actor_type != _HORSE):
-            raise ValueError("an observed chest minecart, hopper minecart, chest boat, or horse with a known identity is required")
+        if target is None or (target.actor_type not in _ENTITY_CONTAINER_LAYOUTS
+                              and target.actor_type not in (_HORSE, _DONKEY)):
+            raise ValueError(
+                "an observed chest minecart, hopper minecart, chest boat, horse, or donkey with a known identity is required"
+            )
         b = self.packets.protocol.binding
-        horse = target.actor_type == _HORSE
-        sneak_target = "horse" if horse else "chest boat" if target.actor_type == _CHEST_BOAT else None
+        equipment = target.actor_type in (_HORSE, _DONKEY)
+        sneak_target = (target.actor_type.removeprefix("minecraft:") if equipment
+                        else "chest boat" if target.actor_type == _CHEST_BOAT else None)
         move = self.movement
         generation = move._pose_generation if sneak_target else None
         layout = self._layout_token
@@ -948,14 +968,14 @@ class Containers:
         def require_sneak_input():
             if not move._sneaking:
                 raise RuntimeError(f"hold sneak to open a {sneak_target}")
-            if horse and entities.vehicle() is not None:
-                raise RuntimeError("opening a horse equipment window requires leaving the vehicle")
+            if equipment and entities.vehicle() is not None:
+                raise RuntimeError(f"opening a {sneak_target} equipment window requires leaving the vehicle")
             held = self.inventory.held_item
             item = held.observed_item
             # A server equipment correction can precede the matching inventory update.
-            equipment = self.inventory._damage_descriptors.get((None, held.slot))
+            equipped = self.inventory._damage_descriptors.get((None, held.slot))
             if (item is None or item.item_id != 0 or item.count != 0 or held.predicted_count is not None
-                    or (equipment is not None and (equipment.id != 0 or equipment.stack_size != 0))
+                    or (equipped is not None and (equipped.id != 0 or equipped.stack_size != 0))
                     or held.slot in self.inventory._unconfirmed_transfer_slots
                     or self.inventory._requests_for_endpoints(((None, held.slot),))):
                 raise RuntimeError(f"opening a {sneak_target} requires an observed empty main hand")
@@ -993,14 +1013,14 @@ class Containers:
             if packet_id == b.UpdateEquipPacket.ID:
                 if self.packets.protocol.decode(raw).type != b.ContainerType.HORSE:
                     return False
-            elif packet_id != b.ContainerOpenPacket.ID and not (horse and packet_id == b.UpdateTradePacket.ID):
+            elif packet_id != b.ContainerOpenPacket.ID and not (equipment and packet_id == b.UpdateTradePacket.ID):
                 return False
             if not submitted:
                 if sneak_target:
                     raise RuntimeError("a container window opened before the interaction")
                 return False
             window = self.window
-            if horse:
+            if equipment:
                 matching = (packet_id == b.UpdateEquipPacket.ID and window is not None
                             and window.container_type == "HORSE" and window.entity_unique_id == target.entity_id)
             else:
@@ -1008,7 +1028,7 @@ class Containers:
             if not matching:
                 raise RuntimeError("the server opened a different container")
             opened = window
-            if not horse:
+            if not equipment:
                 self._entity_container = target
             return True
 
@@ -1016,7 +1036,7 @@ class Containers:
             require_sneak_input()
         packet_ids = (b.ContainerOpenPacket.ID, b.ChangeDimensionPacket.ID, b.DisconnectPacket.ID,
                       b.RemoveActorPacket.ID, b.AddActorPacket.ID, b.RespawnPacket.ID)
-        if horse:
+        if equipment:
             packet_ids += (b.UpdateEquipPacket.ID, b.UpdateTradePacket.ID)
         self._entity_opening = True
         tasks = []
@@ -1037,7 +1057,7 @@ class Containers:
                 if opened is None or self.window is not opened:
                     raise RuntimeError("the entity container window closed or changed during open")
                 require_target()
-                if not horse:
+                if not equipment:
                     return opened
         finally:
             try:
@@ -1052,7 +1072,8 @@ class Containers:
         if self.window is not opened:
             raise RuntimeError("the entity container window closed or changed during open")
         require_target()
-        self._entity_container = target
+        if target.actor_type == _HORSE:
+            self._entity_container = target
         return opened
 
     async def open_inventory_screen(
