@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from math import dist
 from typing import TYPE_CHECKING
 
 from .inventory import _InventoryMoveNotSubmitted, _PLAYER_CONTAINERS
@@ -20,17 +21,21 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class CollectionStorage:
-    """Authorize one registered item and explicit slots in an ordinary chest."""
+    """Authorize one registered item and explicit slots in ordinary chests."""
 
     position: tuple[int, int, int]
     item: int | str
     inventory_slots: range = field(kw_only=True)
     chest_slots: range = field(kw_only=True)
+    additional_positions: tuple[tuple[int, int, int], ...] = field(default=(), kw_only=True)
 
     def __post_init__(self) -> None:
         from .collection import _position
 
         object.__setattr__(self, "position", _position(self.position))
+        positions = dict.fromkeys(_position(value) for value in self.additional_positions)
+        positions.pop(self.position, None)
+        object.__setattr__(self, "additional_positions", tuple(positions))
         if not (type(self.item) is int and self.item != 0 or isinstance(self.item, str) and self.item):
             raise ValueError("item must be a nonempty registered name or its transferable network ID")
         for name, limit in (("inventory_slots", _PLAYER_SIZE), ("chest_slots", _DOUBLE_CHEST_SIZE)):
@@ -66,6 +71,7 @@ def _target_window(window: ContainerWindow, chest: tuple[int, int, int]) -> bool
 async def _close_owned_window(containers, window, timeout, failure):
     closing = asyncio.create_task(containers.close_window(timeout=timeout, _expected_window=window))
     cancellation = None
+    closed = None
     # Keep the close request and its observer together if the caller stops the task.
     while True:
         try:
@@ -77,7 +83,7 @@ async def _close_owned_window(containers, window, timeout, failure):
             if closing.done():
                 break
     try:
-        closing.result()
+        closed = closing.result()
     except (Exception, asyncio.CancelledError) as error:
         primary = failure if failure is not None else cancellation
         if primary is None:
@@ -85,6 +91,7 @@ async def _close_owned_window(containers, window, timeout, failure):
         primary.add_note(f"collection chest close failed: {error!r}")
     if cancellation is not None:
         raise cancellation
+    return closed
 
 
 async def _store_at_chest(
@@ -92,7 +99,7 @@ async def _store_at_chest(
     containers, blocks, registry, item_id: int, item_name: str, epoch: int,
     inventory_slots: range, chest_slots: range | None, ticks: int, search_radius: int, timeout: float,
     update=None, dimension_id: int | None = None, authorize: Callable[[int | None], None] | None = None,
-    record: Callable[[CollectionStorageResult], None] | None = None,
+    record: Callable[[CollectionStorageResult], None] | None = None, multi_chest: bool = False,
 ) -> CollectionStorageResult:
     strict = authorize is not None
     owned_window: ContainerWindow | None = None
@@ -100,6 +107,8 @@ async def _store_at_chest(
     chest_changed = False
     transfer = None
     close_observed = False
+    client_close_observed = False
+    closed = None
     unsubscribe_chest = None
     unsubscribe_close = None
     inventory = bot._inventory
@@ -139,7 +148,7 @@ async def _store_at_chest(
         close_id = packets.protocol.binding.ContainerClosePacket.ID
 
         def observe_close(raw):
-            nonlocal close_observed
+            nonlocal close_observed, client_close_observed
             if containers.window is window:
                 return
             # The container subscriber has already applied this packet. The first
@@ -149,6 +158,7 @@ async def _store_at_chest(
                 # Vanilla BDS acknowledges client closes with type NONE.
                 close_observed = (int(packet.container_id) == window.container_id
                                   and packet.container_type.name in ("NONE", window.container_type))
+                client_close_observed = close_observed and not packet.server_initiated_close
             unsubscribe_close()
 
         unsubscribe_close = packets.subscribe_raw(observe_close)
@@ -205,6 +215,8 @@ async def _store_at_chest(
                             or containers._entity_opening):
                         raise _InventoryMoveNotSubmitted("window_busy")
                     movement = containers.movement
+                    if multi_chest and movement.observed_feet_position is None:
+                        raise _InventoryMoveNotSubmitted("unobserved")
                     origin = movement.input_position
                     if origin is None or movement._foot_cell(origin) != approach.stand_position:
                         raise _InventoryMoveNotSubmitted("position_changed")
@@ -278,18 +290,21 @@ async def _store_at_chest(
                         record(CollectionStorageResult("closing", transfer))
                 finally:
                     try:
-                        await _close_owned_window(containers, owned_window, timeout, failure)
+                        closed = await _close_owned_window(containers, owned_window, timeout, failure)
                     except (Exception, asyncio.CancelledError):
                         publish(phase="closing", notify=False)
                         raise
-        if strict and reason == "complete":
+        empty_full = (multi_chest and reason == "destination_full"
+                      and transfer is not None and not transfer.steps)
+        if strict and (reason == "complete" or empty_full):
             try:
                 require_world()
                 require_same_chest()
             except _InventoryMoveNotSubmitted as stopped:
                 reason = str(stopped)
             else:
-                if not close_observed or foreign_window_pending():
+                if (not close_observed or foreign_window_pending()
+                        or (empty_full and (not client_close_observed or closed is not owned_window))):
                     reason = "window_changed"
     except (Exception, asyncio.CancelledError) as error:
         if record is not None:
@@ -311,7 +326,7 @@ async def _store_at_chest(
 async def _store_for_collection(
     bot: Bot, storage: CollectionStorage, *, source_slot: int, count: int, dimension_id: int, epoch: int,
     ticks: int, search_radius: int, timeout: float, authorize: Callable[[int | None], None],
-    record: Callable[[CollectionStorageResult], None],
+    record: Callable[[tuple[int, int, int] | None, CollectionStorageResult], None],
 ) -> CollectionStorageResult:
     """Authorize the click with None and each item-stack write with its request ID."""
     if (type(source_slot) is not int or source_slot not in storage.inventory_slots
@@ -322,9 +337,46 @@ async def _store_for_collection(
         raise RuntimeError("player has not joined")
     registry = bot.item_registry
     item_id, item_name = _registered_storage_item(registry, storage.item)
-    return await _store_at_chest(
-        bot, storage.position, count, containers=containers, blocks=blocks, registry=registry,
-        item_id=item_id, item_name=item_name, epoch=epoch, inventory_slots=range(source_slot, source_slot + 1),
-        chest_slots=storage.chest_slots, ticks=ticks, search_radius=search_radius, timeout=timeout,
-        dimension_id=dimension_id, authorize=authorize, record=record,
-    )
+    multiple = bool(storage.additional_positions)
+
+    async def store(chest, time_left):
+        return await _store_at_chest(
+            bot, chest, count, containers=containers, blocks=blocks, registry=registry,
+            item_id=item_id, item_name=item_name, epoch=epoch, inventory_slots=range(source_slot, source_slot + 1),
+            chest_slots=storage.chest_slots, ticks=ticks, search_radius=search_radius, timeout=time_left,
+            dimension_id=dimension_id, authorize=authorize, multi_chest=multiple,
+            record=lambda attempt: record(chest if multiple else None, attempt),
+        )
+
+    if not multiple:
+        return await store(storage.position, timeout)
+
+    remaining = [storage.position, *storage.additional_positions]
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    last_chest = last_attempt = None
+
+    def stop(reason):
+        result = (CollectionStorageResult(reason) if last_attempt is None else replace(last_attempt, stop_reason=reason))
+        record(last_chest, result)
+        return result
+
+    while remaining:
+        time_left = deadline - loop.time()
+        if time_left <= 0:
+            stop("timeout")
+            raise TimeoutError("collection storage timed out before selecting another chest")
+        try:
+            authorize(None)
+        except _InventoryMoveNotSubmitted as stopped:
+            return stop(str(stopped))
+        feet = containers.movement.observed_feet_position
+        if feet is None:
+            return stop("unobserved")
+        chest = min(remaining, key=lambda position: dist(feet, tuple(axis + 0.5 for axis in position)))
+        remaining.remove(chest)
+        last_chest, last_attempt = chest, await store(chest, time_left)
+        transfer = last_attempt.transfer
+        if last_attempt.stop_reason != "destination_full" or transfer is None or transfer.steps:
+            break
+    return last_attempt

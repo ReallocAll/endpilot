@@ -1026,9 +1026,9 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def start_storage_collection(
         self, positions=(TARGET, SECOND_TARGET), *, dirt_count=64, slots=36, empty_slot=False, vein=False,
-        chest=REFILL_CHEST, terrain=(), ticks=0, search_radius=0, timeout=1, other_drops=(),
+        chest=REFILL_CHEST, additional_positions=(), terrain=(), ticks=0, search_radius=0, timeout=1, other_drops=(),
     ):
-        bot = await self.refill_bot(chest=chest)
+        bot = await self.refill_bot(chest=chest, additional_chests=additional_positions)
         inventory = [stack_descriptor(self.b, OAK_LOG_ITEM, 64, 100 + index) for index in range(slots)]
         inventory[0] = stack_descriptor(self.b, 445, 1, 10)
         inventory[2] = stack_descriptor(self.b, DIRT, dirt_count, 15)
@@ -1042,7 +1042,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             *terrain,
         )
         storage = CollectionStorage(chest, "minecraft:dirt", inventory_slots=range(2, 3),
-                                    chest_slots=range(4, 5))
+                                    chest_slots=range(4, 5), additional_positions=additional_positions)
         options = dict(storage=storage, ticks=ticks, search_radius=search_radius, timeout=timeout)
         action = (bot.collect_vein_by_count(TARGET, item_id=DIRT, count=2, **options) if vein
                   else bot.collect_targets(positions, **options))
@@ -1168,6 +1168,130 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((attempt.storage_attempt.stop_reason, attempt.storage_attempt.transfer.confirmed_count),
                          ("destination_full", 1))
         self.assertEqual(bot.observed_block(SECOND_TARGET).runtime_id, ORE)
+        self.assertIsNone(bot.open_window)
+        self.assert_no_storage_followup()
+
+    async def test_storage_chooses_nearer_first_and_waits_for_each_close_and_original_pickup(self):
+        far = (-4, 100, 3)
+        bot, task = await self.start_storage_collection(
+            chest=far, additional_positions=(REFILL_CHEST,), vein=True,
+            terrain=(self.pose(eye=(-2.5, 101.62, 3.4)),),
+        )
+        await self.refill_click(position=REFILL_CHEST)
+        await self.emit(*self.refill_window(item_id=DIRT, count=64))
+        full_close = await self.refill_close(confirm=False)
+        await self.emit(self.b.ContainerClosePacket(container_id=9))
+        self.assertTrue(self.wire.outgoing.empty())
+        self.assertFalse(task.done())
+        await self.emit(full_close)
+
+        request = await self.assert_storage_deposit(64, chest=far)
+        await self.emit(self.storage_receipt(request, player_count=0, chest_count=64))
+        close = await self.refill_close(confirm=False)
+        self.assertTrue(self.wire.outgoing.empty())
+        await self.emit(close)
+        await self.next_mixed_move()
+        await self.emit(self.take())
+        self.assertTrue(self.wire.outgoing.empty())
+        await self.emit(self.pose(), self.slot(2, DIRT, 1, net_id=25))
+        await self.expect_batch_start(SECOND_TARGET)
+        await self.finish_batch_break(SECOND_TARGET, runtime_id=102, total=2, net_id=25)
+
+        first, second = (await task).results
+        self.assertEqual((first.status, first.inventory_delta, first.pickup_drop.runtime_id), ("collected", 1, 101))
+        self.assertEqual([(position, attempt.stop_reason, attempt.transfer.confirmed_count)
+                          for position, attempt in first.storage_attempts],
+                         [(REFILL_CHEST, "destination_full", 0), (far, "complete", 64)])
+        self.assertIs(first.storage_attempt, first.storage_attempts[-1][1])
+        self.assertEqual((second.status, second.storage_attempts), ("collected", ()))
+        self.assertIsNone(bot.open_window)
+        self.assert_no_storage_followup()
+
+    async def test_storage_keeps_partial_near_deposit_without_trying_another_chest(self):
+        bot, task = await self.start_storage_collection(additional_positions=((-5, 100, 3),))
+        request = await self.assert_storage_deposit(1, chest_count=63)
+        await self.emit(self.storage_receipt(request, player_count=63, chest_count=64))
+        await self.refill_close()
+
+        first, = (await task).results
+        (position, attempt), = first.storage_attempts
+        self.assertIs(first.storage_attempt, attempt)
+        self.assertEqual((position, attempt.stop_reason, attempt.transfer.confirmed_count),
+                         (REFILL_CHEST, "destination_full", 1))
+        self.assertFalse(first.pickup_confirmed)
+        self.assertIsNone(bot.open_window)
+        self.assert_no_storage_followup()
+
+    async def test_storage_does_not_fall_back_after_server_initiated_close(self):
+        b = self.b
+        bot, task = await self.start_storage_collection(additional_positions=((-5, 100, 3),))
+        await self.refill_click()
+        await self.emit(*self.refill_window(item_id=DIRT, count=64))
+        close = await self.refill_close(confirm=False)
+        await self.emit(b.ContainerClosePacket(container_id=close.container_id,
+                                               container_type=b.ContainerType.NONE, server_initiated_close=True))
+        ack = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+        self.assertIsInstance(ack, b.ContainerClosePacket)
+        self.assertTrue(ack.server_initiated_close)
+
+        first, = (await task).results
+        (position, attempt), = first.storage_attempts
+        self.assertEqual((position, attempt.stop_reason, attempt.transfer.stop_reason, attempt.transfer.steps),
+                         (REFILL_CHEST, "window_changed", "destination_full", ()))
+        self.assertIs(first.storage_attempt, attempt)
+        self.assertIsNone(bot.open_window)
+        self.assert_no_storage_followup()
+
+    async def test_storage_rechecks_source_before_selecting_another_chest(self):
+        bot, task = await self.start_storage_collection(additional_positions=((-5, 100, 3),))
+        await self.refill_click()
+        await self.emit(*self.refill_window(item_id=DIRT, count=64))
+        close = await self.refill_close(confirm=False)
+        await self.emit(self.slot(2, DIRT, 64, net_id=72), close)
+
+        first, = (await task).results
+        (position, attempt), = first.storage_attempts
+        self.assertEqual((position, attempt.stop_reason, attempt.transfer.stop_reason, attempt.transfer.steps),
+                         (REFILL_CHEST, "source_changed", "destination_full", ()))
+        self.assertIs(first.storage_attempt, attempt)
+        self.assertIsNone(bot.open_window)
+        self.assert_no_storage_followup()
+
+    async def test_storage_uses_configured_order_for_equal_chest_distance(self):
+        first_position = (-4, 100, 3)
+        bot, task = await self.start_storage_collection(chest=first_position, additional_positions=(REFILL_CHEST,))
+        request = await self.assert_storage_deposit(1, chest=first_position, chest_count=63)
+        await self.emit(self.storage_receipt(request, player_count=63, chest_count=64))
+        await self.refill_close()
+        first, = (await task).results
+        self.assertEqual([position for position, _ in first.storage_attempts], [first_position])
+        self.assertIsNone(bot.open_window)
+        self.assert_no_storage_followup()
+
+    async def test_storage_with_more_chests_stops_without_trusted_feet(self):
+        with patch("endpilot.movement.Movement.observed_feet_position", None):
+            bot, task = await self.start_storage_collection(additional_positions=((-4, 100, 3),))
+            first, = (await task).results
+        self.assertEqual((first.storage_attempt.stop_reason, first.storage_attempts), ("unobserved", ()))
+        self.assertIsNone(bot.open_window)
+        self.assert_no_storage_followup()
+
+    async def test_storage_rechecks_trusted_feet_at_the_actual_click(self):
+        send = self.packets.send
+
+        async def lose_feet_at_click(packet, **options):
+            if isinstance(packet, self.b.InventoryTransactionPacket):
+                with patch("endpilot.movement.Movement.observed_feet_position", None):
+                    await send(packet, **options)
+            else:
+                await send(packet, **options)
+
+        with patch.object(self.packets, "send", lose_feet_at_click):
+            bot, task = await self.start_storage_collection(additional_positions=((-4, 100, 3),))
+            first, = (await task).results
+        (position, attempt), = first.storage_attempts
+        self.assertEqual((position, attempt.stop_reason), (REFILL_CHEST, "unobserved"))
+        self.assertIs(first.storage_attempt, attempt)
         self.assertIsNone(bot.open_window)
         self.assert_no_storage_followup()
 

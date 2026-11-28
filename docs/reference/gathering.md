@@ -234,6 +234,7 @@ storage = CollectionStorage(
     "minecraft:cobblestone",
     inventory_slots=range(4, 5),
     chest_slots=range(0, 1),
+    additional_positions=(backup_chest_position,),
 )
 batch = await bot.collect_targets(positions, storage=storage)
 ```
@@ -250,17 +251,27 @@ target's movement and search budgets.
 
 The bot chooses the first eligible stack of the configured item in
 `inventory_slots` and attempts to store that entire stack in `chest_slots`.
+Omit `additional_positions` for a single chest. Every listed chest uses the
+same authorized item and slot ranges. When several chests are authorized,
+the bot chooses the nearest untried chest by straight-line distance from its
+observed feet to the block center, breaking ties in the configured order.
+It tries another only after confirming no room, making zero transfer
+requests, and receiving the matching acknowledgment of its own window
+close. The original drop and source stack must still qualify.
+
 After confirming the whole transfer and receiving the chest's matching
 close, it continues with the original drop. The batch advances only after
 the bot confirms its own pickup of that instance and the matching inventory
 gain. Counted collection continues to count confirmed pickups even when the
 same item was stored during the detour.
 
-Read `BlockCollection.storage_attempt` for the trip's stop reason and
-confirmed transfer steps. When storage stops short, the batch ends with
-`pickup_unconfirmed`, or with `storage_incomplete` if the original pickup
-was already confirmed. The exception's `collection_progress` includes
-known storage and pickup evidence for the interrupted target.
+Read `BlockCollection.storage_attempt` for the last storage result. A
+multi-chest trip also records the ordered `(position, result)` pairs in
+`storage_attempts`, including confirmed and pending transfer steps. When
+storage stops short, the batch ends with `pickup_unconfirmed`, or with
+`storage_incomplete` if the original pickup was already confirmed. The
+exception's `collection_progress` includes known storage and pickup evidence
+for the interrupted target.
 
 ## Collect an observed drop
 

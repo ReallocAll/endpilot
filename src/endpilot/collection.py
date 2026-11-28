@@ -37,7 +37,8 @@ class BlockCollection:
     item instead. pickup_drop identifies the confirmed actor. An unknown delta
     is None. Ordered refills record each chest and its available
     acquisition evidence in tool_refill_attempts. An opted-in storage trip
-    records its transfer and stopping reason in storage_attempt.
+    records its last transfer and stopping reason in storage_attempt. A
+    multi-chest trip also records each attempted chest in storage_attempts.
     """
 
     position: tuple[int, int, int]
@@ -55,6 +56,9 @@ class BlockCollection:
         default=(), kw_only=True,
     )
     storage_attempt: CollectionStorageResult | None = field(default=None, kw_only=True)
+    storage_attempts: tuple[tuple[tuple[int, int, int], CollectionStorageResult], ...] = field(
+        default=(), kw_only=True,
+    )
     pickup_drop: EntityState | None = field(default=None, kw_only=True)
     _pickup_confirmed: bool = field(default=False, kw_only=True, repr=False)
 
@@ -685,8 +689,14 @@ class _BlockCollector:
         if not self._pickup_is_blocked(slots, drop):
             return
 
-        def remember(attempt: CollectionStorageResult) -> None:
+        last_chest = None
+
+        def remember(chest: tuple[int, int, int] | None, attempt: CollectionStorageResult) -> None:
+            nonlocal last_chest
+            last_chest = chest
             observation.storage_attempt = attempt
+            if chest is not None:
+                observation.storage_attempts[chest] = attempt
             result = observation.result()
             observation.storage_pickup_confirmed |= result.pickup_confirmed
             if record is not None:
@@ -694,7 +704,7 @@ class _BlockCollector:
 
         source_slot = next((slot for slot in storage.inventory_slots if slots[slot].id == item_id), None)
         if source_slot is None:
-            remember(CollectionStorageResult("source_exhausted"))
+            remember(None, CollectionStorageResult("source_exhausted"))
             return
         source = _stack_snapshot(slots[source_slot])
         observation.storage_item_id = item_id
@@ -729,14 +739,14 @@ class _BlockCollector:
             if observation.storage_attempt is None:
                 reason = ("cancelled" if isinstance(error, asyncio.CancelledError) else
                           "timeout" if isinstance(error, TimeoutError) else "error")
-                remember(CollectionStorageResult(reason, getattr(error, "transfer_progress", None)))
+                remember(None, CollectionStorageResult(reason, getattr(error, "transfer_progress", None)))
             raise
         if attempt.stop_reason == "complete":
             transfer = attempt.transfer
             if transfer is None or transfer.stop_reason != "complete" or transfer.confirmed_count != source.count:
                 attempt = replace(attempt, stop_reason="unconfirmed")
         if observation.storage_attempt != attempt:
-            remember(attempt)
+            remember(last_chest, attempt)
 
     async def _collect_one(
         self, position: tuple[int, int, int], before: BlockObservation | None, dimension: int, *,
@@ -957,6 +967,7 @@ class _CollectionObservation:
         self.pickups = {}
         self.storage_item_id: int | None = None
         self.storage_attempt: CollectionStorageResult | None = None
+        self.storage_attempts: dict[tuple[int, int, int], CollectionStorageResult] = {}
         self.storage_write_seen = False
         self.storage_pickup_confirmed = False
         self.changed = asyncio.Event()
@@ -1129,10 +1140,13 @@ class _CollectionObservation:
                 status, collector_id, delta = "drop_unobserved", None, None
         pickup_confirmed = status == "collected"
         attempt = self.storage_attempt
+        storage_attempts = tuple(self.storage_attempts.items())
         if attempt is not None and attempt.stop_reason != "complete":
             status = "storage_incomplete" if pickup_confirmed else "pickup_unconfirmed"
             if timed_out and attempt.stop_reason == "cancelled":
                 attempt = replace(attempt, stop_reason="timeout")
+                if storage_attempts:
+                    storage_attempts = (*storage_attempts[:-1], (storage_attempts[-1][0], attempt))
         return BlockCollection(
             position=self.before.position,
             status="dimension_changed" if dimension_changed else status,
@@ -1143,6 +1157,7 @@ class _CollectionObservation:
             inventory_delta=delta,
             timed_out=timed_out,
             storage_attempt=attempt,
+            storage_attempts=storage_attempts,
             pickup_drop=pickup_drop,
             _pickup_confirmed=pickup_confirmed and (dimension_changed or status != "collected"),
         )
