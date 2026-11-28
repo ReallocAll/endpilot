@@ -1492,6 +1492,18 @@ with patch("endpilot.mcp_server.MCPPlayer", Player), patch("endpilot.transport.n
                 rejected = await session.call_tool("connect", {"url": "invalid", "accept_resource_packs": "true"})
                 self.assertTrue(rejected.is_error)
                 self.assertIn("accept_resource_packs", rejected.content[0].text)
+                observation = tools["observe_script"].input_schema
+                self.assertEqual(observation["required"], ["run_id"])
+                wait = observation["properties"]["wait_seconds"]
+                self.assertEqual((wait["type"], wait["minimum"], wait["maximum"], wait["default"]),
+                                 ("number", 0, 30, 0))
+                for invalid in (True, "1.25"):
+                    with self.subTest(wait_seconds=invalid):
+                        rejected = await session.call_tool("observe_script", {
+                            "run_id": "missing", "wait_seconds": invalid,
+                        })
+                        self.assertTrue(rejected.is_error)
+                        self.assertIn("wait_seconds", rejected.content[0].text)
                 self.assertEqual(set(tools["observed_block"].output_schema["required"]),
                                  {"position", "layer", "observed", "runtime_id", "is_air"})
                 placement = tools["place_block"]

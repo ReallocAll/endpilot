@@ -1432,6 +1432,55 @@ async def main(bot):
         before = self.bot.get_tick()
         self.assertGreater(await self.bot.wait_ticks(1), before)
 
+    async def test_observe_waits_for_output_without_sharing_cancellation(self):
+        ready, release = asyncio.Event(), asyncio.Event()
+
+        async def hold(ticks):
+            self.assertEqual(ticks, 1)
+            ready.set()
+            await release.wait()
+
+        with patch.object(self.bot, "wait_ticks", hold):
+            run = await self.start("""
+import sys
+
+async def main(bot):
+    await bot.wait_ticks(1)
+    sys.stdout.write('new output')
+    return 42
+""")
+            async with asyncio.timeout(7):
+                await ready.wait()
+                snapshot = await self.scripts.observe_script(run)
+                self.assertEqual((snapshot["state"], snapshot["output"]), ("running", []))
+
+                async def observe(entered):
+                    entered.set()
+                    return await self.scripts.observe_script(run, cursor=0, wait_seconds=10)
+
+                first, second = asyncio.Event(), asyncio.Event()
+                cancelled = asyncio.create_task(observe(first))
+                observer = asyncio.create_task(observe(second))
+                self.addCleanup(cancelled.cancel)
+                self.addCleanup(observer.cancel)
+                await asyncio.gather(first.wait(), second.wait())
+                self.assertFalse(cancelled.done() or observer.done())
+                cancelled.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await cancelled
+                self.assertFalse(observer.done())
+
+                self.assertEqual(await self.scripts.observe_script(run, wait_seconds=.01), snapshot)
+                release.set()
+                result = await observer
+                self.assertEqual((result["cursor"], result["lost"], self.text(result)), (1, 0, "new output"))
+                terminal = await self.scripts.observe_script(run, cursor=1, wait_seconds=10)
+                self.assertEqual((terminal["state"], terminal["result"], terminal["output"]), ("succeeded", 42, []))
+
+        for invalid in (-1, 31, float("nan"), float("inf")):
+            with self.subTest(wait_seconds=invalid), self.assertRaisesRegex(ValueError, "between 0 and 30"):
+                await self.scripts.observe_script(run, wait_seconds=invalid)
+
     async def test_stop_before_spawning_and_report_dropped_output(self):
         early = await self.start("async def main(bot): raise AssertionError('script was executed')")
         self.assertEqual((await self.scripts.stop_script(early))["state"], "stopped")

@@ -12,7 +12,7 @@ import json
 import multiprocessing
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NotRequired, TypedDict
 from uuid import uuid4
 
 from . import navigation
@@ -41,6 +41,7 @@ _MAX_FRAME = 2 * 1024 * 1024
 _MAX_OUTGOING_FRAMES = 64
 _MAX_PENDING = 64
 _OUTPUT_CHUNKS = 128
+_MAX_OBSERVE_WAIT = 30
 _CHUNK_SIZE = 2048
 _State = Literal["running", "succeeded", "failed", "stopped"]
 _Stream = Literal["stdout", "stderr", "log"]
@@ -438,6 +439,7 @@ class _Run:
         self.result = None
         self.output: deque[tuple[_Stream, str]] = deque(maxlen=_OUTPUT_CHUNKS)
         self.cursor = 0
+        self._observation_change: asyncio.Event | None = None
         self._actions: dict[int, asyncio.Task] = {}
         self._subscriptions = {}
         self._outgoing = asyncio.Queue(maxsize=_MAX_OUTGOING_FRAMES)
@@ -454,10 +456,26 @@ class _Run:
         start = max(0, chunks - _OUTPUT_CHUNKS) * _CHUNK_SIZE
         for offset in range(start, len(text), _CHUNK_SIZE):
             self.output.append((stream, text[offset:offset + _CHUNK_SIZE]))
+        if chunks:
+            self._publish_observation()
 
-    def observe(self, cursor: int) -> _Observation:
+    def _publish_observation(self) -> None:
+        if self._observation_change is not None:
+            changed, self._observation_change = self._observation_change, None
+            changed.set()
+
+    async def observe(self, cursor: int, wait_seconds: float) -> _Observation:
         if not 0 <= cursor <= self.cursor:
             raise ValueError("cursor must be between zero and the current script cursor")
+        if wait_seconds and cursor == self.cursor and self.state == "running":
+            # The cursor check and event selection run without yielding to a publisher.
+            if self._observation_change is None:
+                self._observation_change = asyncio.Event()
+            try:
+                async with asyncio.timeout(wait_seconds):
+                    await self._observation_change.wait()
+            except TimeoutError:
+                pass
         floor = self.cursor - len(self.output)
         return {"run_id": self.id, "state": self.state, "cursor": self.cursor, "lost": max(0, floor - cursor),
                 "result": self.result, "error": self.error,
@@ -668,6 +686,7 @@ class _Run:
                 self.state = "succeeded"
             else:
                 self.state = "failed"
+            self._publish_observation()
 
     async def _release(self):
         self._kill_worker()
@@ -706,8 +725,17 @@ class MCPScripts:
         self._closing = False
 
     def register(self, server: "MCPServer") -> None:
+        from pydantic import Field
+
+        async def observe_script(
+            run_id: str,
+            cursor: int = 0,
+            wait_seconds: Annotated[float, Field(strict=True, ge=0, le=_MAX_OBSERVE_WAIT)] = 0,
+        ) -> _Observation:
+            return await self.observe_script(run_id, cursor, wait_seconds)
+
         server.tool()(self.run_script)
-        server.tool()(self.observe_script)
+        server.tool(description=self.observe_script.__doc__)(observe_script)
         server.tool()(self.stop_script)
 
     async def run_script(self, source: str | None = None, path: str | None = None,
@@ -754,9 +782,15 @@ class MCPScripts:
         except KeyError:
             raise ValueError("unknown or expired script run ID") from None
 
-    async def observe_script(self, run_id: str, cursor: int = 0) -> _Observation:
-        """Read output after a cursor. Lost counts output chunks that expired."""
-        return self._get(run_id).observe(cursor)
+    async def observe_script(self, run_id: str, cursor: int = 0, wait_seconds: float = 0) -> _Observation:
+        """Read output after a cursor, counting expired chunks in lost.
+
+        Set wait_seconds between 0 and 30 to wait at the current cursor for output
+        or script completion. The default of zero returns immediately.
+        """
+        if type(wait_seconds) not in (int, float) or not 0 <= wait_seconds <= _MAX_OBSERVE_WAIT:
+            raise ValueError("wait_seconds must be finite and between 0 and 30 seconds")
+        return await self._get(run_id).observe(cursor, wait_seconds)
 
     async def stop_script(self, run_id: str) -> _Status:
         """Terminate a worker and drain its host Bot actions and subscriptions.

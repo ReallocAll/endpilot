@@ -132,6 +132,16 @@ available. Inspect compound or preformatted text through `raw_message`. Player
 command output is delivered one record at a time in the order received,
 including repeated records and errors. Formatted messages retain Bedrock
 formatting codes.
+
+Use `observe_script` to read script output after a cursor. Pass the returned
+`cursor` to the next observation. The default `wait_seconds=0` returns the
+current snapshot immediately. Use a JSON number from 0 to 30 seconds. A
+positive value waits when a running script has no output after that cursor.
+New output, script completion or the timeout returns a snapshot from the
+supplied cursor. Earlier cursors return the buffered output immediately.
+`lost` counts expired output chunks. Cancelling one observation allows the
+script and other observers to continue.
+
 [MCP tests](../../tests/test_mcp.py)
 
 ## Place a block
