@@ -531,12 +531,13 @@ the previous one. The estimate stays at `0` when the countdown runs out or a
 server update confirms the player stopped gliding. Starting another glide
 requires a fresh boost report for a new countdown.
 
-The value is `None` until a usable report arrives in the current world cycle
-and resets on dimension change, respawn, or disconnect. Reading it sends no
-packets. The estimate measures local elapsed ticks and cannot identify the
-server tick when the firework stops affecting motion. `wait_for_glide_boost`
-still waits for a future report and includes the server's last handled input
-tick in its event.
+The value is `None` until a usable report arrives in the current world cycle.
+It resets on dimension change, respawn, or disconnect and is unavailable if
+the client clock stops. Reading it sends no packets. The estimate measures
+local elapsed ticks and cannot identify the server tick when the firework
+stops affecting motion. While the packet stream is open, `wait_for_glide_boost`
+still observes future reports and includes the server's last handled input
+tick in its event, even if the client clock has stopped.
 
 ## Find a nearby or targeted entity
 

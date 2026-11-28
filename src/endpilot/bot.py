@@ -572,7 +572,7 @@ class Bot:
             if (session._dimensions.active is not None or session._end_state.result is not None
                     or session.packets._reader_end_result()[0]):
                 return None
-            return session.clock.tick
+            return session.clock._tick_if_open()
 
         player_state = self._player_state = PlayerState(
             session.packets, session.player_id, unique_id=session.player_unique_id,

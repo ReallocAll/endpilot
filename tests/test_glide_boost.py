@@ -185,6 +185,64 @@ class GlideBoostTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await waiting, GlideBoostEvent(1, 25, 175))
         self.assertIsNone(legacy.estimated_glide_boost_ticks_remaining)
 
+    async def test_stopped_clock_hides_estimates_but_not_live_reports(self):
+        bot, wire = await self.join(runtime_id=1)
+        await self.deliver(bot, wire, STOCK_BOOSTS[28])
+        self.assertEqual(bot.estimated_glide_boost_ticks_remaining, 28)
+        await bot._clock.close()
+        try:
+            with self.assertRaisesRegex(ConnectionError, "client clock closed"):
+                bot.get_tick()
+            self.assertIsNone(bot.session_end)
+            self.assertIsNone(bot.estimated_glide_boost_ticks_remaining)
+
+            waiting = asyncio.create_task(bot.wait_for_glide_boost(timeout=1))
+            await asyncio.sleep(0)
+            await self.deliver(bot, wire, STOCK_BOOSTS[30])
+            self.assertEqual(await waiting, GlideBoostEvent(1, 30, 174))
+            self.assertIsNone(bot.estimated_glide_boost_ticks_remaining)
+        finally:
+            with self.assertRaisesRegex(ConnectionError, "client clock closed"):
+                await bot.close()
+        self.assertTrue(wire.closed)
+
+    async def test_scheduled_send_failure_hides_estimates_but_not_live_reports(self):
+        bot, wire = await self.join(runtime_id=1)
+        b = bot.protocol.binding
+        await self.deliver(bot, wire, b.MovePlayerPacket(
+            player_id=1, pos=b.Vec3(x=0.5, y=101.62, z=0.5), on_ground=True, reset_position=2,
+        ))
+        await bot.wait_for_position_sync(timeout=1)
+        await self.deliver(bot, wire, STOCK_BOOSTS[28])
+        self.assertEqual(bot.estimated_glide_boost_ticks_remaining, 28)
+        failure = OSError("scheduled input write failed")
+
+        async def fail_send():
+            raise failure
+
+        wire.before_send = fail_send
+        await self.clock.wake_at(50)
+        try:
+            with self.assertRaises(OSError) as input_error:
+                await asyncio.wait_for(bot.wait_for_input_end(), 1)
+            self.assertIs(input_error.exception, failure)
+            with self.assertRaises(OSError) as tick_error:
+                bot.get_tick()
+            self.assertIs(tick_error.exception, failure)
+            self.assertIsNone(bot.session_end)
+            self.assertIsNone(bot.estimated_glide_boost_ticks_remaining)
+
+            waiting = asyncio.create_task(bot.wait_for_glide_boost(timeout=1))
+            await asyncio.sleep(0)
+            await self.deliver(bot, wire, STOCK_BOOSTS[30])
+            self.assertEqual(await waiting, GlideBoostEvent(1, 30, 174))
+            self.assertIsNone(bot.estimated_glide_boost_ticks_remaining)
+        finally:
+            with self.assertRaises(OSError) as close_error:
+                await bot.close()
+            self.assertIs(close_error.exception, failure)
+        self.assertTrue(wire.closed)
+
     async def test_public_wait_returns_the_next_own_glide_boost_in_wire_order(self):
         bot, wire = await self.join()
         b = bot.protocol.binding

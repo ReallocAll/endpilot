@@ -84,9 +84,14 @@ class ClientClock:
     def get_tick(self) -> int:
         if self._failure is not None:
             raise self._failure
-        if self._closed:
+        tick = self._tick_if_open()
+        if tick is None:
             raise ConnectionError("client clock closed")
-        return self.tick
+        return tick
+
+    def _tick_if_open(self) -> int | None:
+        """Read the executed count for an observation that needs an open clock."""
+        return None if self._closed else self.tick
 
     async def wait_ticks(self, ticks: int) -> int:
         return await self.wait_until_tick(self.tick + ticks)
