@@ -3398,9 +3398,9 @@ class Bot:
         """Observe future joins and departures on the server's player list.
 
         The synchronous callback receives the joined or last departed member
-        snapshot after each membership change. The optional UUID filter also
-        matches future rejoins. Returns an idempotent unsubscribe function.
-        The subscription ends with the session.
+        snapshot after the entry and its visible actor associations are applied.
+        The optional UUID filter also matches future rejoins. Returns an
+        idempotent unsubscribe function. The subscription ends with the session.
         """
         if self._entities is None:
             raise RuntimeError("player has not joined")

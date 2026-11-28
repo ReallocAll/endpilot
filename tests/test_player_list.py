@@ -827,6 +827,50 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(report.call_args_list), 1)
         self.assertIsInstance(report.call_args.args[0]["exception"], ValueError)
 
+    async def test_membership_join_applies_visible_identity_before_each_callback(self):
+        b = self.binding
+        peer, zero, removed, unseen = (UUID(int=index) for index in (110, 111, 112, 113))
+        runtimes = {peer: 201, zero: 202, removed: 203, unseen: 204}
+        await self.join(*(self.player_spawn(uuid, runtimes[uuid], 0, b.GameType.DEFAULT)
+                          for uuid in (peer, zero, removed)))
+        await self.deliver_through(
+            b.MobArmorEquipmentPacket(
+                runtime_id=201, head=b.SerializedNetworkItemStackDescriptor(id=6, stack_size=1),
+            ),
+            b.RemoveActorPacket(entity_id=303),
+        )
+        self.assertEqual([(actor.runtime_id, actor.entity_id) for actor in self.bot.observed_entities],
+                         [(201, 0), (202, 0), (203, 0)])
+        self.assertIsNone(self.bot.observed_player_equipment(201).entity_id)
+        self.assertEqual(self.bot.observed_players, ())
+        memberships, packet_views = [], []
+
+        def observe(event):
+            runtime_id = runtimes[event.player.uuid]
+            actor = next((actor for actor in self.bot.observed_entities if actor.runtime_id == runtime_id), None)
+            equipment = self.bot.observed_player_equipment(runtime_id)
+            memberships.append((event, tuple(player.uuid for player in self.bot.observed_players), actor, equipment))
+
+        self.bot.subscribe_player_membership(observe)
+        self.bot.subscribe_player_list_updates(lambda _: packet_views.append(self.bot.observed_entities))
+        await self.deliver_through(self.roster(entries=[
+            self.add(peer, "Visible", id=301), self.add(zero, "Without identity"),
+            self.add(removed, "Previously removed", id=303), self.add(unseen, "Unseen", id=304),
+        ]))
+
+        peers = tuple(runtimes)
+        self.assertEqual([(event.kind, event.player.uuid, event.player.entity_id, roster)
+                          for event, roster, _, _ in memberships],
+                         [("joined", uuid, entity_id, peers[:index])
+                          for index, (uuid, entity_id) in enumerate(zip(peers, (301, 0, 303, 304)), start=1)])
+        _, _, actor, equipment = memberships[0]
+        self.assertEqual((actor.entity_id, equipment.entity_id, equipment.head.item_id), (301, 301, 6))
+        self.assertEqual(memberships[1][2].entity_id, 0)
+        self.assertIsNone(memberships[1][3].entity_id)
+        self.assertEqual([item[2:] for item in memberships[2:]], [(None, None), (None, None)])
+        self.assertEqual([[(actor.runtime_id, actor.entity_id) for actor in actors] for actors in packet_views],
+                         [[(201, 301), (202, 0)]])
+
     async def test_reader_failure_releases_subscription_callbacks(self):
         await self.join()
 

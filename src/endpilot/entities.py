@@ -750,8 +750,7 @@ class Entities:
     def _record_player_list_add(
         self, player: PlayerListEntry, runtime_id: int | None,
         observers: tuple[Callable[[PlayerListEntry], None], ...],
-        membership_observers: tuple[Callable[[PlayerMembershipEvent], None], ...],
-    ) -> None:
+    ) -> PlayerListEntry | None:
         previous = self._players_by_uuid.get(player.uuid)
         instance = self._actor_instances.get(runtime_id)
         pending = None
@@ -766,10 +765,54 @@ class Entities:
         updated = replace(player, game_mode=mode) if mode is not None else player
         self._players_by_uuid[player.uuid] = updated
         if previous is None:
-            if membership_observers:
-                self.packets._notify(membership_observers, PlayerMembershipEvent("joined", updated))
-        elif observers and updated != previous:
+            return updated
+        if observers and updated != previous:
             self.packets._notify(observers, updated)
+        return None
+
+    def _associate_player_list_actor(
+        self, player: PlayerListEntry, runtime_id: int | None,
+        lifecycle_events: list[EntityLifecycleEvent] | None,
+    ) -> None:
+        if runtime_id is None or (state := self._by_runtime.get(runtime_id)) is None:
+            return
+        entity_id = player.entity_id
+        if not entity_id:
+            # A roster entry without a unique ID supplies no new entity identity.
+            return
+        since = self._unidentified_equipment_since.pop(runtime_id, None)
+        if since is not None and self._equipment_removal_may_match(since, entity_id):
+            self._forget_runtime(runtime_id, lifecycle_events=lifecycle_events)
+            return
+        feet = self._player_feet_by_runtime.get(runtime_id)
+        changes = self._unresolved_ride_changes
+        if feet is not None and not state.entity_id and changes:
+            _, observed_epoch = feet
+            # A late identity can expose a ride after the foot observation.
+            # If older changes have expired, that interval is unverified.
+            if (observed_epoch + 1 < changes[0][0] or any(
+                epoch > observed_epoch and rider == entity_id for epoch, rider in changes
+            )):
+                feet = None
+        identity_matches = (runtime_id in self._player_views
+                            and self._animation_entity_id(runtime_id) in (None, entity_id))
+        state = replace(state, entity_id=entity_id)
+        self._record(state, player_uuid=player.uuid, player_feet=feet, new_instance=False,
+                     identity_matches=identity_matches, lifecycle_events=lifecycle_events)
+        equipment = self._player_equipment.get(runtime_id)
+        if equipment is None:
+            return
+        if equipment.entity_id is None:
+            self._player_equipment[runtime_id] = replace(equipment, entity_id=entity_id)
+        elif equipment.entity_id != entity_id:
+            self._forget_player_equipment(runtime_id)
+            self._player_views.pop(runtime_id, None)
+            state = self._by_runtime[runtime_id]
+            if (state.last_observed_offhand is not None or state.gliding is not None
+                    or state.sneaking is not None or state.sleeping is not None):
+                self._by_runtime[runtime_id] = replace(
+                    state, last_observed_offhand=None, gliding=None, sneaking=None, sleeping=None,
+                )
 
     def _record_player_game_mode(self, player: PlayerListEntry, mode: GameType, *, startup: bool) -> None:
         if player.game_mode == mode:
@@ -1910,45 +1953,10 @@ class Entities:
                     observed_changes.append(change)
                 runtime_id = self._player_runtime_by_uuid.get(change.uuid)
                 if change.player is not None:
-                    self._record_player_list_add(change.player, runtime_id, player_observers, membership_observers)
-                    state = self._by_runtime.get(runtime_id)
-                    if state is not None:
-                        entity_id = change.player.entity_id
-                        if not entity_id:
-                            # A roster entry without a unique ID supplies no new entity identity.
-                            continue
-                        since = self._unidentified_equipment_since.pop(runtime_id, None)
-                        if since is not None and self._equipment_removal_may_match(since, entity_id):
-                            self._forget_runtime(runtime_id, lifecycle_events=lifecycle_events)
-                            continue
-                        feet = self._player_feet_by_runtime.get(runtime_id)
-                        changes = self._unresolved_ride_changes
-                        if feet is not None and not state.entity_id and changes:
-                            _, observed_epoch = feet
-                            # A late identity can expose a ride after the foot observation.
-                            # If older changes have expired, that interval is unverified.
-                            if (observed_epoch + 1 < changes[0][0] or any(
-                                epoch > observed_epoch and rider == entity_id for epoch, rider in changes
-                            )):
-                                feet = None
-                        identity_matches = (runtime_id in self._player_views
-                                            and self._animation_entity_id(runtime_id) in (None, entity_id))
-                        state = replace(state, entity_id=entity_id)
-                        self._record(state, player_uuid=change.uuid, player_feet=feet, new_instance=False,
-                                     identity_matches=identity_matches, lifecycle_events=lifecycle_events)
-                        equipment = self._player_equipment.get(runtime_id)
-                        if equipment is not None:
-                            if equipment.entity_id is None:
-                                self._player_equipment[runtime_id] = replace(equipment, entity_id=entity_id)
-                            elif equipment.entity_id != entity_id:
-                                self._forget_player_equipment(runtime_id)
-                                self._player_views.pop(runtime_id, None)
-                                state = self._by_runtime[runtime_id]
-                                if (state.last_observed_offhand is not None or state.gliding is not None
-                                        or state.sneaking is not None or state.sleeping is not None):
-                                    self._by_runtime[runtime_id] = replace(
-                                        state, last_observed_offhand=None, gliding=None, sneaking=None, sleeping=None,
-                                    )
+                    joined = self._record_player_list_add(change.player, runtime_id, player_observers)
+                    self._associate_player_list_actor(change.player, runtime_id, lifecycle_events)
+                    if joined is not None and membership_observers:
+                        self.packets._notify(membership_observers, PlayerMembershipEvent("joined", joined))
                 else:
                     removed = self._players_by_uuid.pop(change.uuid, None)
                     if removed is not None and (runtime_id is None

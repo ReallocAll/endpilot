@@ -271,7 +271,9 @@ includes any skin and game mode observed by the time of the event. Omit
 `player_uuid` to observe all members. Repeated adds and removals of unknown
 UUIDs are silent. After each membership transition the callback can read
 `observed_players` as of that entry, including when a single packet contains
-several transitions. Membership continues outside the visible entity range.
+several transitions. A join callback can also read the visible actor and
+equipment identity associations applied by that entry. Membership continues
+outside the visible entity range.
 
 These subscriptions receive future observations during the joined session. Use
 `observed_players` to read the roster and skins already observed during join.
