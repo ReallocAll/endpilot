@@ -200,8 +200,10 @@ read `bot.furnace_progress` or `bot.brewing_progress` separately. See the item
 reference for [crafting grids](../reference/items.md#craft-from-the-observed-recipe-book),
 [enchanting](../reference/items.md#observe-enchanting-choices), and
 [anvil previews](../reference/items.md#preview-anvil-costs). For villager
-exchanges, use `open_trade()` and `execute_trade()` with the current server
-quote in place of storage transfers.
+exchanges, use `open_trade()` and the current server quote with
+`execute_trade()` or `trade_many()`. For supported native economy quotes,
+`trade_many()` uses the payable count advertised by the server, including
+a discounted first ingredient such as a Hero of the Village quote.
 
 ## Choose ranges and interpret partial results
 

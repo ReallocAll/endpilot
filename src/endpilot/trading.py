@@ -188,11 +188,14 @@ def _recipe_terms(recipe, *, economy_price: bool = False, block_id_mode: _BlockI
     demand = _number(recipe, "demand")
     if "demand" in recipe and (demand is None or demand < 0):
         return None
-    adjusted_a = demand is not None and demand > 0
+    base_a = _lookup(recipe, "buyCountA")
+    # Native quotes also report a reduced payable count with zero demand.
+    adjusted_a = demand is not None and (
+        demand > 0 or (isinstance(base_a, nbt.IntTag) and buy_a.count < base_a.value)
+    )
     if adjusted_a:
-        buy_a = _lookup(recipe, "buyA")
-        count_a = _lookup(buy_a, "Count") if isinstance(buy_a, nbt.CompoundTag) else None
-        base_a = _lookup(recipe, "buyCountA")
+        buy_a_tag = _lookup(recipe, "buyA")
+        count_a = _lookup(buy_a_tag, "Count") if isinstance(buy_a_tag, nbt.CompoundTag) else None
         multiplier = _lookup(recipe, "priceMultiplierA")
         if (not economy_price or not isinstance(demand_tag, nbt.IntTag)
                 or not isinstance(count_a, nbt.ByteTag) or count_a.value <= 0

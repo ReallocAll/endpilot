@@ -648,14 +648,14 @@ class TradeManyTests(unittest.IsolatedAsyncioTestCase):
         for observer in tuple(self.observers):
             observer(raw)
 
-    def native_quote(self, *recipes):
+    def native_quote(self, *recipes, economy=True, new_screen=True):
         from bedrock_protocol import nbt
 
         data = nbt.CompoundTag({"Recipes": nbt.ListTag(list(recipes), int(nbt.Type.COMPOUND))})
         packet = self.b.UpdateTradePacket(
             container_id=7, type=self.b.ContainerType.TRADE, size=len(recipes), trader_tier=0,
             entity_unique_id=42, last_trading_player=1, display_name="Librarian",
-            use_new_trade_screen=True, using_economy_trade=True, data=data,
+            use_new_trade_screen=new_screen, using_economy_trade=economy, data=data,
         )
         self.dispatch(self.codec.encode(packet))
 
@@ -672,6 +672,29 @@ class TradeManyTests(unittest.IsolatedAsyncioTestCase):
             "buyCountA": nbt.IntTag(9), "buyCountB": nbt.IntTag(1),
             "sell": item("minecraft:enchanted_book", 1),
         })
+
+    def hero_price_recipe(self, payable=16):
+        from bedrock_protocol import nbt
+
+        recipe = self.native_recipe(123)
+        recipe["buyA"] = nbt.CompoundTag({
+            "Name": nbt.StringTag("minecraft:carrot"), "Count": nbt.ByteTag(payable),
+            "Damage": nbt.ShortTag(32767), "WasPickedUp": nbt.ByteTag(0),
+        })
+        del recipe["buyB"]
+        recipe["buyCountA"] = nbt.IntTag(22)
+        recipe["buyCountB"] = nbt.IntTag(0)
+        recipe["demand"] = nbt.IntTag(0)
+        recipe["priceMultiplierA"] = nbt.FloatTag(0.05)
+        recipe["sell"] = nbt.CompoundTag({
+            "Name": nbt.StringTag("minecraft:emerald"), "Count": nbt.ByteTag(1),
+        })
+        return recipe
+
+    def observe_discount_materials(self):
+        self.trading.item_names[4] = "minecraft:carrot"
+        self.observe_player_slot(0, 4, 16, 100)
+        self.observe_player_slot(1, 0, 0, None)
 
     def pumpkin_quote(self, *, block=None, mode="hashed", name="minecraft:pumpkin", two_inputs=False):
         from bedrock_protocol import nbt
@@ -1405,6 +1428,72 @@ class TradeManyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((first.actions[0].amount, second.actions[0].amount), (61, 1))
         reply = await self.answer_exchange()
         self.assertEqual([int(action.amount) for action in reply.actions[2:4]], [61, 1])
+
+    async def answer_discounted_exchange(self, *, reprice=False):
+        stage = await self.answer_stage(1)
+        self.assertEqual((stage.actions[0].amount, self.inventory.slots[0].stack_size), (16, 0))
+        exchange = await self.next_request()
+        consume, = (action for action in exchange.actions if isinstance(
+            action, self.b.ItemStackRequestCereal.ConsumeActionData
+        ))
+        self.assertEqual((consume.amount, consume.source.slot, consume.source.net_id_variant), (16, 4, 501))
+        if reprice:
+            window = self.containers.window
+            self.native_quote(self.hero_price_recipe(22))
+            self.assertIs(self.containers.window, window)
+        output = exchange.actions[-1].destination.slot
+        self.receipt(exchange, [self.input_slot(1, 0), self.player_slot(output, 1, 800 + output)])
+        return output
+
+    async def test_native_hero_quote_trades_for_payable_amount_when_base_is_unaffordable(self):
+        self.observe_discount_materials()
+        self.native_quote(self.hero_price_recipe())
+        trade = asyncio.create_task(self.bot.trade_many(123, 1))
+        output = await self.answer_discounted_exchange()
+        result = await trade
+        self.assertEqual((result.stop_reason, result.confirmed_count), ("complete", 1))
+        self.assertEqual([(step.ingredient, step.status) for step in result.requests], [(1, "confirmed"), (None, "confirmed")])
+        self.assertEqual((self.inventory.slots[output].id, self.inventory.slots[output].stack_size), (1, 1))
+        self.assertTrue(self.sent.empty())
+
+    async def test_native_hero_quote_reprice_keeps_confirmation_of_already_sent_exchange(self):
+        self.observe_discount_materials()
+        self.native_quote(self.hero_price_recipe())
+        trade = asyncio.create_task(self.bot.trade_many(123, 2))
+        await self.answer_discounted_exchange(reprice=True)
+        result = await trade
+        self.assertEqual((result.stop_reason, result.confirmed_count), ("quote_changed", 1))
+        self.assertEqual(len(result.requests), 2)
+        self.assertTrue(self.sent.empty())
+
+    async def test_discount_requires_native_economy_fields_and_keeps_other_predicates_strict(self):
+        from bedrock_protocol import nbt
+
+        known_second = self.native_recipe(123)["buyB"]
+        self.observe_discount_materials()
+        for label, changes, flags in (
+            ("ordinary screen", {}, {"new_screen": False}),
+            ("non-economy", {}, {"economy": False}),
+            ("missing demand", {"demand": None}, {}),
+            ("short demand", {"demand": nbt.ShortTag(0)}, {}),
+            ("negative demand", {"demand": nbt.IntTag(-1)}, {}),
+            ("non-native base", {"buyCountA": nbt.ShortTag(22)}, {}),
+            ("missing multiplier", {"priceMultiplierA": None}, {}),
+            ("invalid multiplier", {"priceMultiplierA": nbt.FloatTag(float("nan"))}, {}),
+            ("unknown predicate", {"extraPredicate": nbt.IntTag(1)}, {}),
+            ("second price mismatch", {"buyB": known_second, "buyCountB": nbt.IntTag(2)}, {}),
+        ):
+            with self.subTest(label=label):
+                recipe = self.hero_price_recipe()
+                for name, replacement in changes.items():
+                    if replacement is None:
+                        del recipe[name]
+                    else:
+                        recipe[name] = replacement
+                self.native_quote(recipe, **flags)
+                result = await self.bot.trade_many(123, 1)
+                self.assertEqual((result.stop_reason, result.confirmed_count, result.requests), ("unsupported_quote", 0, ()))
+                self.assertTrue(self.sent.empty())
 
     async def test_price_update_during_sent_exchange_confirms_old_trade_then_replans_only_on_new_call(self):
         self.quote(emeralds=18)
