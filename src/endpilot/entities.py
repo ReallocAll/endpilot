@@ -394,6 +394,14 @@ class PlayerListChange:
 
 
 @dataclass(frozen=True, slots=True)
+class PlayerMembershipEvent:
+    """One transition into or out of the server's player list."""
+
+    kind: Literal["joined", "left"]
+    player: PlayerListEntry
+
+
+@dataclass(frozen=True, slots=True)
 class VehicleLink:
     """A server-observed ride. Runtime IDs are absent until the actors are known."""
 
@@ -638,6 +646,7 @@ class Entities:
         self._own_uuid = own_uuid
         self._players_by_uuid: dict[UUID, PlayerListEntry] = {}
         self._player_list_observers: list[Callable[[tuple[PlayerListChange, ...]], None]] = []
+        self._player_membership_observers: list[Callable[[PlayerMembershipEvent], None]] = []
         self._player_skin_observers: list[Callable[[PlayerListEntry], None]] = []
         self._player_change_observers: list[Callable[[PlayerListEntry], None]] = []
         self._last_skin_update: tuple[RawPacket, UUID] | None = None
@@ -706,6 +715,7 @@ class Entities:
         self._last_pickup = None
         self._last_skin_update = None
         self._player_list_observers.clear()
+        self._player_membership_observers.clear()
         self._player_skin_observers.clear()
         self._player_change_observers.clear()
         self._lifecycle_observers.clear()
@@ -740,6 +750,7 @@ class Entities:
     def _record_player_list_add(
         self, player: PlayerListEntry, runtime_id: int | None,
         observers: tuple[Callable[[PlayerListEntry], None], ...],
+        membership_observers: tuple[Callable[[PlayerMembershipEvent], None], ...],
     ) -> None:
         previous = self._players_by_uuid.get(player.uuid)
         instance = self._actor_instances.get(runtime_id)
@@ -754,7 +765,10 @@ class Entities:
             mode = pending[1]
         updated = replace(player, game_mode=mode) if mode is not None else player
         self._players_by_uuid[player.uuid] = updated
-        if observers and previous is not None and updated != previous:
+        if previous is None:
+            if membership_observers:
+                self.packets._notify(membership_observers, PlayerMembershipEvent("joined", updated))
+        elif observers and updated != previous:
             self.packets._notify(observers, updated)
 
     def _record_player_game_mode(self, player: PlayerListEntry, mode: GameType, *, startup: bool) -> None:
@@ -801,6 +815,17 @@ class Entities:
                 callback(changes)
 
         return self.packets._subscribe(self._player_list_observers, observe)
+
+    def subscribe_player_membership(
+        self, callback: Callable[[PlayerMembershipEvent], None], *, player_uuid: UUID | None = None,
+    ) -> Callable[[], None]:
+        self._require_live()
+
+        def observe(event: PlayerMembershipEvent) -> None:
+            if player_uuid is None or event.player.uuid == player_uuid:
+                callback(event)
+
+        return self.packets._subscribe(self._player_membership_observers, observe)
 
     async def wait_for_player_skin_update(
         self, player_uuid: UUID, *, timeout: float | None,
@@ -1877,6 +1902,7 @@ class Entities:
             packet = self.packets.protocol.decode(raw)
             observers = tuple(self._player_list_observers)
             player_observers = () if startup else tuple(self._player_change_observers)
+            membership_observers = () if startup else tuple(self._player_membership_observers)
             observed_changes = [] if observers else None
             for entry in packet.entries:
                 change = _player_list_change(entry)
@@ -1884,7 +1910,7 @@ class Entities:
                     observed_changes.append(change)
                 runtime_id = self._player_runtime_by_uuid.get(change.uuid)
                 if change.player is not None:
-                    self._record_player_list_add(change.player, runtime_id, player_observers)
+                    self._record_player_list_add(change.player, runtime_id, player_observers, membership_observers)
                     state = self._by_runtime.get(runtime_id)
                     if state is not None:
                         entity_id = change.player.entity_id
@@ -1930,6 +1956,8 @@ class Entities:
                         self._forget_links(removed.entity_id)
                     if runtime_id is not None:
                         self._forget_runtime(runtime_id, lifecycle_events=lifecycle_events, reason="roster_removed")
+                    if removed is not None and membership_observers:
+                        self.packets._notify(membership_observers, PlayerMembershipEvent("left", removed))
             if observed_changes:
                 self.packets._notify(observers, tuple(observed_changes))
         elif packet_id == b.UpdatePlayerGameTypePacket.ID:

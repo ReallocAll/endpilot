@@ -263,7 +263,17 @@ packet updates the same UUID more than once, each change has its own snapshot
 in packet order. A player-list packet subscription still sees the whole
 applied packet.
 
-All three subscriptions receive future observations during the joined session. Use
+`bot.subscribe_player_membership(callback, player_uuid=...)` observes when a
+UUID enters or leaves the server's player list. The callback receives a
+`PlayerMembershipEvent` with `kind` equal to `"joined"` or `"left"` and a
+`player` containing the joined or last listed `PlayerListEntry`. This
+includes any skin and game mode observed by the time of the event. Omit
+`player_uuid` to observe all members. Repeated adds and removals of unknown
+UUIDs are silent. After each membership transition the callback can read
+`observed_players` as of that entry, including when a single packet contains
+several transitions. Membership continues outside the visible entity range.
+
+These subscriptions receive future observations during the joined session. Use
 `observed_players` to read the roster and skins already observed during join.
 Callbacks run synchronously on the packet reader, and the immutable snapshots
 can be retained. Callback failures go to the event loop's exception handler.

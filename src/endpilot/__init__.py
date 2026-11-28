@@ -33,7 +33,7 @@ from .entities import (
     ActorEquipmentSnapshot, EntityActorEvent, EntityAttribute, EntityAttributeModifier, EntityAttributeUpdate,
     EntityCriticalEffect, EntityCursorResult, EntityEffectUpdate, EntityHealthEvent, EntityLifecycleEvent,
     EntityMovementUpdate, EntitySwing, EntityVisibleEffectUpdate, ItemPickup, PaintingSnapshot, PlayerEquipmentSnapshot,
-    PlayerListChange, PlayerListEntry, ShieldBlockEvent, VehicleLink, VehicleLinkChange,
+    PlayerListChange, PlayerListEntry, PlayerMembershipEvent, ShieldBlockEvent, VehicleLink, VehicleLinkChange,
 )
 from .entity_registry import (
     EntityRegistryEntry, EntityRegistrySnapshot, VanillaEntityDimensions, vanilla_entity_dimensions,
@@ -194,6 +194,7 @@ __all__ = [
     "PlayerEquipmentSnapshot",
     "PlayerListChange",
     "PlayerListEntry",
+    "PlayerMembershipEvent",
     "PlayerRespawnPoint",
     "PlayerSkinSnapshot",
     "PlayerVitals",

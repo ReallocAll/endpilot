@@ -47,7 +47,8 @@ from .entities import (
     ActorEquipmentSnapshot, Entities, EntityActorEvent, EntityAttributeUpdate, EntityCriticalEffect,
     EntityCriticalEffectKind, EntityCursorResult, EntityEffectUpdate, EntityHealthEvent, EntityHealthEventKind, EntityLifecycleEvent,
     EntityMovement, EntityMovementUpdate, EntitySpawn, EntityState, EntitySwing, EntityVisibleEffectUpdate, ItemPickup,
-    PlayerEquipmentSnapshot, PlayerListChange, PlayerListEntry, ShieldBlockEvent, VehicleLink, VehicleLinkChange,
+    PlayerEquipmentSnapshot, PlayerListChange, PlayerListEntry, PlayerMembershipEvent, ShieldBlockEvent,
+    VehicleLink, VehicleLinkChange,
 )
 from .expression import skin_packet
 from .fishing import Fishing, FishingResult
@@ -3390,6 +3391,20 @@ class Bot:
         if self._entities is None:
             raise RuntimeError("player has not joined")
         return self._entities.subscribe_player_list_updates(callback, action=action, player_uuid=player_uuid)
+
+    def subscribe_player_membership(
+        self, callback: Callable[[PlayerMembershipEvent], None], *, player_uuid: UUID | None = None,
+    ) -> Callable[[], None]:
+        """Observe future joins and departures on the server's player list.
+
+        The synchronous callback receives the joined or last departed member
+        snapshot after each membership change. The optional UUID filter also
+        matches future rejoins. Returns an idempotent unsubscribe function.
+        The subscription ends with the session.
+        """
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return self._entities.subscribe_player_membership(callback, player_uuid=player_uuid)
 
     async def wait_for_player_skin_update(
         self, player_uuid: UUID, *, timeout: float | None = 15,
