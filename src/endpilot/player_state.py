@@ -167,6 +167,7 @@ class PlayerState:
         self.air_supply_max: int | None = None
         self.experience_level: int | None = None
         self.experience_progress: float | None = None
+        self._experience_observers: dict[object, Callable[[PlayerVitals], None]] = {}
         self._effects: dict[int, PlayerEffect] = {}
         self._auto_respawn = False
         self._cycle: _RespawnCycle | None = None
@@ -200,6 +201,16 @@ class PlayerState:
             air_supply=self.air_supply, air_supply_max=self.air_supply_max,
             experience_level=self.experience_level, experience_progress=self.experience_progress,
         )
+
+    def subscribe_experience(self, callback: Callable[[PlayerVitals], None]) -> Callable[[], None]:
+        observers = self._experience_observers
+        token = object()
+        observers[token] = callback
+
+        def unsubscribe() -> None:
+            observers.pop(token, None)
+
+        return unsubscribe
 
     def status_effects(self) -> tuple[PlayerEffect, ...]:
         return tuple(self._effects[effect_id] for effect_id in sorted(self._effects))
@@ -329,10 +340,12 @@ class PlayerState:
                 elif self._observed_flying is not None or not self._can_attempt_flight():
                     self._reset_flight_target()
         elif raw.packet_id == b.UpdateAttributesPacket.ID:
+            reported_experience = False
             for attribute in self._attributes(raw):
                 field_name = VITAL_ATTRIBUTES.get(attribute.name)
                 if field_name is None:
                     continue
+                reported_experience = reported_experience or field_name in ("experience_level", "experience_progress")
                 value = attribute.current_value
                 if field_name != "experience_level":
                     setattr(self, field_name, float(value))
@@ -342,6 +355,11 @@ class PlayerState:
                     self.experience_level = int(value)
                 else:
                     self.experience_level = None
+            if reported_experience and self._experience_observers:
+                snapshot = self.vitals()
+                for token, callback in tuple(self._experience_observers.items()):
+                    if token in self._experience_observers:
+                        self.packets._notify((callback,), snapshot)
         elif raw.packet_id == b.SetActorDataPacket.ID:
             packet = self.packets.protocol.decode(raw)
             if packet.id == self.runtime_id:
@@ -599,6 +617,7 @@ class PlayerState:
         if not self._closed:
             self._closed = True
             self._on_spawn = None
+            self._end_experience_observation()
             self._unsubscribe()
             for task in self._respawn_tasks:
                 task.cancel()
@@ -607,3 +626,6 @@ class PlayerState:
         self.close()
         if self._respawn_tasks:
             await asyncio.gather(*self._respawn_tasks, return_exceptions=True)
+
+    def _end_experience_observation(self) -> None:
+        self._experience_observers.clear()

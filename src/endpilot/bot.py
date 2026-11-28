@@ -2928,6 +2928,20 @@ class Bot:
             return None
         return _experience_balance(player_state.vitals())
 
+    def subscribe_experience(self, callback: Callable[[PlayerVitals], None]) -> Callable[[], None]:
+        """Observe each future local experience attributes packet in the joined session.
+
+        The synchronous callback receives vitals after the entire packet is
+        applied, including repeated reports. The returned function unsubscribes.
+        """
+        player_state = self._player_state
+        state = self._get_session_end_state()
+        if player_state is None or state is None:
+            raise RuntimeError("player has not joined")
+        if state.result is not None:
+            raise ConnectionError("experience subscription stream is closed")
+        return player_state.subscribe_experience(callback)
+
     async def wait_for_vitals_update(self, *, timeout: float = 15) -> PlayerVitals:
         """Wait for the next change in local-player vitals."""
         if self._player_state is None:
@@ -3729,6 +3743,8 @@ class Bot:
     def _publish_session_end(self, result: SessionEnd) -> None:
         self._placement_completion_observers.clear()
         self._entity_placement_completion_observers.clear()
+        if self._player_state is not None:
+            self._player_state._end_experience_observation()
         for callback in tuple(self._session_end_observers.values()):
             try:
                 callback(result)

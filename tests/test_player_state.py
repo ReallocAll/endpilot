@@ -676,6 +676,75 @@ class VitalSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.vitals, PlayerVitals(experience_level=3, experience_progress=0.5))
         self.assertIsNone(self.bot.experience_balance)
 
+    async def test_experience_subscription_observes_reports_after_whole_packet_application(self):
+        seen = []
+
+        def observe(snapshot):
+            seen.append((snapshot, self.bot.vitals, self.bot.experience_balance))
+
+        with self.assertRaisesRegex(RuntimeError, "player has not joined"):
+            self.bot.subscribe_experience(observe)
+        await self.join(self.attributes(level=16, experience=0.5))
+        self.bot.subscribe_experience(observe)
+        self.assertEqual(seen, [])
+        await self.processed(self.attributes(43, level=0, experience=0), self.attributes(health=12))
+        self.assertEqual(seen, [])
+
+        await self.processed(self.attributes(level=23, experience=0.6428571343421936, health=18))
+        complete = PlayerVitals(health=18, experience_level=23, experience_progress=0.6428571343421936)
+        expected = (complete, complete, ExperienceBalance(77, 50, 801))
+        self.assertEqual(seen, [expected])
+        waiter = asyncio.create_task(self.bot.wait_for_vitals_update(timeout=1))
+        await asyncio.sleep(0)
+        await self.processed(self.attributes(level=23))
+        self.assertEqual(seen, [expected, expected])
+        self.assertFalse(waiter.done())
+
+        await self.processed(self.attributes(experience=0.5))
+        sparse = PlayerVitals(health=18, experience_level=23, experience_progress=0.5)
+        self.assertEqual(await waiter, sparse)
+        self.assertEqual(seen, [expected, expected, (sparse, sparse, ExperienceBalance(77, 39, 790))])
+        with self.assertRaises(FrozenInstanceError):
+            seen[0][0].experience_level = 0
+
+    async def test_experience_subscription_isolates_errors_and_ends_with_its_session(self):
+        errors, seen = [], []
+        loop = asyncio.get_running_loop()
+        self.addCleanup(loop.set_exception_handler, loop.get_exception_handler())
+        loop.set_exception_handler(lambda _, context: errors.append(context["exception"]))
+
+        def failing(_snapshot):
+            raise ValueError("experience observer failed")
+
+        await self.join(self.attributes(level=3, experience=0))
+        self.bot.subscribe_experience(failing)
+        callback = seen.append
+        off = self.bot.subscribe_experience(callback)
+        old = self.bot.subscribe_experience(callback)
+        off()
+        off()
+        await self.processed(self.attributes(experience=0.5))
+        self.assertEqual(seen, [PlayerVitals(experience_level=3, experience_progress=0.5)])
+        self.assertEqual([str(error) for error in errors], ["experience observer failed"])
+        await self.processed(self.b.DisconnectPacket(), self.attributes(level=100))
+        with self.assertRaises(ConnectionError):
+            self.bot.subscribe_experience(callback)
+        await self.bot.close()
+
+        self.transport = Transport()
+        await self.join(self.attributes(level=70, experience=0))
+        off_new = self.bot.subscribe_experience(callback)
+        old()
+        old()
+        self.assertEqual(len(seen), 1)
+        await self.processed(self.attributes(experience=0.25))
+        self.assertEqual(seen, [PlayerVitals(experience_level=3, experience_progress=0.5),
+                                PlayerVitals(experience_level=70, experience_progress=0.25)])
+        off_new()
+        await self.processed(self.attributes(level=69))
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(len(errors), 1)
+
     async def test_dimension_and_respawn_follow_the_reported_updates(self):
         b = self.b
         await self.join(

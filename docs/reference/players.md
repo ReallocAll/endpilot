@@ -103,6 +103,14 @@ latest observed attributes. Sparse updates can change either value on its
 own. Death and respawn follow the received attributes, so a snapshot can
 reflect values received in different packets.
 
+`bot.subscribe_experience(callback)` delivers an immutable `PlayerVitals` to a
+synchronous callback after each local attributes packet that reports a level
+or bar, including repeated reports. A packet containing both fields delivers
+one snapshot, with omitted fields carried from earlier reports. The callback
+can read `bot.experience_balance` to see the balance for that snapshot.
+The subscription starts with future reports in the joined session, sends no
+packets, and ends with that session. Call the returned function to unsubscribe.
+
 ## Observe advertised entity types
 
 `bot.entity_registry` is an immutable snapshot of the entity types advertised
