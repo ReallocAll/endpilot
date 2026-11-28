@@ -159,6 +159,100 @@ class ContainerCursorTests(unittest.IsolatedAsyncioTestCase):
         self.reply(request, [(CHEST, 0, 2, 40), (CURSOR, 0, 3, 41)])
         self.assertEqual((await take).confirmed_count, 3)
 
+    async def test_incomplete_main_take_blocks_ordinary_writes_until_that_slot_is_observed(self):
+        self.open_chest()
+        self.player_slot(9, self.stack(PAPER, 5, 31))
+        self.player_slot(10, self.stack(PAPER, 1, 32))
+        self.cursor()
+        pending = self.hold_requests()
+        take = self.start(self.bot.take_inventory_to_cursor(9, half=True))
+        request = await asyncio.wait_for(pending.get(), 1)
+        self.assert_action(request, "Take", 3, (PLAYER, 9, 31), (CURSOR, 0, 0))
+        self.reply(request, [(CURSOR, 0, 3, 33)])
+        self.assertEqual((await take).stop_reason, "unconfirmed")
+
+        self.cursor(3, 33)
+        self.assertEqual(self.bot.inventory_slots[9].net_id_variant, 31)
+        for function, destination in ((self.bot.put_into_container, 1), (self.bot.move_inventory_item, 11)):
+            attempt = self.start(function(9, destination, 5))
+            submitted = self.start(pending.get())
+            await asyncio.wait((attempt, submitted), timeout=1, return_when=asyncio.FIRST_COMPLETED)
+            if submitted.done():
+                action = range_tests.RangeTransferTests.action(submitted.result())
+                self.fail(f"an unconfirmed slot reached the wire: {action}")
+            self.assertTrue(attempt.done())
+            submitted.cancel()
+            with self.assertRaisesRegex(RuntimeError, "unconfirmed"):
+                await attempt
+        self.assertEqual(len(self.outgoing()), 1)
+
+        put = self.start(self.bot.put_into_container(10, 1, 1))
+        request = await asyncio.wait_for(pending.get(), 1)
+        self.assert_action(request, "Place", 1, (PLAYER, 10, 32), (CHEST, 1, 0))
+        self.reply(request, [(PLAYER, 10, 0, None), (CHEST, 1, 1, 32)])
+        self.assertEqual((await put).result.name, "SUCCESS")
+
+        self.player_slot(9, self.stack(PAPER, 2, 34))
+        put = self.start(self.bot.put_into_container(9, 2, 2))
+        request = await asyncio.wait_for(pending.get(), 1)
+        self.assert_action(request, "Place", 2, (PLAYER, 9, 34), (CHEST, 2, 0))
+        self.reply(request, [(PLAYER, 9, 0, None), (CHEST, 2, 2, 34)])
+        self.assertEqual((await put).result.name, "SUCCESS")
+
+    async def test_return_skips_an_ordinary_request_slot_across_chest_areas(self):
+        pending = self.hold_requests()
+        for area in ("container", "inventory", "reopened_double"):
+            with self.subTest(area=area):
+                in_inventory = area == "inventory"
+                reopened = area == "reopened_double"
+                first = 40 if reopened else 0
+                width = 54 if reopened else 27
+                if reopened:
+                    self.observe_chest_pair()
+                stacks = ([self.stack()] * first
+                          + [self.stack(PAPER, 20, 31), self.stack(PAPER, 20, 32)])
+                self.open_chest(*stacks, width=width)
+                self.cursor(2, 35)
+                self.player_slot(9, self.stack(PAPER, 20, 33))
+                self.player_slot(10, self.stack(PAPER, 20, 34))
+                take = self.start(self.bot.take_from_container(first, 9, 1))
+                held = await asyncio.wait_for(pending.get(), 1)
+                self.assert_action(held, "Take", 1, (CHEST, first, 31), (PLAYER, 9, 33))
+
+                if reopened:
+                    self.close_chest()
+                    self.open_chest(*stacks, position=range_tests.EAST, width=width)
+                    self.cursor(2, 35)
+
+                start = 9 if in_inventory else first
+                destination_area = "inventory" if in_inventory else "container"
+                family, next_id = (PLAYER, 34) if in_inventory else (CHEST, 32)
+                move = self.bot.return_cursor_to_inventory if in_inventory else self.bot.return_cursor_to_container
+                sent = len(self.outgoing())
+                self.assertEqual(await move(range(start, start + 1)), RangeTransferResult(2, (), "unconfirmed"))
+                self.assertEqual(await self.bot.place_one_from_cursor(start, destination_area=destination_area),
+                                 RangeTransferResult(1, (), "unconfirmed"))
+                self.assertEqual(len(self.outgoing()), sent)
+
+                returning = self.start(move(range(start, start + 2)))
+                submitted = self.start(pending.get())
+                await asyncio.wait((returning, submitted), timeout=1, return_when=asyncio.FIRST_COMPLETED)
+                if not submitted.done():
+                    submitted.cancel()
+                    self.reply(held, [(CHEST, first, 19, 31), (PLAYER, 9, 21, 33)])
+                    await take
+                    self.close_chest()
+                    self.assertTrue(returning.done())
+                    self.fail(f"did not use the available slot: {returning.result()}")
+                request = submitted.result()
+                self.assert_action(request, "Place", 2, (CURSOR, 0, 35), (family, start + 1, next_id))
+                self.reply(request, [(CURSOR, 0, 0, None), (family, start + 1, 22, next_id)])
+                self.assertEqual((await returning).confirmed_count, 2)
+                self.assertEqual(len(self.outgoing()), sent + 1)
+                self.reply(held, [(CHEST, first, 19, 31), (PLAYER, 9, 21, 33)])
+                self.assertEqual((await take).result.name, "SUCCESS")
+                self.close_chest()
+
     async def test_late_chest_receipt_does_not_revise_a_cancelled_range_result(self):
         self.open_chest(self.stack(PAPER, 63, 31))
         self.cursor(5, 32)

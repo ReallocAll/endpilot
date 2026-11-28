@@ -2344,12 +2344,14 @@ class Containers:
         item = None if self._slots is None else self._slots.get(index)
         return item if _valid_transfer_stack(item) and self._can_plan_container_slot(index) else None
 
-    def _can_plan_container_slot_write(self, index: int) -> bool:
+    def _can_plan_container_slot_write(self, index: int, *, exclusive_only: bool = True) -> bool:
         entity = self._entity_container
         block_endpoint = self._block_transfer_endpoint(index) if entity is None else None
         endpoint = block_endpoint if entity is None else (entity.instance, index)
         return (endpoint is not None and not self._transfer_slot_is_unconfirmed(index, block_endpoint)
-                and (self.inventory is None or not self.inventory._has_submitted_exchange((endpoint,))))
+                and (self.inventory is None or not self.inventory._has_submitted_request(
+                    (endpoint,), exclusive_only=exclusive_only,
+                )))
 
     async def _move_within_container(self, window, source, destination, amount, *, domain, timeout, expected,
                                      window_is_current, on_submitted, on_confirmed):

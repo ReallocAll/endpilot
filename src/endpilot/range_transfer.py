@@ -251,7 +251,8 @@ async def _transfer_cursor(
                 destinations = {index: item for index in slots
                                 if (item := read_peer(index)) is not None}
                 plan = _plan_step({0: cursor_item}, destinations, item_id, remaining, limit, range(1), slots,
-                                  writable_destination={index for index in destinations if writable(index)})
+                                  writable_destination={index for index in destinations
+                                                        if writable(index, exclusive_only=False)})
                 if isinstance(plan, str):
                     return result(plan)
                 _, index, amount = plan

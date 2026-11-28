@@ -112,16 +112,17 @@ opens a verified double chest with the same slot ordering.
 Call `await bot.return_cursor_to_inventory(range(13, 15))` to place the cursor
 stack in main inventory slots 13 and 14, or call
 `await bot.return_cursor_to_container(range(13, 15))` for chest slots 13 and 14.
-Both calls fill compatible stacks first, then use observed empty slots in the
-range, and stop when authorized space runs out. Each call returns a
+Both calls fill available compatible stacks first, then use available observed
+empty slots in the range. They skip slots with submitted item-stack requests
+and stop when authorized space runs out. Each call returns a
 `RangeTransferResult` with its own confirmed count and step records. Check
 `stop_reason` and the confirmed count before continuing. A timeout or
 cancellation carries `error.transfer_progress`. A step with a request ID and no
 verdict may still complete in the same window.
 
 After rejection or an incomplete receipt, wait for a fresh full cursor report
-in the current window before retrying. A main inventory or chest slot involved
-in a rejected step also needs a fresh description or a matching correction.
+in the current window before retrying. A main inventory or chest slot left
+unconfirmed also needs a fresh description or a matching correction.
 Closing or replacing the window, changing its chest layout, changing dimensions,
 or ending the connection invalidates cursor state for writes.
 `bot.last_cursor_observation` retains the latest historical report during the

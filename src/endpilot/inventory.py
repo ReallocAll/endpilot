@@ -235,8 +235,8 @@ class Inventory:
         self._count_observation_gaps: set[int] = set()
         self._pending_requests = {}
         self._unconfirmed_transfer_slots: set[int] = set()
-        # An ambiguous container swap can change either item identity. All
-        # subsequent item-stack writes need fresh evidence for those endpoints.
+        # A swap or cursor move can leave a slot's identity unconfirmed.
+        # All subsequent item-stack writes need fresh evidence for that slot.
         self._unconfirmed_swap_slots: set[_TransferEndpoint] = set()
         self._qa_requests = {}
         self._request_sends = set()
@@ -655,8 +655,8 @@ class Inventory:
             for owned in pending.endpoints for requested in endpoints
         ))
 
-    def _has_submitted_exchange(self, endpoints, *, except_request=None):
-        return any(other is not except_request and other.submitted and other.exclusive_exchange
+    def _has_submitted_request(self, endpoints, *, except_request=None, exclusive_only=False):
+        return any(other is not except_request and other.submitted and (not exclusive_only or other.exclusive_exchange)
                    for other in self._requests_for_endpoints(endpoints))
 
     def _swap_slots_need_observation(self, endpoints):
@@ -666,9 +666,9 @@ class Inventory:
     def _main_transfer_slot_is_unconfirmed(self, index: int) -> bool:
         return index in self._unconfirmed_transfer_slots or self._swap_slots_need_observation(((None, index),))
 
-    def _can_plan_main_slot_write(self, index: int) -> bool:
+    def _can_plan_main_slot_write(self, index: int, *, exclusive_only: bool = True) -> bool:
         return (not self._main_transfer_slot_is_unconfirmed(index)
-                and not self._has_submitted_exchange(((None, index),)))
+                and not self._has_submitted_request(((None, index),), exclusive_only=exclusive_only))
 
     def _mark_range_overlap(self, endpoints, *, except_request):
         for pending in self._requests_for_endpoints(endpoints, allow_possible=False):
@@ -739,7 +739,7 @@ class Inventory:
         endpoints = self._request_player_endpoints(request) if _endpoints is None else _endpoints
         armor_endpoints = endpoints.intersection(_DAMAGE_ARMOR_SLOTS)
 
-        def require_confirmed_swap_slots():
+        def require_confirmed_endpoints():
             if self._swap_slots_need_observation(endpoints):
                 reason = "unconfirmed" if _range_step else "unconfirmed item-stack slot needs a fresh server observation"
                 raise _InventoryMoveNotSubmitted(reason)
@@ -748,7 +748,7 @@ class Inventory:
         # observation arrives before the send task runs. Deferred transfers
         # build their request after the pending exchange has settled.
         if not _wait_for:
-            require_confirmed_swap_slots()
+            require_confirmed_endpoints()
         reply = asyncio.get_running_loop().create_future()
         pending = _PendingStackRequest(
             reply, apply, endpoints, _range_step, _on_unconfirmed, _on_slot_observed,
@@ -765,9 +765,9 @@ class Inventory:
                                        and (pending.creative_armor or other.creative_armor)
                                        for other in self._requests_for_endpoints(armor_endpoints)):
                 raise RuntimeError("the armor slot has an item-stack request in flight")
-            if self._has_submitted_exchange(endpoints, except_request=pending):
+            if self._has_submitted_request(endpoints, except_request=pending, exclusive_only=True):
                 raise _InventoryMoveNotSubmitted("unconfirmed")
-            require_confirmed_swap_slots()
+            require_confirmed_endpoints()
             if _at_write is not None:
                 if reply.done():
                     raise RuntimeError("item-stack request ended before submission")
@@ -1385,21 +1385,17 @@ class Inventory:
         expected = {peer_endpoint: _stack_snapshot(peer_item), cursor_endpoint: _stack_snapshot(cursor_item)}
         peer_domains = _PLAYER_CONTAINERS if containers is None else ("LEVEL_ENTITY_CONTAINER",)
         known_peer = self._known_main_transfer_slot if containers is None else containers._known_container_cursor_slot
-        mark = index if containers is None else peer_endpoint
         changed = set()
         overlapped = False
 
         def is_current():
             return window_is_current() and (containers is None or containers._block_transfer_endpoint(index) == peer_endpoint)
 
-        def unconfirmed_peers():
-            return self._unconfirmed_transfer_slots if containers is None else self._unconfirmed_swap_slots
-
         def observed_peer():
             return self._slots.get(index) if containers is None else containers._slots.get(index)
 
         def write_peer(updated):
-            unconfirmed_peers().discard(mark)
+            self._unconfirmed_swap_slots.discard(peer_endpoint)
             if containers is None:
                 self._set_slot(index, updated)
             else:
@@ -1428,13 +1424,13 @@ class Inventory:
             if not is_current():
                 raise _InventoryMoveNotSubmitted("window_changed")
             own = self._pending_requests[request_id]
-            if (any(other is not own and other.submitted for other in self._requests_for_endpoints(endpoints))
+            if (self._has_submitted_request(endpoints, except_request=own)
                     or _stack_snapshot(known_peer(index)) != expected[peer_endpoint]
                     or _stack_snapshot(self._cursor_item) != expected[cursor_endpoint]):
                 raise _InventoryMoveNotSubmitted("unconfirmed")
             # The request may change both slots before the next authoritative report.
             self._cursor_item = None
-            unconfirmed_peers().add(mark)
+            self._unconfirmed_swap_slots.add(peer_endpoint)
             on_submitted(request_id)
 
         def observe(endpoint, item):
@@ -1456,7 +1452,7 @@ class Inventory:
             if response.result.name != "SUCCESS":
                 # A rejection alone does not verify the cached peer slot.
                 # A full description received while pending has already cleared the mark.
-                if (not overlapped and mark in unconfirmed_peers() and peer_receipt is not None
+                if (not overlapped and peer_endpoint in self._unconfirmed_swap_slots and peer_receipt is not None
                         and peer_endpoint not in changed):
                     corrected = _correct_observed_item(b, observed_peer(), peer_receipt)
                     if corrected is not None:
@@ -1784,7 +1780,7 @@ class Inventory:
     async def _drop_hotbar_stack(self, whole_stack: bool) -> None:
         slot = self.selected_slot
         endpoints = ((None, slot),)
-        if self._swap_slots_need_observation(endpoints) or self._has_submitted_exchange(endpoints):
+        if self._swap_slots_need_observation(endpoints) or self._has_submitted_request(endpoints, exclusive_only=True):
             raise _InventoryMoveNotSubmitted("unconfirmed drop slot needs a fresh server observation")
         observed = self._slots.get(slot)
         if observed is None:
