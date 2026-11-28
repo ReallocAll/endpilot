@@ -151,9 +151,13 @@ the target block or server state to verify placement.
 
 In Survival on protocol 2225, select a server-observed stack of a supported
 item and move within reach of the required block. Pass that block's
-coordinates to `await bot.place_entity(position, timeout=15)`. The SDK
+coordinates to `await bot.place_entity(position, face=1, timeout=15)`. The SDK
 resolves the selected item name through the current session's registry and
-sends one top-face click when the terrain and held item still match.
+sends one click when the terrain and held item still match. Face `1` selects
+the top. Supported spawn eggs also accept horizontal faces `2` through `5`
+on stone. An unsupported face or surface fails the precondition before
+submission. The face must be an integer from `0` through `5`. Booleans,
+floats, and out-of-range values raise `ValueError`.
 
 | Held item | Observed block | Local click point | Matching `AddActorPacket` |
 | --- | --- | --- | --- |
@@ -164,9 +168,10 @@ sends one top-face click when the terrain and held item still match.
 | `minecraft:hopper_minecart` | Ordinary, powered, activator, or inactive detector rail | `(0.5, 0.125, 0.5)` | `minecraft:hopper_minecart` |
 | `minecraft:armor_stand` | Stone with clearance | `(0.5, 1.0, 0.5)` | `minecraft:armor_stand` |
 | `minecraft:end_crystal` | Obsidian or bedrock with clearance | `(0.5, 1.0, 0.5)` | `minecraft:ender_crystal` |
-| `minecraft:cow_spawn_egg` | Stone with clearance | `(0.5, 1.0, 0.5)` | `minecraft:cow` |
-| `minecraft:zombie_spawn_egg` | Stone with clearance | `(0.5, 1.0, 0.5)` | `minecraft:zombie` |
-| `minecraft:villager_spawn_egg` | Stone with clearance | `(0.5, 1.0, 0.5)` | `minecraft:villager_v2` |
+| `minecraft:cow_spawn_egg` | Spawn egg surfaces below | Face center | `minecraft:cow` |
+| `minecraft:pig_spawn_egg` | Spawn egg surfaces below | Face center | `minecraft:pig` |
+| `minecraft:zombie_spawn_egg` | Spawn egg surfaces below | Face center | `minecraft:zombie` |
+| `minecraft:villager_spawn_egg` | Spawn egg surfaces below | Face center | `minecraft:villager_v2` |
 
 The 22 watercraft use the `minecraft:` namespace and the item names in this
 table.
@@ -191,10 +196,18 @@ ascending, and curved shapes. Powered (`minecraft:golden_rail`), activator,
 and detector rails use `rail_direction` of `0` through `5`. Powered and
 activator rails accept `rail_data_bit` of `0` or `1`. A detector rail requires
 `rail_data_bit=0` before sending and can activate after a minecart spawns.
-Land placements require
-observed air in the two main-layer cells above their support and in layer 1
-of all three cells. The initial `AddActorPacket` matches the world click
-coordinates for boats and land placements, or the rail block center, offset
+The four listed spawn eggs share the same placement rules. Top faces support
+stone, grass blocks, dirt, and oak planks. Vanilla Survival checks exercised
+cow eggs on all four top surfaces and all four stone sides, pig eggs on an
+oak plank top and the east face of stone, zombie eggs on the east face of
+stone, and villager eggs on the south face of stone.
+
+For egg, armor stand, and end crystal placement, the SDK checks the cell adjacent to the
+clicked face and the cell above it for observed air. It also checks layer 1
+of those two cells and the clicked block. A horizontal egg placement can have
+air below the adjacent cell. It matches the spawn at that cell's horizontal
+center and base height. The initial `AddActorPacket` matches the world click
+coordinates for boats and other land placements, or the rail block center, offset
 `(0.5, 0.5, 0.5)`, for minecarts. Coordinates are compared at the wire's
 float32 precision, with a tolerance of `0.001` block per axis for minecarts.
 A minecart's position can change after it spawns.

@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import FrozenInstanceError
+from enum import IntEnum
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -881,8 +882,8 @@ class EntityPlacementTests(_EntityPlacementHarness):
         self.assertEqual((tx.item.id, tx.item.stack_size), (BOAT_ITEM, 1))
         return pending
 
-    async def assert_entity_placement_rejected(self):
-        result = await self.bot.place_entity(SUPPORT, timeout=0.1)
+    async def assert_entity_placement_rejected(self, *, face=1):
+        result = await self.bot.place_entity(SUPPORT, face=face, timeout=0.1)
         self.assertEqual((result.submitted, result.reason), (False, "precondition_failed"))
         self.assertEqual(self.wire.sent, [])
         self.assertEqual(self.completions, [])
@@ -1118,6 +1119,125 @@ class EntityPlacementTests(_EntityPlacementHarness):
         self.assertFalse(pending.done())
         await self.deliver(self.boat_slot(0))
         self.assert_entity_placement_completed(await pending, EntitySpawn(-93, 93, "minecraft:pig", position))
+
+    async def test_cow_egg_top_uses_the_same_center_on_the_observed_surfaces(self):
+        x, y, z = SUPPORT
+        head = (x, y + 2, z)
+        actor_type = "minecraft:cow"
+        point = (x + .5, y + 1, z + .5)
+        await self.deliver(self.registry_packet("minecraft:cow_spawn_egg"), self.block(head),
+                           *(self.block(cell, layer=1) for cell in (SUPPORT, TARGET, head)))
+        for index, block_id in enumerate((STONE, 3727763636, 2186211206, 1921718966), 150):
+            with self.subTest(block_id=block_id):
+                self.wire.sent.clear()
+                self.completions.clear()
+                await self.deliver(self.block(SUPPORT, block_id), self.boat_slot(1))
+                pending = await self.arm_entity(surface=block_id, click_height=1.0)
+                await self.deliver(self.spawn(-index, position=point, actor_type=actor_type), self.boat_slot(0))
+                self.assert_entity_placement_completed(await pending, EntitySpawn(-index, index, actor_type, point))
+
+    async def test_horizontal_egg_click_matches_first_spawn_at_adjacent_cell_base(self):
+        b = self.b
+        x, y, z = SUPPORT
+        actor_type = "minecraft:cow"
+        await self.deliver(self.registry_packet("minecraft:cow_spawn_egg"), self.block(SUPPORT, STONE),
+                           self.block(SUPPORT, layer=1))
+        for face, dx, dz, click in ((2, 0, -1, (.5, .5, 0)), (3, 0, 1, (.5, .5, 1)),
+                                    (4, -1, 0, (0, .5, .5)), (5, 1, 0, (1, .5, .5))):
+            with self.subTest(face=face):
+                self.wire.sent.clear()
+                self.completions.clear()
+                feet, head = (x + dx, y, z + dz), (x + dx, y + 1, z + dz)
+                point = (feet[0] + .5, y, feet[2] + .5)
+                world_hit = (x + click[0], y + click[1], z + click[2])
+                existing_id, wrong_id, expected_id = (-180 - face, -190 - face, -200 - face)
+                existing = self.spawn(existing_id, position=point, actor_type=actor_type)
+                await self.deliver(self.boat_slot(1), existing, self.block(feet), self.block(head),
+                                   *(self.block(cell, layer=1) for cell in (feet, head)))
+                pending = await self.arm_click(self.bot.place_entity(SUPPORT, face=face, timeout=.6))
+                packet, = self.wire.sent
+                tx = packet.variant_transaction
+                self.assertEqual((tx.face, tx.slot, tx.target_block_id), (face, BOAT_SLOT, STONE))
+                self.assertEqual((tx.pos.x, tx.pos.y, tx.pos.z), SUPPORT)
+                self.assertEqual((tx.click_pos.x, tx.click_pos.y, tx.click_pos.z), click)
+                await self.deliver(
+                    self.boat_slot(0), existing, self.spawn(wrong_id, position=world_hit, actor_type=actor_type),
+                    self.spawn(-210 - face, position=point, actor_type="minecraft:pig"),
+                    b.MoveActorAbsolutePacket(move_data=b.MoveActorAbsoluteData(
+                        runtime_id=-wrong_id, pos=b.Vec3(x=point[0], y=point[1], z=point[2]),
+                    )),
+                )
+                self.assertFalse(pending.done())
+                await self.deliver(self.spawn(expected_id, position=point, actor_type=actor_type))
+                self.assert_entity_placement_completed(await pending, EntitySpawn(expected_id, -expected_id, actor_type, point))
+
+    async def test_egg_rejects_unknown_or_obstructed_side_and_rechecks_before_send(self):
+        x, y, z = SUPPORT
+        feet, head = (x + 1, y, z), (x + 1, y + 1, z)
+        await self.deliver(self.registry_packet("minecraft:cow_spawn_egg"), self.boat_slot(1),
+                           self.block(SUPPORT, STONE), self.block(SUPPORT, layer=1))
+        await self.assert_entity_placement_rejected(face=5)
+        await self.deliver(self.block(feet, STONE), self.block(head),
+                           *(self.block(cell, layer=1) for cell in (feet, head)))
+        await self.assert_entity_placement_rejected(face=5)
+        await self.deliver(self.block(feet), self.block(head, WATER, layer=1))
+        await self.assert_entity_placement_rejected(face=5)
+        await self.deliver(self.block(head, layer=1), self.block(SUPPORT, 1921718966))
+        await self.assert_entity_placement_rejected(face=5)
+        await self.deliver(self.block(SUPPORT, STONE))
+
+        async def obstruct(*, timeout):
+            await self.deliver(self.block(head, STONE))
+
+        self.movement.wait_for_position_sync.side_effect = obstruct
+        await self.assert_entity_placement_rejected(face=5)
+        self.assert_observers_restored()
+
+    async def test_late_egg_spawn_does_not_complete_an_expired_side_click(self):
+        x, y, z = SUPPORT
+        feet, head = (x + 1, y, z), (x + 1, y + 1, z)
+        await self.deliver(self.registry_packet("minecraft:cow_spawn_egg"), self.boat_slot(1),
+                           self.block(SUPPORT, STONE), self.block(feet), self.block(head),
+                           *(self.block(cell, layer=1) for cell in (SUPPORT, feet, head)))
+        pending = await self.arm_click(self.bot.place_entity(SUPPORT, face=5, timeout=.12))
+        await self.deliver(self.boat_slot(0))
+        expired = await pending
+        self.assertEqual((expired.submitted, expired.reason, expired.spawn), (True, "timed_out", None))
+        self.assertEqual(expired.inventory_change.after.count, 0)
+        await self.deliver(self.spawn(-217, position=(x + 1.5, y, z + .5), actor_type="minecraft:cow"))
+        self.assertFalse(self.completions)
+        self.assertIsNone(expired.spawn)
+        self.assert_observers_restored()
+
+    async def test_non_egg_faces_and_bottom_are_rejected_and_invalid_face_raises(self):
+        for face in (-1, 6):
+            with self.assertRaisesRegex(ValueError, "placement face"):
+                await self.bot.place_entity(SUPPORT, face=face)
+        await self.assert_entity_placement_rejected(face=2)
+        await self.assert_entity_placement_rejected(face=0)
+        await self.deliver(self.registry_packet("minecraft:cow_spawn_egg"), self.block(SUPPORT, STONE))
+        await self.assert_entity_placement_rejected(face=0)
+
+    async def test_egg_face_rejects_bool_and_float_before_sending_and_accepts_intenum(self):
+        x, y, z = SUPPORT
+        head = (x, y + 2, z)
+        await self.deliver(self.registry_packet("minecraft:cow_spawn_egg"), self.boat_slot(1),
+                           self.block(SUPPORT, STONE), self.block(TARGET), self.block(head),
+                           *(self.block(cell, layer=1) for cell in (SUPPORT, TARGET, head)))
+        for invalid in (True, False, 1.0, 5.0):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "placement face"):
+                    await self.bot.place_entity(SUPPORT, face=invalid, timeout=.05)
+                self.assertEqual(self.wire.sent, [])
+        self.assert_observers_restored()
+
+        face = IntEnum("Face", {"TOP": 1})
+        pending = await self.arm_click(self.bot.place_entity(SUPPORT, face=face.TOP, timeout=.6))
+        packet, = self.wire.sent
+        self.assertEqual(packet.variant_transaction.face, 1)
+        position = (x + .5, y + 1, z + .5)
+        await self.deliver(self.spawn(-218, position=position, actor_type="minecraft:cow"), self.boat_slot(0))
+        self.assert_entity_placement_completed(await pending, EntitySpawn(-218, 218, "minecraft:cow", position))
 
     async def test_bamboo_chest_raft_matches_the_chest_boat_family_and_bamboo_variant(self):
         b = self.b

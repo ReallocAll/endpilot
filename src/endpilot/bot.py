@@ -2413,15 +2413,17 @@ class Bot:
                                                position, timeout=timeout)
 
     async def place_entity(
-        self, position: tuple[int, int, int], *, timeout: float = 15,
+        self, position: tuple[int, int, int], *, face: int = 1, timeout: float = 15,
     ) -> EntityPlacementResult:
         """Place a supported held item with one click on observed terrain in Survival.
 
         Plain, chest, and hopper minecarts use ordinary, powered, activator, or inactive detector rails.
+        Supported spawn eggs use the top of stone, grass blocks, dirt, or oak
+        planks, or a horizontal face of stone with observed clearance.
         Report a matching new spawn and a one-item decrease in the selected slot
         when each observation arrives after submission.
         """
-        return await self._place_entity(position, EntityPlacementResult, timeout)
+        return await self._place_entity(position, EntityPlacementResult, face=face, timeout=timeout)
 
     async def place_oak_boat(
         self, position: tuple[int, int, int], *, timeout: float = 15,
@@ -2432,10 +2434,10 @@ class Bot:
         decrease in the selected slot, when each is observed after submission.
         These server observations carry no request ID linking them to the click.
         """
-        return await self._place_entity(position, BoatPlacementResult, timeout)
+        return await self._place_entity(position, BoatPlacementResult, timeout=timeout)
 
     async def _place_entity[Result: EntityPlacementResult](
-        self, position: tuple[int, int, int], result_type: type[Result], timeout: float,
+        self, position: tuple[int, int, int], result_type: type[Result], *, face: int = 1, timeout: float,
     ) -> Result:
         session = self._session
         containers, blocks, creative, entities = self._containers, self._blocks, self._creative, self._entities
@@ -2443,7 +2445,7 @@ class Bot:
             raise RuntimeError("player has not joined")
         result = await observe_entity_placement(
             containers, blocks, creative, entities, lambda: session.item_registry, position,
-            result_type=result_type, timeout=timeout,
+            result_type=result_type, face=face, timeout=timeout,
         )
         if self._session is session:
             self._notify_placement_completion(result, self._entity_placement_completion_observers,

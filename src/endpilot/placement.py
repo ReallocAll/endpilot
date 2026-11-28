@@ -37,6 +37,13 @@ _WATERCRAFT = {
     )
     for prefix, actor_type in (("", "minecraft:boat"), ("chest_", "minecraft:chest_boat"))
 }
+_SPAWN_EGGS = {
+    "minecraft:cow_spawn_egg": "minecraft:cow",
+    "minecraft:pig_spawn_egg": "minecraft:pig",
+    "minecraft:zombie_spawn_egg": "minecraft:zombie",
+    "minecraft:villager_spawn_egg": "minecraft:villager_v2",
+}
+_EGG_TOP_SURFACES = ("minecraft:stone", "minecraft:grass_block", "minecraft:dirt", "minecraft:oak_planks")
 
 
 @dataclass(frozen=True, slots=True)
@@ -493,9 +500,12 @@ async def observe_entity_placement[Result: EntityPlacementResult](
     position: tuple[int, int, int],
     *,
     result_type: type[Result],
+    face: int = 1,
     timeout: float = 15,
 ) -> Result:
-    """Submit one top-face click and wait for entity and inventory observations."""
+    """Submit one supported face click and wait for entity and inventory observations."""
+    if not isinstance(face, int) or isinstance(face, bool) or face not in FACE_OFFSETS:
+        raise ValueError("placement face must be an integer between 0 and 5")
     if not isfinite(timeout) or timeout < 0:
         raise ValueError("placement timeout must be a finite nonnegative number")
 
@@ -528,8 +538,11 @@ async def observe_entity_placement[Result: EntityPlacementResult](
         return result("precondition_failed")
 
     item_name = registry_name(before.item_id)
+    egg_actor = _SPAWN_EGGS.get(item_name)
     legacy_oak_boat = result_type is BoatPlacementResult
     if legacy_oak_boat and item_name != "minecraft:oak_boat":
+        return result("precondition_failed")
+    if face == 0 or (face != 1 and egg_actor is None):
         return result("precondition_failed")
 
     clicked = blocks.observed_block_state(position)
@@ -555,28 +568,30 @@ async def observe_entity_placement[Result: EntityPlacementResult](
             spawn_offset = (0.5, 0.5, 0.5)
             spawn_tolerance = 0.001
         case _:
-            actor_type = {
-                "minecraft:armor_stand": "minecraft:armor_stand",
-                "minecraft:end_crystal": "minecraft:ender_crystal",
-                "minecraft:cow_spawn_egg": "minecraft:cow",
-                "minecraft:pig_spawn_egg": "minecraft:pig",
-                "minecraft:zombie_spawn_egg": "minecraft:zombie",
-                "minecraft:villager_spawn_egg": "minecraft:villager_v2",
-            }.get(item_name)
-            if actor_type is None:
+            if egg_actor is not None:
+                actor_type = egg_actor
+                supported_blocks = _EGG_TOP_SURFACES if face == 1 else ("minecraft:stone",)
+            elif item_name == "minecraft:armor_stand":
+                actor_type = "minecraft:armor_stand"
+                supported_blocks = ("minecraft:stone",)
+            elif item_name == "minecraft:end_crystal":
+                actor_type = "minecraft:ender_crystal"
+                supported_blocks = ("minecraft:obsidian", "minecraft:bedrock")
+            else:
                 return result("precondition_failed")
-            supported_blocks = (("minecraft:obsidian", "minecraft:bedrock") if item_name == "minecraft:end_crystal"
-                                else ("minecraft:stone",))
             if clicked.name not in supported_blocks:
                 return result("precondition_failed")
+            dx, dy, dz = FACE_OFFSETS[face]
+            adjacent = (x + dx, y + dy, z + dz)
+            head = (x + dx, y + dy + 1, z + dz)
             clearance = (
-                blocks.observed_block((x, y + 1, z)),
-                blocks.observed_block((x, y + 2, z)),
-                *(blocks.observed_block((x, y + offset, z), layer=1) for offset in (0, 1, 2)),
+                blocks.observed_block(adjacent), blocks.observed_block(head),
+                *(blocks.observed_block(cell, layer=1) for cell in (position, adjacent, head)),
             )
             if any(block is None or block.is_air is not True for block in clearance):
                 return result("precondition_failed")
-            click_pos = spawn_offset = (0.5, 1.0, 0.5)
+            click_pos = None  # Use the shared encoder's face center.
+            spawn_offset = (0.5 + dx, dy, 0.5 + dz)
 
     if timeout == 0:
         return result("timed_out")
@@ -656,7 +671,7 @@ async def observe_entity_placement[Result: EntityPlacementResult](
         if movement.input_position is None:
             return "precondition_failed"
         try:
-            await containers.click_block(position, blocks, face=1, click_pos=click_pos, _before_send=before_send)
+            await containers.click_block(position, blocks, face=face, click_pos=click_pos, _before_send=before_send)
         except _PreconditionChanged:
             return "precondition_failed"
         except Exception:
