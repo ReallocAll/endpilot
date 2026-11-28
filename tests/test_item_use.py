@@ -13,7 +13,6 @@ class ItemUseTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.bot = Bot("ItemUser", protocol=2225)
         self.b = self.bot.protocol.binding
-        self.incoming = asyncio.Queue()
         self.sent = asyncio.Queue()
         self.send_gate = None
         self.send_error = None
@@ -28,10 +27,15 @@ class ItemUseTests(unittest.IsolatedAsyncioTestCase):
                     if self.send_error is not None:
                         raise self.send_error
 
-        transport = SimpleNamespace(send=send, recv=self.incoming.get, close=AsyncMock())
+        self.send = send
+        await self.join()
+
+    async def join(self, *before_spawn, before_game=()):
+        self.incoming = asyncio.Queue()
+        transport = SimpleNamespace(send=self.send, recv=self.incoming.get, close=AsyncMock())
         b = self.b
         self.enqueue(b.NetworkSettingsPacket(compression_algorithm=b.PacketCompressionAlgorithm.NONE))
-        self.enqueue(b.StartGamePacket(runtime_id=1, entity_id=2),
+        self.enqueue(*before_game, b.StartGamePacket(runtime_id=1, entity_id=2), *before_spawn,
                      b.PlayStatusPacket(status=b.PlayStatus.PLAYER_SPAWN))
         with patch("endpilot.transport.nethernet.connect", return_value=transport):
             await self.bot.join_nethernet("http://127.0.0.1:19152")
@@ -64,6 +68,42 @@ class ItemUseTests(unittest.IsolatedAsyncioTestCase):
         return b.SetActorDataPacket(id=player_id, packed_items=b.SynchedActorData.CopyableDataList(data=[
             b.DataItemEntry(id=0, payload=b.DataItemInt64Payload(value=(1 << int(b.ActorFlags.USINGITEM)) if value else 0)),
         ]))
+
+    async def test_login_keeps_last_valid_own_using_flag_in_receive_order(self):
+        b = self.b
+        missing = b.SetActorDataPacket(id=1)
+        other_respawn = b.RespawnPacket(runtime_id=2, state=b.PlayerRespawnState.READY_TO_SPAWN)
+        await self.bot.close()
+        await self.join(self.using(False, player_id=2), missing, other_respawn, before_game=(self.using(True),))
+        self.assertIs(self.bot.using_item, True)
+
+        await self.bot.close()
+        await self.join(self.using(True), self.using(False), self.using(True, player_id=2), missing)
+        self.assertIs(self.bot.using_item, False)
+
+    async def test_login_using_observation_respects_dimension_and_own_respawn_order(self):
+        b = self.b
+        resets = (b.ChangeDimensionPacket(dimension_id=1),
+                  b.RespawnPacket(runtime_id=0, state=b.PlayerRespawnState.READY_TO_SPAWN),
+                  b.RespawnPacket(runtime_id=1, state=b.PlayerRespawnState.SEARCHING_FOR_SPAWN))
+        for reset in resets:
+            with self.subTest(reset=type(reset).__name__, runtime_id=getattr(reset, "runtime_id", None)):
+                await self.bot.close()
+                await self.join(self.using(True), reset, self.using(True, player_id=2), b.SetActorDataPacket(id=1))
+                self.assertIsNone(self.bot.using_item)
+
+                await self.bot.close()
+                await self.join(self.using(True), reset, self.using(False))
+                self.assertIs(self.bot.using_item, False)
+
+    async def test_rejoin_without_own_flag_remains_unknown_until_a_live_report(self):
+        await self.deliver(self.using(True))
+        self.assertIs(self.bot.using_item, True)
+        await self.bot.close()
+        await self.join(self.using(False, player_id=2), self.b.SetActorDataPacket(id=1))
+        self.assertIsNone(self.bot.using_item)
+        await self.deliver(self.using(False))
+        self.assertIs(self.bot.using_item, False)
 
     def consumption_transaction(self, slot=0, *, use=True, off_hand=False):
         b = self.b

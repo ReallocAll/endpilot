@@ -439,7 +439,9 @@ class Bot:
             self._inventory._on_packet(raw)
         session.inventory_packets.clear()
         self._books = Books(self._inventory, session.item_names, identity.name, _xuid=xuid)
-        self._item_use = ItemUse(session.packets, self._movement, self._inventory, session.player_id)
+        self._item_use = ItemUse(session.packets, self._movement, self._inventory, session.player_id,
+                                 initial_packets=session.item_use_packets)
+        session.item_use_packets.clear()
         self._blocks = Blocks(
             session.packets, self._movement, self._inventory,
             hashed_runtime_ids=session.block_network_ids_are_hashes,
@@ -1939,7 +1941,7 @@ class Bot:
 
     @property
     def using_item(self) -> bool | None:
-        """Latest server-reported held-item use flag, or None before it is observed."""
+        """Latest server-reported local use flag, including during join, or None if unknown."""
         if self._item_use is None:
             raise RuntimeError("player has not joined")
         return self._item_use.using_item

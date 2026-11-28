@@ -1,8 +1,11 @@
 """Submit hand actions and observe the server's held-item lifecycle."""
 
 import asyncio
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
+
+from .protocol import RawPacket
 
 
 # SetActorData index 0 carries the low actor-flag bits in BDS 2225.
@@ -54,7 +57,7 @@ def _stack(item) -> tuple[int, int, int, bytes]:
 
 
 class ItemUse:
-    def __init__(self, packets, movement, inventory, runtime_id: int):
+    def __init__(self, packets, movement, inventory, runtime_id: int, *, initial_packets: Iterable[RawPacket] = ()):
         self.packets = packets
         self.movement = movement
         self.inventory = inventory
@@ -65,6 +68,8 @@ class ItemUse:
         self._disconnected = False
         b = packets.protocol.binding
         self._interruptions = (b.DisconnectPacket.ID, b.ChangeDimensionPacket.ID, b.RespawnPacket.ID)
+        for raw in initial_packets:
+            self._on_packet(raw)
         self._unsubscribe = packets.subscribe_raw(self._on_packet)
 
     def close(self) -> None:

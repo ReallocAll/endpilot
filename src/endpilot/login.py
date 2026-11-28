@@ -213,6 +213,7 @@ class JoinSession:
         self.command_catalog_packets: list[RawPacket] = []
         self.commands_enabled: bool | None = None
         self.movement_packets = []
+        self.item_use_packets = []
         self.entity_packets = []
         self.form_packets = []
         self.scoreboard_packets = []
@@ -401,6 +402,7 @@ class JoinSession:
         binding = protocol.binding
         environment_ids = world_environment_packet_ids(binding)
         creative_ids = creative_packet_ids(binding)
+        item_use_ids = (binding.SetActorDataPacket.ID, binding.ChangeDimensionPacket.ID, binding.RespawnPacket.ID)
         startup_chunks = []
         early_equipment = []
         startup_dimension_change = False
@@ -418,6 +420,9 @@ class JoinSession:
         while not self.spawned:
             raw = await self.packets.recv_raw()
             await self._receive_dimension_packet(raw)
+            if raw.packet_id in item_use_ids:
+                # Keep the observation and reset order until StartGame identifies the local player.
+                self.item_use_packets.append(raw)
             if raw.packet_id == binding.ServerToClientHandshakePacket.ID:
                 server_key, salt = _verify_handshake(self.packets.protocol.decode(raw).token)
                 if hasattr(self.packets.transport, "enable_encryption"):
