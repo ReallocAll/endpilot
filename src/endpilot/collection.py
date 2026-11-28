@@ -546,6 +546,7 @@ class _BlockCollector:
             self._store_for_drop, bot, storage, storage_item_id,
             dimension=progress.dimension_id, ticks=ticks, search_radius=search_radius,
         )
+        preflight = None if storage is None or not storage.before_dig_when_full else storage
         async with self._lock:
             settle_before_approach = False
             for position, before in targets:
@@ -556,6 +557,7 @@ class _BlockCollector:
                     timeout=timeout, epoch=epoch, progress=progress, refill=refill, refill_chests=chests,
                     ordered_refill=ordered_refill, store=store, settle_before_approach=settle_before_approach,
                     requested_drop_id=requested_drop_id, refresh_candidates=refresh_candidates,
+                    preflight=preflight, bot=bot,
                 )
                 progress.results.append(result)
                 progress.active = None
@@ -764,6 +766,86 @@ class _BlockCollector:
         limit = STACK_LIMITS.get(drop.item_id) if self.blocks.packets.protocol.number == 2225 else None
         return limit is not None and all(stack.stack_size == limit for stack in matching)
 
+    def _preflight_inventory_is_observed(self, slots, *, submitting: int | None = None) -> bool:
+        return (not self.blocks.inventory._main_inventory_has_count_gaps()
+                and self.harvest._inventory_is_observed(slots, submitting=submitting))
+
+    async def _store_before_dig(
+        self, bot: "Bot", storage: CollectionStorage, *, epoch: int, dimension: int, ticks: int,
+        search_radius: int, timeout: float, check_target, record,
+    ) -> bool:
+        inventory = self.blocks.inventory
+        slots = inventory.slots
+        if not self._preflight_inventory_is_observed(slots):
+            record(None, CollectionStorageResult("unobserved"), new_visit=False)
+            return False
+        if any(not slots[index].id for index in range(_MAIN_INVENTORY_SIZE)):
+            return True
+
+        item_id, _ = _registered_storage_item(bot.item_registry, storage.item)
+        expected = {index: _stack_snapshot(slots[index]) for index in storage.inventory_slots}
+        sources = [index for index, stack in expected.items() if stack.item_id == item_id]
+        if not sources:
+            record(None, CollectionStorageResult("source_exhausted"), new_visit=False)
+            return False
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        cleared = set()
+
+        for source_slot in sources:
+            time_left = deadline - loop.time()
+            if time_left <= 0:
+                record(None, CollectionStorageResult("timeout"), new_visit=False)
+                raise TimeoutError("preflight storage timed out")
+            before = expected[source_slot]
+            started = False
+            last_chest = last_attempt = None
+
+            def authorize(request_id):
+                nonlocal started
+                if (status := check_target()) is not None:
+                    raise _InventoryMoveNotSubmitted(status)
+                current = inventory.slots
+                if not self._preflight_inventory_is_observed(current, submitting=request_id):
+                    raise _InventoryMoveNotSubmitted("unobserved")
+                for index, stack in expected.items():
+                    if index in cleared:
+                        if current[index].id:
+                            raise _InventoryMoveNotSubmitted("source_changed")
+                    elif (not started or index != source_slot) and _stack_snapshot(current[index]) != stack:
+                        raise _InventoryMoveNotSubmitted("source_changed")
+                if request_id is not None:
+                    started = True
+
+            def remember(chest, attempt):
+                nonlocal last_chest, last_attempt
+                record(chest, attempt, new_visit=chest is not None and chest != last_chest)
+                last_chest = chest
+                last_attempt = attempt
+
+            try:
+                authorize(None)
+                attempt = await _store_for_collection(
+                    bot, storage, source_slot=source_slot, count=before.count, dimension_id=dimension, epoch=epoch,
+                    ticks=ticks, search_radius=search_radius, timeout=time_left, authorize=authorize, record=remember,
+                    whole_source=True,
+                )
+                if attempt.stop_reason != "complete":
+                    return False
+                if attempt.transfer is None or attempt.transfer.confirmed_count != before.count:
+                    remember(last_chest, replace(attempt, stop_reason="unconfirmed"))
+                    return False
+                cleared.add(source_slot)
+                authorize(None)
+            except _InventoryMoveNotSubmitted as stopped:
+                if last_attempt is None:
+                    remember(None, CollectionStorageResult(str(stopped)))
+                else:
+                    remember(last_chest, replace(last_attempt, stop_reason=str(stopped)))
+                return False
+        return True
+
     async def _store_for_drop(
         self, bot: "Bot", storage: CollectionStorage, item_id: int, observation: "_CollectionObservation",
         timeout: float, record: Callable[[BlockCollection], None] | None, *,
@@ -845,7 +927,7 @@ class _BlockCollector:
         progress: _BatchProgress | _MixedProgress | None = None, refill: _ToolRefill | None = None,
         refill_chests: tuple[HarvestToolChest, ...] = (), ordered_refill: bool = False,
         store: _StoreForDrop | None = None, settle_before_approach: bool = False, requested_drop_id: int | None = None,
-        refresh_candidates: bool = False,
+        refresh_candidates: bool = False, preflight: CollectionStorage | None = None, bot: "Bot | None" = None,
     ) -> BlockCollection:
         if before is None or before.is_air is None:
             return BlockCollection(position, "target_unobserved", before)
@@ -879,6 +961,28 @@ class _BlockCollector:
             remember(replace(evidence, tool_acquisition=acquisition, tool_refill_attempts=attempts))
 
         remember(evidence)
+        if preflight is not None:
+            if (status := check_target()) is not None:
+                return replace(evidence, status=status)
+
+            def remember_storage(chest, attempt, *, new_visit):
+                attempts = evidence.storage_attempts
+                if chest is None and attempts:
+                    chest, previous = attempts[-1]
+                    attempt = replace(attempt, transfer=previous.transfer)
+                if chest is not None:
+                    entry = (chest, attempt)
+                    attempts = (*attempts, entry) if new_visit else (*attempts[:-1], entry)
+                remember(replace(evidence, storage_attempt=attempt, storage_attempts=attempts))
+
+            succeeded = await self._store_before_dig(
+                bot, preflight, epoch=epoch, dimension=dimension, ticks=ticks, search_radius=search_radius,
+                timeout=timeout, check_target=check_target, record=remember_storage,
+            )
+            if not succeeded:
+                return replace(evidence, status="storage_unconfirmed")
+        preflight_last, preflight_attempts = evidence.storage_attempt, evidence.storage_attempts
+
         while True:
             approach, match = await self._approach(
                 position, ticks=ticks, search_radius=search_radius, timeout=timeout,
@@ -941,6 +1045,12 @@ class _BlockCollector:
             self.blocks._check_mining_epoch(epoch)
             if self.blocks.observed_block(position) != before:
                 raise _BeforeStartRejected("target_changed")
+            if preflight is not None:
+                slots = self.blocks.inventory.slots
+                if (not self._preflight_inventory_is_observed(slots)
+                        or all(slots[index].id for index in range(_MAIN_INVENTORY_SIZE))
+                        or (preflight_last is not None and self.harvest._window_busy() is not None)):
+                    raise _BeforeStartRejected("storage_unconfirmed")
             if requested_drop_id is not None and not self.harvest._has_equipped_drop_tool(before, tool, requested_drop_id):
                 raise _BeforeStartRejected("tool_unavailable")
             try:
@@ -949,8 +1059,13 @@ class _BlockCollector:
                 raise _BeforeStartRejected("unobserved" if error.status == "unknown" else "unreachable") from None
 
         def with_equipment(result: BlockCollection) -> BlockCollection:
+            attempts = result.storage_attempts
+            if preflight_attempts and not attempts and result.storage_attempt is not None:
+                attempts = ((preflight.position, result.storage_attempt),)
             return replace(result, approach=approach, tool=tool, tool_acquisition=evidence.tool_acquisition,
-                           tool_refill_attempts=evidence.tool_refill_attempts)
+                           tool_refill_attempts=evidence.tool_refill_attempts,
+                           storage_attempt=result.storage_attempt or preflight_last,
+                           storage_attempts=(*preflight_attempts, *attempts))
 
         def record(result: BlockCollection) -> None:
             remember(with_equipment(result))

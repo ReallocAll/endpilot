@@ -1,4 +1,4 @@
-"""Store one caller-authorized inventory stack during block collection."""
+"""Store caller-authorized inventory stacks during block collection."""
 
 from __future__ import annotations
 
@@ -8,9 +8,10 @@ from dataclasses import dataclass, field, replace
 from math import dist
 from typing import TYPE_CHECKING
 
-from .inventory import _InventoryMoveNotSubmitted, _PLAYER_CONTAINERS
+from ._stack_limits_2225 import STACK_LIMITS
+from .inventory import _InventoryMoveNotSubmitted, _PLAYER_CONTAINERS, _stack_snapshot
 from .range_transfer import (
-    RangeTransferResult, _check_range, _DOUBLE_CHEST_SIZE, _PLAYER_SIZE, _receipt_slot, _receipt_stack,
+    RangeTransferResult, _check_range, _DOUBLE_CHEST_SIZE, _known_slots, _merge_key, _PLAYER_SIZE, _receipt_slot, _receipt_stack,
     _SINGLE_CONTAINER_SIZE, _TRANSFER_BLOCKS, _transfer_range,
 )
 
@@ -28,6 +29,7 @@ class CollectionStorage:
     inventory_slots: range = field(kw_only=True)
     chest_slots: range = field(kw_only=True)
     additional_positions: tuple[tuple[int, int, int], ...] = field(default=(), kw_only=True)
+    before_dig_when_full: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
         from .collection import _position
@@ -36,6 +38,8 @@ class CollectionStorage:
         positions = dict.fromkeys(_position(value) for value in self.additional_positions)
         positions.pop(self.position, None)
         object.__setattr__(self, "additional_positions", tuple(positions))
+        if type(self.before_dig_when_full) is not bool:
+            raise TypeError("before_dig_when_full must be a bool")
         if not (type(self.item) is int and self.item != 0 or isinstance(self.item, str) and self.item):
             raise ValueError("item must be a nonempty registered name or its transferable network ID")
         for name, limit in (("inventory_slots", _PLAYER_SIZE), ("chest_slots", _DOUBLE_CHEST_SIZE)):
@@ -100,6 +104,7 @@ async def _store_at_chest(
     inventory_slots: range, chest_slots: range | None, ticks: int, search_radius: int, timeout: float,
     update=None, dimension_id: int | None = None, authorize: Callable[[int | None], None] | None = None,
     record: Callable[[CollectionStorageResult], None] | None = None, multi_chest: bool = False,
+    whole_source: bool = False,
 ) -> CollectionStorageResult:
     strict = authorize is not None
     owned_window: ContainerWindow | None = None
@@ -115,6 +120,14 @@ async def _store_at_chest(
     source_slot = inventory_slots.start
     source_before = inventory._observed_stack(source_slot) if strict else None
     last_reply = None
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout if whole_source else None
+
+    def time_left():
+        remaining = timeout if deadline is None else deadline - loop.time()
+        if remaining <= 0 and whole_source:
+            raise TimeoutError("preflight storage timed out")
+        return remaining
 
     def require_world() -> None:
         if bot._containers is not containers or containers._unsubscribe is None:
@@ -195,7 +208,7 @@ async def _store_at_chest(
                 )
 
             publish(phase="approaching")
-            async with asyncio.timeout(timeout):
+            async with asyncio.timeout(time_left()):
                 approach = await bot.approach_block(chest, ticks=ticks, search_radius=search_radius)
             publish(approach=approach, notify=False)
             require_world()
@@ -226,7 +239,7 @@ async def _store_at_chest(
                         authorize(None)
 
                 publish(phase="opening")
-                window = await containers.open(chest, blocks, face=approach.face, timeout=timeout,
+                window = await containers.open(chest, blocks, face=approach.face, timeout=time_left(),
                                                _before_click=before_click, _on_observed=remember_window)
         if not _target_window(window, chest):
             return "window_busy"
@@ -234,7 +247,7 @@ async def _store_at_chest(
             if strict:
                 return "window_changed"
             publish(phase="opening")
-        await containers.wait_for_slots(timeout=timeout, _expected_window=window)
+        await containers.wait_for_slots(timeout=time_left(), _expected_window=window)
         width = containers._observed_window_slot_count(window)
         if width is None:
             return "unobserved"
@@ -265,11 +278,18 @@ async def _store_at_chest(
                     last_reply = inventory._pending_requests[request_id].reply
 
         before_write()
-        transfer = await _transfer_range(
-            bot, direction="put", item=item_name, count=count, source_slots=inventory_slots,
-            destination_slots=range(width) if chest_slots is None else chest_slots,
-            match=source_matches if strict else None, timeout=timeout, before_write=before_write,
-        )
+        destination = range(width) if chest_slots is None else chest_slots
+        if whole_source:
+            _check_range(destination, width, "chest_slots")
+            transfer = await _put_whole_source(
+                bot, item_name, count, inventory_slots, destination, time_left(), before_write, source_matches,
+            )
+        else:
+            transfer = await _transfer_range(
+                bot, direction="put", item=item_name, count=count, source_slots=inventory_slots,
+                destination_slots=destination, match=source_matches if strict else None,
+                timeout=timeout, before_write=before_write,
+            )
         publish(phase="closing" if owned_window is not None else "storing", transfer=transfer)
         return transfer.stop_reason
 
@@ -294,7 +314,7 @@ async def _store_at_chest(
                     except (Exception, asyncio.CancelledError):
                         publish(phase="closing", notify=False)
                         raise
-        empty_full = (multi_chest and reason == "destination_full"
+        empty_full = ((multi_chest or whole_source) and reason == "destination_full"
                       and transfer is not None and not transfer.steps)
         if strict and (reason == "complete" or empty_full):
             try:
@@ -304,7 +324,7 @@ async def _store_at_chest(
                 reason = str(stopped)
             else:
                 if (not close_observed or foreign_window_pending()
-                        or (empty_full and (not client_close_observed or closed is not owned_window))):
+                        or ((empty_full or whole_source) and (not client_close_observed or closed is not owned_window))):
                     reason = "window_changed"
     except (Exception, asyncio.CancelledError) as error:
         if record is not None:
@@ -323,10 +343,72 @@ async def _store_at_chest(
     return result
 
 
+async def _put_whole_source(bot, item, count, source_slots, destination_slots, timeout, before_write, source_matches):
+    inventory, containers = bot._inventory, bot._containers
+    source_slot = source_slots.start
+    source = inventory.slots.get(source_slot)
+    expected_source = _stack_snapshot(source)
+    observed = _known_slots(bot.container_slots or {}, destination_slots)
+    if not source_matches(expected_source) or len(observed) != len(destination_slots):
+        return RangeTransferResult(count, (), "unobserved")
+    endpoints = tuple(containers._block_transfer_endpoint(index) for index in destination_slots)
+    if None in endpoints or inventory._requests_for_endpoints(endpoints):
+        return RangeTransferResult(count, (), "unobserved")
+
+    limit = STACK_LIMITS.get(item) if bot.protocol.number == 2225 else None
+    capacity = {}
+    unknown_capacity = False
+    for index, stack in observed.items():
+        if stack.id == 0:
+            capacity[index] = count
+        elif _merge_key(stack) == _merge_key(source):
+            if limit is None:
+                unknown_capacity = True
+            else:
+                capacity[index] = max(0, limit - stack.stack_size)
+    single = next((index for index, spare in capacity.items() if spare >= count), None)
+    if single is not None:
+        destination_slots = range(single, single + 1)
+    elif sum(capacity.values()) < count:
+        return RangeTransferResult(count, (), "unobserved" if unknown_capacity else "destination_full")
+
+    expected = {index: _stack_snapshot(stack) for index, stack in observed.items()}
+
+    def validate(request_id):
+        nonlocal expected_source
+        before_write(request_id)
+        own = inventory._pending_requests[request_id]
+        if any(request is not own for request in inventory._requests_for_endpoints(endpoints)):
+            raise _InventoryMoveNotSubmitted("unobserved")
+        slots = bot.container_slots or {}
+        if any(_stack_snapshot(slots.get(index)) != stack for index, stack in expected.items()):
+            raise _InventoryMoveNotSubmitted("destination_changed")
+        expected_source = inventory._observed_stack(source_slot)
+
+    def confirmed(slot, stack):
+        moved = stack.count - expected[slot].count
+        if moved != min(expected_source.count, capacity[slot]):
+            raise _InventoryMoveNotSubmitted("partial_transfer")
+        expected[slot] = stack
+        capacity[slot] -= moved
+
+    try:
+        result = await _transfer_range(
+            bot, direction="put", item=item, count=count, source_slots=source_slots,
+            destination_slots=destination_slots, match=source_matches, timeout=timeout,
+            before_write=validate, on_confirmed=confirmed,
+        )
+    except _InventoryMoveNotSubmitted as stopped:
+        return replace(stopped.transfer_progress, stop_reason=str(stopped))
+    if result.stop_reason == "destination_full":
+        return replace(result, stop_reason="destination_changed")
+    return result
+
+
 async def _store_for_collection(
     bot: Bot, storage: CollectionStorage, *, source_slot: int, count: int, dimension_id: int, epoch: int,
     ticks: int, search_radius: int, timeout: float, authorize: Callable[[int | None], None],
-    record: Callable[[tuple[int, int, int] | None, CollectionStorageResult], None],
+    record: Callable[[tuple[int, int, int] | None, CollectionStorageResult], None], whole_source: bool = False,
 ) -> CollectionStorageResult:
     """Authorize the click with None and each item-stack write with its request ID."""
     if (type(source_slot) is not int or source_slot not in storage.inventory_slots
@@ -344,8 +426,8 @@ async def _store_for_collection(
             bot, chest, count, containers=containers, blocks=blocks, registry=registry,
             item_id=item_id, item_name=item_name, epoch=epoch, inventory_slots=range(source_slot, source_slot + 1),
             chest_slots=storage.chest_slots, ticks=ticks, search_radius=search_radius, timeout=time_left,
-            dimension_id=dimension_id, authorize=authorize, multi_chest=multiple,
-            record=lambda attempt: record(chest if multiple else None, attempt),
+            dimension_id=dimension_id, authorize=authorize, multi_chest=multiple, whole_source=whole_source,
+            record=lambda attempt: record(chest if multiple or whole_source else None, attempt),
         )
 
     if not multiple:

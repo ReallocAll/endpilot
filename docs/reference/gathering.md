@@ -276,10 +276,26 @@ the bot confirms its own pickup of that instance and the matching inventory
 gain. Counted collection continues to count confirmed pickups even when the
 same item was stored during the detour.
 
+Set `before_dig_when_full=True` to check inventory before each target.
+All 36 main slots must have settled observations. If every slot is occupied,
+the bot stores each whole stack of the authorized item from `inventory_slots`.
+One authorized chest must have room for the entire source stack. The bot
+prefers one destination slot and may use several authorized slots in the same
+chest. It can try the next authorized chest after confirming insufficient
+capacity for the current source and closing its own window. A partial transfer,
+unsettled result, or slot identity change stops preflight storage.
+
+The bot waits for its chest close and verifies an empty main slot before
+starting the break. If it cannot establish these conditions, the target
+reports `storage_unconfirmed`. A main inventory with a known empty slot
+uses ordinary collection. The option defaults to `False`.
+
 Read `BlockCollection.storage_attempt` for the last storage result. A
 multi-chest trip also records the ordered `(position, result)` pairs in
-`storage_attempts`, including confirmed and pending transfer steps. When
-storage stops short, the batch ends with `pickup_unconfirmed`, or with
+`storage_attempts`, including confirmed and pending transfer steps. Preflight
+storage records these pairs for each attempted source stack, so the same chest
+can appear more than once. When storage after a break stops short, the batch
+ends with `pickup_unconfirmed`, or with
 `storage_incomplete` if the original pickup was already confirmed. The
 exception's `collection_progress` includes known storage and pickup evidence
 for the interrupted target.

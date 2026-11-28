@@ -1095,6 +1095,215 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(packet.player_block_actions)
             self.assertNotIn(b.PlayerAuthInputPacket.InputData.UP, packet.input_data)
 
+    async def start_preflight(
+        self, *, method="targets", sources=range(2, 3), chest=REFILL_CHEST, additional_positions=(),
+        destinations=range(4, 6), foreign_window=False, **inventory,
+    ):
+        bot = await self.storage_bot(chest=chest, additional_positions=additional_positions, **inventory)
+        if foreign_window:
+            await self.emit(*self.refill_window(position=chest, count=0))
+        storage = CollectionStorage(chest, "minecraft:dirt", inventory_slots=sources, chest_slots=destinations,
+                                    additional_positions=additional_positions, before_dig_when_full=True)
+        options = dict(storage=storage, ticks=0, search_radius=0, timeout=2)
+        if method == "vein":
+            collecting = bot.collect_vein_by_count(TARGET, item_id=DIRT, count=1, **options)
+        elif method == "counted":
+            collecting = bot.collect_by_count(ORE, item_id=DIRT, count=1, **options)
+        else:
+            collecting = bot.collect_targets([TARGET, SECOND_TARGET], count=1, **options)
+        task = asyncio.create_task(collecting)
+
+        async def settle_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        self.addAsyncCleanup(settle_task)
+        return bot, task
+
+    async def preflight_window(self, counts, *, position=REFILL_CHEST):
+        await self.refill_click(position=position)
+        opening, contents = self.refill_window(position=position, count=0)
+        slots = list(contents.slots)
+        for offset, count in enumerate(counts):
+            if count:
+                slots[4 + offset] = stack_descriptor(self.b, DIRT, count, 21 + offset)
+        contents.slots = slots
+        await self.emit(opening, contents)
+
+    async def preflight_request(self, expected):
+        packet = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+        self.assertIsInstance(packet, self.b.ItemStackRequestPacket)
+        request, = packet.requests
+        action, = request.actions
+        self.assertIsInstance(action, self.b.ItemStackRequestCereal.PlaceActionData)
+        self.assertEqual((action.source.slot, action.destination.slot, action.amount), expected)
+        return request
+
+    def preflight_receipt(self, request, *, source, destination, remaining, stored):
+        return self.stack_response(request, [
+            ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", source, remaining, 15 if remaining else None),
+            ("LEVEL_ENTITY_CONTAINER", destination, stored, 21 + destination - 4),
+        ])
+
+    async def test_preflight_retains_two_whole_source_receipts_for_the_same_chest(self):
+        bot, task = await self.start_preflight(sources=range(2, 13))
+        await self.preflight_window((0, 0))
+        first = await self.preflight_request((2, 4, 64))
+        await self.emit(self.preflight_receipt(first, source=2, destination=4, remaining=0, stored=64))
+        await self.refill_close()
+
+        await self.preflight_window((64, 0))
+        second = await self.preflight_request((12, 5, 64))
+        await self.emit(self.preflight_receipt(second, source=12, destination=5, remaining=0, stored=64))
+        close = await self.refill_close(confirm=False)
+        self.assertFalse(task.done())
+        self.assertTrue(self.wire.outgoing.empty())
+        await self.emit(close)
+        await self.expect_batch_start(TARGET)
+        await self.finish_batch_break(TARGET, runtime_id=101, total=1, net_id=25)
+
+        result, = (await task).results
+        self.assertEqual((result.status, result.inventory_delta, result.collector_id), ("collected", 1, PLAYER))
+        self.assertEqual([chest for chest, _ in result.storage_attempts], [REFILL_CHEST, REFILL_CHEST])
+        self.assertIs(result.storage_attempt, result.storage_attempts[-1][1])
+        transfers = [attempt.transfer for _, attempt in result.storage_attempts]
+        self.assertEqual([(transfer.confirmed_count, transfer.steps[0].source_slot) for transfer in transfers],
+                         [(64, 2), (64, 12)])
+        self.assertEqual([transfer.steps[0].request_id for transfer in transfers],
+                         [first.client_request_id.raw_id, second.client_request_id.raw_id])
+        self.assertEqual(bot.inventory_count(DIRT), 1)
+        self.assert_no_storage_followup()
+
+    async def test_preflight_may_split_one_whole_source_across_confirmed_room_in_one_chest(self):
+        _, task = await self.start_preflight(method="counted", terrain=(self.block(HASHED_AIR_RUNTIME_ID, position=SECOND_TARGET),))
+        await self.preflight_window((32, 32))
+        first = await self.preflight_request((2, 4, 32))
+        await self.emit(self.preflight_receipt(first, source=2, destination=4, remaining=32, stored=64))
+        second = await self.preflight_request((2, 5, 32))
+        await self.emit(self.preflight_receipt(second, source=2, destination=5, remaining=0, stored=64))
+        await self.refill_close()
+        await self.expect_batch_start(TARGET)
+        await self.finish_batch_break(TARGET, runtime_id=101, total=1, net_id=25)
+
+        batch = await task
+        result, = batch.results
+        self.assertEqual((batch.collected_count, result.status, result.storage_attempt.transfer.confirmed_count),
+                         (1, "collected", 64))
+        self.assertEqual([step.confirmed for step in result.storage_attempt.transfer.steps], [32, 32])
+        self.assert_no_storage_followup()
+
+    async def test_preflight_capacity_short_by_one_sends_no_stack_requests_to_either_chest(self):
+        far = (-4, 100, 3)
+        bot, task = await self.start_preflight(chest=far, additional_positions=(REFILL_CHEST,),
+                                              terrain=(self.pose(eye=(-2.5, 101.62, 3.4)),))
+        await self.preflight_window((33, 32))
+        near_close = await self.refill_close(confirm=False)
+        self.assertTrue(self.wire.outgoing.empty())
+        await self.emit(near_close)
+        await self.preflight_window((64, 64), position=far)
+        await self.refill_close()
+
+        result, = (await task).results
+        self.assertEqual(result.status, "storage_unconfirmed")
+        self.assertEqual([(chest, attempt.stop_reason, attempt.transfer.steps)
+                          for chest, attempt in result.storage_attempts],
+                         [(REFILL_CHEST, "destination_full", ()), (far, "destination_full", ())])
+        self.assertEqual(bot.inventory_count(DIRT), 128)
+        self.assertEqual(bot.observed_block(TARGET).runtime_id, ORE)
+        self.assert_no_storage_followup()
+
+    async def test_preflight_cancellation_retains_confirmed_stack_and_pending_second_stack(self):
+        bot, task = await self.start_preflight(method="vein", sources=range(2, 13))
+        await self.preflight_window((0, 0))
+        first = await self.preflight_request((2, 4, 64))
+        await self.emit(self.preflight_receipt(first, source=2, destination=4, remaining=0, stored=64))
+        await self.refill_close()
+
+        await self.preflight_window((64, 0))
+        second = await self.preflight_request((12, 5, 64))
+        task.cancel()
+        await self.refill_close()
+        with self.assertRaises(asyncio.CancelledError) as cancelled:
+            await task
+        progress = cancelled.exception.collection_progress
+        self.assertEqual((progress.results, progress.collected_count), ((), 0))
+        first_attempt, second_attempt = (attempt for _, attempt in progress.active.storage_attempts)
+        self.assertEqual((first_attempt.stop_reason, first_attempt.transfer.confirmed_count), ("complete", 64))
+        self.assertEqual((second_attempt.stop_reason, second_attempt.transfer.confirmed_count), ("cancelled", 0))
+        pending, = second_attempt.transfer.steps
+        self.assertEqual((pending.request_id, pending.verdict), (second.client_request_id.raw_id, None))
+        self.assertEqual(bot.observed_block(TARGET).runtime_id, ORE)
+        self.assert_no_storage_followup()
+
+    async def test_preflight_stops_split_source_when_the_next_destination_identity_changes(self):
+        bot, task = await self.start_preflight()
+        await self.preflight_window((32, 32))
+        first = await self.preflight_request((2, 4, 32))
+        await self.emit(self.preflight_receipt(first, source=2, destination=4, remaining=32, stored=64),
+                        self.slot(5, DIRT, 32, net_id=99, container=2))
+        await self.refill_close()
+
+        result, = (await task).results
+        self.assertEqual((result.status, result.storage_attempt.stop_reason, result.storage_attempt.transfer.confirmed_count),
+                         ("storage_unconfirmed", "destination_changed", 32))
+        self.assertEqual(bot.observed_block(TARGET).runtime_id, ORE)
+        self.assert_no_storage_followup()
+
+    async def test_preflight_stops_after_a_short_success_receipt(self):
+        bot, task = await self.start_preflight()
+        await self.preflight_window((32, 32))
+        request = await self.preflight_request((2, 4, 32))
+        await self.emit(self.preflight_receipt(request, source=2, destination=4, remaining=48, stored=48))
+        await self.refill_close()
+
+        result, = (await task).results
+        transfer = result.storage_attempt.transfer
+        (step,) = transfer.steps
+        self.assertEqual((result.status, result.storage_attempt.stop_reason), ("storage_unconfirmed", "partial_transfer"))
+        self.assertEqual((step.requested, step.confirmed, step.request_id), (32, 16, request.client_request_id.raw_id))
+        self.assertEqual(bot.observed_block(TARGET).runtime_id, ORE)
+        self.assert_no_storage_followup()
+
+    async def test_preflight_with_unknown_main_slot_stops_without_chest_or_start(self):
+        bot, task = await self.start_preflight(slots=35)
+        result, = (await task).results
+        self.assertEqual((result.status, result.storage_attempt.stop_reason), ("storage_unconfirmed", "unobserved"))
+        self.assertEqual(bot.observed_block(TARGET).runtime_id, ORE)
+        self.assert_no_storage_followup()
+
+    async def test_preflight_with_known_space_uses_the_ordinary_collection_path(self):
+        bot, task = await self.start_preflight(empty_slot=True)
+        equipped = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+        self.assertIsInstance(equipped, self.b.MobEquipmentPacket)
+        await self.expect_batch_start(TARGET)
+        self.wire.emit(self.block(HASHED_AIR_RUNTIME_ID), self.drop(), self.take(), self.slot(35, DIRT, 1, net_id=25))
+        self.assertEqual(await self.next_actions(), ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
+        result, = (await task).results
+        self.assertEqual((result.status, result.storage_attempt, result.storage_attempts), ("collected", None, ()))
+        self.assertEqual(bot.inventory_count(DIRT), 129)
+        self.assert_no_storage_followup()
+
+    async def test_preflight_rechecks_space_at_start_after_the_only_empty_slot_fills(self):
+        bot, task = await self.start_preflight(empty_slot=True)
+        async with bot._blocks._mining_lock:
+            equipped = await asyncio.wait_for(self.wire.outgoing.get(), 1)
+            self.assertIsInstance(equipped, self.b.MobEquipmentPacket)
+            await self.emit(self.slot(35, OAK_LOG_ITEM, 64, net_id=71))
+        result, = (await task).results
+        self.assertEqual((result.status, result.storage_attempt), ("storage_unconfirmed", None))
+        self.assertEqual(bot.observed_block(TARGET).runtime_id, ORE)
+        self.assert_no_storage_followup()
+
+    async def test_preflight_leaves_foreign_chest_window_untouched(self):
+        bot, task = await self.start_preflight(foreign_window=True)
+        original = bot.open_window
+        result, = (await task).results
+        self.assertEqual((result.status, result.storage_attempt.stop_reason), ("storage_unconfirmed", "window_busy"))
+        self.assertIsNotNone(original)
+        self.assertIs(bot.open_window, original)
+        self.assertEqual(bot.observed_block(TARGET).runtime_id, ORE)
+        self.assertTrue(self.wire.outgoing.empty())
+
     async def test_storage_does_not_open_when_the_same_item_has_stack_space(self):
         bot, task = await self.start_storage_collection((TARGET,), dirt_count=63)
         frame = await asyncio.wait_for(self.wire.outgoing.get(), 1)
