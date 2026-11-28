@@ -18,6 +18,32 @@ Known air has the name `minecraft:air` and an empty property mapping. The
 returns `None` for missing observations, unresolved IDs, unverified sequential
 IDs and unsupported protocol versions. It sends no packets.
 
+## Read observed block collision boxes
+
+`bot.observed_block_collision_boxes((x, y, z), layer=0)` reads the cached
+collision geometry for the specified layer in the current dimension. It is
+synchronous and sends no packets. The result is an immutable tuple of boxes
+in the order in the protocol 2225 block export. Each box is
+`(minX, minY, minZ, maxX, maxY, maxZ)` in block-local coordinates. Bounds can
+extend beyond the unit cell. Add the integer block position to both corners
+to convert them to world coordinates.
+
+Known empty geometry is `()`. This includes air, an observed empty extra
+layer, buttons and open fence gates. `None` means the requested layer is
+negative or unobserved, the state or protocol is unsupported, or the session has ended.
+A sparse update describes its own layer, and a complete section can confirm
+that its extra layer is empty. Later observations and eviction leave earlier
+results unchanged.
+
+The table covers the exported collision shapes of selected static vanilla
+blocks, including common full cubes, slabs, stairs, fences, gates and walls.
+An oak fence with only its north connection bit set reaches local Z `0`.
+The isolated post starts at local Z `0.375`.
+Custom or unresolved IDs and states with runtime-dependent shapes, such as
+doors, pistons, shulker boxes and scaffolding, yield `None`. Use the raycast
+methods for selection outlines. A stone button can be selected and has an
+empty collision tuple. [Pinned data and regeneration](block-data.md)
+
 ## Observe block entity updates
 
 `bot.observed_block_entity((x, y, z))` reads an independent native NBT copy

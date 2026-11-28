@@ -32,6 +32,11 @@ is authoritative for the fields it publishes, including the block palette,
 names and shapes. The shared reader checks the SHA-256 of each input file.
 [Pinned source](https://github.com/EndstoneMC/bedrock-data/tree/40570f03ef64e37c71a81388b52fd55da5d73521)
 
+`generate_outline_data.py` produces the outline and collision tables. The
+collision table takes the ordered `collision_shapes` arrays for its supported
+states from `block_palette.json`, including boxes that extend outside a block.
+Both block network ID modes use the same palette entries.
+
 The harvest table also uses the mining observations included in the source
 distribution. The data records tool qualification and survival crack progress
 from Windows vanilla Bedrock Dedicated Server `1.26.66.1`, build `53696234`,

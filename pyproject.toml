@@ -26,4 +26,11 @@ Repository = "https://github.com/ReallocAll/endpilot"
 where = ["src"]
 
 [tool.setuptools.package-data]
-endpilot = ["data/anvil-2225.json", "data/biomes-*.json", "data/harvest-*.json", "data/outline-*.json", "data/recipe-tags-2225.json"]
+endpilot = [
+    "data/anvil-2225.json",
+    "data/biomes-*.json",
+    "data/collision-*.json",
+    "data/harvest-*.json",
+    "data/outline-*.json",
+    "data/recipe-tags-2225.json",
+]

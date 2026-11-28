@@ -106,6 +106,7 @@ class BlockRaycastTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(hit.click_pos[0], 0.3125)
         self.assertAlmostEqual(hit.click_pos[1], 0.5)
         self.assertTrue(0 < hit.click_pos[2] < 0.125)
+        self.assertEqual(self.bot.observed_block_collision_boxes(button), ())
 
         await self.bot.look_at((-10.5, 221.5, -8.5))
         self.assertEqual(self.bot.raycast_block(max_distance=3.49), BlockRaycastResult("miss", 0))

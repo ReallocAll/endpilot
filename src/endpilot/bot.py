@@ -21,6 +21,7 @@ from .authentication import (
 )
 from .beds import BedObservation, Beds, PlayerRespawnPoint, _BedEvent
 from .biome_data import BiomeDefinition
+from .block_data import BlockCollisionBoxes
 from .block_raycast import BlockRaycastResult, MiningFaceResult
 from .blocks import (
     Blocks, BlockChange, BlockEntityUpdate, BlockMatch, BlockObservation, BlockSearchResult, BlockStateObservation,
@@ -1338,6 +1339,18 @@ class Bot:
         if self._blocks is None:
             raise RuntimeError("player has not joined")
         return self._blocks.observed_block_state(position, layer=layer)
+
+    def observed_block_collision_boxes(
+        self, position: tuple[int, int, int], *, layer: int = 0,
+    ) -> BlockCollisionBoxes | None:
+        """Read the cached layer's immutable block-local collision boxes without sending packets.
+
+        Each box is (minX, minY, minZ, maxX, maxY, maxZ) and may extend outside
+        the block. Return () for known empty geometry or None when unknown.
+        """
+        if self._blocks is None or self.session_end is not None:
+            return None
+        return self._blocks.observed_block_collision_boxes(position, layer=layer)
 
     def observed_block_entity(self, position: tuple[int, int, int]) -> nbt.CompoundTag | None:
         """Return an independent copy of the latest observed block entity NBT.

@@ -20,6 +20,8 @@ _PISTON_FACINGS = {
 }
 _STATE_TAGS = {"byte": nbt.ByteTag, "int": nbt.IntTag, "string": nbt.StringTag}
 
+type BlockCollisionBoxes = tuple[tuple[float, float, float, float, float, float], ...]
+
 
 def matches_vanilla_palette(registry_checksum: int, block_properties) -> bool:
     """Verify the sequential registry and exact built-in block declarations for 2225."""
@@ -59,6 +61,7 @@ class VanillaBlockState:
     ladder_facing: int | None = None
     piston_face: int | None = None
     plain_masonry: bool = False
+    collision_boxes: BlockCollisionBoxes | None = None
 
 
 @cache
@@ -69,6 +72,9 @@ def _catalog() -> tuple[tuple[VanillaBlockState | None, ...], dict[int, int]]:
     outlines = json.loads(resource.read_text(encoding="utf-8"))
     boxes = tuple(None if box is None else tuple(box) for box in outlines["boxes"])
     unresolved_overhang_id = outlines["unresolved_overhang_id"]
+    resource = files("endpilot").joinpath("data", "collision-2225.json")
+    collision = json.loads(resource.read_text(encoding="utf-8"))
+    collision_shapes = tuple(None if shape is None else tuple(map(tuple, shape)) for shape in collision["shapes"])
     rules = [
         None if rule is None else MiningRule(
             None if rule[0] is None else frozenset(rule[0]), rule[1]
@@ -88,10 +94,11 @@ def _catalog() -> tuple[tuple[VanillaBlockState | None, ...], dict[int, int]]:
             rules[rule_id], index == terrain["air"], index in cubes, index in unsafe,
             names[index], beds.get(index), boxes[shape_id], shape_id == unresolved_overhang_id,
             _LADDER_FACINGS.get(hash_id), _PISTON_FACINGS.get(hash_id),
-            plain_masonry=index in plain_masonry,
+            plain_masonry=index in plain_masonry, collision_boxes=collision_shapes[collision_id],
         )
-        for index, ((hash_id, rule_id), shape_id) in
-        enumerate(zip(data["palette"], outlines["shape_ids"], strict=True))
+        for index, ((hash_id, rule_id), shape_id, collision_id) in enumerate(
+            zip(data["palette"], outlines["shape_ids"], collision["shape_ids"], strict=True)
+        )
     )
     by_hash = {hash_id: index for index, (hash_id, _) in enumerate(data["palette"])}
     return palette, by_hash

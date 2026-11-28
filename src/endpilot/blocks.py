@@ -11,7 +11,9 @@ from typing import Literal
 
 from bedrock_protocol import DecodeError, nbt
 
-from .block_data import VanillaBlockState, _catalog, _vanilla_state_properties, vanilla_block_state
+from .block_data import (
+    BlockCollisionBoxes, VanillaBlockState, _catalog, _vanilla_state_properties, vanilla_block_state,
+)
 from .block_raycast import (
     BlockRaycastResult, MiningFaceResult, OutlineObservation, _UNIT_BOX, trace_blocks, trace_blocks_towards,
     trace_mining_face,
@@ -936,6 +938,19 @@ class Blocks:
             return None
         properties = _vanilla_state_properties(state.name, runtime_id, hashed=self.hashed_runtime_ids)
         return BlockStateObservation(position, runtime_id, layer, state.name, properties)
+
+    def observed_block_collision_boxes(
+        self, position: tuple[int, int, int], *, layer: int = 0,
+    ) -> BlockCollisionBoxes | None:
+        if self._protocol != 2225 or layer < 0:
+            return None
+        observation = self.observed_block(position, layer=layer)
+        if observation is None:
+            return None
+        if observation.is_air is True:
+            return ()
+        state = self._vanilla_state(observation.runtime_id)
+        return None if state is None else state.collision_boxes
 
     def observed_biome(self, position: tuple[int, int, int]) -> int | None:
         """Return the current column's observed biome ID at an integer block position."""

@@ -17,6 +17,7 @@ from endpilot import (
 from endpilot.compression import PacketConnection
 from endpilot.login import JoinSession
 from endpilot.protocol import RawPacket, read_batch, write_batch
+from test_subchunks import solid_sub_chunk
 
 
 class Transport:
@@ -218,6 +219,8 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.bot.observed_block_state(position))
         self.assertEqual(self.bot.observed_block_state(position, layer=1),
                          BlockStateObservation(position, None, 1, "minecraft:air", {}))
+        self.assertIsNone(self.bot.observed_block_collision_boxes(position))
+        self.assertEqual(self.bot.observed_block_collision_boxes(position, layer=1), ())
         self.assertEqual(len(self.transport.sent), sent_at_join)
 
     async def test_observed_block_state_requires_protocol_2225_even_for_known_air(self):
@@ -230,7 +233,118 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.bot.observed_block(position, layer=1).is_air)
         self.assertIsNone(self.bot.observed_block_state(position))
         self.assertIsNone(self.bot.observed_block_state(position, layer=1))
+        self.assertIsNone(self.bot.observed_block_collision_boxes(position))
+        self.assertIsNone(self.bot.observed_block_collision_boxes(position, layer=1))
         self.assertEqual(self.transport.sent, [])
+
+    async def test_block_collision_boxes_preserve_local_geometry_and_order_in_both_id_modes(self):
+        # Runtime IDs and ordered collision arrays from the pinned 2225 block palette.
+        bottom = ((0, 0, 0, 1, 0.5, 1),)
+        top = ((0, 0.5, 0, 1, 1, 1),)
+        post = ((0.375, 0, 0.375, 0.625, 1.5, 0.625),)
+        north = ((0.375, 0, 0, 0.625, 1.5, 0.625),)
+        east = ((0.375, 0, 0.375, 1, 1.5, 0.625),)
+        connected = ((0.375, 0, 0, 0.625, 1.5, 1), (0, 0, 0.375, 1, 1.5, 0.625))
+        cases = (
+            (18894, 0xDBF44120, ()),  # Air
+            (3317, 2150698529, ((0, 0, 0, 1, 1, 1),)),  # Stone
+            (2793, 577382071, ()),  # Stone button, released
+            (2799, 4129211666, ()),  # Stone button, pressed
+            (21903, 98367658, bottom),
+            (21904, 3884087355, top),
+            (14806, 425458381, post),
+            (14807, 2198062720, north),
+            (14808, 3720363220, east),
+            (14809, 1049392737, north + east),
+            (14821, 1313577375, connected),
+            (303, 2421924416, ((0, 0, 0.375, 1, 1.5, 0.625),)),  # Closed gate
+            (307, 3477230987, ()),  # Open gate
+            (5277, 2977869888, ((0.25, 0, 0.25, 0.75, 1.5, 0.75),)),  # Wall
+            (1858, 4172483059, (*bottom, (0.5, 0.5, 0, 1, 1, 1))),  # Stairs
+            (7400, 650702320, None),  # Door
+            (4127, 1899755433, None),  # Piston
+            (14586, 3651099133, None),  # Moving block
+            (7059, 2647010207, None),  # Shulker box
+            (351, 196630051, None),  # Powder snow
+            (1179, 3699616834, None),  # Snow layer
+            (6617, 2498125071, None),  # Scaffolding
+            (21354, 604419874, None),  # Pointed dripstone
+            (14122, 1211861802, None),  # Water
+            (11244, 0xFFFFFFFE, None),  # Unknown placeholder
+            (0xFFFFFFFF, 0xFFFFFFFF, None),  # Undeclared ID
+        )
+        position = (-13, -4, -9)
+        for hashed in (False, True):
+            with self.subTest(hashed=hashed):
+                await self.connect(hashed_runtime_ids=hashed)
+                b = self.b
+                pos = b.BlockPos(x=-13, y=-4, z=-9)
+                self.assertIsNone(self.bot.observed_block_collision_boxes(position))
+                snapshots = {}
+                for sequential, network_hash, expected in cases:
+                    runtime_id = network_hash if hashed else sequential
+                    await self.deliver(b.UpdateBlockPacket(pos=pos, runtime_id=runtime_id))
+                    with self.subTest(runtime_id=runtime_id):
+                        current = self.bot.observed_block_collision_boxes(position)
+                        self.assertEqual(current, expected)
+                        snapshots[sequential] = current
+                saved = snapshots[14821]
+                self.assertEqual(saved, connected)
+                with self.assertRaises(TypeError):
+                    saved[0] = top[0]
+                with self.assertRaises(TypeError):
+                    saved[0][4] = 1
+                self.assertEqual(self.transport.sent, [])
+                await self.bot.close()
+                self.assertIsNone(self.bot.observed_block_collision_boxes(position))
+
+    async def test_block_collision_boxes_follow_layer_coverage_unload_and_dimension(self):
+        position = (-13, 64, -9)
+        column = (-1, -1)
+        cube = ((0, 0, 0, 1, 1, 1),)
+        slab = ((0, 0.5, 0, 1, 1, 1),)
+        self.assertIsNone(Bot("Unjoined").observed_block_collision_boxes(position))
+        for hashed, stone_id, upper_slab_id in ((False, 3317, 21904), (True, 2150698529, 3884087355)):
+            with self.subTest(hashed=hashed):
+                await self.connect(hashed_runtime_ids=hashed)
+                b = self.b
+                pos = b.BlockPos(x=-13, y=64, z=-9)
+
+                def query():
+                    return tuple(self.bot.observed_block_collision_boxes(position, layer=layer) for layer in (0, 1))
+
+                self.assertEqual(query(), (None, None))
+                await self.deliver(self.published(0), b.UpdateBlockPacket(pos=pos, runtime_id=upper_slab_id, layer=1))
+                self.assertEqual(query(), (None, slab))
+                await self.deliver(self.air(4, column=column), b.UpdateBlockPacket(pos=pos, runtime_id=stone_id))
+                self.assertEqual(query(), (cube, ()))
+                section = bytes((9, 2, 4)) + solid_sub_chunk(upper_slab_id)[3:] + solid_sub_chunk(stone_id)[3:]
+                await self.deliver(b.SubChunkPacket(
+                    dimension_type=0, center_pos=b.SubChunkPos(x=-1, y=4, z=-1),
+                    sub_chunk_data=[b.SubChunkPacket.SubChunkPacketData(
+                        result=b.SubChunkPacket.SubChunkRequestResult.SUCCESS, serialized_sub_chunk=section,
+                    )],
+                ))
+                self.assertEqual(query(), (slab, cube))
+                for layer in (-1, -2, -3, 2):
+                    with self.subTest(layer=layer):
+                        self.assertIsNone(self.bot.observed_block_collision_boxes(position, layer=layer))
+                await self.deliver(self.published(1024))
+                self.assertEqual(query(), (None, None))
+                await self.deliver(self.published(0), b.UpdateBlockPacket(pos=pos, runtime_id=stone_id))
+                self.assertEqual(query(), (cube, None))
+                await self.deliver(b.ChangeDimensionPacket(dimension_id=1), self.air(4, column=column))
+                self.assertEqual(query(), (None, None))
+                await self.deliver(self.air(4, column=column, dimension=1))
+                self.assertEqual(query(), ((), ()))
+
+                ended = []
+                self.bot.subscribe_session_end(lambda _: ended.append(query()))
+                await self.deliver(b.DisconnectPacket(), b.UpdateBlockPacket(pos=pos, runtime_id=stone_id))
+                self.assertEqual(ended, [(None, None)])
+                self.assertEqual(query(), (None, None))
+                self.assertEqual(self.transport.sent, [])
+                await self.bot.close()
 
     async def test_block_entity_query_distinguishes_empty_and_unknown_and_copies_native_values(self):
         await self.connect()
@@ -551,6 +665,8 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
         chests = {(5, 220, 10): 741882976, (6, 220, 10): 741882976, (6, 220, 9): 2001328343}
         for position in chests:
             self.assertIsNone(self.bot.observed_block(position))
+        stone, air = (5, 219, 10), (5, 221, 10)
+        self.assertIsNone(self.bot.observed_block_collision_boxes(stone))
 
         # The capture retained the game packet header and body after decompression.
         # Rebuild a single-packet batch and its raw DEFLATE frame for the shared reader.
@@ -563,8 +679,14 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(position=position):
                 self.assertEqual(self.bot.observed_block(position),
                                  BlockObservation(position, runtime_id, 0, False))
+                self.assertIsNone(self.bot.observed_block_collision_boxes(position))
+        self.assertEqual(self.bot.observed_block_collision_boxes(stone), ((0, 0, 0, 1, 1, 1),))
+        self.assertEqual(self.bot.observed_block_collision_boxes(air), ())
+        self.assertEqual(self.bot.observed_block_collision_boxes(stone, layer=1), ())
         self.assertIsNone(self.bot.observed_block((5, 224, 10)))
         self.assertIsNone(self.bot.observed_block((16, 220, 10)))
+        self.assertIsNone(self.bot.observed_block_collision_boxes((5, 224, 10)))
+        self.assertEqual(self.transport.sent, [])
 
     async def test_dimension_bounds_are_ready_at_join_and_keep_terrain_replay_in_wire_order(self):
         self.bot = Bot("DimensionBounds")
@@ -938,11 +1060,16 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
         ended = asyncio.create_task(self.bot.wait_for_terrain_coverage(selected))
         self.addCleanup(ended.cancel)
         await asyncio.sleep(0)
+        position = (4, 64, 2)
+        pos = self.b.BlockPos(x=4, y=64, z=2)
+        await self.deliver(self.b.UpdateBlockPacket(pos=pos, runtime_id=3317))
+        self.assertEqual(self.bot.observed_block_collision_boxes(position), ((0, 0, 0, 1, 1, 1),))
         failure = EOFError("reader ended")
         self.transport.incoming.put_nowait(failure)
         with self.assertRaises(ConnectionError) as disconnected:
             await asyncio.wait_for(ended, 1)
         self.assertIs(disconnected.exception.__cause__, failure)
+        self.assertIsNone(self.bot.observed_block_collision_boxes(position))
         with self.assertRaises(ConnectionError):
             await self.bot.wait_for_terrain_coverage(selected)
         self.assertEqual(self.transport.sent, [])
