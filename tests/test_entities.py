@@ -6,12 +6,13 @@ from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock
 from uuid import UUID
 
+from endpilot import Bot
 from endpilot.compression import PacketConnection
 from endpilot.entities import Entities, EntityMovement, EntitySpawn, EntityState, ItemPickup
 from endpilot.inventory import Inventory
 from endpilot.movement import Movement
 from endpilot.protocol import Protocol, RawPacket, write_batch
-from test_scheduled_input import Wire
+from test_scheduled_input import ManualClock, ScheduledInputTests, Wire
 
 
 def _movement_at(packets, position):
@@ -546,6 +547,90 @@ class EntityTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await Entities(packets).wait_for_movement(200, timeout=9)
         self.assertEqual(result, EntityMovement(200, 5.0, 101.5, 2.0))
+
+
+class EntityWorldInteractionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.enterContext(ManualClock().patch_scheduler())
+        self.input = ScheduledInputTests()
+
+    async def join(self):
+        bot = Bot("WorldInteractor", protocol=2225)
+        self.addAsyncCleanup(bot.close)
+        wire = await self.input.join(bot)
+        b = bot.protocol.binding
+        await self.input.observe(bot, wire, self.actor(b))
+        return bot, wire
+
+    @staticmethod
+    def actor(b, entity_id=42):
+        return b.AddActorPacket(entity_id=entity_id, runtime_id=77, actor_type="minecraft:armor_stand",
+                                pos=b.Vec3(x=2.5, y=100, z=0.5))
+
+    async def test_world_point_and_current_hand_after_pose_sync(self):
+        bot, wire = await self.join()
+        b = bot.protocol.binding
+        point = (2.625, 100.375, -0.5)
+        call = asyncio.create_task(bot.interact_entity_at(77, point))
+        await asyncio.sleep(0)
+        self.assertFalse(call.done())
+        self.assertEqual(wire.sent, [])
+
+        await self.input.observe(bot, wire, b.MoveActorAbsolutePacket(move_data=b.MoveActorAbsoluteData(
+            runtime_id=77, pos=b.Vec3(x=3.5, y=100, z=0.5),
+        )))
+        await self.input.observe(bot, wire, b.InventorySlotPacket(
+            inventory_id=b.ContainerID.INVENTORY, slot=3, item=b.SerializedNetworkItemStackDescriptor(
+                id=5, stack_size=2, net_id_variant=14, user_data_buffer=b"\x00" * 10,
+            ),
+        ))
+        await self.input.observe(bot, wire, b.PlayerHotbarPacket(
+            selected_slot=3, container_id=b.ContainerID.INVENTORY, should_select_slot=True,
+        ))
+        origin = (0.5, 101.625, -0.25)
+        self.input.teleport(wire, origin)
+        self.assertIsNone(await asyncio.wait_for(call, 1))
+
+        packet, = wire.sent
+        self.assertIsInstance(packet, b.InventoryTransactionPacket)
+        txn = packet.variant_transaction
+        self.assertIsInstance(txn, b.ItemUseOnActorInventoryTransaction)
+        self.assertEqual((txn.runtime_id, txn.action_type.name, txn.slot), (77, "INTERACT", 3))
+        self.assertEqual((txn.item.id, txn.item.stack_size, txn.item.net_id_variant), (5, 2, 14))
+        self.assertEqual((txn.from_pos.x, txn.from_pos.y, txn.from_pos.z), origin)
+        self.assertEqual((txn.hit_pos.x, txn.hit_pos.y, txn.hit_pos.z), point)
+        self.assertEqual(bot.rotation, (0, 0))
+
+    async def test_invalid_positions_and_unobserved_target_send_nothing(self):
+        bot, wire = await self.join()
+        for point in ((1, 2), (1, 2, 3, 4), (1, float("nan"), 3), (1, 2, float("inf")),
+                      (1e100, 2, 3), (1, "2", 3), None):
+            with self.subTest(point=point), self.assertRaises(ValueError):
+                await asyncio.wait_for(bot.interact_entity_at(77, point), 1)
+        with self.assertRaisesRegex(LookupError, "not currently observed"):
+            await asyncio.wait_for(bot.interact_entity_at(88, (1, 2, 3)), 1)
+        self.assertEqual(wire.sent, [])
+
+    async def test_target_leave_reuse_and_dimension_change_prevent_send(self):
+        for change in ("removed", "reused", "same IDs", "dimension"):
+            with self.subTest(change=change):
+                bot, wire = await self.join()
+                b = bot.protocol.binding
+                call = asyncio.create_task(bot.interact_entity_at(77, (1.25, 100.5, 2.75)))
+                await asyncio.sleep(0)
+                self.assertFalse(call.done())
+                if change == "dimension":
+                    await self.input.observe(bot, wire, b.ChangeDimensionPacket(dimension_id=1))
+                    await self.input.observe(bot, wire, self.actor(b))
+                else:
+                    await self.input.observe(bot, wire, b.RemoveActorPacket(entity_id=42))
+                    if change != "removed":
+                        await self.input.observe(bot, wire, self.actor(b, entity_id=43 if change == "reused" else 42))
+                self.input.teleport(wire, (0.5, 101.625, -0.25))
+                with self.assertRaisesRegex(LookupError, "target changed"):
+                    await asyncio.wait_for(call, 1)
+                self.assertEqual(wire.sent, [])
+                await bot.close()
 
 
 class ItemPickupTests(unittest.IsolatedAsyncioTestCase):

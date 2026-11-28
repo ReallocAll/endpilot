@@ -94,7 +94,7 @@ _MEMBERS = {
             execute_command_output
             wait_for_health_update wait_for_vitals_update wait_for_abilities wait_for_status_effects_update
             wait_for_hunger_update respawn wait_for_death wait_for_respawn submit_respawn attack_entity
-            swing animate missed_swing emote interact_entity mount dismount set_boat_input collect_drop
+            swing animate missed_swing emote interact_entity interact_entity_at mount dismount set_boat_input collect_drop
             wait_for_item_drop wait_for_item_pickup wait_for_entity_spawn wait_for_entity_removal
             wait_for_entity_movement
         """,

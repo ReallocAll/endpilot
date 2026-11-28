@@ -3363,6 +3363,16 @@ class Bot:
         await self._entities.interact(self._movement, self._inventory, runtime_id,
                                       hit_height=hit_height)
 
+    async def interact_entity_at(self, runtime_id: int, position: tuple[float, float, float]) -> None:
+        """Submit one main-hand interaction on a visible actor at a finite world point.
+
+        Raises LookupError if the target is unknown or its instance changes before
+        submission. The action leaves aim unchanged and returns after submission.
+        """
+        if self._entities is None or self._movement is None or self._inventory is None:
+            raise RuntimeError("player has not joined")
+        await self._entities.interact_at(self._movement, self._inventory, runtime_id, position)
+
     @property
     def vehicle(self) -> VehicleLink | None:
         """The local player's current ride link as reported by the server."""

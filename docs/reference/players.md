@@ -426,8 +426,17 @@ feet position is known. For sheep, spawn and verified position updates establish
 the feet position. Juvenile sheep and sheep in an unverified pose can leave the
 result unknown.
 
-`attack_entity` and `interact_entity` submit input; a normal return does not
-confirm a hit, damage, or another server-side effect.
+`await bot.interact_entity(runtime_id, hit_height=0.5)` submits a right-click
+at a height above the tracked actor position. To supply a specific point, use
+`await bot.interact_entity_at(runtime_id, (x, y, z))`. This sends one main-hand
+interaction using those three finite world coordinates at protocol precision.
+It uses the current input origin after position synchronization, and raises
+`LookupError` if the target is unobserved or its instance changes before
+submission. It leaves the current aim unchanged. Use `await bot.look_at(position)`
+first if you want to turn toward the point.
+
+`attack_entity`, `interact_entity`, and `interact_entity_at` return after
+submitting input. Observe server events to confirm the effect.
 
 ## Observe shield blocks
 

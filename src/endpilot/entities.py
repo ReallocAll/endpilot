@@ -2265,6 +2265,21 @@ class Entities:
         await self._use_actor(movement, inventory, runtime_id,
                               hit_height=hit_height, interact=True, _before_send=_before_send)
 
+    async def interact_at(self, movement, inventory, runtime_id: int,
+                          position: tuple[float, float, float]) -> None:
+        b = self.packets.protocol.binding
+        invalid_position = "position must contain three finite world coordinates representable by Vec3"
+        if not isinstance(position, Sequence) or len(position) != 3:
+            raise ValueError(invalid_position)
+        try:
+            hit_pos = b.Vec3(x=position[0], y=position[1], z=position[2])
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(invalid_position) from error
+        if not all(map(math.isfinite, (hit_pos.x, hit_pos.y, hit_pos.z))):
+            raise ValueError(invalid_position)
+
+        await self._use_actor(movement, inventory, runtime_id, interact=True, hit_pos=hit_pos)
+
     async def mount(self, movement, inventory, runtime_id: int) -> None:
         await self._use_actor(movement, inventory, runtime_id, hit_height=0.5, interact=True, mounting=True)
 
@@ -2278,11 +2293,16 @@ class Entities:
         await self.packets.send(animation(b, player_id, action_name, data, source=source))
 
     async def _use_actor(self, movement, inventory, runtime_id: int, *,
-                         hit_height: float, interact: bool, mounting: bool = False,
+                         hit_height: float = 0.5, interact: bool, mounting: bool = False, hit_pos=None,
                          _before_send: Callable[[int, object], None] | None = None) -> None:
         """Use an ItemUseOnActor transaction with the selected item and position."""
         self._require_live()
         actor = self.get(runtime_id)
+        if hit_pos is not None:
+            instance = self._actor_instance(runtime_id)
+            if instance is None:
+                raise LookupError("entity is not currently observed")
+            target_entity_id = self._animation_entity_id(runtime_id)
         unsubscribe = None
         if mounting:
             if actor is None or not actor.entity_id:
@@ -2299,14 +2319,21 @@ class Entities:
 
             unsubscribe = self.packets.subscribe_raw(check_target)
         try:
-            slot = inventory.selected_slot
-            item = inventory.item_or_empty(slot)
+            if hit_pos is None:
+                slot = inventory.selected_slot
+                item = inventory.item_or_empty(slot)
             await movement.wait_for_position_sync()
         finally:
             if unsubscribe is not None:
                 unsubscribe()
         self._require_live()
-        if mounting:
+        if hit_pos is not None:
+            if (self._actor_instance(runtime_id) is not instance or (target_entity_id is not None
+                    and self._animation_entity_id(runtime_id) != target_entity_id)):
+                raise LookupError("entity target changed while waiting to interact")
+            slot = inventory.selected_slot
+            item = inventory.item_or_empty(slot)
+        elif mounting:
             actor = check_target()
             if invalidated:
                 raise RuntimeError("vehicle target changed while waiting to mount")
@@ -2315,9 +2342,11 @@ class Entities:
         # Position sync waits for a server pose. Flat walking can then advance the
         # input origin through committed frames before the server sends another pose.
         x, y, z = movement._actor_interaction_origin()
-        # Use the player's position when the target actor is outside the tracking cache.
-        target = actor.position if actor is not None else (x, y, z)
         b = self.packets.protocol.binding
+        if hit_pos is None:
+            # Use the player's position when the target actor is outside the tracking cache.
+            target = actor.position if actor is not None else (x, y, z)
+            hit_pos = b.Vec3(x=target[0], y=target[1] + hit_height, z=target[2])
         action = b.ItemUseOnActorInventoryTransaction(
             transaction=b.InventoryTransaction(actions=[]),
             runtime_id=runtime_id,
@@ -2326,11 +2355,7 @@ class Entities:
             slot=slot,
             item=item,
             from_pos=b.Vec3(x=x, y=y, z=z),
-            hit_pos=b.Vec3(
-                x=target[0],
-                y=target[1] + hit_height,
-                z=target[2],
-            ),
+            hit_pos=hit_pos,
         )
         packet = b.InventoryTransactionPacket(
             legacy_request_id=b.ItemStackLegacyRequestId(raw_id=0),

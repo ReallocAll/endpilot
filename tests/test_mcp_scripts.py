@@ -91,6 +91,27 @@ async def main(bot, expected_host_pid, label):
         self.assertTrue(any(isinstance(packet, self.bot.protocol.binding.TextPacket)
                             and packet.body.message == "fixture chat" for packet in self.wire.sent))
 
+    async def test_world_entity_interaction_uses_the_resident_connection(self):
+        b = self.bot.protocol.binding
+        await test_scheduled_input.ScheduledInputTests().observe(
+            self.bot, self.wire, b.AddActorPacket(
+                entity_id=42, runtime_id=77, actor_type="minecraft:armor_stand",
+                pos=b.Vec3(x=2.5, y=100, z=0.5),
+            ),
+        )
+        script = """
+async def main(bot):
+    result = await bot.interact_entity_at(77, position=(2.625, 100.375, 0.125))
+    return {"interaction": result}
+"""
+        status = await self.completed(await self.start(script))
+        self.assertEqual(status["state"], "succeeded", status)
+        self.assertEqual(status["result"], {"interaction": None})
+        txn, = [packet.variant_transaction for packet in self.wire.sent
+                if isinstance(packet, b.InventoryTransactionPacket)]
+        self.assertEqual((txn.runtime_id, txn.action_type.name), (77, "INTERACT"))
+        self.assertEqual((txn.hit_pos.x, txn.hit_pos.y, txn.hit_pos.z), (2.625, 100.375, 0.125))
+
     async def test_command_output_preserves_ordered_packet_fields_and_zero_success(self):
         b = self.bot.protocol.binding
         data = ' \n{"键":"猫 🌱","accent":"e\u0301"} '
