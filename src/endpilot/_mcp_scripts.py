@@ -23,6 +23,7 @@ from .entities import EntityState
 from .inventory import _stack_snapshot
 from .placement import BoatPlacementResult, EntityPlacementResult, PlacementResult
 from .range_transfer import RangeTransferResult, transfer_container_range, transfer_inventory_range
+from .trading import TradeManyResult
 from .world_environment import WorldTime
 from .world_feedback import BlockEvent, ParticleEvent, SoundEvent
 
@@ -60,7 +61,7 @@ _MEMBERS = {
             rotation is_swimming dimension_bounds is_sleeping sleeping_bed player_respawn_point
             held_item inventory_slots armor_slots offhand_item open_window container_slots
             furnace_progress brewing_progress mining_target health hunger experience_level vitals abilities
-            status_effects is_dead observed_entities observed_drops vehicle vehicle_links commands_enabled
+            status_effects is_dead observed_entities observed_drops vehicle vehicle_links commands_enabled trade_offers
         """,
         "sync": """
             get_tick get_pending_form plan_navigation observed_block observed_block_state observed_biome
@@ -86,7 +87,7 @@ _MEMBERS = {
             drop_selected_item use_item consume release_using_item
             wait_for_container_slots wait_for_furnace_progress wait_for_brewing_progress take_from_container
             put_into_container open_inventory_screen close_container open_container open_entity_container
-            craft_recipe_auto
+            craft_recipe_auto open_trade trade_many
             use_item_on place_block place_against place_entity place_oak_boat
             start_mining continue_mining stop_mining finish_mining
             mine_block collect_block collect_targets collect_by_count collect_vein_by_count equip_harvest_tool
@@ -131,6 +132,7 @@ _RECORDS = {
     "player_state": "PlayerVitals PlayerEffect PlayerAbilities DeathEvent",
     "range_transfer": "RangeTransferResult RangeTransferStep",
     "recipes": "Recipe RecipeIngredient RecipeResult RecipeItemAmount RecipeDeltaPlan",
+    "trading": "TradeItem TradeOffer TradeOffers TradeManyRequest TradeManyResult",
     "world_environment": "WorldClock WorldTime Weather WorldRule WorldSpawn",
     "world_feedback": "SoundEvent ParticleEvent BlockEvent",
 }
@@ -150,7 +152,8 @@ _ITEM_VERDICTS = frozenset({
 _ERROR_FIELDS = {SleepRejected: "translation_key", ColumnCoverageInvalidated: "reason", MiningFaceUnavailable: "status"}
 _ERROR_PROGRESS = {"collection_progress": (BlockCollectionBatch, CountedBlockCollection, MixedCollectionBatch),
                    "placement_progress": (PlacementResult, EntityPlacementResult, BoatPlacementResult),
-                   "transfer_progress": (RangeTransferResult,)}
+                   "transfer_progress": (RangeTransferResult,),
+                   "trade_progress": (TradeManyResult,)}
 _ERROR_ATTRIBUTES = frozenset((*_ERROR_FIELDS.values(), *_ERROR_PROGRESS))
 
 
@@ -241,7 +244,7 @@ def _project(value):
             output.update(daytime=value.daytime, day=value.day, observed_moon_phase=value.observed_moon_phase)
         elif kind is EntityState:
             output["visible_effect_ids"] = _project(value.visible_effect_ids)
-        elif kind is RangeTransferResult:
+        elif kind in (RangeTransferResult, TradeManyResult):
             output["confirmed_count"] = value.confirmed_count
         elif isinstance(value, (SoundEvent, ParticleEvent, BlockEvent)):
             output.update(_feedback_fields(value))

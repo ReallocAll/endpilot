@@ -33,6 +33,7 @@ _REMOTE_ERRORS = {error.__name__: error for error in (
     MiningAborted, OSError, PermissionError, RuntimeError, TimeoutError, TypeError, ValueError,
 )}
 _SDK_ERRORS = {cls.__name__: (cls, name) for cls, name in _ERROR_FIELDS.items()}
+_SETTLED_PROGRESS = dict.fromkeys(_RANGE_TRANSFERS, "transfer_progress") | {"trade_many": "trade_progress"}
 
 
 class _Snapshot(SimpleNamespace):
@@ -222,12 +223,12 @@ class _Channel:
                 except ConnectionError:
                     raise error from None
             detail = frame.get("error")
-            if name in _RANGE_TRANSFERS:
+            if (progress := _SETTLED_PROGRESS.get(name)) is not None:
                 # Keep the host's settled progress even if local cancellation wins the await.
                 if detail is None:
-                    error.transfer_progress = self.reply(frame, name)
+                    setattr(error, progress, self.reply(frame, name))
                 else:
-                    _restore(error, detail, ("transfer_progress",))
+                    _restore(error, detail, (progress,))
             elif detail is not None and detail["type"] == "CancelledError":
                 _restore(error, detail, _ERROR_PROGRESS)
             raise

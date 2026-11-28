@@ -14,11 +14,13 @@ from endpilot.blocks import MiningFaceUnavailable
 from endpilot.chat import ChatMessage
 from endpilot.collection import BlockCollection, BlockCollectionBatch
 from endpilot.entities import EntityState
+from endpilot.mcp_server import MCPPlayer
 from endpilot.protocol import RawPacket, write_batch
 from endpilot.world_environment import WorldClock, WorldTime
 import test_placement
 import test_recipe_auto_tags
 import test_scheduled_input
+import test_trading
 
 
 class MCPScriptTests(unittest.IsolatedAsyncioTestCase):
@@ -932,6 +934,200 @@ async def main(bot):
                 {"item_id": 3, "aux_value": 0, "count": 1, "name": "minecraft:crafting_table"},
             ]},
         })
+
+
+class MCPScriptTradingTests(unittest.IsolatedAsyncioTestCase):
+    deliver = test_recipe_auto_tags.RecipeAutoTagTests.deliver
+    item = test_recipe_auto_tags.RecipeAutoTagTests.item
+    native_recipe = staticmethod(test_trading.TradeManyTests.native_recipe)
+    player_slot = staticmethod(test_trading.TradeManyTests.player_slot)
+    input_slot = staticmethod(test_trading.TradeManyTests.input_slot)
+    start = MCPScriptTests.start
+    wait_for = MCPScriptTests.wait_for
+    completed = MCPScriptTests.completed
+
+    async def asyncSetUp(self):
+        from bedrock_protocol import nbt
+
+        self.enterContext(test_scheduled_input.ManualClock().patch_scheduler())
+        self.bot = Bot("TradeFixture", protocol=2225)
+        self.addAsyncCleanup(self.bot.close)
+        self.wire = await test_scheduled_input.ScheduledInputTests().join(self.bot)
+        self.b = b = self.bot.protocol.binding
+        self.player = MCPPlayer()
+        self.player.bot = self.bot
+        self.scripts = MCPScripts(self.player)
+        self.addAsyncCleanup(self.scripts.close)
+        names = ("minecraft:emerald", "minecraft:book", "minecraft:enchanted_book", "minecraft:stick")
+        self.bot._session._replace_item_registry(b.ItemRegistryPacket(items=[
+            b.ItemData(id=item_id, name=name) for item_id, name in enumerate(names, 1)
+        ]))
+        slots = [self.item(1, 18, net_id=100), self.item(2, 2, net_id=200), *(self.item() for _ in range(34))]
+        await self.deliver(
+            b.InventoryContentPacket(inventory_id=b.ContainerID.INVENTORY, slots=slots),
+            b.UpdateTradePacket(container_id=7, type=b.ContainerType.TRADE, size=1, trader_tier=0,
+                                entity_unique_id=42, last_trading_player=1, display_name="Librarian",
+                                use_new_trade_screen=True, using_economy_trade=True, data=nbt.CompoundTag({
+                                    "Recipes": nbt.ListTag([self.native_recipe(123)], int(nbt.Type.COMPOUND)),
+                                })),
+        )
+        self.sent = asyncio.Queue()
+        self.addCleanup(self.bot.packets.subscribe_sent(
+            lambda packet_id: self.sent.put_nowait(None) if packet_id == b.ItemStackRequestPacket.ID else None,
+        ))
+
+    async def request(self, run):
+        await self.wait_for(run, lambda _: not self.sent.empty())
+        self.sent.get_nowait()
+        packet = self.wire.sent[-1]
+        self.assertIsInstance(packet, self.b.ItemStackRequestPacket)
+        request, = packet.requests
+        return request
+
+    async def reply(self, request, *rows, verdict="SUCCESS"):
+        b = self.b
+        groups = [b.ItemStackResponseContainerInfo(
+            full_container_name=b.FullContainerName(name=b.ContainerEnumName[name]),
+            slots=[b.ItemStackResponseSlotInfo(requested_slot=slot, slot=slot, amount=amount,
+                                               item_stack_net_id=None if net_id is None else b.ItemStackNetId(raw_id=net_id))],
+        ) for name, slot, amount, net_id in rows]
+        response = b.ItemStackResponseInfo(client_request_id=request.client_request_id, result=b.ItemStackNetResult[verdict],
+                                           containers=groups or None)
+        await self.deliver(b.ItemStackResponsePacket(responses=[response]))
+
+    async def test_cancelled_trade_keeps_pending_progress_and_late_inventory_on_the_same_connection(self):
+        run = await self.start("""
+import asyncio
+
+async def main(bot):
+    assert bot.trade_offers.offers[0].buy_b.name == 'minecraft:book'
+    trade = asyncio.create_task(bot.trade_many(123, 3))
+    await bot.wait_for_inventory_item_count(4, 1)
+    trade.cancel('script paused the trade')
+    try:
+        await trade
+    except asyncio.CancelledError as error:
+        assert error.trade_progress.confirmed_count == 1
+        assert error.trade_progress.requests[-1].status == 'unconfirmed'
+        raise
+""")
+        ids = []
+        for round_number in (1, 2):
+            for ingredient, count, net_id in ((1, 9, 100), (2, 1, 200)):
+                request = await self.request(run)
+                ids.append(request.client_request_id.raw_id)
+                remaining = count if round_number == 1 else 0
+                await self.reply(request, self.player_slot(ingredient - 1, remaining, net_id if remaining else None),
+                                 self.input_slot(ingredient, count, 500 + ingredient))
+            exchange = await self.request(run)
+            ids.append(exchange.client_request_id.raw_id)
+            destination = exchange.actions[-1].destination.slot
+            if round_number == 1:
+                await self.reply(exchange, self.input_slot(1, 0), self.input_slot(2, 0),
+                                 self.player_slot(destination, 1, 701))
+        await self.deliver(self.b.InventorySlotPacket(inventory_id=self.b.ContainerID.INVENTORY, slot=35,
+                                                      item=self.item(4, 1, net_id=810)))
+        ended = await self.completed(run)
+        self.assertEqual(ended["state"], "failed", ended)
+        self.assertEqual(ended["error"]["error_type"], "CancelledError")
+        self.assertEqual(ended["error"]["message"], "script paused the trade")
+        progress = ended["error"]["attributes"]["trade_progress"]
+        self.assertEqual((progress["stop_reason"], progress["confirmed_count"], progress["requested"]), ("cancelled", 1, 3))
+        self.assertEqual([row["request_id"] for row in progress["requests"]], ids)
+        self.assertEqual(progress["requests"][-1], {
+            "trade": 2, "request_id": ids[-1], "ingredient": None, "inventory_slot": destination,
+            "status": "unconfirmed", "verdict": None,
+        })
+        self.assertTrue(all(row["status"] == "confirmed" and row["verdict"] == "SUCCESS"
+                            for row in progress["requests"][:-1]))
+        await self.reply(exchange, self.input_slot(1, 0), self.input_slot(2, 0),
+                         self.player_slot(destination, 1, 702))
+        self.assertEqual(await self.completed(run), ended)
+        self.assertTrue(self.sent.empty())
+        self.assertFalse(self.wire.closed)
+        self.assertEqual((await self.player.session_status())["state"], "connected")
+        next_run = await self.start("""
+async def main(bot):
+    return [bot.player_id, bot.trade_offers.window_id, bot.inventory_count(3)]
+""")
+        self.assertEqual((await self.completed(next_run))["result"], [1, 7, 2])
+
+    async def test_trade_timeout_keeps_the_submitted_id_and_unknown_verdict(self):
+        run = await self.start("""
+async def main(bot):
+    return await bot.trade_many(123, 1, timeout=0.4)
+""")
+        request = await self.request(run)
+        ended = await self.completed(run)
+        self.assertEqual(ended["state"], "failed", ended)
+        self.assertEqual(ended["error"]["error_type"], "TimeoutError")
+        self.assertEqual(ended["error"]["attributes"]["trade_progress"], {
+            "recipe_net_id": 123, "requested": 1, "window_id": 7, "trader_unique_id": 42,
+            "stop_reason": "timeout", "confirmed_count": 0, "requests": [
+                {"trade": 1, "request_id": request.client_request_id.raw_id, "ingredient": 1,
+                 "inventory_slot": 0, "status": "unconfirmed", "verdict": None},
+            ],
+        })
+        self.assertEqual(self.bot.inventory_count(1), 18)
+        self.assertTrue(self.sent.empty())
+
+    async def test_settled_trade_reply_survives_local_cancellation(self):
+        run = await self.start("""
+import asyncio
+
+async def main(bot):
+    channel = bot._channel
+    start = channel.start
+    replies = []
+    def capture(*args, **kwargs):
+        started = start(*args, **kwargs)
+        replies.append(started[1])
+        return started
+    channel.start = capture
+    trade = asyncio.create_task(bot.trade_many(123, 0))
+    await asyncio.sleep(0)
+    assert 'value' in replies[0].result(timeout=5)
+    trade.cancel('pause after reply')
+    await trade
+""")
+        ended = await self.completed(run)
+        self.assertEqual(ended["state"], "failed", ended)
+        self.assertEqual(ended["error"], {"error_type": "CancelledError", "message": "pause after reply",
+                                         "attributes": {"trade_progress": {
+                                             "recipe_net_id": 123, "requested": 0, "window_id": 7, "trader_unique_id": 42,
+                                             "stop_reason": "complete", "confirmed_count": 0, "requests": [],
+                                         }}})
+        self.assertTrue(self.sent.empty())
+
+    async def test_trade_distinguishes_rejection_from_a_step_blocked_before_send(self):
+        script = "async def main(bot): return await bot.trade_many(123, 1)"
+        rejected = await self.start(script)
+        request = await self.request(rejected)
+        await self.reply(request, verdict="ERROR")
+        observed = (await self.completed(rejected))["result"]
+        self.assertEqual((observed["stop_reason"], observed["confirmed_count"]), ("rejected", 0))
+        self.assertEqual(observed["requests"], [{
+            "trade": 1, "request_id": request.client_request_id.raw_id, "ingredient": 1,
+            "inventory_slot": 0, "status": "rejected", "verdict": "ERROR",
+        }])
+
+        plan = self.bot._trading._plan
+
+        def invalidate_destination(*args):
+            proposal = plan(*args)
+            self.bot._inventory._unconfirmed_transfer_slots.add(proposal[1])
+            return proposal
+
+        with patch.object(self.bot._trading, "_plan", side_effect=invalidate_destination):
+            blocked = await self.start(script)
+            observed = (await self.completed(blocked))["result"]
+        self.assertEqual((observed["stop_reason"], observed["confirmed_count"]), ("inventory_unobserved", 0))
+        self.assertEqual(observed["requests"], [{
+            "trade": 1, "request_id": request.client_request_id.raw_id - 2, "ingredient": 1,
+            "inventory_slot": 0, "status": "not_sent", "verdict": None,
+        }])
+        self.assertTrue(self.sent.empty())
+        self.assertEqual(self.bot.inventory_count(1), 18)
 
 
 class MCPScriptPlacementTests(test_placement._PlacementHarness):

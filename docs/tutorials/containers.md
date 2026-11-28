@@ -216,6 +216,25 @@ observed for that actor instance. `TradeOffers.trader_tier` describes the
 window's last server quote. The actor can level up while that quote still
 reports the earlier tier. Use the server verdict to confirm an exchange.
 
+### Trade with a villager from MCP scripts
+
+In a script started with `run_script`, find the trader in
+`bot.observed_entities` and call `await bot.open_trade(trader.runtime_id)`.
+Read the latest window quote from `bot.trade_offers`. It is `None` when
+there is no current quote. Select an offer from `bot.trade_offers.offers` and use its `recipe_net_id` with
+`await bot.trade_many(recipe_net_id, count)`.
+
+The result's `confirmed_count` counts completed exchanges. Check
+`stop_reason` for an early stop and `requests` for the ordered stages and
+exchanges, their request IDs, and their verdicts. A request ID can be assigned
+before submission. A `not_sent` step was blocked before sending, while an
+`unconfirmed` step may still receive a verdict. Inspect `bot.inventory_slots`
+for observed stock.
+When the SDK attaches progress to a timeout or local cancellation, read
+`error.trade_progress`. If uncaught, it is reported in
+`observe_script.error.attributes.trade_progress`. Close the window with
+`await bot.close_container()`.
+
 ## Choose ranges and interpret partial results
 
 - With `direction="take"`, the source range is in the open container and
