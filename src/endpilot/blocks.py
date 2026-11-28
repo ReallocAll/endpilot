@@ -223,7 +223,7 @@ class MiningFaceUnavailable(RuntimeError):
 
 
 class MiningAborted(RuntimeError):
-    """A concurrent stop_mining call stopped this break."""
+    """A stop or replacement interrupted this break."""
 
 
 @dataclass(slots=True)
@@ -232,8 +232,10 @@ class _MiningOperation:
     interrupted: asyncio.Future[None]
     released: asyncio.Future[tuple[bool, int | None, Exception | None]]
     accepts_stop: bool = True
-    stop_requested: bool = False
+    interruption: Literal["stopped", "replaced"] | None = None
+    release_requested: bool = False
     pending_release: asyncio.Task | None = None
+    successor: asyncio.Future[bool] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -559,6 +561,7 @@ class Blocks:
         self._mining_completed = False
         operation = self._mining_operation
         if operation is not None:
+            self._cancel_mining_successor(operation)
             if not operation.interrupted.done():
                 operation.interrupted.set_result(None)
             if operation.pending_release is not None:
@@ -2142,14 +2145,67 @@ class Blocks:
                     self._end_mining_attempt(reason=self._mining_abort_reason(error))
                 raise
 
+    def _interrupt_mining(self, operation: _MiningOperation, reason: Literal["stopped", "replaced"]) -> None:
+        if operation.accepts_stop and not operation.interrupted.done():
+            operation.interruption = reason
+            operation.release_requested = True
+            operation.interrupted.set_result(None)
+            self._end_mining_attempt(reason=reason)
+
+    def _finish_mining_turn(self) -> None:
+        operation = self._mining_operation
+        if operation is not None and operation.successor is not None:
+            # Pass the already-held lock ahead of the ordinary FIFO waiters.
+            operation.successor.set_result(True)
+        else:
+            self._mining_operation = None
+            self._mining_lock.release()
+
+    def _cancel_mining_successor(self, operation: _MiningOperation) -> None:
+        successor, operation.successor = operation.successor, None
+        if successor is not None:
+            if successor.done():
+                # The predecessor has already passed the lock to this reservation.
+                self._finish_mining_turn()
+            else:
+                successor.set_result(False)
+
+    async def _acquire_mining_replacement(self, epoch: int) -> None:
+        operation = self._mining_operation
+        if operation is None or operation.epoch != epoch:
+            await self._mining_lock.acquire()
+            return
+        successor = asyncio.get_running_loop().create_future()
+        previous, operation.successor = operation.successor, successor
+        if previous is not None:
+            if previous.done():
+                # The previous reservation was granted but had not taken the turn.
+                successor.set_result(True)
+            else:
+                previous.set_result(False)
+        # A matched update still wins, and its release now belongs to the handoff.
+        operation.release_requested = True
+        self._interrupt_mining(operation, "replaced")
+        try:
+            granted = await asyncio.shield(successor)
+            self._check_mining_epoch(epoch)
+            if not granted or operation.successor is not successor:
+                raise MiningAborted("mining replacement was interrupted before START")
+            _, _, failure = operation.released.result()
+            if failure is not None:
+                raise failure
+        except BaseException:
+            if operation.successor is successor:
+                self._cancel_mining_successor(operation)
+            raise
+        operation.successor = None
+
     async def stop_mining(self) -> int | None:
         operation = self._mining_operation
         if operation is not None:
             self._check_mining_epoch(operation.epoch)
-            if operation.accepts_stop and not operation.interrupted.done():
-                operation.stop_requested = True
-                operation.interrupted.set_result(None)
-                self._end_mining_attempt(reason="stopped")
+            self._cancel_mining_successor(operation)
+            self._interrupt_mining(operation, "stopped")
             submitted, tick, failure = await asyncio.shield(operation.released)
             if not submitted:
                 self._check_mining_epoch(operation.epoch)
@@ -2233,6 +2289,7 @@ class Blocks:
 
     async def mine_block(
         self, position: tuple[int, int, int], *, face: int | None = 1, timeout: float = 15,
+        replace_current: bool = False,
         before_start: Callable[[], None] | None = None,
         _prepare_start: Callable[[], None] | None = None,
     ) -> BlockUpdate:
@@ -2242,11 +2299,17 @@ class Blocks:
         return the first matching update; callers must interpret its runtime ID.
         One deadline covers acquiring ownership, starting, and observing the break.
         A timed-out or cancelled break that already started is aborted.
-        An explicit stop raises MiningAborted.
+        An explicit stop or replacement raises MiningAborted.
         """
         epoch = self._mining_epoch
         prepare_start = _prepare_start
         async with asyncio.timeout(timeout) as budget:
+            def check_start():
+                self._check_mining_epoch(epoch)
+                deadline = budget.when()
+                if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("mining timed out before submitting START")
+
             if face is None:
                 match = self._sample_mining_face(position, encoded=True)
                 if match.status != "hit":
@@ -2256,10 +2319,7 @@ class Blocks:
                 before = self.observed_block(position)
 
                 def prepare_automatic_start():
-                    self._check_mining_epoch(epoch)
-                    deadline = budget.when()
-                    if deadline is not None and asyncio.get_running_loop().time() >= deadline:
-                        raise TimeoutError("mining timed out before submitting START")
+                    check_start()
                     current = self.observed_block(position)
                     if current is None or (self.hashed_runtime_ids and current.runtime_id == HASHED_UNKNOWN_RUNTIME_ID):
                         raise MiningFaceUnavailable("unknown")
@@ -2272,7 +2332,37 @@ class Blocks:
                     self._aim_mining_face(position, face, match.click_pos, encoded=True)
 
                 prepare_start = prepare_automatic_start
-            await self._mining_lock.acquire()
+                if replace_current and (before is None or before.is_air is not False or before.runtime_id is None):
+                    raise MiningFaceUnavailable("unknown")
+            elif replace_current:
+                position = tuple(position)
+                if len(position) != 3 or any(type(axis) is not int for axis in position):
+                    raise ValueError("mining position must contain three integer coordinates")
+                if type(face) is not int:
+                    raise ValueError("mining face must be between 0 and 5")
+                target = MiningTarget(position, face)
+
+                def observe_replacement_target():
+                    check_start()
+                    if not self.movement._can_send_input:
+                        raise RuntimeError("player input is unavailable for mining")
+                    return self._observed_mining_input(target, allow_edge_hit=True)[0]
+
+                before = observe_replacement_target()
+
+                def prepare_replacement_start():
+                    if observe_replacement_target() != before:
+                        raise ValueError("mining replacement target changed")
+                    if _prepare_start is not None:
+                        _prepare_start()
+
+                prepare_start = prepare_replacement_start
+
+            if replace_current:
+                check_start()
+                await self._acquire_mining_replacement(epoch)
+            else:
+                await self._mining_lock.acquire()
         try:
             self._check_mining_epoch(epoch)
             loop = asyncio.get_running_loop()
@@ -2280,8 +2370,7 @@ class Blocks:
             self._mining_operation = operation
             return await self._mine_observed(position, face, budget.when(), before_start, operation, prepare_start)
         finally:
-            self._mining_operation = None
-            self._mining_lock.release()
+            self._finish_mining_turn()
 
     async def _mine_observed(self, position, face, deadline, before_start, operation, prepare_start) -> BlockUpdate:
         b = self.packets.protocol.binding
@@ -2326,7 +2415,9 @@ class Blocks:
             if owner.cancelling() > initial_cancellations:
                 raise asyncio.CancelledError
             self._check_mining_epoch(epoch)
-            if operation.stop_requested:
+            if operation.interruption == "replaced":
+                raise MiningAborted("mining replaced by a new mine_block call")
+            if operation.interruption == "stopped":
                 raise MiningAborted("mining stopped by stop_mining")
 
         def prepare():
@@ -2403,10 +2494,10 @@ class Blocks:
             await asyncio.gather(*pending, return_exceptions=True)
             held = self._mining_target
             if (self._mining_epoch != operation.epoch or held is None
-                    or (target is not held and not (target is None and operation.stop_requested))):
+                    or (target is not held and not (target is None and operation.interruption is not None))):
                 return None
             # The observed break can end before the server's held input is released.
-            release = held if succeeded or operation.stop_requested else None
+            release = held if succeeded or operation.release_requested else None
             operation.pending_release = asyncio.current_task()
             try:
                 return await self._submit_mining(
@@ -2429,7 +2520,7 @@ class Blocks:
                     await asyncio.wait((cleanup,))
                 except asyncio.CancelledError as cancellation:
                     cancelled = cancellation
-                    if not operation.stop_requested:
+                    if not operation.release_requested:
                         cleanup.cancel()
             if cancelled is None or not cleanup.cancelled():
                 tick = cleanup.result()

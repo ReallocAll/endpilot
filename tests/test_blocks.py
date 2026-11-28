@@ -650,6 +650,255 @@ class BlocksTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await blocks.stop_mining())
             self.assertEqual(len(stream.sent), 2)
 
+    async def test_replacement_waits_for_one_release_and_rejects_unusable_successors(self):
+        for outcome in ("invalid", "superseded", "stopped", "failed", "cancelled", "timeout", "stale",
+                        "out_of_reach", "dimension", "respawn", "disconnect"):
+            with self.subTest(outcome=outcome):
+                async with asyncio.timeout(3):
+                    protocol, stream, blocks, observe = self.mining_fixture()
+                    a, b, c = (1, 100, 0), (2, 100, 0), (1, 100, 1)
+                    for position in (a, b, c):
+                        observe(position)
+                    events = []
+                    self.addCleanup(blocks.subscribe_mining_events(events.append))
+                    started, releasing, allow_release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+                    successor_started = asyncio.Event()
+                    original_send = stream.send
+                    write_error = OSError("old release write failed")
+                    tasks = []
+
+                    async def send(packet):
+                        await original_send(packet)
+                        if len(stream.sent) == 1:
+                            started.set()
+                        elif len(stream.sent) == 2:
+                            releasing.set()
+                            await allow_release.wait()
+                            if outcome == "failed":
+                                raise write_error
+                        elif len(stream.sent) == 3:
+                            successor_started.set()
+
+                    stream.send = send
+                    first = asyncio.create_task(blocks.mine_block(a, face=4))
+                    tasks.append(first)
+                    try:
+                        await started.wait()
+                        original = asyncio.create_task(blocks.mine_block(
+                            b, face=4, replace_current=True, timeout=0.05 if outcome == "timeout" else 15,
+                        ))
+                        tasks.append(original)
+                        await releasing.wait()
+                        chosen = stop = None
+                        if outcome == "invalid":
+                            with self.assertRaisesRegex(ValueError, "mining face"):
+                                await blocks.mine_block(c, face=8, replace_current=True)
+                            with self.assertRaisesRegex(ValueError, "observed non-air"):
+                                await blocks.mine_block((2, 100, 1), face=4, replace_current=True)
+                            distant = (20, 100, 0)
+                            observe(distant)
+                            with self.assertRaisesRegex(ValueError, "reach"):
+                                await blocks.mine_block(distant, face=4, replace_current=True)
+                            with patch.object(blocks.movement, "_input_position", None):
+                                with self.assertRaisesRegex(RuntimeError, "input is unavailable"):
+                                    await blocks.mine_block(c, face=4, replace_current=True)
+                            with self.assertRaises(TimeoutError):
+                                await blocks.mine_block(c, face=4, timeout=0, replace_current=True)
+                            chosen, position = original, b
+                            self.assertFalse(original.done())
+                        elif outcome == "superseded":
+                            chosen = asyncio.create_task(blocks.mine_block(c, face=4, replace_current=True))
+                            tasks.append(chosen)
+                            position = c
+                            with self.assertRaises(MiningAborted):
+                                await original
+                        elif outcome == "stopped":
+                            stop = asyncio.create_task(blocks.stop_mining())
+                            tasks.append(stop)
+                            with self.assertRaises(MiningAborted):
+                                await original
+                            self.assertFalse(stop.done())
+                        elif outcome == "cancelled":
+                            original.cancel()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await original
+                        elif outcome == "timeout":
+                            with self.assertRaises(TimeoutError):
+                                await original
+                        elif outcome == "stale":
+                            observe(b, 0x54A1D0FD)
+                        elif outcome == "out_of_reach":
+                            blocks.movement._input_position = (10.5, 101.62, 0.5)
+                        elif outcome in ("dimension", "respawn", "disconnect"):
+                            binding = protocol.binding
+                            packet = {
+                                "dimension": binding.ChangeDimensionPacket(dimension_id=1),
+                                "respawn": binding.RespawnPacket(
+                                    runtime_id=7, state=binding.PlayerRespawnState.READY_TO_SPAWN,
+                                ),
+                                "disconnect": binding.DisconnectPacket(),
+                            }[outcome]
+                            stream.emit(protocol.encode(packet))
+                            expected = ConnectionError if outcome == "disconnect" else RuntimeError
+                            with self.assertRaises(expected) as changed:
+                                await original
+                            self.assertIs(type(changed.exception), expected)
+
+                        self.assertEqual(len(stream.sent), 2)
+                        allow_release.set()
+                        with self.assertRaises(MiningAborted):
+                            await first
+                        if stop is not None:
+                            self.assertEqual(await stop, stream.sent[1].client_tick)
+                        if outcome == "failed":
+                            with self.assertRaises(OSError) as failure:
+                                await original
+                            self.assertIs(failure.exception, write_error)
+                        elif outcome == "stale":
+                            with self.assertRaisesRegex(ValueError, "target changed"):
+                                await original
+                        elif outcome == "out_of_reach":
+                            with self.assertRaisesRegex(ValueError, "reach"):
+                                await original
+                        if chosen is not None:
+                            await successor_started.wait()
+                            action, = stream.sent[2].player_block_actions
+                            self.assertEqual(action.player_action_type.name, "START_DESTROY_BLOCK")
+                            self.assertEqual((action.pos.x, action.pos.y, action.pos.z), position)
+                            observe(position, HASHED_AIR_RUNTIME_ID)
+                            self.assertEqual((await chosen).position, position)
+                        self.assertEqual(len(stream.sent), 4 if chosen is not None else 2)
+                        release = stream.sent[1].player_block_actions
+                        self.assertEqual([action.player_action_type.name for action in release],
+                                         ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"])
+                        self.assertEqual((release[0].pos.x, release[0].pos.y, release[0].pos.z), a)
+                        self.assertEqual([(event.target.position, event.reason) for event in events],
+                                         [(a, "replaced")] + ([(position, None)] if chosen is not None else []))
+                        self.assertFalse(blocks._mining_lock.locked())
+                    finally:
+                        allow_release.set()
+                        for task in tasks:
+                            task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_replacement_at_same_position_keeps_an_already_matched_result(self):
+        async with asyncio.timeout(3):
+            _, stream, blocks, observe = self.mining_fixture()
+            target = (1, 100, 0)
+            observe(target)
+            events = []
+            self.addCleanup(blocks.subscribe_mining_events(events.append))
+            started, finish_start, successor_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+            original_send = stream.send
+
+            async def send(packet):
+                await original_send(packet)
+                if len(stream.sent) == 1:
+                    started.set()
+                    await finish_start.wait()
+                if len(stream.sent) == 3:
+                    successor_started.set()
+
+            stream.send = send
+            first = asyncio.create_task(blocks.mine_block(target, face=4))
+            replacing = None
+            try:
+                await started.wait()
+                observe(target, HASHED_AIR_RUNTIME_ID)
+                observe(target)
+                replacing = asyncio.create_task(blocks.mine_block(target, face=4, replace_current=True))
+                await asyncio.sleep(0)
+                finish_start.set()
+                self.assertEqual(await first, BlockUpdate(target, HASHED_AIR_RUNTIME_ID, 0))
+                await successor_started.wait()
+                self.assertFalse(replacing.done())
+                observe(target, HASHED_AIR_RUNTIME_ID, layer=1)
+                await asyncio.sleep(0)
+                self.assertFalse(replacing.done())
+                observe(target, HASHED_AIR_RUNTIME_ID)
+                self.assertEqual(await replacing, BlockUpdate(target, HASHED_AIR_RUNTIME_ID, 0))
+                self.assertEqual([event.kind for event in events], ["completed", "completed"])
+                self.assertEqual([[action.player_action_type.name for action in packet.player_block_actions]
+                                  for packet in stream.sent], [
+                    ["START_DESTROY_BLOCK"], ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"],
+                    ["START_DESTROY_BLOCK"], ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"],
+                ])
+            finally:
+                finish_start.set()
+                tasks = (first,) if replacing is None else (first, replacing)
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_new_request_supersedes_a_granted_replacement_or_its_started_break(self):
+        for before_start in (True, False):
+            with self.subTest(before_start=before_start):
+                async with asyncio.timeout(3):
+                    _, stream, blocks, observe = self.mining_fixture()
+                    a, b, c = (1, 100, 0), (2, 100, 0), (1, 100, 1)
+                    for target in (a, b, c):
+                        observe(target)
+                    events = []
+                    self.addCleanup(blocks.subscribe_mining_events(events.append))
+                    sent = asyncio.Queue()
+                    original_send = stream.send
+
+                    async def send(packet):
+                        await original_send(packet)
+                        sent.put_nowait(packet)
+
+                    async def next_input(*expected):
+                        frame = await sent.get()
+                        self.assertEqual([action.player_action_type.name for action in frame.player_block_actions],
+                                         list(expected))
+                        position = frame.player_block_actions[0].pos
+                        return position.x, position.y, position.z
+
+                    third = None
+                    finish_turn = blocks._finish_mining_turn
+
+                    def finish_and_supersede():
+                        nonlocal third
+                        finish_turn()
+                        if third is None and len(stream.sent) == 2:
+                            third = asyncio.eager_task_factory(
+                                asyncio.get_running_loop(), blocks.mine_block(c, face=4, replace_current=True),
+                            )
+
+                    stream.send = send
+                    tasks = []
+                    first = asyncio.create_task(blocks.mine_block(a, face=4))
+                    tasks.append(first)
+                    start, abort, stop = "START_DESTROY_BLOCK", "ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"
+                    try:
+                        self.assertEqual(await next_input(start), a)
+                        with patch.object(blocks, "_finish_mining_turn",
+                                          side_effect=finish_and_supersede if before_start else finish_turn):
+                            second = asyncio.create_task(blocks.mine_block(b, face=4, replace_current=True))
+                            tasks.append(second)
+                            self.assertEqual(await next_input(abort, stop), a)
+                            with self.assertRaises(MiningAborted):
+                                await first
+                            if not before_start:
+                                self.assertEqual(await next_input(start), b)
+                                third = asyncio.create_task(blocks.mine_block(c, face=4, replace_current=True))
+                                self.assertEqual(await next_input(abort, stop), b)
+                            with self.assertRaises(MiningAborted):
+                                await second
+                        self.assertEqual(await next_input(start), c)
+                        observe(c, HASHED_AIR_RUNTIME_ID)
+                        self.assertEqual((await third).position, c)
+                        self.assertEqual(await next_input(abort, stop), c)
+                        expected = [(a, "replaced")] + ([] if before_start else [(b, "replaced")]) + [(c, None)]
+                        self.assertEqual([(event.target.position, event.reason) for event in events], expected)
+                        self.assertTrue(sent.empty())
+                    finally:
+                        if third is not None:
+                            tasks.append(third)
+                        for task in tasks:
+                            task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+
     async def test_caller_can_cancel_while_successful_break_is_releasing(self):
         _, stream, blocks, observe = self.mining_fixture()
         target = (1, 100, 0)

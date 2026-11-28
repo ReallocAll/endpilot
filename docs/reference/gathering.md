@@ -16,6 +16,19 @@ starting the break if no face can be confirmed. Omit `face` to use the
 default top face (`1`), or pass the face explicitly. A completed action
 returns the observed `BlockUpdate`.
 
+`await bot.mine_block(position, replace_current=True)` can take over an active
+whole-block mining call. The new call first checks the observed non-air target,
+its reach and face, and whether the player can send input. It waits for the
+old hold to release, then rechecks the target before starting ahead of queued
+mining actions. With `face=None`, aiming happens when the new break starts.
+
+A break interrupted before its matching update raises `MiningAborted`. If an
+update has already matched, the old call finishes normally. A newer valid
+replacement or `stop_mining()` ends a pending replacement with `MiningAborted`.
+A release failure reaches the replacement caller. A new break at
+the same coordinates listens for matching updates after its own start, which
+can include updates caused by other players or game actions.
+
 ## Choose a tool for a specific drop
 
 The ordinary tool ranking can retain a confirmed held pickaxe or shovel in

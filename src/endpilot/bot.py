@@ -2696,17 +2696,19 @@ class Bot:
         return await self._blocks.finish_mining(position, face=face)
 
     async def mine_block(
-        self, position: tuple[int, int, int], *, face: int | None = 1, timeout: float = 15
+        self, position: tuple[int, int, int], *, face: int | None = 1, timeout: float = 15,
+        replace_current: bool = False,
     ) -> BlockUpdate:
         """Mine until a server block update.
 
         Face None selects and aims at a visible mining face without moving.
         Raise MiningFaceUnavailable if automatic selection cannot submit START.
-        Raise MiningAborted if stop_mining stops the break before its matching update.
+        Pass replace_current=True to take over an active break after its release.
+        Raise MiningAborted if a stop or replacement wins before the matching update.
         """
         if self._blocks is None:
             raise RuntimeError("player has not joined")
-        return await self._blocks.mine_block(position, face=face, timeout=timeout)
+        return await self._blocks.mine_block(position, face=face, timeout=timeout, replace_current=replace_current)
 
     async def collect_block(
         self, position: tuple[int, int, int], *, ticks: int = 160,

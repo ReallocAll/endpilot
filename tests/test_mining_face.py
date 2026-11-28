@@ -5,7 +5,7 @@ from dataclasses import FrozenInstanceError
 from math import cos, dist, radians, sin
 import unittest
 
-from endpilot import Bot, MiningFaceResult, MiningFaceUnavailable
+from endpilot import Bot, MiningAborted, MiningFaceResult, MiningFaceUnavailable
 from endpilot.block_raycast import trace_blocks
 from endpilot.blocks import Blocks, BlockUpdate, HASHED_AIR_RUNTIME_ID, HASHED_UNKNOWN_RUNTIME_ID, MiningTarget
 from endpilot.harvest import HarvestTools
@@ -132,6 +132,54 @@ class MiningFaceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((abort.player_action_type.name, release.player_action_type.name),
                                  ("ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"))
                 self.assertEqual((abort.pos.x, abort.pos.y, abort.pos.z), TARGET)
+
+    async def test_replacement_samples_a_face_without_aiming_before_the_old_release(self):
+        self.scene()
+        self.block(HELD, STONE)
+        await self.bot.set_rotation(13, 28)
+        started, released, finish_release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        original_send = self.stream.send
+
+        async def send(packet):
+            await original_send(packet)
+            if len(self.stream.sent) == 1:
+                started.set()
+            elif len(self.stream.sent) == 2:
+                released.set()
+                await finish_release.wait()
+            elif len(self.stream.sent) == 3:
+                self.block(TARGET, HASHED_AIR_RUNTIME_ID)
+
+        self.stream.send = send
+        first = asyncio.create_task(self.bot.mine_block(HELD, face=4))
+        replacing = None
+        async with asyncio.timeout(3):
+            try:
+                await started.wait()
+                self.block(WALL, STONE)
+                with self.assertRaises(MiningFaceUnavailable):
+                    await self.bot.mine_block(TARGET, face=None, replace_current=True)
+                self.assertEqual(self.bot.mining_target, MiningTarget(HELD, 4))
+                self.assertEqual((len(self.stream.sent), self.bot.rotation), (1, (13, 28)))
+                self.block(WALL, HASHED_AIR_RUNTIME_ID)
+                replacing = asyncio.create_task(self.bot.mine_block(TARGET, face=None, replace_current=True))
+                await released.wait()
+                self.assertEqual((len(self.stream.sent), self.bot.rotation), (2, (13, 28)))
+                finish_release.set()
+                with self.assertRaises(MiningAborted):
+                    await first
+                self.assertEqual(await replacing, BlockUpdate(TARGET, HASHED_AIR_RUNTIME_ID, 0))
+                start = self.stream.sent[2]
+                action, = start.player_block_actions
+                self.assertEqual((action.player_action_type.name, action.facing), ("START_DESTROY_BLOCK", 4))
+                self.assertEqual((action.pos.x, action.pos.y, action.pos.z), TARGET)
+                self.assertEqual((start.rot.x, start.rot.y), (0, -90))
+            finally:
+                finish_release.set()
+                tasks = (first,) if replacing is None else (first, replacing)
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     async def test_half_slab_covers_five_samples_but_leaves_an_unsampled_gap(self):
         self.scene(y=100.15)

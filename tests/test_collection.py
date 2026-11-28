@@ -396,6 +396,69 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(no_queued_frame)
         self.assertTrue(self.wire.outgoing.empty())
 
+    async def check_mining_replacement_precedes_queued_work(self, *, phased):
+        bot = await self.public_bot()
+        await self.emit(self.block(ORE, position=SECOND_TARGET), self.block(ORE, position=THIRD_TARGET))
+        events = []
+        self.addCleanup(bot.subscribe_mining_events(events.append))
+        tasks = []
+
+        async def expect_frame(actions, position):
+            frame = await self.wire.outgoing.get()
+            self.assertEqual([action.player_action_type.name for action in frame.player_block_actions], actions)
+            first = frame.player_block_actions[0].pos
+            self.assertEqual((first.x, first.y, first.z), position)
+            return frame.client_tick
+
+        start = ["START_DESTROY_BLOCK"]
+        release = ["ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"]
+        async with asyncio.timeout(4):
+            try:
+                first = asyncio.create_task(bot.mine_block(TARGET, face=4))
+                tasks.append(first)
+                await expect_frame(start, TARGET)
+                queued = asyncio.create_task(
+                    bot.start_mining(THIRD_TARGET, face=4) if phased else bot.mine_block(THIRD_TARGET, face=4)
+                )
+                tasks.append(queued)
+                await asyncio.sleep(0)
+                self.assertFalse(queued.done())
+                replacing = asyncio.create_task(bot.mine_block(SECOND_TARGET, face=4, replace_current=True))
+                tasks.append(replacing)
+                await expect_frame(release, TARGET)
+                with self.assertRaises(MiningAborted):
+                    await first
+                await expect_frame(start, SECOND_TARGET)
+                self.assertFalse(queued.done())
+                await self.emit(self.block(HASHED_AIR_RUNTIME_ID, position=SECOND_TARGET))
+                self.assertEqual((await replacing).position, SECOND_TARGET)
+                await expect_frame(release, SECOND_TARGET)
+                tick = await expect_frame(start, THIRD_TARGET)
+                await self.emit(self.block(HASHED_AIR_RUNTIME_ID, position=THIRD_TARGET))
+                if phased:
+                    self.assertEqual(await queued, tick)
+                    await bot.stop_mining()
+                    await expect_frame(["STOP_DESTROY_BLOCK"], (0, 0, 0))
+                else:
+                    self.assertEqual((await queued).position, THIRD_TARGET)
+                    await expect_frame(release, THIRD_TARGET)
+                await asyncio.sleep(0)
+                self.assertTrue(self.wire.outgoing.empty())
+                self.assertEqual([(event.kind, event.target.position, event.reason) for event in events], [
+                    ("aborted", TARGET, "replaced"), ("completed", SECOND_TARGET, None),
+                    ("completed", THIRD_TARGET, None),
+                ])
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_mining_replacement_precedes_queued_whole_break(self):
+        await self.check_mining_replacement_precedes_queued_work(phased=False)
+
+    async def test_mining_replacement_precedes_queued_phased_start(self):
+        await self.check_mining_replacement_precedes_queued_work(phased=True)
+
     async def test_mine_block_does_not_renew_its_deadline_between_locks(self):
         bot = await self.public_bot()
         async with bot._movement._action_lock:
