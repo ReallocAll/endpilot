@@ -1,12 +1,46 @@
 import asyncio
 from dataclasses import FrozenInstanceError
+from types import MappingProxyType
 import unittest
 from unittest.mock import patch
 
-from endpilot import Bot, ItemRegistrySnapshot
+from endpilot import Bot, ItemRegistrySnapshot, vanilla_item_stack_limits
+from endpilot._stack_limits_2225 import STACK_LIMITS
 from endpilot.protocol import write_batch
 
 from test_scheduled_input import Wire
+
+
+class VanillaItemStackLimitTests(unittest.TestCase):
+    def test_catalog_is_complete_read_only_and_uses_exact_names(self):
+        limits = vanilla_item_stack_limits(protocol=2225)
+        self.assertEqual(len(limits), 1623)
+        self.assertEqual((limits["minecraft:paper"], limits["minecraft:snowball"], limits["minecraft:iron_pickaxe"]),
+                         (64, 16, 1))
+        for name in ("snowball", "minecraft:Snowball", "custom:snowball", "minecraft:unknown_item"):
+            with self.subTest(name=name):
+                self.assertIsNone(limits.get(name))
+        with self.assertRaises(TypeError):
+            limits["minecraft:paper"] = 1
+
+    def test_each_catalog_snapshot_has_its_own_backing_dictionary(self):
+        with patch("endpilot.item_registry.MappingProxyType", wraps=MappingProxyType) as wrap:
+            first = vanilla_item_stack_limits()
+            second = vanilla_item_stack_limits()
+
+        self.assertIsNot(first, second)
+        self.assertEqual(first, second)
+        first_call, second_call = wrap.call_args_list
+        first_data, = first_call.args
+        second_data, = second_call.args
+        self.assertIsNot(first_data, STACK_LIMITS)
+        self.assertIsNot(second_data, STACK_LIMITS)
+        self.assertIsNot(first_data, second_data)
+
+    def test_other_protocols_raise_value_error(self):
+        for protocol in (2193, 2226, 2225.0, "2225", True, None):
+            with self.subTest(protocol=protocol), self.assertRaisesRegex(ValueError, "unsupported vanilla item stack"):
+                vanilla_item_stack_limits(protocol)
 
 
 class ItemRegistryTests(unittest.IsolatedAsyncioTestCase):
@@ -70,6 +104,30 @@ class ItemRegistryTests(unittest.IsolatedAsyncioTestCase):
             registry.by_id[9] = "custom:changed"
         with self.assertRaises(FrozenInstanceError):
             registry.by_id = {}
+
+    async def test_vanilla_capacity_decision_uses_observed_registry_without_sending(self):
+        b = self.b
+        # Use a session-local ID to distinguish registry lookup from a vanilla numeric-ID lookup.
+        stack_id = 1234
+        slot = b.InventorySlotPacket(inventory_id=b.ContainerID.INVENTORY, slot=35,
+                                     item=b.SerializedNetworkItemStackDescriptor(id=stack_id, stack_size=15,
+                                                                                  net_id_variant=19))
+        await self.join(self.registry((stack_id, "minecraft:snowball")), slot)
+        sent = list(self.wire.sent)
+        stack = self.bot.inventory_slots[35]
+        name = self.bot.item_registry.name_for_id(stack.id)
+        limits = vanilla_item_stack_limits(self.bot.protocol.number)
+        self.assertEqual(name, "minecraft:snowball")
+        self.assertEqual(min(2, limits[name] - stack.stack_size), 1)
+        self.assertEqual(self.wire.sent, sent)
+
+        await self.deliver(self.registry((stack_id, "custom:snowball")))
+        sent = list(self.wire.sent)
+        name = self.bot.item_registry.name_for_id(stack.id)
+        self.assertEqual(name, "custom:snowball")
+        self.assertIsNone(limits.get(name))
+        self.assertEqual(limits["minecraft:snowball"], 16)
+        self.assertEqual(self.wire.sent, sent)
 
     async def test_batches_preserve_registry_order_and_derived_results(self):
         b = self.b

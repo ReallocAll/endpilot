@@ -1,5 +1,32 @@
 # Inventory and items
 
+## Look up vanilla stack capacities
+
+`vanilla_item_stack_limits(protocol=2225)` returns a new read-only snapshot
+from exact namespaced item names to their vanilla stack capacities. Keep the
+snapshot for repeated lookups. Paper stacks to 64, snowballs to 16, and iron
+pickaxes to 1. Lookup is local and sends no packets. Other protocols raise
+`ValueError`.
+
+Use the current session's item registry to resolve an observed stack's item
+ID before looking up its capacity. For example, for a known occupied slot:
+
+```python
+from endpilot import vanilla_item_stack_limits
+
+stack = bot.inventory_slots[slot]
+registry = bot.item_registry
+name = registry.name_for_id(stack.id) if registry is not None else None
+limits = vanilla_item_stack_limits(bot.protocol.number)
+limit = limits.get(name) if name is not None else None
+room = max(0, limit - stack.stack_size) if limit is not None else None
+```
+
+A stack of 15 snowballs has room for one more at the vanilla limit. An
+unregistered item ID or an item name outside the catalog yields `None` in
+this example. The mapping describes vanilla behavior. A server may use
+different limits, so check its transfer verdict when moving items.
+
 ## Move items within a storage window
 
 Call `transfer_container_range()` with two non-overlapping ranges in an

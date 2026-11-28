@@ -1,8 +1,17 @@
-"""Item names and network identifiers announced for a player session."""
+"""Session item names and versioned vanilla stack capacities."""
 
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
+
+from ._stack_limits_2225 import STACK_LIMITS as _STACK_LIMITS_2225
+
+
+def vanilla_item_stack_limits(protocol: int = 2225) -> Mapping[str, int]:
+    """Return a read-only snapshot of vanilla capacities by exact namespaced item name."""
+    if type(protocol) is not int or protocol != 2225:
+        raise ValueError(f"unsupported vanilla item stack limit protocol {protocol!r}")
+    return MappingProxyType(_STACK_LIMITS_2225.copy())
 
 
 @dataclass(frozen=True, slots=True)

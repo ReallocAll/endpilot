@@ -39,7 +39,7 @@ from .entity_registry import EntityRegistryEntry, EntityRegistrySnapshot
 from .fishing import FishingResult
 from .game_hp_estimate import TntDamageEstimate
 from .inventory import CursorObservation, HeldItemSnapshot, HeldItemStack, InventorySlotChange
-from .item_registry import ItemRegistrySnapshot
+from .item_registry import ItemRegistrySnapshot, vanilla_item_stack_limits
 from .item_use import ItemCooldownEvent
 from .login import LoginRefused, SessionEnd
 from .movement import BlockApproach, ForwardInput, MovementState
@@ -246,5 +246,6 @@ __all__ = [
     "transfer_range",
     "vanilla_biomes",
     "vanilla_blocks",
+    "vanilla_item_stack_limits",
     "vanilla_note_instruments",
 ]
