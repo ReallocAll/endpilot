@@ -3,8 +3,10 @@ from dataclasses import FrozenInstanceError
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from endpilot import Bot
-from endpilot.protocol import write_batch
+from endpilot import Bot, PlayerAbilities
+from endpilot.compression import PacketConnection
+from endpilot.player_state import PlayerState
+from endpilot.protocol import Protocol, write_batch
 from test_scheduled_input import ManualClock, Wire
 
 
@@ -140,6 +142,96 @@ class FlightTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(unchanged.done())
         wire.push(self.packet(b, -27, ("BASE", may_fly | flying, 0)))
         self.assertEqual(await unchanged, bot.abilities)
+
+    async def test_declared_speeds_follow_own_wire_updates_and_layer_priority(self):
+        bot = Bot("Flight")
+        self.addAsyncCleanup(bot.close)
+        b = bot.protocol.binding
+        wire = Wire(bot.protocol)
+        data = b.SerializedAbilitiesData
+        layers = data.SerializedAbilitiesLayer
+        fly, vertical, walk = (1 << bit for bit in (13, 19, 14))
+        base = data.SerializedLayer(serialized_layer=layers.BASE, abilities_set=fly | vertical | walk,
+                                    fly_speed=0.125, vertical_fly_speed=1.5, walk_speed=0.25)
+        commands = data.SerializedLayer(serialized_layer=layers.COMMANDS, abilities_set=fly,
+                                        fly_speed=0.0, vertical_fly_speed=4.0, walk_speed=4.0)
+        initial = b.UpdateAbilitiesPacket(data=data(target_player=-27, layers=[commands, base]))
+        other = b.UpdateAbilitiesPacket(data=data(target_player=13, layers=[base]))
+        await self.join(bot, wire, initial, other)
+        original = bot.abilities
+        self.assertEqual(original, PlayerAbilities(fly | vertical | walk, 0, None, None,
+                                                   fly_speed=0.0, vertical_fly_speed=1.5, walk_speed=0.25))
+
+        waiting = asyncio.create_task(bot.wait_for_abilities())
+        await asyncio.sleep(0)
+        await self.deliver(bot, wire, other)
+        self.assertFalse(waiting.done())
+        self.assertIs(bot.abilities, original)
+        partial = data.SerializedLayer(serialized_layer=layers.BASE, abilities_set=walk,
+                                       ability_values=fly | vertical, fly_speed=2.0,
+                                       vertical_fly_speed=3.0, walk_speed=0.5)
+        wire.push(b.UpdateAbilitiesPacket(data=data(target_player=-27, layers=[partial])))
+        update = await waiting
+        self.assertEqual(update, PlayerAbilities(walk, 0, None, None, walk_speed=0.5))
+        self.assertEqual(bot.abilities, update)
+        self.assertEqual((original.fly_speed, original.vertical_fly_speed, original.walk_speed), (0.0, 1.5, 0.25))
+        with self.assertRaises(FrozenInstanceError):
+            original.walk_speed = 9.0
+
+        waiting = asyncio.create_task(bot.wait_for_abilities())
+        await asyncio.sleep(0)
+        wire.push(b.DisconnectPacket())
+        with self.assertRaises(ConnectionError):
+            await waiting
+        await bot.close()
+        with self.assertRaises(RuntimeError):
+            _ = bot.abilities
+
+    async def test_nonfinite_speeds_in_the_highest_declaration_are_unknown(self):
+        bot = Bot("Flight")
+        self.addAsyncCleanup(bot.close)
+        b = bot.protocol.binding
+        wire = Wire(bot.protocol)
+        data = b.SerializedAbilitiesData
+        layers = data.SerializedAbilitiesLayer
+        fly, vertical, walk = (1 << bit for bit in (13, 19, 14))
+        may_fly, flying = (1 << int(index) for index in (b.AbilitiesIndex.MAY_FLY, b.AbilitiesIndex.FLYING))
+        declared = fly | vertical | walk | may_fly | flying
+        base = data.SerializedLayer(serialized_layer=layers.BASE, abilities_set=declared, ability_values=may_fly,
+                                    fly_speed=0.0, vertical_fly_speed=0.75, walk_speed=0.25)
+        commands = data.SerializedLayer(serialized_layer=layers.COMMANDS, abilities_set=fly | vertical,
+                                        fly_speed=float("nan"), vertical_fly_speed=float("inf"))
+        initial = b.UpdateAbilitiesPacket(data=data(target_player=-27, layers=[commands, base]))
+        await self.join(bot, wire, initial)
+        expected = PlayerAbilities(declared, may_fly, True, False, walk_speed=0.25)
+        self.assertEqual(bot.abilities, expected)
+
+        waiting = asyncio.create_task(bot.wait_for_abilities())
+        await asyncio.sleep(0)
+        commands = data.SerializedLayer(serialized_layer=layers.COMMANDS, abilities_set=walk, walk_speed=-float("inf"))
+        editor = data.SerializedLayer(serialized_layer=layers.EDITOR, abilities_set=vertical, vertical_fly_speed=-0.5)
+        wire.push(b.UpdateAbilitiesPacket(data=data(target_player=-27, layers=[editor, base, commands])))
+        expected = PlayerAbilities(declared, may_fly, True, False, fly_speed=0.0, vertical_fly_speed=-0.5)
+        self.assertEqual(await waiting, expected)
+        self.assertEqual(bot.abilities, expected)
+
+    def test_legacy_speed_layout_uses_only_available_floats(self):
+        for version, speeds, expected_vertical in ((766, {}, None), (1001, {"vertical_fly_speed": 0.5}, 0.5)):
+            with self.subTest(protocol=version):
+                protocol = Protocol(version)
+                b = protocol.binding
+                data = type(b.UpdateAbilitiesPacket().data)
+                mask = (1 << 13) | (1 << 19) | (1 << 14)
+                layer = data.SerializedLayer(serialized_layer=data.SerializedAbilitiesLayer.BASE, abilities_set=mask,
+                                             fly_speed=0.125, walk_speed=0.25, **speeds)
+                raw = protocol.encode(b.UpdateAbilitiesPacket(data=data(target_player=-27, layers=[layer])))
+                packets = PacketConnection(Wire(protocol), protocol, b.NetworkSettingsPacket(
+                    compression_algorithm=b.PacketCompressionAlgorithm.NONE,
+                ))
+                state = PlayerState(packets, 13, unique_id=-27, initial_packets=(raw,))
+                self.addCleanup(state.close)
+                self.assertEqual(state.abilities, PlayerAbilities(mask, 0, None, None, fly_speed=0.125,
+                                                                 vertical_fly_speed=expected_vertical, walk_speed=0.25))
 
     async def test_switches_use_confirmed_and_submitted_targets_without_duplicate_inputs(self):
         clock = ManualClock()

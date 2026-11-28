@@ -341,6 +341,41 @@ async def main(bot):
         self.assertEqual(report["state"], "succeeded", report)
         self.assertEqual(report["result"], [123, 2, 5, [[9, 3], [], None]])
 
+    async def test_ability_speeds_are_projected_in_read_and_wait_snapshots(self):
+        b = self.bot.protocol.binding
+        data = b.SerializedAbilitiesData
+        fly, vertical, walk = (1 << bit for bit in (13, 19, 14))
+        may_fly, flying = (1 << int(index) for index in (b.AbilitiesIndex.MAY_FLY, b.AbilitiesIndex.FLYING))
+        declared = fly | vertical | walk | may_fly | flying
+        initial_layer = data.SerializedLayer(serialized_layer=data.SerializedAbilitiesLayer.BASE,
+                                             abilities_set=declared, ability_values=may_fly, fly_speed=float("nan"),
+                                             vertical_fly_speed=float("inf"), walk_speed=-float("inf"))
+        initial = b.UpdateAbilitiesPacket(data=data(target_player=1, layers=[initial_layer]))
+        await test_scheduled_input.ScheduledInputTests().observe(self.bot, self.wire, initial)
+        run = await self.start("""
+import asyncio
+
+async def main(bot):
+    can_fly = bot.abilities.may_fly
+    original = bot.abilities
+    waiting = asyncio.create_task(bot.wait_for_abilities(timeout=3))
+    await asyncio.sleep(0)
+    bot.get_tick()
+    print('abilities waiting')
+    return [can_fly, original, await waiting, bot.abilities]
+""")
+        await self.wait_for(run, lambda status: "abilities waiting\n" in self.text(status))
+        layer = data.SerializedLayer(serialized_layer=data.SerializedAbilitiesLayer.BASE,
+                                     abilities_set=fly | vertical | may_fly | flying, ability_values=may_fly,
+                                     fly_speed=0.0, vertical_fly_speed=-0.75, walk_speed=0.25)
+        self.wire.push(b.UpdateAbilitiesPacket(data=data(target_player=1, layers=[layer])))
+        report = await self.completed(run)
+        self.assertEqual(report["state"], "succeeded", report)
+        original = {"abilities_set": declared, "ability_values": may_fly, "may_fly": True, "flying": False,
+                    "fly_speed": None, "vertical_fly_speed": None, "walk_speed": None}
+        updated = dict(original, abilities_set=declared & ~walk, fly_speed=0.0, vertical_fly_speed=-0.75)
+        self.assertEqual(report["result"], [True, original, updated, updated])
+
     async def test_column_coverage_carries_sdk_invalidation_for_a_real_range(self):
         run = await self.start("""
 import asyncio

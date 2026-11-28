@@ -27,6 +27,14 @@ whether the switch takes effect. Observe the server's
 reported flight state in `bot.abilities.flying` or await
 `bot.wait_for_abilities()` to receive the next ability packet.
 
+`bot.abilities` and `bot.wait_for_abilities()` return immutable `PlayerAbilities`
+snapshots. `fly_speed`, `vertical_fly_speed`, and `walk_speed` are the speeds
+reported by the server. For each speed, the highest-priority layer that
+declares it supplies the value, including finite negative values and `0.0`.
+An undeclared speed is `None`. If the selected layer's field is missing or
+non-finite, that speed is `None`. `ability_values` continues to carry the
+merged boolean ability bits.
+
 ## Fly to a position in Creative
 
 ```python

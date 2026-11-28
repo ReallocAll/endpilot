@@ -90,12 +90,15 @@ def _effect_from_packet(packet) -> PlayerEffect:
 
 @dataclass(frozen=True, slots=True)
 class PlayerAbilities:
-    """Effective server ability bits. None denotes an undefined flight ability."""
+    """Effective server ability bits and declared speeds. None denotes an unknown value."""
 
     abilities_set: int = 0
     ability_values: int = 0
     may_fly: bool | None = None
     flying: bool | None = None
+    fly_speed: float | None = None
+    vertical_fly_speed: float | None = None
+    walk_speed: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,18 +284,34 @@ class PlayerState:
 
     def _read_abilities(self, data) -> PlayerAbilities:
         defined = values = 0
+        fly_speed = vertical_fly_speed = walk_speed = None
+        index = self.packets.protocol.binding.AbilitiesIndex
         # Later, higher-priority layers override only the abilities they define.
         for layer in sorted(data.layers, key=lambda item: int(item.serialized_layer)):
             mask = int(layer.abilities_set)
             values = (values & ~mask) | (int(layer.ability_values) & mask)
             defined |= mask
+            if mask & (1 << int(index.FLY_SPEED)):
+                fly_speed = layer.fly_speed
+            if mask & (1 << int(index.VERTICAL_FLY_SPEED)):
+                # Older packet layouts omit the vertical speed field.
+                vertical_fly_speed = getattr(layer, "vertical_fly_speed", None)
+            if mask & (1 << int(index.WALK_SPEED)):
+                walk_speed = layer.walk_speed
 
         def flag(index) -> bool | None:
             bit = 1 << int(index)
             return bool(values & bit) if defined & bit else None
 
-        index = self.packets.protocol.binding.AbilitiesIndex
-        return PlayerAbilities(defined, values, flag(index.MAY_FLY), flag(index.FLYING))
+        def finite_speed(value: float | None) -> float | None:
+            return value if value is not None and math.isfinite(value) else None
+
+        return PlayerAbilities(
+            defined, values, flag(index.MAY_FLY), flag(index.FLYING),
+            fly_speed=finite_speed(fly_speed),
+            vertical_fly_speed=finite_speed(vertical_fly_speed),
+            walk_speed=finite_speed(walk_speed),
+        )
 
     def _on_packet(self, raw) -> None:
         if self._disconnected:
