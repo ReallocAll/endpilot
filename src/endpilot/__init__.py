@@ -16,7 +16,9 @@ from .books import BookSnapshot
 from .boss_bars import BossBar, BossBarEvent, BossBarEventKind
 from .bot import Bot
 from .chat import ChatMatch, ChatMessage, DisplayMatch, TextEvent, TextPacketType, TextTranslations
-from .collection import BlockCollection, BlockCollectionBatch, CountedBlockCollection, DropCollection, MixedCollectionBatch
+from .collection import (
+    BlockCollection, BlockCollectionBatch, CollectionTargetQueue, CountedBlockCollection, DropCollection, MixedCollectionBatch,
+)
 from .collection_storage import CollectionStorage, CollectionStorageResult
 from .commands import CommandCatalog, CommandCatalogEntry
 from .containers import BrewingProgress, ContainerSlotChange, FurnaceProgress
@@ -80,6 +82,7 @@ __all__ = [
     "BlockChange",
     "BlockCollection",
     "BlockCollectionBatch",
+    "CollectionTargetQueue",
     "BlockEntityUpdate",
     "BlockEvent",
     "BlockFaceGoal",

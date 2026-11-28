@@ -91,6 +91,17 @@ settings, as in `collect_block`. The first result with a status other than
 results of the attempted targets. When an exception interrupts collection,
 read `collection_progress` on the original exception for any known progress.
 
+Pass a fresh `CollectionTargetQueue` as `additions` to append targets while
+`collect_targets` is active. Call `additions.extend(positions)` synchronously
+on the same event loop. The returned tuple contains the newly admitted
+coordinates, in input order. Initial and added targets share the `count`
+limit. The SDK snapshots each added target's current block when admitting it.
+
+`BlockCollectionBatch.positions` includes admitted targets that collection
+did not reach. `results` and `active` report attempted and interrupted work.
+The queue seals when the batch finishes, stops, or is cancelled. Use a new
+queue for each call. Empty initial input or `count=0` completes immediately.
+
 On a local offline BDS, replace the sample coordinates with two nearby blocks
 and give the bot a suitable tool in its main inventory.
 

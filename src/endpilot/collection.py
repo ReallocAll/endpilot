@@ -87,6 +87,32 @@ class BlockCollectionBatch:
     active: BlockCollection | None = None
 
 
+class CollectionTargetQueue:
+    """Append coordinates to one active collect_targets call on its event loop."""
+
+    def __init__(self) -> None:
+        self._used = False
+        self._admit: Callable[[Iterable[tuple[int, int, int]]], tuple[tuple[int, int, int], ...]] | None = None
+
+    def extend(self, positions: Iterable[tuple[int, int, int]]) -> tuple[tuple[int, int, int], ...]:
+        """Validate positions and return the new targets admitted in input order."""
+        admit = self._admit
+        if admit is None:
+            raise RuntimeError("collection target queue is not open")
+        return admit(positions)
+
+    def _require_unused(self) -> None:
+        if self._used:
+            raise RuntimeError("collection target queue has already been used")
+
+    def _bind(self) -> None:
+        self._require_unused()
+        self._used = True
+
+    def _seal(self) -> None:
+        self._admit = None
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CountedBlockCollection(BlockCollectionBatch):
     """Admitted candidates and confirmed main-inventory gains for one item ID.
@@ -249,29 +275,91 @@ class _BlockCollector:
         self, bot: "Bot", positions: Iterable[tuple[int, int, int]], *, count: int | None = None,
         ticks: int = 160, search_radius: int = 8, timeout: float = 15, tool_chest: HarvestToolChest | None = None,
         tool_chests: Sequence[HarvestToolChest] | None = None, storage: CollectionStorage | None = None,
-        requested_drop_id: int | None = None,
+        requested_drop_id: int | None = None, additions: CollectionTargetQueue | None = None,
     ) -> BlockCollectionBatch:
+        if additions is not None:
+            if not isinstance(additions, CollectionTargetQueue):
+                raise TypeError("additions must be a CollectionTargetQueue")
+            additions._require_unused()
         if count is not None and (not isinstance(count, int) or count < 0):
             raise ValueError("collection count must be a nonnegative integer")
         tool_chests = _snapshot_tool_chests(tool_chest, tool_chests)
         storage_item_id = _storage_item_id(bot, storage, timeout)
         positions = tuple(dict.fromkeys(map(_position, positions)))[:count]
         progress = _BatchProgress(self.blocks.dimension_id, positions)
+        seal = None
         try:
             self._check_connection()
+            if additions is not None:
+                additions._bind()
+                seal = additions._seal
             if not positions:
                 return progress.snapshot()
+
             epoch = self.blocks._mining_epoch
             before = tuple(self.blocks.observed_block(position) for position in positions)
-            await self._run(self._collect_batch(
-                bot, progress, zip(positions, before, strict=True), epoch,
-                ticks=ticks, search_radius=search_radius, timeout=timeout,
-                tool_chest=tool_chest, tool_chests=tool_chests, storage=storage, storage_item_id=storage_item_id,
-                requested_drop_id=requested_drop_id,
-            ))
+            targets = zip(positions, before, strict=True)
+            if additions is not None:
+                pending = list(targets)
+                admitted = set(positions)
+                owner = asyncio.current_task()
+                loop = asyncio.get_running_loop()
+                if owner is None:
+                    raise RuntimeError("a collection target queue requires an asyncio task")
+                initial_cancellations = owner.cancelling()
+                if initial_cancellations:
+                    # Deliver pending cancellation before admitting work. Handled cancellations can leave a count.
+                    await asyncio.sleep(0)
+                    initial_cancellations = owner.cancelling()
+                    self._check_connection()
+                    self.blocks._check_mining_epoch(epoch)
+
+                def require_active():
+                    if asyncio.get_running_loop() is not loop:
+                        raise RuntimeError("collection target queue belongs to another event loop")
+                    if owner.cancelling() > initial_cancellations or owner.done():
+                        additions._seal()
+                        raise RuntimeError("collection target queue is not open")
+                    try:
+                        self._check_connection()
+                        self.blocks._check_mining_epoch(epoch)
+                    except (ConnectionError, RuntimeError) as error:
+                        additions._seal()
+                        raise RuntimeError("collection target queue is no longer active") from error
+
+                def admit(extra):
+                    require_active()
+                    supplied = tuple(dict.fromkeys(map(_position, extra)))
+                    require_active()
+                    remaining = None if count is None else count - len(admitted)
+                    accepted = tuple(position for position in supplied if position not in admitted)[:remaining]
+                    snapshots = [(position, self.blocks.observed_block(position)) for position in accepted]
+                    pending.extend(snapshots)
+                    admitted.update(accepted)
+                    progress.positions += accepted
+                    return accepted
+
+                additions._admit = admit
+                targets = pending
+
+            async def collect_batch():
+                try:
+                    await self._collect_batch(
+                        bot, progress, targets, epoch, ticks=ticks, search_radius=search_radius, timeout=timeout,
+                        tool_chest=tool_chest, tool_chests=tool_chests, storage=storage, storage_item_id=storage_item_id,
+                        requested_drop_id=requested_drop_id,
+                    )
+                finally:
+                    if seal is not None:
+                        seal()
+
+            await self._run(collect_batch(), before_cleanup=seal)
         except (Exception, asyncio.CancelledError) as error:
             error.collection_progress = progress.snapshot()
             raise
+        finally:
+            if seal is not None:
+                seal()
         return progress.snapshot()
 
     async def collect_by_count(
@@ -404,7 +492,8 @@ class _BlockCollector:
             error.collection_progress = progress.snapshot()
             raise
 
-    async def _run[T](self, operation: Coroutine[None, None, T]) -> T:
+    async def _run[T](self, operation: Coroutine[None, None, T], *,
+                      before_cleanup: Callable[[], None] | None = None) -> T:
         # A kick can leave the packet reader running while callers wait for the lock.
         async def watch_disconnect():
             self._check_connection()
@@ -421,6 +510,8 @@ class _BlockCollector:
             self._check_connection()
             return await action
         finally:
+            if before_cleanup is not None:
+                before_cleanup()
             for task in (action, watcher):
                 if not task.done():
                     task.cancel()

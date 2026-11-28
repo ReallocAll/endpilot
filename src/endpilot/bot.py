@@ -32,7 +32,9 @@ from .books import BookEdit, BookSnapshot, Books
 from .boss_bars import BossBar, BossBarEvent, BossBarEventKind, BossBars
 from .chat import Chat, ChatMatch, ChatMessage, ChatPatterns, DisplayMatch, TextEvent, TextPacketType, TextTranslations
 from .client_clock import ClientClock
-from .collection import BlockCollection, BlockCollectionBatch, CountedBlockCollection, MixedCollectionBatch, _BlockCollector
+from .collection import (
+    BlockCollection, BlockCollectionBatch, CollectionTargetQueue, CountedBlockCollection, MixedCollectionBatch, _BlockCollector,
+)
 from .collection_storage import CollectionStorage
 from .commands import CommandCatalog, CommandCompletion, Commands
 from .compression import PacketConnection
@@ -2597,12 +2599,17 @@ class Bot:
         self, positions: Iterable[tuple[int, int, int]], *, count: int | None = None,
         ticks: int = 160, search_radius: int = 8, timeout: float = 15, tool_chest: HarvestToolChest | None = None,
         tool_chests: Sequence[HarvestToolChest] | None = None, storage: CollectionStorage | None = None,
+        additions: CollectionTargetQueue | None = None,
     ) -> BlockCollectionBatch:
         """Collect unique targets in input order, up to count.
 
         Apply the movement and wait budgets to each target. Stop at the first
         result whose status is not collected. An exception can carry known
         progress in its collection_progress attribute.
+
+        Pass a fresh additions queue to admit more coordinates during this
+        call. Initial and added targets share the count limit. Admitting a
+        coordinate snapshots its current block and includes it in positions.
 
         With tool_chest, a confirmed inventory shortage can trigger one trip
         to the specified chest for that target, then a return to the target.
@@ -2623,7 +2630,7 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._block_collector.collect_targets(
             self, positions, count=count, ticks=ticks, search_radius=search_radius, timeout=timeout,
-            tool_chest=tool_chest, tool_chests=tool_chests, storage=storage,
+            tool_chest=tool_chest, tool_chests=tool_chests, storage=storage, additions=additions,
         )
 
     async def collect_by_count(

@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from endpilot import (
-    BlockCollectionBatch, BlockObservation, Bot, CollectionStorage, CountedBlockCollection, DropCollection,
+    BlockCollectionBatch, BlockObservation, Bot, CollectionStorage, CollectionTargetQueue, CountedBlockCollection, DropCollection,
     MiningAborted, MiningEvent, MiningTarget, MixedCollectionBatch, NavigationRules,
 )
 from endpilot._mcp_scripts import MCPScripts
@@ -1047,6 +1047,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
     async def start_storage_collection(
         self, positions=(TARGET, SECOND_TARGET), *, dirt_count=64, slots=36, empty_slot=False, vein=False,
         chest=REFILL_CHEST, additional_positions=(), terrain=(), ticks=0, search_radius=0, timeout=1, other_drops=(),
+        additions=None,
     ):
         bot = await self.storage_bot(dirt_count=dirt_count, slots=slots, empty_slot=empty_slot, chest=chest,
                                      additional_positions=additional_positions, terrain=terrain)
@@ -1054,7 +1055,7 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
                                     chest_slots=range(4, 5), additional_positions=additional_positions)
         options = dict(storage=storage, ticks=ticks, search_radius=search_radius, timeout=timeout)
         action = (bot.collect_vein_by_count(TARGET, item_id=DIRT, count=2, **options) if vein
-                  else bot.collect_targets(positions, **options))
+                  else bot.collect_targets(positions, additions=additions, **options))
         task = asyncio.create_task(action)
 
         async def settle_task():
@@ -3309,6 +3310,201 @@ async def main(bot, item_id):
         self.assertIsNone(result.active)
         self.assertEqual(bot.observed_block(TARGET).runtime_id, ORE)
         self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_append_queue_seals_for_empty_batches_and_cannot_be_reused(self):
+        bot = await self.batch_bot()
+        for positions, count in (([], None), ([TARGET], 0)):
+            with self.subTest(positions=positions, count=count):
+                queue = CollectionTargetQueue()
+                with self.assertRaises(RuntimeError):
+                    queue.extend([SECOND_TARGET])
+                async with bot._block_collector._lock:
+                    result = await bot.collect_targets(positions, count=count, additions=queue)
+                self.assertEqual(result, BlockCollectionBatch(0, (), ()))
+                with self.assertRaises(RuntimeError):
+                    queue.extend([SECOND_TARGET])
+                with self.assertRaises(RuntimeError):
+                    await bot.collect_targets([TARGET], additions=queue)
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_append_queue_admits_active_targets_and_deduplicates_completed_ones(self):
+        bot = await self.batch_bot()
+        queue = CollectionTargetQueue()
+        async with asyncio.TaskGroup() as tasks:
+            task = tasks.create_task(bot.collect_targets([TARGET], additions=queue, count=2, timeout=2))
+            await self.expect_batch_start(TARGET)
+            self.assertEqual(queue.extend([TARGET, SECOND_TARGET, SECOND_TARGET]), (SECOND_TARGET,))
+            with self.assertRaises(RuntimeError):
+                await bot.collect_targets([], additions=queue)
+            self.assertTrue(self.wire.outgoing.empty())
+            await self.finish_batch_break(TARGET, runtime_id=101, total=1)
+            await self.expect_batch_start(SECOND_TARGET)
+            self.assertEqual(queue.extend([TARGET, SECOND_TARGET, THIRD_TARGET]), ())
+            await self.finish_batch_break(SECOND_TARGET, runtime_id=102, total=2)
+        batch = task.result()
+        self.assertEqual(batch.positions, (TARGET, SECOND_TARGET))
+        self.assertEqual([(row.position, row.collector_id, row.inventory_delta) for row in batch.results],
+                         [(TARGET, PLAYER, 1), (SECOND_TARGET, PLAYER, 1)])
+        self.assertIsNone(batch.active)
+        self.assertEqual(bot.observed_block(THIRD_TARGET).runtime_id, ORE)
+        with self.assertRaises(RuntimeError):
+            queue.extend([THIRD_TARGET])
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_append_queue_allows_collection_after_a_handled_task_group_failure(self):
+        bot = await self.batch_bot()
+        queue = CollectionTargetQueue()
+
+        async def fail():
+            raise ValueError("previous task group failed")
+
+        async def collect_after_failure():
+            owner = asyncio.current_task()
+            try:
+                async with asyncio.TaskGroup() as previous:
+                    previous.create_task(fail())
+            except* ValueError:
+                pass
+            # Python 3.12 leaves a cancellation count after this TaskGroup exits.
+            if not owner.cancelling():
+                owner.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.sleep(0)
+            self.assertGreater(owner.cancelling(), 0)
+            return await bot.collect_targets([TARGET], additions=queue, timeout=2)
+
+        async with asyncio.TaskGroup() as tasks:
+            task = tasks.create_task(collect_after_failure())
+            await self.expect_batch_start(TARGET)
+            self.assertEqual(queue.extend([SECOND_TARGET]), (SECOND_TARGET,))
+            await self.finish_batch_break(TARGET, runtime_id=101, total=1)
+            await self.expect_batch_start(SECOND_TARGET)
+            await self.finish_batch_break(SECOND_TARGET, runtime_id=102, total=2)
+
+        batch = task.result()
+        self.assertEqual(batch.positions, (TARGET, SECOND_TARGET))
+        self.assertEqual([row.status for row in batch.results], ["collected", "collected"])
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_append_queue_rejects_cancellation_pending_at_binding(self):
+        bot = await self.batch_bot()
+        for during_iteration in (False, True):
+            with self.subTest(during_iteration=during_iteration):
+                queue = CollectionTargetQueue()
+                cancellation_requested = asyncio.Event()
+
+                async def collect():
+                    def cancel_owner():
+                        asyncio.current_task().cancel("cancel before binding")
+                        cancellation_requested.set()
+
+                    def initial_positions():
+                        yield TARGET
+                        cancel_owner()
+
+                    if not during_iteration:
+                        cancel_owner()
+                    positions = initial_positions() if during_iteration else [TARGET]
+                    return await bot.collect_targets(positions, additions=queue, count=2)
+
+                async def append():
+                    await cancellation_requested.wait()
+                    try:
+                        return queue.extend([SECOND_TARGET])
+                    except RuntimeError:
+                        return None
+
+                async with asyncio.TaskGroup() as tasks:
+                    appender = tasks.create_task(append())
+                    task = tasks.create_task(collect())
+
+                with self.assertRaisesRegex(asyncio.CancelledError, "cancel before binding") as stopped:
+                    await task
+                self.assertEqual(stopped.exception.collection_progress, BlockCollectionBatch(0, (TARGET,), ()))
+                self.assertIsNone(appender.result())
+                self.assertTrue(self.wire.outgoing.empty())
+                with self.assertRaises(RuntimeError):
+                    await bot.collect_targets([], additions=queue)
+
+    async def test_append_queue_validates_all_positions_and_snapshots_while_waiting_for_lock(self):
+        bot = await self.batch_bot()
+        queue = CollectionTargetQueue()
+        async with asyncio.TaskGroup() as tasks:
+            async with bot._block_collector._lock:
+                original = [TARGET]
+                task = tasks.create_task(bot.collect_targets(iter(original), additions=queue, count=2, timeout=2))
+                await asyncio.sleep(0)
+                original.append(THIRD_TARGET)
+                with self.assertRaises(ValueError):
+                    queue.extend([THIRD_TARGET, (1, 2)])
+                self.assertEqual(queue.extend(iter([TARGET, SECOND_TARGET, SECOND_TARGET, THIRD_TARGET])), (SECOND_TARGET,))
+                await self.emit(self.block(DEEPSLATE_ORE, position=SECOND_TARGET))
+                self.assertTrue(self.wire.outgoing.empty())
+            await self.expect_batch_start(TARGET)
+            await self.finish_batch_break(TARGET, runtime_id=101, total=1)
+        batch = task.result()
+        first, second = batch.results
+        self.assertEqual(batch.positions, (TARGET, SECOND_TARGET))
+        self.assertEqual((first.status, second.status, second.block_before.runtime_id), ("collected", "target_changed", ORE))
+        self.assertEqual(bot.observed_block(SECOND_TARGET).runtime_id, DEEPSLATE_ORE)
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_append_queue_rejects_after_same_dimension_epoch_invalidates_waiting_batch(self):
+        bot = await self.batch_bot()
+        queue = CollectionTargetQueue()
+        async with bot._block_collector._lock:
+            task = asyncio.create_task(bot.collect_targets([TARGET], additions=queue))
+            await asyncio.sleep(0)
+            self.assertEqual(queue.extend([SECOND_TARGET]), (SECOND_TARGET,))
+            await self.emit(self.b.ChangeDimensionPacket(dimension_id=0))
+            with self.assertRaises(RuntimeError):
+                queue.extend([THIRD_TARGET])
+        with self.assertRaisesRegex(RuntimeError, "world changed") as stopped:
+            await task
+        self.assertEqual(stopped.exception.collection_progress, BlockCollectionBatch(0, (TARGET, SECOND_TARGET), ()))
+        self.assertTrue(self.wire.outgoing.empty())
+
+    async def test_append_queue_retains_unattempted_target_admitted_during_failed_storage_close(self):
+        queue = CollectionTargetQueue()
+        bot, task = await self.start_storage_collection(positions=(TARGET,), additions=queue, timeout=2)
+        request = await self.assert_storage_deposit(1, chest_count=63)
+        await self.emit(self.storage_receipt(request, player_count=63, chest_count=64))
+        close = await self.refill_close(confirm=False)
+        self.assertEqual(queue.extend([TARGET, SECOND_TARGET]), (SECOND_TARGET,))
+        await self.emit(close)
+
+        batch = await task
+        first, = batch.results
+        self.assertEqual(batch.positions, (TARGET, SECOND_TARGET))
+        self.assertEqual((first.status, first.storage_attempt.stop_reason, first.storage_attempt.transfer.confirmed_count),
+                         ("pickup_unconfirmed", "destination_full", 1))
+        self.assertEqual(bot.observed_block(SECOND_TARGET).runtime_id, ORE)
+        with self.assertRaises(RuntimeError):
+            queue.extend([THIRD_TARGET])
+        self.assert_no_storage_followup()
+
+    async def test_append_queue_rejects_synchronously_on_cancellation_while_owned_close_pending(self):
+        queue = CollectionTargetQueue()
+        bot, task = await self.start_storage_collection(positions=(TARGET,), additions=queue, timeout=2)
+        request = await self.assert_storage_deposit(1, chest_count=63)
+        await self.emit(self.storage_receipt(request, player_count=63, chest_count=64))
+        close = await self.refill_close(confirm=False)
+        self.assertEqual(queue.extend([SECOND_TARGET]), (SECOND_TARGET,))
+        task.cancel("cancel pending close")
+        with self.assertRaises(RuntimeError):
+            queue.extend([THIRD_TARGET])
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        self.assertTrue(self.wire.outgoing.empty())
+        await self.emit(close)
+        with self.assertRaisesRegex(asyncio.CancelledError, "cancel pending close") as stopped:
+            await task
+        progress = stopped.exception.collection_progress
+        self.assertEqual((progress.positions, progress.results), ((TARGET, SECOND_TARGET), ()))
+        self.assertEqual(progress.active.storage_attempt.transfer.confirmed_count, 1)
+        self.assertIsNone(bot.open_window)
+        self.assertEqual(bot.observed_block(SECOND_TARGET).runtime_id, ORE)
+        self.assert_no_storage_followup()
 
     async def test_batch_checks_queued_targets_against_admission_observations(self):
         bot = await self.batch_bot()
