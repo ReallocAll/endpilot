@@ -1,6 +1,7 @@
 import asyncio
 from functools import partial
 import math
+from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -8,6 +9,7 @@ from endpilot import (
     BlockCollectionBatch, BlockObservation, Bot, CollectionStorage, CountedBlockCollection, DropCollection,
     MiningAborted, MiningEvent, MiningTarget, MixedCollectionBatch, NavigationRules,
 )
+from endpilot._mcp_scripts import MCPScripts
 from endpilot.block_data import _catalog
 from endpilot.block_raycast import trace_blocks
 from endpilot.blocks import HASHED_AIR_RUNTIME_ID, Blocks
@@ -1024,9 +1026,8 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
                          [("collected", None), ("tool_unavailable", None)])
         self.assertTrue(self.wire.outgoing.empty())
 
-    async def start_storage_collection(
-        self, positions=(TARGET, SECOND_TARGET), *, dirt_count=64, slots=36, empty_slot=False, vein=False,
-        chest=REFILL_CHEST, additional_positions=(), terrain=(), ticks=0, search_radius=0, timeout=1, other_drops=(),
+    async def storage_bot(
+        self, *, dirt_count=64, slots=36, empty_slot=False, chest=REFILL_CHEST, additional_positions=(), terrain=(),
     ):
         bot = await self.refill_bot(chest=chest, additional_chests=additional_positions)
         inventory = [stack_descriptor(self.b, OAK_LOG_ITEM, 64, 100 + index) for index in range(slots)]
@@ -1041,6 +1042,14 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
               for x in (-3, -2) for y in (99, 100, 101)),
             *terrain,
         )
+        return bot
+
+    async def start_storage_collection(
+        self, positions=(TARGET, SECOND_TARGET), *, dirt_count=64, slots=36, empty_slot=False, vein=False,
+        chest=REFILL_CHEST, additional_positions=(), terrain=(), ticks=0, search_radius=0, timeout=1, other_drops=(),
+    ):
+        bot = await self.storage_bot(dirt_count=dirt_count, slots=slots, empty_slot=empty_slot, chest=chest,
+                                     additional_positions=additional_positions, terrain=terrain)
         storage = CollectionStorage(chest, "minecraft:dirt", inventory_slots=range(2, 3),
                                     chest_slots=range(4, 5), additional_positions=additional_positions)
         options = dict(storage=storage, ticks=ticks, search_radius=search_radius, timeout=timeout)
@@ -1580,6 +1589,153 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((step.request_id, step.confirmed), (request.client_request_id.raw_id, None))
         self.assertEqual(bot.observed_block(SECOND_TARGET).runtime_id, ORE)
         self.assertIsNone(bot.open_window)
+        self.assert_no_storage_followup()
+
+    def storage_scripts(self, bot):
+        scripts = MCPScripts(SimpleNamespace(connected_bot=lambda: bot))
+        self.addAsyncCleanup(scripts.close)
+        return scripts
+
+    async def script_result(self, scripts, run, state):
+        async with asyncio.timeout(8):
+            while (observed := await scripts.observe_script(run))["state"] == "running":
+                await asyncio.sleep(.005)
+        self.assertEqual(observed["state"], state, observed)
+        return observed
+
+    async def test_mcp_storage_validates_authorization_and_keeps_settled_progress(self):
+        bot = await self.storage_bot()
+        scripts = self.storage_scripts(bot)
+        source = """
+import asyncio
+from endpilot import CollectionStorage
+
+async def main(bot, target, chest, item_id):
+    def storage(item):
+        return CollectionStorage(chest, item, inventory_slots=range(2, 3), chest_slots=range(4, 5))
+
+    async def rejected(call, expected, message):
+        try:
+            await call
+        except expected as error:
+            assert message in str(error), str(error)
+        else:
+            raise AssertionError('invalid authorization accepted')
+
+    entries = (
+        lambda value: bot.collect_targets([target], count=0, storage=value),
+        lambda value: bot.collect_by_count('minecraft:netherite_block', item_id=item_id, count=1, storage=value),
+        lambda value: bot.collect_vein_by_count([70, 100, 70], item_id=item_id, count=1, storage=value),
+    )
+    valid = storage(item_id)
+    for entry in entries:
+        await rejected(entry(storage('not:a_registered_item')), ValueError, 'exact registered')
+        assert not (await entry(valid)).results
+    await rejected(bot.collect_block(target, storage=valid), TypeError, 'storage')
+    try:
+        bot.plan_navigation(valid)
+    except TypeError as error:
+        assert 'navigation goal' in str(error), str(error)
+    else:
+        raise AssertionError('storage accepted as a navigation goal')
+
+    marker = lambda start, stop, step=1: {'$endpilot': 'range', 'start': start, 'stop': stop, 'step': step}
+    fields = {'position': chest, 'item': item_id, 'inventory_slots': marker(2, 3), 'chest_slots': marker(4, 5)}
+    for change, expected, message in (
+        ({'position': [0, 1]}, ValueError, 'three integer block coordinates'),
+        ({'additional_positions': [[0, 'bad', 2]]}, ValueError, 'three integer block coordinates'),
+        ({'additional_positions': {}}, TypeError, 'additional storage positions'),
+        ({'inventory_slots': marker(True, 4)}, TypeError, 'integer inventory_slots range'),
+        ({'inventory_slots': marker(2, 2)}, ValueError, 'must not be empty'),
+        ({'chest_slots': marker(5, 4, -1)}, ValueError, 'forward half-open range'),
+        ({'chest_slots': marker(0, 55)}, ValueError, 'within 0..54'),
+        ({'extra': 1}, TypeError, 'extra'),
+    ):
+        encoded = {'$endpilot': 'record', 'type': 'CollectionStorage', 'fields': fields | change}
+        await rejected(entries[0](encoded), expected, message)
+
+    channel = bot._channel
+    start = channel.start
+    replies = []
+    def capture(*args, **kwargs):
+        started = start(*args, **kwargs)
+        replies.append(started[1])
+        return started
+    channel.start = capture
+    collecting = asyncio.create_task(entries[0](valid))
+    await asyncio.sleep(0)
+    assert 'value' in replies[0].result(timeout=5)
+    collecting.cancel('pause after collection reply')
+    await collecting
+"""
+        run = (await scripts.run_script(source=source, args=[TARGET, REFILL_CHEST, DIRT]))["run_id"]
+        final = await self.script_result(scripts, run, "failed")
+        self.assertEqual(final["error"], {
+            "error_type": "CancelledError", "message": "pause after collection reply",
+            "attributes": {"collection_progress": {"dimension_id": 0, "positions": [], "results": [], "active": None}},
+        })
+        self.assertIsNone(bot.open_window)
+        self.assert_no_storage_followup()
+
+    async def test_mcp_storage_cancellation_keeps_ordered_pending_progress_and_the_resident_player(self):
+        near, far = REFILL_CHEST, ALTERNATE_REFILL_CHEST
+        bot = await self.storage_bot(chest=far, additional_positions=(near,), terrain=(
+            self.pose(eye=(-2.5, 101.62, 3.4)),
+        ))
+        scripts = self.storage_scripts(bot)
+        source = """
+import asyncio
+from endpilot import CollectionStorage
+
+async def main(bot, targets, near, far):
+    storage = CollectionStorage(far, "minecraft:dirt", inventory_slots=range(2, 3), chest_slots=range(4, 5),
+                                additional_positions=(near,))
+    collecting = asyncio.create_task(bot.collect_targets(targets, storage=storage, ticks=0, search_radius=0, timeout=8))
+    await bot.wait_for_inventory_item_count(999, 1)
+    collecting.cancel("deposit pending")
+    try:
+        await collecting
+    except asyncio.CancelledError as error:
+        (_, first), (_, pending) = error.collection_progress.active.storage_attempts
+        assert first.transfer.confirmed_count == pending.transfer.confirmed_count == 0
+        assert pending.transfer.steps[0].confirmed is None
+        raise
+"""
+        run = (await scripts.run_script(source=source, args=[[TARGET, SECOND_TARGET], near, far]))["run_id"]
+        await self.expect_batch_start(TARGET, timeout=7)
+        await self.finish_batch_break(TARGET, runtime_id=101)
+        await self.refill_click(position=near)
+        await self.emit(*self.refill_window(position=near, item_id=DIRT, count=64))
+        await self.refill_close()
+        request = await self.assert_storage_deposit(64, chest=far)
+        await self.emit(self.slot(35, 999, 1, net_id=910))
+        close = await self.refill_close(confirm=False)
+        await self.emit(self.storage_receipt(request, player_count=0, chest_count=64),
+                        self.take(), self.slot(2, DIRT, 1, net_id=25))
+        self.assertEqual(bot.inventory_count(DIRT), 65)
+        self.assertEqual((await scripts.observe_script(run))["state"], "running")
+        await self.emit(close)
+        final = await self.script_result(scripts, run, "failed")
+        self.assertEqual((final["error"]["error_type"], final["error"]["message"]), ("CancelledError", "deposit pending"))
+        progress = final["error"]["attributes"]["collection_progress"]
+        self.assertEqual(progress["results"], [])
+        active = progress["active"]
+        self.assertFalse(active["pickup_confirmed"])
+        (near_position, full), (far_position, pending) = active["storage_attempts"]
+        self.assertEqual((near_position, far_position), (list(near), list(far)))
+        self.assertEqual((full["stop_reason"], full["transfer"]["steps"]), ("destination_full", []))
+        self.assertEqual(pending, active["storage_attempt"])
+        self.assertEqual(pending["stop_reason"], "cancelled")
+        self.assertEqual(pending["transfer"]["steps"], [{
+            "source_slot": 2, "destination_slot": 4, "requested": 64, "confirmed": None,
+            "request_id": request.client_request_id.raw_id, "verdict": None,
+        }])
+        readback = (await scripts.run_script(source="""
+async def main(bot, item_id):
+    return [bot.player_id, bot.open_window, bot.inventory_count(item_id)]
+""", args=[DIRT]))["run_id"]
+        self.assertEqual((await self.script_result(scripts, readback, "succeeded"))["result"], [PLAYER, None, 65])
+        self.assertEqual(bot.observed_block(SECOND_TARGET).runtime_id, ORE)
         self.assert_no_storage_followup()
 
     async def test_storage_closes_without_depositing_after_reused_actor_ids(self):

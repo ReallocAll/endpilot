@@ -273,6 +273,14 @@ storage stops short, the batch ends with `pickup_unconfirmed`, or with
 exception's `collection_progress` includes known storage and pickup evidence
 for the interrupted target.
 
+The same three methods accept `storage` in scripts started with `run_script`.
+Import `CollectionStorage` inside the script and pass it as shown above.
+The worker gets snapshots of `storage_attempt` and the ordered
+`storage_attempts` pairs. Read `attempt.transfer.confirmed_count` when a
+transfer exists. A pending step retains its request ID with an unknown
+confirmation. If an interruption with `collection_progress` goes uncaught,
+`observe_script` includes it under `error.attributes.collection_progress`.
+
 ## Collect an observed drop
 
 `await bot.collect_drop(runtime_id, ticks=120, timeout=15)` approaches an item

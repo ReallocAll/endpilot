@@ -15,11 +15,12 @@ from threading import BoundedSemaphore, Lock, Thread
 from types import SimpleNamespace
 
 from ._mcp_scripts import (
-    _ERROR_FIELDS, _ERROR_PROGRESS, _INPUT_RECORDS, _MAX_FRAME, _MAX_OUTGOING_FRAMES, _RANGE_TRANSFERS, _SLOT_MAPS,
-    _read,
+    _COLLECTION_STORAGE_CALLS, _ERROR_FIELDS, _ERROR_PROGRESS, _INPUT_RECORDS, _MAX_FRAME, _MAX_OUTGOING_FRAMES,
+    _RANGE_TRANSFERS, _SLOT_MAPS, _read,
 )
 from .blocks import MiningAborted
 from .bot import Bot
+from .collection_storage import CollectionStorage
 
 
 class _RemoteError(RuntimeError):
@@ -33,7 +34,9 @@ _REMOTE_ERRORS = {error.__name__: error for error in (
     MiningAborted, OSError, PermissionError, RuntimeError, TimeoutError, TypeError, ValueError,
 )}
 _SDK_ERRORS = {cls.__name__: (cls, name) for cls, name in _ERROR_FIELDS.items()}
-_SETTLED_PROGRESS = dict.fromkeys(_RANGE_TRANSFERS, "transfer_progress") | {"trade_many": "trade_progress"}
+_SETTLED_PROGRESS = (dict.fromkeys(_RANGE_TRANSFERS, "transfer_progress")
+                     | dict.fromkeys(_COLLECTION_STORAGE_CALLS, "collection_progress")
+                     | {"trade_many": "trade_progress"})
 
 
 class _Snapshot(SimpleNamespace):
@@ -54,7 +57,7 @@ def _decode(value):
 
 def _argument(value):
     kind = type(value)
-    if _INPUT_RECORDS.get(kind.__name__) is kind:
+    if kind is CollectionStorage or _INPUT_RECORDS.get(kind.__name__) is kind:
         return {"$endpilot": "record", "type": kind.__name__,
                 "fields": {field.name: getattr(value, field.name) for field in fields(value)}}
     if kind is range:

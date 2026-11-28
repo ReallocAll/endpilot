@@ -19,6 +19,7 @@ from . import navigation
 from .beds import SleepRejected
 from .blocks import BlockObservation, BlockUpdate, ColumnCoverageInvalidated, MiningFaceUnavailable
 from .collection import BlockCollectionBatch, CountedBlockCollection, MixedCollectionBatch
+from .collection_storage import CollectionStorage
 from .entities import EntityState
 from .inventory import _stack_snapshot
 from .placement import BoatPlacementResult, EntityPlacementResult, PlacementResult
@@ -48,6 +49,7 @@ _RANGE_TRANSFERS = {
     "transfer_container_range": transfer_container_range,
     "transfer_inventory_range": transfer_inventory_range,
 }
+_COLLECTION_STORAGE_CALLS = frozenset({"collect_targets", "collect_by_count", "collect_vein_by_count"})
 
 # The bridge owns this allowlist independently of the worker. Listed methods
 # have data-only parameters and copyable results, subject to the checks below.
@@ -118,6 +120,7 @@ _RECORDS = {
     "boss_bars": "BossBar",
     "chat": "ChatMessage",
     "collection": "BlockCollection BlockCollectionBatch CountedBlockCollection DropCollection MixedCollectionBatch",
+    "collection_storage": "CollectionStorageResult",
     "containers": "ContainerWindow ContainerSlotChange FurnaceProgress BrewingProgress",
     "dimension_transition": "DimensionTransition",
     "entities": "EntityState PaintingSnapshot EntityAttribute EntityAttributeModifier EntityMovementUpdate "
@@ -143,7 +146,7 @@ _INPUT_RECORDS = {cls.__name__: cls for cls in (
     navigation.EntityNearGoal, navigation.EntityVisibilityGoal, navigation.AnyGoal, navigation.AllGoal,
     navigation.NavigationRules, navigation.NavigationCosts,
 )}
-_UNSUPPORTED_PARAMETERS = frozenset({"predicate", "match", "on_plan", "on_event", "tool_chest", "tool_chests", "storage"})
+_UNSUPPORTED_PARAMETERS = frozenset({"predicate", "match", "on_plan", "on_event", "tool_chest", "tool_chests"})
 _SLOT_MAPS = frozenset({"inventory_slots", "armor_slots", "container_slots", "wait_for_container_slots"})
 _ITEM_VERDICTS = frozenset({
     "move_inventory_item", "swap_inventory_items", "equip_armor", "unequip_armor", "equip_offhand",
@@ -294,21 +297,46 @@ def _tuples(value):
     return value
 
 
-def _bind(member, args, kwargs):
+def _input_range(value, name):
+    if not isinstance(value, dict) or value.get("$endpilot") != "range":
+        return _tuples(value)
+    bounds = tuple(value.get(key) for key in ("start", "stop", "step"))
+    if not all(type(bound) is int for bound in bounds):
+        label = "section" if name == "sections" else name
+        raise TypeError(f"expected integer {label} range bounds")
+    return range(*bounds)
+
+
+def _collection_storage(value):
+    if (not isinstance(value, dict) or value.keys() != {"$endpilot", "type", "fields"}
+            or value["$endpilot"] != "record" or value["type"] != "CollectionStorage"
+            or not isinstance(value["fields"], dict)):
+        raise TypeError("storage must be a CollectionStorage")
+    fields = value["fields"]
+    if not isinstance(fields.get("position"), list):
+        raise TypeError("expected a storage position")
+    additional = fields.get("additional_positions", [])
+    if not isinstance(additional, list) or not all(isinstance(position, list) for position in additional):
+        raise TypeError("expected additional storage positions")
+    return CollectionStorage(**{
+        name: _input_range(item, name) if name in {"inventory_slots", "chest_slots"} else _tuples(item)
+        for name, item in fields.items()
+    })
+
+
+def _bind(member, args, kwargs, *, allow_storage=False):
     bound = inspect.signature(member).bind(*args, **kwargs)
     for name, value in bound.arguments.items():
         if name in _UNSUPPORTED_PARAMETERS and value is not None:
             raise TypeError(f"{name} is unavailable through the MCP script Bot")
         if name in {"goal", "rules"}:
             value = _input_record(value)
-        elif name in {"sections", "source_slots", "destination_slots"} and (
-            isinstance(value, dict) and value.get("$endpilot") == "range"
-        ):
-            bounds = tuple(value.get(key) for key in ("start", "stop", "step"))
-            if not all(type(bound) is int for bound in bounds):
-                label = "section" if name == "sections" else name
-                raise TypeError(f"expected integer {label} range bounds")
-            value = range(*bounds)
+        elif name in {"sections", "source_slots", "destination_slots"}:
+            value = _input_range(value, name)
+        elif name == "storage" and value is not None:
+            if not allow_storage:
+                raise TypeError("storage is unavailable through the MCP script Bot")
+            value = _collection_storage(value)
         elif name == "against" and isinstance(value, dict):
             if value.get("$endpilot") != "record" or not isinstance(value.get("fields"), dict):
                 raise TypeError("expected a block observation")
@@ -499,7 +527,7 @@ class _Run:
             self._subscriptions[request_id] = member(*bound.args, **bound.kwargs)
             return
 
-        bound = _bind(member, args, kwargs)
+        bound = _bind(member, args, kwargs, allow_storage=name in _COLLECTION_STORAGE_CALLS)
         value = member(*bound.args, **bound.kwargs)
         if kind == "async":
             value = await value
