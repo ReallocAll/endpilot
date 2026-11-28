@@ -11,9 +11,10 @@ import zlib
 from bedrock_protocol import nbt
 
 from endpilot import (
-    BlockEntityUpdate, BlockObservation, BlockStateObservation, Bot, ColumnCoverageInvalidated, DimensionBounds,
-    RecoverableError,
+    BlockEntityUpdate, BlockObservation, BlockState, BlockStateObservation, Bot, ColumnCoverageInvalidated,
+    DimensionBounds, RecoverableError,
 )
+from endpilot.block_data import _catalog, _state_lookup
 from endpilot.compression import PacketConnection
 from endpilot.login import JoinSession
 from endpilot.protocol import RawPacket, read_batch, write_batch
@@ -172,6 +173,56 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.transport.sent, [])
                 await self.bot.close()
 
+    async def test_block_state_by_id_resolves_saved_button_ids_after_release(self):
+        position = (-2, 220, 4)
+        for hashed, released_id, pressed_id in ((True, 700331717, 4252161312), (False, 2791, 2797)):
+            with self.subTest(hashed=hashed):
+                _catalog.cache_clear()
+                _state_lookup.cache_clear()
+                await self.connect(hashed_runtime_ids=hashed)
+                b = self.b
+                pos = b.BlockPos(x=position[0], y=position[1], z=position[2])
+                self.assertIsNone(self.bot.observed_block(position))
+                # Both lookup tables are available on the first query after a cold join.
+                with patch("endpilot.block_data.files", side_effect=AssertionError("unexpected palette I/O")):
+                    initial = self.bot.block_state_by_id(released_id)
+                expected_released = {"facing_direction": 1, "button_pressed_bit": 0}
+                expected_pressed = {"facing_direction": 1, "button_pressed_bit": 1}
+                self.assertEqual(initial, BlockState(released_id, "minecraft:stone_button", expected_released))
+
+                await self.deliver(b.UpdateBlockPacket(pos=pos, runtime_id=pressed_id))
+                saved_pressed = self.bot.observed_block(position).runtime_id
+                pressed = self.bot.block_state_by_id(saved_pressed)
+                await self.deliver(b.UpdateBlockPacket(pos=pos, runtime_id=released_id))
+                saved_released = self.bot.observed_block(position).runtime_id
+                self.assertEqual(self.bot.block_state_by_id(saved_pressed), pressed)
+                self.assertEqual(pressed, BlockState(pressed_id, "minecraft:stone_button", expected_pressed))
+                self.assertEqual(self.bot.block_state_by_id(saved_released), initial)
+                self.assertIs(type(pressed.properties["button_pressed_bit"]), int)
+                if hashed:
+                    self.assertEqual(self.bot.block_state_by_id(pressed_id - (1 << 32)), pressed)
+                    self.assertIsNone(self.bot.block_state_by_id(pressed_id + (1 << 32)))
+                for invalid in (-2147483649, -2, False, "2797", 0xFFFFFFFF, 0xFFFFFFFE):
+                    self.assertIsNone(self.bot.block_state_by_id(invalid))
+                with self.assertRaises(FrozenInstanceError):
+                    pressed.runtime_id = saved_released
+                with self.assertRaises(TypeError):
+                    pressed.properties["button_pressed_bit"] = 0
+                self.assertEqual(self.transport.sent, [])
+                await self.deliver(b.DisconnectPacket())
+                self.assertEqual(self.bot.session_end.kind, "server_disconnect")
+                self.assertIsNone(self.bot.block_state_by_id(saved_pressed))
+                await self.bot.close()
+                self.assertIsNone(self.bot.block_state_by_id(saved_pressed))
+                self.assertEqual(pressed.properties, expected_pressed)
+
+    def test_block_state_by_id_before_join_and_snapshot_owns_properties(self):
+        self.assertIsNone(Bot().block_state_by_id(700331717))
+        properties = {"facing_direction": 2}
+        state = BlockState(1838280610, "minecraft:piston", properties)
+        properties["facing_direction"] = 4
+        self.assertEqual(state.properties, {"facing_direction": 2})
+
     def test_block_state_observation_copies_input_properties(self):
         properties = {"facing_direction": 2}
         snapshot = BlockStateObservation((3, 64, 7), 1838280610, 0, "minecraft:piston", properties)
@@ -217,6 +268,7 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertEqual(self.bot.observed_block(position), BlockObservation(position, 1888, 0, None))
         self.assertIsNone(self.bot.observed_block_state(position))
+        self.assertIsNone(self.bot.block_state_by_id(1888))
         self.assertEqual(self.bot.observed_block_state(position, layer=1),
                          BlockStateObservation(position, None, 1, "minecraft:air", {}))
         self.assertIsNone(self.bot.observed_block_collision_boxes(position))
@@ -233,6 +285,7 @@ class WorldObservationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.bot.observed_block(position, layer=1).is_air)
         self.assertIsNone(self.bot.observed_block_state(position))
         self.assertIsNone(self.bot.observed_block_state(position, layer=1))
+        self.assertIsNone(self.bot.block_state_by_id(3671572261))
         self.assertIsNone(self.bot.observed_block_collision_boxes(position))
         self.assertIsNone(self.bot.observed_block_collision_boxes(position, layer=1))
         self.assertEqual(self.transport.sent, [])

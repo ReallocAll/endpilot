@@ -42,9 +42,15 @@ _EXPLOSION_COLLISION_SHAPES = {
     21904: ((0., 0.5, 0., 1., 1., 1.),),  # Top smooth stone slab.
 }
 
-def _prepare_terrain_palette() -> None:
-    _catalog()
-    _state_lookup()
+async def _prepare_block_palette() -> None:
+    if _catalog.cache_info().currsize and _state_lookup.cache_info().currsize:
+        return
+
+    def load() -> None:
+        _catalog()
+        _state_lookup()
+
+    await asyncio.to_thread(load)
 
 
 def _publisher_bounds(packet) -> tuple[int, int, int, int]:
@@ -88,6 +94,18 @@ class BlockStateObservation:
 
     def __post_init__(self):
         object.__setattr__(self, "position", tuple(self.position))
+        object.__setattr__(self, "properties", MappingProxyType(dict(self.properties)))
+
+
+@dataclass(frozen=True, slots=True)
+class BlockState:
+    """A vanilla block state identified by its session's network runtime ID."""
+
+    runtime_id: int
+    name: str
+    properties: Mapping[str, int | str]
+
+    def __post_init__(self):
         object.__setattr__(self, "properties", MappingProxyType(dict(self.properties)))
 
 
@@ -979,11 +997,25 @@ class Blocks:
             return BlockStateObservation(position, runtime_id, layer, "minecraft:air", {})
         if runtime_id is None:
             return None
+        state = self._block_state_details(runtime_id)
+        return None if state is None else BlockStateObservation(position, runtime_id, layer, *state)
+
+    def block_state_by_id(self, runtime_id: int) -> BlockState | None:
+        if not isinstance(runtime_id, int) or isinstance(runtime_id, bool):
+            return None
+        if self.hashed_runtime_ids and -(1 << 31) <= runtime_id < 0:
+            runtime_id &= 0xFFFFFFFF
+        if not 0 <= runtime_id <= 0xFFFFFFFF:
+            return None
+        state = self._block_state_details(runtime_id)
+        return None if state is None else BlockState(runtime_id, *state)
+
+    def _block_state_details(self, runtime_id: int) -> tuple[str, dict[str, int | str]] | None:
         state = self._vanilla_state(runtime_id)
         if state is None:
             return None
         properties = _vanilla_state_properties(state.name, runtime_id, hashed=self.hashed_runtime_ids)
-        return BlockStateObservation(position, runtime_id, layer, state.name, properties)
+        return state.name, properties
 
     def observed_block_collision_boxes(
         self, position: tuple[int, int, int], *, layer: int = 0,

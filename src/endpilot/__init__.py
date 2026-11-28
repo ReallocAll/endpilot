@@ -7,7 +7,8 @@ from .biome_data import BiomeDefinition, VanillaBiome, vanilla_biomes
 from .block_catalog import VanillaBlock, VanillaBlockToolProperties, vanilla_blocks
 from .block_raycast import BlockRaycastResult, MiningFaceResult
 from .blocks import (
-    BlockChange, BlockEntityUpdate, BlockMatch, BlockObservation, BlockSearchResult, BlockStateObservation, ColumnCoverage,
+    BlockChange, BlockEntityUpdate, BlockMatch, BlockObservation, BlockSearchResult, BlockState, BlockStateObservation,
+    ColumnCoverage,
     ColumnCoverageEvent, ColumnCoverageInvalidated, DimensionBounds, MiningAborted, MiningEvent, MiningFaceUnavailable,
     MiningTarget,
 )
@@ -91,6 +92,7 @@ __all__ = [
     "BlockPlacementMatch",
     "BlockRaycastResult",
     "BlockSearchResult",
+    "BlockState",
     "BlockStateObservation",
     "BoatPlacementResult",
     "BookSnapshot",

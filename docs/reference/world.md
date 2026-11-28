@@ -18,6 +18,15 @@ Known air has the name `minecraft:air` and an empty property mapping. The
 returns `None` for missing observations, unresolved IDs, unverified sequential
 IDs and unsupported protocol versions. It sends no packets.
 
+Use `bot.block_state_by_id(runtime_id)` to resolve a saved network ID during
+the same joined session. It returns an immutable `BlockState` with
+`runtime_id`, `name` and read-only `properties`. It reads the session's local
+protocol 2225 palette and sends no packets. The ID need not be in the current
+terrain cache. Hash mode accepts signed 32-bit and unsigned 32-bit IDs and
+returns the unsigned ID used on the wire. An unknown ID, an unverified
+sequential palette, an unsupported protocol or an inactive session yields
+`None`.
+
 ## Read observed block collision boxes
 
 `bot.observed_block_collision_boxes((x, y, z), layer=0)` reads the cached

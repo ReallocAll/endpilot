@@ -24,9 +24,9 @@ from .biome_data import BiomeDefinition
 from .block_data import BlockCollisionBoxes
 from .block_raycast import BlockRaycastResult, MiningFaceResult
 from .blocks import (
-    Blocks, BlockChange, BlockEntityUpdate, BlockMatch, BlockObservation, BlockSearchResult, BlockStateObservation,
+    Blocks, BlockChange, BlockEntityUpdate, BlockMatch, BlockObservation, BlockSearchResult, BlockState, BlockStateObservation,
     BlockUpdate, ColumnCoverage, ColumnCoverageEvent, ColumnCoverageInvalidated, DimensionBounds, MiningEvent,
-    MiningTarget, _prepare_terrain_palette,
+    MiningTarget, _prepare_block_palette,
 )
 from .books import BookEdit, BookSnapshot, Books
 from .boss_bars import BossBar, BossBarEvent, BossBarEventKind, BossBars
@@ -354,9 +354,9 @@ class Bot:
                     raise ConnectionError("player closed while joining")
             if self._skin is not None:
                 identity = identity._with_skin(self._skin)
-            if terrain_storage is not None and self.protocol.number == 2225:
-                # Load the palette before terrain capture runs in the packet reader.
-                await asyncio.to_thread(_prepare_terrain_palette)
+            if self.protocol.number == 2225:
+                # Prepare local block state lookups before the session starts.
+                await _prepare_block_palette()
                 if self._clock is not clock:
                     raise ConnectionError("player closed while joining")
             session = await connect(
@@ -1365,6 +1365,13 @@ class Bot:
         if self._blocks is None:
             raise RuntimeError("player has not joined")
         return self._blocks.observed_block_state(position, layer=layer)
+
+    def block_state_by_id(self, runtime_id: int) -> BlockState | None:
+        """Resolve a vanilla runtime ID using the current joined session's palette."""
+        blocks = self._blocks
+        if blocks is None or self._session_end_state is None or self.session_end is not None:
+            return None
+        return blocks.block_state_by_id(runtime_id)
 
     async def terrain_column(self, column: tuple[int, int]) -> TerrainColumnSnapshot | None:
         """Read current and stored block layers for a column in the active dimension.
