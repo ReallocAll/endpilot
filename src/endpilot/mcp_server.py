@@ -301,8 +301,13 @@ class MCPPlayer:
 
             self._target = target
             try:
-                bot = Bot(target.name, chat_languages=self._chat_languages)
-                options = {"locale": target.locale}
+                if self._chat_languages:
+                    bot = Bot(target.name, chat_languages=self._chat_languages)
+                else:
+                    bot = Bot(target.name)
+                options = {}
+                if target.locale != DEFAULT_LOCALE:
+                    options["locale"] = target.locale
                 if target.xuid is not None:
                     options["credential_provider"] = self._accounts.credential_provider(bot, xuid=target.xuid)
                 if target.accept_resource_packs:

@@ -693,3 +693,54 @@ class MCPResourcePackTests(unittest.IsolatedAsyncioTestCase):
                     else:
                         self.assertEqual(status["last_join_failure"]["message"],
                                          "resource-pack SHA-256 does not match the received archive")
+
+
+class MCPLanguageSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chat_language_survives_connection_replacement_on_the_real_bot(self):
+        protocol = Protocol(2225)
+        b = protocol.binding
+        translations = {
+            "en_US": b"death.attack.lava=%s fell into lava\n",
+            "zh_CN": "death.attack.lava=%s 掉进了岩浆\n".encode(),
+        }
+        cases = (
+            ({}, {}, None),
+            (translations, {"locale": "en_US"}, "Victim fell into lava"),
+            (translations, {"locale": "zh_CN"}, "Victim 掉进了岩浆"),
+        )
+        for languages, options, message in cases:
+            with self.subTest(locale=options.get("locale", "default"), has_languages=bool(languages)):
+                player = MCPPlayer(chat_languages=languages)
+                previous = None
+                try:
+                    joins = (
+                        (player.connect, ("http://localhost:19132", "Original"), options, "Original"),
+                        (player.reconnect, (), {}, "Original"),
+                        (player.switch_account, (), {"name": "Replacement"}, "Replacement"),
+                    )
+                    for player_id, (join, args, kwargs, name) in enumerate(joins, start=41):
+                        wire = PackTransport(protocol)
+                        wire.deliver(b.NetworkSettingsPacket(
+                            compression_algorithm=b.PacketCompressionAlgorithm.ZLIB, compression_threshold=0,
+                        ), compressed_connection=False)
+                        wire.deliver(b.StartGamePacket(runtime_id=player_id, entity_id=player_id),
+                                     b.PlayStatusPacket(status=b.PlayStatus.PLAYER_SPAWN))
+                        with patch("endpilot.transport.nethernet.connect", return_value=wire):
+                            async with asyncio.timeout(3):
+                                self.assertEqual(await join(*args, **kwargs), {"name": name, "player_id": player_id})
+                        if previous is not None:
+                            self.assertTrue(previous.closed)
+                        banner = asyncio.get_running_loop().create_future()
+                        unsubscribe = player.connected_bot().subscribe_chat(banner.set_result)
+                        try:
+                            wire.deliver(b.TextPacket(localize=True, body=b.TextPacket.MessageAndParams(
+                                type=b.TextPacketType.TRANSLATE, message="death.attack.lava", params=["Victim"],
+                            )))
+                            delivered = await asyncio.wait_for(banner, 2)
+                            self.assertEqual((delivered.message, delivered.translation_key, delivered.params),
+                                             (message, "death.attack.lava", ("Victim",)))
+                        finally:
+                            unsubscribe()
+                        previous = wire
+                finally:
+                    await player.disconnect()
