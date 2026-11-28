@@ -2782,6 +2782,13 @@ class Movement:
             nonlocal remaining, submitted, release_input, accepted_level, use_ground_velocity
             buffer = _runout(source, landing)
             short = blocks._descent_landing(buffer) is not True
+            x, _, z = self._input_position
+            direct_stop = not short and (isinstance(goal, FootGoal)
+                      and goal.position == landing and at_center(source, x, z)
+                      and self._observed_ground is not False
+                      and self._standard_ground_motion(blocks)
+                      and blocks._short_descent(source, landing, buffer) is True)
+            short |= direct_stop
             dx, dz = landing[0] - source[0], landing[2] - source[2]
             yaw = math.atan2(-dx, dz)
             lip = 0.5 + _PLAYER_HALF_WIDTH
@@ -2792,7 +2799,7 @@ class Movement:
             acceleration = 0.1 * _GROUND_ACCELERATION
             max_step = acceleration * lip_strength / (1 - _GROUND_FRICTION)
             # Continue just beyond whole-body lip clearance before neutral.
-            stop_at = lip + 0.035
+            stop_at = lip + (0.075 if direct_stop else 0.035)
             margin = 0.005
             side_safe = clearance - margin
             last_safe = 1 + side_safe
@@ -2863,6 +2870,8 @@ class Movement:
                 # previously open runout is obstructed during normal descent.
                 if short:
                     clear = blocks._short_descent(source, landing, buffer)
+                    if direct_stop and clear is True:
+                        clear = blocks._descent_landing(buffer)
                 else:
                     clear = blocks._descent_landing(buffer)
                     if clear is True:
