@@ -61,14 +61,14 @@ def _online_identity() -> _OnlineIdentity:
 
 class JoinTests(unittest.IsolatedAsyncioTestCase):
     async def test_raknet_dial_and_send_os_errors_keep_the_original_exception_and_cause(self):
-        from endpilot.transport.raknet import RakNetTransport
-
         bot = Bot()
         self.addAsyncCleanup(bot.close)
         for stage in ("transport_connect", "transport_send"):
             with self.subTest(stage=stage):
                 cause = RuntimeError("private diagnostics from the OS adapter")
-                error = OSError(errno.EMSGSIZE, "private endpoint or transport data")
+                code = errno.ECONNRESET if stage == "transport_connect" else errno.EMSGSIZE
+                error = OSError(code, "private endpoint or transport data")
+                cleanup = OSError(errno.EBADF, "failed to close the dial peer")
                 args = error.args
 
                 async def fail(*_args, **_options):
@@ -78,6 +78,7 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
                 peer = SimpleNamespace(connect=AsyncMock(return_value=connection), close=AsyncMock())
                 if stage == "transport_connect":
                     peer.connect.side_effect = fail
+                    peer.close.side_effect = cleanup
                 else:
                     connection.send.side_effect = fail
                 with (
@@ -87,11 +88,197 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
                     await bot.join_raknet("127.0.0.1", timeout=1)
                 self.assertIs(caught.exception, error)
                 self.assertIs(error.__cause__, cause)
-                self.assertEqual((error.args, error.errno), (args, errno.EMSGSIZE))
-                self.assertEqual(error.join_failure, JoinFailureDetails("raknet", stage, "os_error", "errno", errno.EMSGSIZE))
+                self.assertEqual((error.args, error.errno), (args, code))
+                self.assertEqual(error.join_failure, JoinFailureDetails("raknet", stage, "os_error", "errno", code))
                 peer.close.assert_awaited_once_with(0 if stage == "transport_connect" else 0.5)
                 if stage == "transport_send":
                     connection.close.assert_awaited_once_with()
+                else:
+                    self.assertIn(repr(cleanup), " ".join(error.__notes__))
+
+    async def test_raknet_cancelled_dial_stays_cancelled_when_peer_close_fails(self):
+        bot = Bot()
+        self.addAsyncCleanup(bot.close)
+        entered = asyncio.Event()
+        cleanup = OSError(errno.EBADF, "failed to close the cancelled dial peer")
+        cancellations = []
+
+        async def dial(_address):
+            entered.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError as error:
+                cancellations.append(error)
+                raise
+
+        peer = SimpleNamespace(connect=dial, close=AsyncMock(side_effect=cleanup))
+        with patch("endpilot.transport.raknet._create_peer", return_value=peer):
+            joining = asyncio.create_task(bot.join_raknet("127.0.0.1"))
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                joining.cancel("cancelled during RakNet dial")
+                with self.assertRaisesRegex(asyncio.CancelledError, "cancelled during RakNet dial") as caught:
+                    await joining
+            finally:
+                if not joining.done():
+                    joining.cancel()
+                await asyncio.gather(joining, return_exceptions=True)
+        peer.close.assert_awaited_once_with(0)
+        self.assertIs(caught.exception, cancellations[0])
+        self.assertIsNone(getattr(caught.exception, "join_failure", None))
+        self.assertIn(repr(cleanup), " ".join(caught.exception.__notes__))
+
+    async def test_raknet_cancellation_during_failed_dial_cleanup_still_propagates(self):
+        bot = Bot()
+        self.addAsyncCleanup(bot.close)
+        entered, release = asyncio.Event(), asyncio.Event()
+        failure = ConnectionResetError(errno.ECONNRESET, "dial failed")
+        cleanup = OSError(errno.EBADF, "failed to close the dial peer")
+
+        async def close(_timeout):
+            entered.set()
+            await release.wait()
+            raise cleanup
+
+        peer = SimpleNamespace(connect=AsyncMock(side_effect=failure), close=AsyncMock(side_effect=close))
+        with patch("endpilot.transport.raknet._create_peer", return_value=peer):
+            joining = asyncio.create_task(bot.join_raknet("127.0.0.1"))
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                joining.cancel("cancelled during RakNet cleanup")
+                await asyncio.sleep(0)
+                self.assertFalse(joining.done())
+                release.set()
+                with self.assertRaisesRegex(asyncio.CancelledError, "cancelled during RakNet cleanup") as caught:
+                    await joining
+            finally:
+                release.set()
+                if not joining.done():
+                    joining.cancel()
+                await asyncio.gather(joining, return_exceptions=True)
+        peer.close.assert_awaited_once_with(0)
+        self.assertIsNone(getattr(caught.exception, "join_failure", None))
+        self.assertIn(repr(cleanup), " ".join(caught.exception.__notes__))
+
+    async def test_raknet_cancelled_discovery_does_not_dial_after_peer_close_fails(self):
+        bot = Bot(protocol=None)
+        self.addAsyncCleanup(bot.close)
+        entered = asyncio.Event()
+        cleanup = OSError(errno.EBADF, "failed to close the discovery peer")
+
+        async def ping(_address):
+            entered.set()
+            await asyncio.Future()
+
+        peer = SimpleNamespace(ping=ping, close=AsyncMock(side_effect=cleanup))
+        with (
+            patch("endpilot.transport.raknet._create_peer", return_value=peer),
+            patch("endpilot.transport.raknet.connect") as dial,
+        ):
+            joining = asyncio.create_task(bot.join_raknet("127.0.0.1"))
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                joining.cancel("cancelled during RakNet discovery")
+                with self.assertRaisesRegex(asyncio.CancelledError, "cancelled during RakNet discovery") as caught:
+                    await joining
+            finally:
+                if not joining.done():
+                    joining.cancel()
+                await asyncio.gather(joining, return_exceptions=True)
+        dial.assert_not_awaited()
+        peer.close.assert_awaited_once_with(0)
+        self.assertIsNone(getattr(caught.exception, "join_failure", None))
+        self.assertIn(repr(cleanup), " ".join(caught.exception.__notes__))
+
+    async def test_raknet_chat_from_first_post_join_tick_has_no_join_diagnostic(self):
+        from endpilot.transport.raknet import RakNetTransport
+
+        bot = Bot()
+        self.addAsyncCleanup(bot.close)
+        wire = _spawn_transport(bot.protocol, 42)
+        failure = OSError(errno.EMSGSIZE, "gameplay send failed")
+
+        async def recv():
+            return b"\xfe" + await wire.recv()
+
+        connection = SimpleNamespace(send=AsyncMock(), recv=recv, close=AsyncMock())
+        transport = RakNetTransport(connection)
+        with patch("endpilot.transport.raknet.connect", return_value=transport):
+            await bot.join_raknet("127.0.0.1", timeout=1)
+        connection.send.side_effect = failure
+        started = asyncio.get_running_loop().create_future()
+
+        def send_after_tick(_tick):
+            unsubscribe()
+            started.set_result(asyncio.create_task(bot.send_chat("after joining")))
+
+        unsubscribe = bot.subscribe_ticks(send_after_tick)
+        sending = await asyncio.wait_for(started, 1)
+        with self.assertRaises(OSError) as caught:
+            await sending
+        self.assertIs(caught.exception, failure)
+        self.assertIsNone(getattr(failure, "join_failure", None))
+
+    async def test_raknet_join_context_tags_only_its_transport_and_expires_after_failure_or_cancel(self):
+        from endpilot.transport.raknet import RakNetTransport
+
+        bot = Bot()
+        self.addAsyncCleanup(bot.close)
+        for cancelled in (False, True):
+            with self.subTest(cancelled=cancelled):
+                entered, join_finished = asyncio.Event(), asyncio.Event()
+                initial_error = OSError(errno.ECONNRESET, "join send failed")
+                unrelated_error = OSError(errno.EMSGSIZE, "another transport send failed")
+                late_error = OSError(errno.EBADF, "late send failed")
+                other = RakNetTransport(SimpleNamespace(send=AsyncMock(side_effect=unrelated_error)))
+                late_send = None
+
+                async def send_late():
+                    await join_finished.wait()
+                    await transport.send(b"late")
+
+                async def send(_data, **_options):
+                    nonlocal late_send
+                    if late_send is not None:
+                        raise late_error
+                    with self.assertRaises(OSError) as caught:
+                        await other.send(b"unrelated")
+                    self.assertIs(caught.exception, unrelated_error)
+                    late_send = asyncio.create_task(send_late())
+                    entered.set()
+                    if cancelled:
+                        await asyncio.Future()
+                    raise initial_error
+
+                transport = RakNetTransport(SimpleNamespace(send=send, close=AsyncMock()))
+                with patch("endpilot.transport.raknet.connect", return_value=transport):
+                    joining = asyncio.create_task(bot.join_raknet("127.0.0.1"))
+                    try:
+                        await asyncio.wait_for(entered.wait(), 1)
+                        if cancelled:
+                            joining.cancel("cancelled during network settings send")
+                            with self.assertRaises(asyncio.CancelledError):
+                                await joining
+                        else:
+                            with self.assertRaises(OSError) as caught:
+                                await joining
+                            self.assertIs(caught.exception, initial_error)
+                            self.assertEqual(initial_error.join_failure, JoinFailureDetails(
+                                "raknet", "transport_send", "os_error", "errno", errno.ECONNRESET,
+                            ))
+                        join_finished.set()
+                        with self.assertRaises(OSError) as caught:
+                            await late_send
+                        self.assertIs(caught.exception, late_error)
+                        self.assertIsNone(getattr(late_error, "join_failure", None))
+                        self.assertIsNone(getattr(unrelated_error, "join_failure", None))
+                    finally:
+                        join_finished.set()
+                        if not joining.done():
+                            joining.cancel()
+                        await asyncio.gather(joining, return_exceptions=True)
+                        if late_send is not None:
+                            await asyncio.gather(late_send, return_exceptions=True)
 
     async def test_join_deadline_identifies_the_last_entered_stage_without_inventing_a_code(self):
         bot = Bot()

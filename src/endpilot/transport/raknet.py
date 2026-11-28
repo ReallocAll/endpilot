@@ -8,7 +8,9 @@ import raknet
 import raknet.asyncio
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from .._join_failure import _join_stage, _record_connection_failure, _record_join_failure, _symbol_code
+from .._join_failure import (
+    _cleanup_failed_candidate, _join_progress, _record_connection_failure, _record_join_failure, _symbol_code,
+)
 
 
 def _checksum(counter: int, payload: bytes, key: bytes) -> bytes:
@@ -80,7 +82,8 @@ class RakNetTransport:
                 channel=0,
             )
         except OSError as error:
-            if _join_stage.get() is not None:
+            progress = _join_progress.get()
+            if progress is not None and progress.transport is self:
                 _record_connection_failure(error, "raknet", "transport_send")
             raise
 
@@ -119,10 +122,10 @@ async def connect(host: str, port: int) -> RakNetTransport:
     try:
         connection = await peer.connect((host, port))
     except BaseException as error:
-        await _close_peer(peer, 0)
         if isinstance(error, raknet.ConnectError):
             _record_join_failure(error, "raknet", "transport_connect", "transport_error", "raknet_result",
                                  _symbol_code(getattr(error.reason, "name", None)))
+        await _cleanup_failed_candidate(_close_peer(peer, 0), error, "RakNet cleanup after failed dial")
         raise
     return RakNetTransport(connection, peer=peer)
 
@@ -134,8 +137,10 @@ async def advertised_protocol(host: str, port: int, *, timeout: float = 5) -> in
             peer = await _create_peer()
             try:
                 pong = await peer.ping((host, port))
-            finally:
-                await _close_peer(peer, 0)
+            except BaseException as error:
+                await _cleanup_failed_candidate(_close_peer(peer, 0), error, "RakNet cleanup after failed discovery")
+                raise
+            await _close_peer(peer, 0)
     except TimeoutError as error:
         raise TimeoutError(f"RakNet protocol discovery timed out after {timeout:g}s for {host}:{port}") from error
 

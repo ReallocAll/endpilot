@@ -1,5 +1,7 @@
 """Safe diagnostics for a failed candidate without replacing its exception."""
 
+import asyncio
+from collections.abc import Awaitable
 from contextvars import ContextVar
 from dataclasses import dataclass
 import re
@@ -16,12 +18,36 @@ class JoinFailureDetails:
     code: str | int | None = None
 
 
-_join_stage: ContextVar[str | None] = ContextVar("join_stage", default=None)
+@dataclass(slots=True)
+class _JoinProgress:
+    stage: str | None = "transport_connect"
+    transport: object | None = None
+
+
+_join_progress: ContextVar[_JoinProgress | None] = ContextVar("join_progress", default=None)
 
 
 def _set_join_stage(stage: str) -> None:
-    if _join_stage.get() is not None:
-        _join_stage.set(stage)
+    progress = _join_progress.get()
+    if progress is not None and progress.stage is not None:
+        progress.stage = stage
+
+
+def _note_join_cleanup_failure(primary: BaseException, cleanup_error: BaseException, activity: str) -> None:
+    if cleanup_error is primary:
+        return
+    primary.add_note(f"{activity}: {cleanup_error!r}")
+    for note in getattr(cleanup_error, "__notes__", ()):
+        primary.add_note(note)
+
+
+async def _cleanup_failed_candidate(cleanup: Awaitable[None], primary: BaseException, activity: str) -> None:
+    try:
+        await cleanup
+    except (Exception, asyncio.CancelledError) as cleanup_error:
+        if isinstance(cleanup_error, asyncio.CancelledError) and not isinstance(primary, asyncio.CancelledError):
+            raise
+        _note_join_cleanup_failure(primary, cleanup_error, activity)
 
 
 def _nethernet_transport(url: str) -> str | None:

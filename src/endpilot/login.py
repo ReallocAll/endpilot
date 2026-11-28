@@ -17,8 +17,8 @@ from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 from ._join_address import _JoinAddress
 from ._join_failure import (
-    JoinFailureDetails, _join_stage, _nethernet_transport, _record_connection_failure, _record_join_failure,
-    _set_join_stage, _symbol_code,
+    JoinFailureDetails, _JoinProgress, _join_progress, _nethernet_transport, _note_join_cleanup_failure,
+    _record_connection_failure, _record_join_failure, _set_join_stage, _symbol_code,
 )
 from .authentication import (
     DEFAULT_LOCALE, SubmittedClientSettings, _OnlineIdentity, _read_submitted_client_settings, _validate_locale,
@@ -107,10 +107,7 @@ async def _close_after_failed_join(resource, error: BaseException, activity: str
     try:
         await resource.close()
     except BaseException as cleanup_error:
-        if cleanup_error is not error:
-            error.add_note(f"{activity}: {cleanup_error!r}")
-            for note in getattr(cleanup_error, "__notes__", ()):
-                error.add_note(note)
+        _note_join_cleanup_failure(error, cleanup_error, activity)
         return cleanup_error
     return None
 
@@ -134,8 +131,8 @@ def _experiments_allow_vanilla_recipe_tags(experiments) -> bool:
     return all(not toggle.enabled or toggle.name == "gametest" for toggle in experiments.toggles)
 
 
-def _record_candidate_failure(error: BaseException, transport: str | None, closed: type[Exception] | None) -> None:
-    stage = _join_stage.get()
+def _record_candidate_failure(error: BaseException, transport: str | None, stage: str | None,
+                              closed: type[Exception] | None) -> None:
     if stage is None or not isinstance(error, Exception):
         return
     details = error.__dict__.get("join_failure")
@@ -384,10 +381,12 @@ class JoinSession:
             if number == DEFAULT_PROTOCOL:
                 await _prepare_block_palette()
 
-        stage_token = _join_stage.set("transport_connect")
+        progress = _JoinProgress()
+        progress_token = _join_progress.set(progress)
         try:
             async with deadline:
                 transport = await (dial(_on_protocol=select_protocol) if protocol is None else dial())
+                progress.transport = transport
                 if _online_join is not None:
                     _online_join.transport = transport
                 session = await cls._join_connected(
@@ -404,9 +403,9 @@ class JoinSession:
                 from .transport._nethernet_http import _NetherNetUnavailable
 
                 if isinstance(error, _NetherNetUnavailable):
-                    _record_candidate_failure(error.error, _candidate_transport, _transport_closed)
+                    _record_candidate_failure(error.error, _candidate_transport, progress.stage, _transport_closed)
                     return error
-            _record_candidate_failure(error, _candidate_transport, _transport_closed)
+            _record_candidate_failure(error, _candidate_transport, progress.stage, _transport_closed)
             if _retry_before_link and transport is None:
                 if isinstance(error, TimeoutError) and deadline.expired():
                     cancelled = error.__cause__
@@ -421,7 +420,10 @@ class JoinSession:
                     _online_join.transport_close_error = cleanup_error
             raise
         finally:
-            _join_stage.reset(stage_token)
+            # Child tasks inherit the candidate object, so expire it before restoring this task's context.
+            progress.stage = None
+            progress.transport = None
+            _join_progress.reset(progress_token)
 
     @classmethod
     async def _join_connected(

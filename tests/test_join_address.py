@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+import errno
 from ipaddress import IPv4Address
 from pathlib import Path
 import socket
@@ -108,9 +109,12 @@ class JoinAddressTests(unittest.IsolatedAsyncioTestCase):
 
         bot = Bot("Knight")
         self.addAsyncCleanup(bot.close)
+        connection = self._mock_connection()
+        cleanup = OSError(errno.EBADF, "failed to close the NetherNet session")
+        connection._session.aclose.side_effect = cleanup
         async with _listen([web.get("/v1/join", deny)]) as authority:
             with (
-                patch("endpilot.transport._nethernet_http._make_http_session", return_value=self._mock_connection()),
+                patch("endpilot.transport._nethernet_http._make_http_session", return_value=connection),
                 self.assertRaises(ConnectionFailed) as caught,
             ):
                 await bot.join_nethernet(f"http://{authority}", timeout=1)
@@ -123,6 +127,8 @@ class JoinAddressTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(error.join_failure, JoinFailureDetails(
             "nethernet_http", "signaling_discovery", "http_error", "http_status", 403,
         ))
+        connection._session.aclose.assert_awaited_once_with(SessionError.GENERIC_FAILURE)
+        self.assertIn(repr(cleanup), " ".join(error.__notes__))
 
     async def test_signaling_requests_disable_redirects(self):
         url = "http://127.0.0.1:19132/v1/join"
@@ -187,6 +193,9 @@ class JoinAddressTests(unittest.IsolatedAsyncioTestCase):
                     connection = self._mock_connection()
                     timeout = ConnectionFailed(SessionError.NEGOTIATION_TIMEOUT_WAITING_FOR_ACCEPT)
                     connection._await_connected.side_effect = timeout
+                    cleanup = OSError(errno.EBADF, "failed to close the unavailable NetherNet candidate")
+                    if not explicit:
+                        connection._session.aclose.side_effect = cleanup
                     with (
                         patch("endpilot.transport._nethernet_http._make_http_session", return_value=connection),
                         self.assertRaises(ConnectionFailed if explicit else _NetherNetUnavailable) as caught,
@@ -197,6 +206,8 @@ class JoinAddressTests(unittest.IsolatedAsyncioTestCase):
                         )
                     error = caught.exception if explicit else caught.exception.error
                     self.assertIs(error, timeout)
+                    if not explicit:
+                        self.assertIn(repr(cleanup), " ".join(error.__notes__))
                     connection._session.accept_answer.assert_awaited_once_with("v=0")
                     connection._session.aclose.assert_awaited_once_with(SessionError.GENERIC_FAILURE)
 
@@ -477,6 +488,8 @@ class JoinAddressTests(unittest.IsolatedAsyncioTestCase):
             return web.json_response({"protocol": 2193})
 
         connection = self._mock_connection()
+        cleanup = OSError(errno.EBADF, "failed to close the cancelled NetherNet session")
+        connection._session.aclose.side_effect = cleanup
         bot = Bot(protocol=None)
         self.addAsyncCleanup(bot.close)
         async with _listen([web.get("/v1/join", announce)]) as authority:
@@ -489,8 +502,10 @@ class JoinAddressTests(unittest.IsolatedAsyncioTestCase):
                     async with asyncio.timeout(3):
                         await entered.wait()
                         await bot.close()
-                        with self.assertRaises(asyncio.CancelledError):
+                        with self.assertRaises(asyncio.CancelledError) as caught:
                             await joining
+                        self.assertIsNone(getattr(caught.exception, "join_failure", None))
+                        self.assertIn(repr(cleanup), " ".join(caught.exception.__notes__))
                 finally:
                     released.set()
                     joining.cancel()

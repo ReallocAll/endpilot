@@ -37,7 +37,8 @@ from nethernet.identity import strip_identity, verify_server_identity
 from nethernet.signaling.http import SDP_CONTENT_TYPE, _parse_answer, _require_aiohttp
 
 from .._join_failure import (
-    _nethernet_transport, _os_error_code, _record_connection_failure, _record_join_failure, _set_join_stage, _symbol_code,
+    _cleanup_failed_candidate, _nethernet_transport, _os_error_code, _record_connection_failure, _record_join_failure,
+    _set_join_stage, _symbol_code,
 )
 
 
@@ -241,5 +242,7 @@ async def connect_http(
     except BaseException as error:
         if isinstance(error, InvalidIdentity):
             _record_join_failure(error, _nethernet_transport(url), "transport_connect", "identity_verification")
-        await session.aclose(SessionError.GENERIC_FAILURE)
+        primary = error.error if isinstance(error, _NetherNetUnavailable) else error
+        await _cleanup_failed_candidate(session.aclose(SessionError.GENERIC_FAILURE), primary,
+                                        "NetherNet cleanup after failed dial")
         raise
