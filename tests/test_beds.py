@@ -92,11 +92,23 @@ class BedTests(unittest.IsolatedAsyncioTestCase):
                 if raw.packet_id == kind.ID:
                     return self.bot.protocol.decode(raw)
 
+    def assert_passive_output(self):
+        # The movement input pump can send an idle frame between observations.
+        while not self.transport.outgoing.empty():
+            for raw in read_batch(self.transport.outgoing.get_nowait()[1:]):
+                self.assertEqual(raw.packet_id, self.b.PlayerAuthInputPacket.ID)
+                packet = self.bot.protocol.decode(raw)
+                self.assertEqual((packet.move.x, packet.move.y), (0.0, 0.0))
+                self.assertFalse(packet.input_data)
+                self.assertIsNone(packet.item_use_transaction)
+                self.assertIsNone(packet.item_stack_request)
+                self.assertFalse(packet.player_block_actions)
+
     async def test_bed_events_follow_local_sleep_transitions_after_cache_updates(self):
         bot, b = self.bot, self.b
         events = []
         bot.subscribe_bed_events(lambda event: events.append((event, bot.is_sleeping, bot.sleeping_bed)))
-        self.assertTrue(self.transport.outgoing.empty())
+        self.assert_passive_output()
         self.deliver(self.metadata(42, 4), self.metadata(43, 2, HEAD), self.metadata(42, bed=HEAD))
         await asyncio.sleep(0)
         self.assertEqual(events, [])
@@ -104,7 +116,7 @@ class BedTests(unittest.IsolatedAsyncioTestCase):
                      self.metadata(43, 0), self.metadata(42, 4), self.metadata(42, 0))
         await asyncio.sleep(0)
         self.assertEqual(events, [("sleep", True, HEAD), ("wake", False, None)])
-        self.assertTrue(self.transport.outgoing.empty())
+        self.assert_passive_output()
 
         dimension = b.ChangeDimensionPacket(dimension_id=1, pos=b.Vec3(x=8.5, y=221.62, z=7.5))
         self.deliver(self.metadata(42, 2), dimension, self.metadata(42, 0))
@@ -140,7 +152,7 @@ class BedTests(unittest.IsolatedAsyncioTestCase):
         self.deliver(invalid)
         await asyncio.sleep(0)
         self.assertEqual(events, [("respawn_point_invalidated", None)] * 2)
-        self.assertTrue(self.transport.outgoing.empty())
+        self.assert_passive_output()
 
     async def test_bed_subscription_removes_one_registration_and_ends_at_disconnect(self):
         bot = self.bot
