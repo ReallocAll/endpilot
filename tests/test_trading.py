@@ -603,8 +603,15 @@ class TradeManyTests(unittest.IsolatedAsyncioTestCase):
         self.decoded = {}
         self.sent = asyncio.Queue()
 
-        async def send(packet):
-            await self.sent.put(packet.requests[0])
+        self.before_write = None
+
+        async def send(packet, *, _before_send=None):
+            request = packet.requests[0]
+            if self.before_write is not None:
+                self.before_write(request)
+            if _before_send is not None:
+                _before_send()
+            await self.sent.put(request)
 
         def subscribe(observer):
             self.observers.append(observer)
@@ -960,8 +967,8 @@ class TradeManyTests(unittest.IsolatedAsyncioTestCase):
     async def test_full_inventory_stops_before_staging_either_ingredient(self):
         for index in range(2, 36):
             self.inventory._set_slot(index, self.stack(4, 64, 1000 + index))
-        self.inventory._set_slot(0, self.stack(1, 9, 100))
-        self.inventory._set_slot(1, self.stack(2, 1, 200))
+        self.inventory._set_slot(0, self.stack(1, 10, 100))
+        self.inventory._set_slot(1, self.stack(2, 2, 200))
         result = await self.trading.trade_many(123, 1)
         self.assertEqual((result.stop_reason, result.requests), ("no_output_slot", ()))
         self.assertTrue(self.sent.empty())
@@ -1006,12 +1013,106 @@ class TradeManyTests(unittest.IsolatedAsyncioTestCase):
         self.native_quote(recipe)
         return recipe
 
+    def full_wheat_quote(self, *stocks, second_cost=0):
+        from bedrock_protocol import nbt
+
+        recipe = self.output_quote(full=True)
+        if second_cost:
+            recipe["buyB"] = nbt.CompoundTag({"Name": nbt.StringTag("minecraft:wheat"),
+                                              "Count": nbt.ByteTag(second_cost)})
+        else:
+            del recipe["buyB"]
+        recipe["buyCountB"] = nbt.IntTag(second_cost)
+        for slot in range(36):
+            if slot < len(stocks):
+                self.observe_player_slot(slot, 4, stocks[slot], 300 + slot, user_data=bytes(10))
+            else:
+                self.observe_player_slot(slot, 5, 64, 2000 + slot)
+        self.native_quote(recipe)
+        return recipe
+
     async def split_stage(self, ingredient, index, amount, source_id, target_id):
         request = await self.next_request()
         action, = request.actions
         self.assertEqual((action.source.slot, action.amount, action.source.net_id_variant), (index, amount, source_id))
         self.assertEqual((action.destination.slot, action.destination.net_id_variant), (3 + ingredient, target_id))
         return request
+
+    async def test_full_inventory_alternative_split_can_free_one_of_its_sources(self):
+        self.full_wheat_quote(21, 7)
+        batch = asyncio.create_task(self.bot.trade_many(123, 1))
+        first = await self.split_stage(1, 0, 13, 300, 0)
+        self.receipt(first, [self.player_slot(0, 8, 310), self.input_slot(1, 13, 501)])
+        second = await self.split_stage(1, 1, 7, 301, 501)
+        self.receipt(second, [self.player_slot(1, 0), self.input_slot(1, 20, 502)])
+        exchange = await self.next_request()
+        self.assertEqual(exchange.actions[-2].source.net_id_variant, 502)
+        self.assertEqual((exchange.actions[-1].destination.slot, exchange.actions[-1].destination.net_id_variant), (1, 0))
+        self.receipt(exchange, [self.input_slot(1, 0), self.player_slot(1, 1, 710)])
+        self.assertEqual((await batch).confirmed_count, 1)
+        self.assertEqual((self.inventory.slots[0].stack_size, self.inventory.slots[1].id), (8, 1))
+
+    async def test_full_inventory_shared_source_must_clear_across_both_costs(self):
+        self.full_wheat_quote(29, second_cost=8)
+        blocked = await self.bot.trade_many(123, 1)
+        self.assertEqual((blocked.stop_reason, blocked.requests), ("no_output_slot", ()))
+        self.assertTrue(self.sent.empty())
+        self.observe_player_slot(0, 4, 28, 310, user_data=bytes(10))
+        batch = asyncio.create_task(self.bot.trade_many(123, 1))
+        first = await self.split_stage(1, 0, 20, 310, 0)
+        self.receipt(first, [self.player_slot(0, 8, 311), self.input_slot(1, 20, 501)])
+        second = await self.split_stage(2, 0, 8, 311, 0)
+        self.receipt(second, [self.player_slot(0, 0), self.input_slot(2, 8, 502)])
+        exchange = await self.next_request()
+        self.assertEqual([action.source.net_id_variant for action in exchange.actions[-3:-1]], [501, 502])
+        self.assertEqual((exchange.actions[-1].destination.slot, exchange.actions[-1].destination.net_id_variant), (0, 0))
+        self.receipt(exchange, [self.input_slot(1, 0), self.input_slot(2, 0), self.player_slot(0, 1, 711)])
+        self.assertEqual((await batch).confirmed_count, 1)
+
+    async def test_freed_slot_requires_the_matching_stage_receipt_to_show_source_zero(self):
+        self.full_wheat_quote(20)
+        batch = asyncio.create_task(self.bot.trade_many(123, 1))
+        stage = await self.split_stage(1, 0, 20, 300, 0)
+        self.observe_player_slot(0, 0, 0, None)
+        self.receipt(stage, [self.input_slot(1, 20, 501)])
+        result = await batch
+        self.assertEqual((result.stop_reason, result.confirmed_count), ("unconfirmed", 0))
+        self.assertEqual([(step.ingredient, step.status) for step in result.requests], [(1, "unconfirmed")])
+        self.assertTrue(self.sent.empty())
+
+    async def test_freed_slot_is_rechecked_after_encoding_the_exchange(self):
+        for replacement in ("reopen", "refill"):
+            with self.subTest(replacement=replacement):
+                self.close_window()
+                recipe = self.full_wheat_quote(20)
+
+                def change_at_write(request):
+                    if not any(type(action).__name__ == "CraftRecipeActionData" for action in request.actions):
+                        return
+                    if replacement == "reopen":
+                        self.close_window()
+                        self.native_quote(recipe)
+                    else:
+                        self.observe_player_slot(0, 1, 1, 911, user_data=bytes(10))
+
+                self.before_write = change_at_write
+                batch = asyncio.create_task(self.bot.trade_many(123, 1))
+                stage = await self.split_stage(1, 0, 20, 300, 0)
+                self.receipt(stage, [self.player_slot(0, 0), self.input_slot(1, 20, 501)])
+                result = await batch
+                reason = "window_changed" if replacement == "reopen" else "inventory_unobserved"
+                self.assertEqual((result.stop_reason, result.confirmed_count), (reason, 0))
+                self.assertEqual([(step.ingredient, step.status) for step in result.requests],
+                                 [(1, "confirmed"), (None, "not_sent")])
+                self.assertTrue(self.sent.empty())
+
+    async def test_freed_slot_source_count_is_rechecked_after_encoding_the_stage(self):
+        self.full_wheat_quote(20)
+        self.before_write = lambda _request: self.observe_player_slot(0, 4, 21, 300, user_data=bytes(10))
+        result = await self.bot.trade_many(123, 1)
+        self.assertEqual((result.stop_reason, result.confirmed_count), ("inventory_unobserved", 0))
+        self.assertEqual([(step.ingredient, step.status) for step in result.requests], [(1, "not_sent")])
+        self.assertTrue(self.sent.empty())
 
     async def test_split_inputs_reserve_shared_sources_and_consume_the_final_stack_ids(self):
         self.split_quote(second_cost=8)
@@ -1079,6 +1180,8 @@ class TradeManyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_split_quote_prefers_single_source_and_preflights_capacity(self):
         self.split_quote()
+        self.observe_player_slot(0, 4, 24, 301, user_data=bytes(10))
+        self.observe_player_slot(1, 4, 25, 302, user_data=bytes(10))
         for slot in range(2, 36):
             self.observe_player_slot(slot, 5, 64, 2000 + slot)
         blocked = await self.bot.trade_many(123, 1)
@@ -1189,9 +1292,9 @@ class TradeManyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.trading._inputs)
         self.assertTrue(self.sent.empty())
 
-    async def test_occupied_output_uses_latest_network_id_and_stops_before_third_stage(self):
+    async def test_occupied_output_uses_latest_network_id_then_replans_to_a_freed_slot(self):
         self.output_quote(full=True)
-        batch = asyncio.create_task(self.trading.trade_many(123, 3))
+        batch = asyncio.create_task(self.trading.trade_many(123, 4))
         for index in (0, 1):
             await self.answer_stage(1)
             if index == 0:
@@ -1203,11 +1306,17 @@ class TradeManyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([action.amount for action in exchange.actions[2:-1]], [20, 1])
             self.receipt(exchange, [self.input_slot(1, 0), self.input_slot(2, 0),
                                     self.player_slot(9, 63 + index, 911 + index)])
+        await self.answer_stage(1)
+        await self.answer_stage(2)
+        exchange = await self.next_request()
+        target = exchange.actions[-1].destination
+        self.assertEqual((target.slot, target.net_id_variant), (1, 0))
+        self.receipt(exchange, [self.input_slot(1, 0), self.input_slot(2, 0), self.player_slot(1, 1, 800)])
         result = await batch
-        self.assertEqual((result.stop_reason, result.confirmed_count), ("no_output_slot", 2))
+        self.assertEqual((result.stop_reason, result.confirmed_count), ("insufficient_materials", 3))
         self.assertEqual([(step.trade, step.ingredient) for step in result.requests],
-                         [(1, 1), (1, 2), (1, None), (2, 1), (2, 2), (2, None)])
-        self.assertEqual((self.inventory.slots[0].stack_size, self.inventory.slots[1].stack_size), (24, 1))
+                         [(trade, ingredient) for trade in (1, 2, 3) for ingredient in (1, 2, None)])
+        self.assertEqual((self.inventory.slots[0].stack_size, self.inventory.slots[1].id), (4, 1))
         self.assertEqual((self.inventory.slots[9].stack_size, self.inventory.slots[9].net_id_variant), (64, 912))
         self.assertTrue(self.sent.empty())
 

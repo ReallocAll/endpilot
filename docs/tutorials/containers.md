@@ -204,6 +204,10 @@ exchanges, use `open_trade()` and the current server quote with
 `execute_trade()` or `trade_many()`. For supported native economy quotes,
 `trade_many()` uses the payable count advertised by the server, including
 a discounted first ingredient such as a Hero of the Village quote.
+It prefers a compatible output stack, then an observed empty slot. With a
+full bag, it can reuse a source slot that the current payment fully empties.
+The matching staging receipts and the observed empty slot are required before
+it sends the exchange.
 
 For a visible `minecraft:villager_v2`, match `TradeOffers.trader_unique_id`
 to an `entity_id` in `bot.observed_entities` to read the villager's latest

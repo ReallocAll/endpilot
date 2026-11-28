@@ -395,11 +395,18 @@ class Trading:
                 and stack.aux_value == 0 and stack.block_runtime_id == 0
                 and bytes(stack.user_data_buffer) == _PLAIN_ITEM_DATA)
 
-    def _require_output_slot(self, slot, item, terms):
+    def _require_stable_slot(self, slot, *, request_id=None):
         observed = self.inventory.slots.get(slot)
-        if (slot in self.inventory._unconfirmed_transfer_slots or not self._can_receive_output(observed, item, terms)
+        own_request = self.inventory._pending_requests.get(request_id)
+        if (observed is None or slot in self.inventory._unconfirmed_transfer_slots
                 or not _same_slot(observed, self.inventory.client_slots().get(slot))
-                or self.inventory._requests_for_endpoints({(None, slot)})):
+                or any(pending is not own_request for pending in self.inventory._requests_for_endpoints({(None, slot)}))):
+            raise _TradeStop("inventory_unobserved")
+        return observed
+
+    def _require_output_slot(self, slot, item, terms, *, freed_slot=False):
+        observed = self._require_stable_slot(slot)
+        if (freed_slot and observed.id != 0) or not self._can_receive_output(observed, item, terms):
             raise _TradeStop("inventory_unobserved")
         return observed
 
@@ -482,27 +489,53 @@ class Trading:
         return known, possible, matched
 
     @staticmethod
-    def _allocate_inputs(costs, options, available):
+    def _payment_from_freed_slot(costs, pools, counts, destination):
+        # For each of the at most two ingredients, the rest of its pool bounds
+        # its minimum debit from this slot. The two debits must empty it jointly.
+        minimum, maximum = [], []
+        for (_, item, _), pool in zip(costs, pools, strict=True):
+            capacity_elsewhere = sum(counts[index] for index in pool if index != destination)
+            minimum.append(max(0, item.count - capacity_elsewhere))
+            maximum.append(item.count if destination in pool else 0)
+        if len(pools) == 1:
+            minimum.append(0)
+            maximum.append(0)
+        first = max(minimum[0], counts[destination] - maximum[1])
+        second = counts[destination] - first
+        if first <= maximum[0] and minimum[1] <= second <= maximum[1]:
+            return first, second
+        return None
+
+    @staticmethod
+    def _allocate_inputs(costs, options, available, *, free_output=False):
         # Try all single-stack assignments before introducing an append step.
         for pools in sorted(product(*options), key=lambda pools: sum(len(pool) > 1 for pool in pools)):
-            selected = []
-            remaining = {index: int(available[index].stack_size) for pool in pools for index in pool}
-            for position, ((ingredient, item, _), pool) in enumerate(zip(costs, pools, strict=True)):
-                later = pools[position + 1] if position + 1 < len(pools) else ()
-                needed = item.count
-                # Take nonshared stacks first to reserve enough for the other ingredient.
-                for index in sorted(pool, key=lambda index: index in later):
-                    amount = min(remaining[index], needed)
-                    if amount:
-                        selected.append((ingredient, index, amount, _merge_key(available[index])))
-                        remaining[index] -= amount
-                        needed -= amount
-                    if not needed:
+            counts = {index: int(available[index].stack_size) for pool in pools for index in pool}
+            for destination in sorted(counts) if free_output else (None,):
+                debits = ((0, 0) if destination is None else
+                          Trading._payment_from_freed_slot(costs, pools, counts, destination))
+                if debits is None:
+                    continue
+                selected = []
+                remaining = counts.copy()
+                for position, ((ingredient, item, _), pool) in enumerate(zip(costs, pools, strict=True)):
+                    later = pools[position + 1] if position + 1 < len(pools) else ()
+                    needed = item.count - debits[position]
+                    # Take nonshared stacks first. A freed slot's debits are
+                    # already counted against both costs and excluded here.
+                    for index in sorted(pool, key=lambda index: index in later):
+                        if index == destination:
+                            amount = debits[position]
+                        else:
+                            amount = min(remaining[index], needed)
+                            remaining[index] -= amount
+                            needed -= amount
+                        if amount:
+                            selected.append((ingredient, index, amount, available[index]))
+                    if needed:
                         break
-                if needed:
-                    break
-            else:
-                return sorted(selected, key=lambda step: step[0])
+                else:
+                    return sorted(selected, key=lambda step: step[0]), destination
         return None
 
     def _plan(self, offer, terms):
@@ -525,14 +558,15 @@ class Trading:
             options.append(pools)
             possible_options.append(possible)
             eligible.update(matched)
-        sources = self._allocate_inputs(costs, options, available)
-        if sources is None:
+        allocation = self._allocate_inputs(costs, options, available)
+        if allocation is None:
             if possible_options != options and self._allocate_inputs(costs, possible_options, available) is not None:
                 return "inventory_unobserved"
             # Count each shared source only once across the combined costs.
             if not enough_each or sum(stack.stack_size for stack in eligible.values()) < sum(item.count for _, item, _ in costs):
                 return shortage
             return "fragmented_materials"
+        sources, _ = allocation
         inputs = {index for _, index, _, _ in sources}
         destination = next((index for index, stack in available.items() if index not in inputs and stack.id
                             and self._can_receive_output(stack, offer.sell, terms)), None)
@@ -540,7 +574,10 @@ class Trading:
             destination = next((index for index, stack in available.items()
                                 if stack.id == 0 and stack.stack_size == 0), None)
         if destination is None:
-            return "no_output_slot" if len(available) == 36 else "inventory_unobserved"
+            allocation = self._allocate_inputs(costs, options, available, free_output=True)
+            if allocation is None:
+                return "no_output_slot" if len(available) == 36 else "inventory_unobserved"
+            return allocation
         return sources, destination
 
     async def trade_many(self, recipe_net_id: int, count: int, *, timeout: float = 15) -> TradeManyResult:
@@ -584,15 +621,22 @@ class Trading:
                     if isinstance(plan, str):
                         return batch.result(plan)
                     sources, destination = plan
-                    for ingredient, source_slot, amount, identity in sources:
+                    expected = {slot: item for _, slot, _, item in sources}
+                    freed_slot = destination in expected
+                    for ingredient, source_slot, amount, _ in sources:
                         self._require_batch_quote(batch)
-                        await self._stage_ingredient(source_slot, amount, ingredient=ingredient, timeout=None,
-                                                     batch=batch, trade=trade, output_slot=destination,
-                                                     source_identity=identity)
+                        source = expected[source_slot]
+                        reply = await self._stage_ingredient(
+                            source_slot, amount, ingredient=ingredient, timeout=None, batch=batch, trade=trade,
+                            output_slot=destination, source_observed=source, output_observed=expected.get(destination),
+                        )
                         if batch.requests[-1].status != "confirmed":
                             return batch.result(batch.requests[-1].status)
+                        remaining = _response_slot(reply, _PLAYER_CONTAINERS, source_slot)
+                        expected[source_slot] = _response_item(self.packets.protocol.binding, source, source, remaining)
                     self._require_batch_quote(batch)
-                    await self._exchange(recipe_net_id, destination, timeout=None, batch=batch, trade=trade)
+                    await self._exchange(recipe_net_id, destination, timeout=None, batch=batch, trade=trade,
+                                         freed_slot=freed_slot)
                     if batch.requests[-1].status != "confirmed":
                         return batch.result(batch.requests[-1].status)
                     if self.containers.window is not window:
@@ -668,8 +712,7 @@ class Trading:
                 if asyncio.get_running_loop().time() >= batch.deadline:
                     raise TimeoutError("trade timed out before submitting the next request")
                 self._require_batch_quote(batch)
-                if (conflicted or inventory_slot in self.inventory._unconfirmed_transfer_slots
-                        or not _same_slot(observed, self.inventory.client_slots().get(inventory_slot))):
+                if conflicted or not _same_slot(observed, self._require_stable_slot(inventory_slot, request_id=request_id)):
                     raise _TradeStop("inventory_unobserved")
             elif self.containers.window is not window:
                 raise RuntimeError("trade window changed before submitting the request")
@@ -704,7 +747,8 @@ class Trading:
 
         try:
             return await self.inventory._request_item_stack(
-                request, receive, timeout=timeout, before_send=before_send,
+                request, receive, timeout=timeout, before_send=before_send if batch is None else None,
+                _at_write=before_send if batch is not None else None,
                 _on_unconfirmed=mark_conflicted if batch is not None else None,
                 _on_slot_observed=on_slot_observed,
             )
@@ -749,7 +793,7 @@ class Trading:
         return await self._stage_ingredient(source_slot, amount, ingredient=ingredient, timeout=timeout)
 
     async def _stage_ingredient(self, source_slot, amount, *, ingredient, timeout, batch=None, trade=0,
-                                output_slot=None, source_identity=None):
+                                output_slot=None, source_observed=None, output_observed=None):
         offers, window = self._trade_window()
         if not 0 <= source_slot <= 255:
             raise ValueError("source slot must fit in a byte")
@@ -763,8 +807,8 @@ class Trading:
             offer = self._offer(batch.recipe_net_id)
             item = (offer.buy_a, offer.buy_b)[ingredient - 1]
             requirement = batch.terms[1].ingredients[ingredient - 1]
-            if (not self._ingredient_match(source, item, requirement) or source.stack_size < amount
-                    or _merge_key(source) != source_identity):
+            if (not _same_slot(source, source_observed) or not self._ingredient_match(source, item, requirement)
+                    or source.stack_size < amount):
                 raise _TradeStop("inventory_unobserved")
         if source is None or int(source.id) == 0:
             raise ValueError("source slot has no observed item")
@@ -848,7 +892,10 @@ class Trading:
             if batch is not None:
                 if not self._ingredient_match(self.inventory.slots.get(source_slot), item, requirement):
                     raise _TradeStop("inventory_unobserved")
-                self._require_output_slot(output_slot, offer.sell, batch.terms[1])
+                if output_observed is None:
+                    self._require_output_slot(output_slot, offer.sell, batch.terms[1])
+                elif not _same_slot(output_observed, self._require_stable_slot(output_slot, request_id=request_id)):
+                    raise _TradeStop("inventory_unobserved")
             elif previous is not None and (source_slot in self.inventory._unconfirmed_transfer_slots
                                            or int(source.net_id_variant or 0) <= 0 or source.stack_size < amount
                                            or not _same_slot(source, self.inventory.client_slots().get(source_slot))):
@@ -924,7 +971,7 @@ class Trading:
         """
         return await self._exchange(recipe_net_id, destination_slot, timeout=timeout)
 
-    async def _exchange(self, recipe_net_id, destination_slot, *, timeout, batch=None, trade=0):
+    async def _exchange(self, recipe_net_id, destination_slot, *, timeout, batch=None, trade=0, freed_slot=False):
         offers, window = self._trade_window()
         if not 0 <= destination_slot <= 255:
             raise ValueError("destination slot must fit in a byte")
@@ -963,9 +1010,9 @@ class Trading:
 
         terms = self._terms.get(recipe_net_id) if batch is None else batch.terms[1]
         destination_observed = (self.inventory.slots.get(destination_slot) if batch is None else
-                                self._require_output_slot(destination_slot, offer.sell, terms))
+                                self._require_output_slot(destination_slot, offer.sell, terms, freed_slot=freed_slot))
         destination = self.inventory.item_or_empty(destination_slot)
-        occupied_output = batch is not None and destination.id != 0
+        observe_destination = batch is not None and (destination.id != 0 or freed_slot)
         output_observation = None
         output_conflicted = False
         use_floor = None
@@ -1028,8 +1075,15 @@ class Trading:
                     self._apply_input_correction(number, original, slot, success)
             player = _response_slot(reply, _PLAYER_CONTAINERS, destination_slot)
             if player is not None:
-                if occupied_output:
-                    corrected = _response_item(b, destination, destination, player)
+                output = destination
+                if success and output_id is not None and int(destination.id) != output_id:
+                    output = b.SerializedNetworkItemStackDescriptor(
+                        id=output_id, stack_size=offer.sell.count, aux_value=0, net_id_variant=None,
+                        block_runtime_id=0,
+                        user_data_buffer=_PLAIN_ITEM_DATA if terms is not None and terms.plain_output else b"",
+                    )
+                if observe_destination:
+                    corrected = _response_item(b, output, output, player)
                     current = self.inventory.slots.get(destination_slot)
                     if (output_conflicted or destination_slot in self.inventory._unconfirmed_transfer_slots
                             or (output_observation is not None and not _same_slot(output_observation, corrected))
@@ -1039,13 +1093,6 @@ class Trading:
                         return
                     if _same_slot(corrected, current):
                         return
-                output = destination
-                if success and output_id is not None and int(destination.id) != output_id:
-                    output = b.SerializedNetworkItemStackDescriptor(
-                        id=output_id, stack_size=offer.sell.count, aux_value=0, net_id_variant=None,
-                        block_runtime_id=0,
-                        user_data_buffer=_PLAIN_ITEM_DATA if terms is not None and terms.plain_output else b"",
-                    )
                 self._apply_player_correction(destination_slot, destination_observed, output, output, player)
 
         def confirms(reply):
@@ -1066,5 +1113,5 @@ class Trading:
 
         return await self._submit(request, apply, window=window, timeout=timeout, inventory_slot=destination_slot,
                                   observed=destination_observed, confirms=confirms, on_submit=on_submit,
-                                  on_slot_observed=observe_output if occupied_output else None,
+                                  on_slot_observed=observe_output if observe_destination else None,
                                   batch=batch, trade=trade)
