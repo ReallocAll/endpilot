@@ -297,8 +297,9 @@ Connect a resident player over stdio and start an async `main(bot, ...)` with
 `bot.subscribe_entity_placement_completions(callback)`. Use `observe_script`
 to read the script result. The action reply and subscription callback receive
 separate snapshots with the placement reason, spawn and inventory observations.
-Snapshot fields are accessible by attribute. Byte fields such as
-`user_data_buffer` are represented as hex strings.
+Snapshot fields are accessible by attribute. Nested item snapshots expose
+the session item name, hex string and local bytes view.
+[Item snapshots in MCP scripts](items.md#read-item-snapshots-in-mcp-scripts)
 
 Worker notifications are queued. Keep the script running for callbacks it
 needs to receive. A synchronous callback observes only completed local action

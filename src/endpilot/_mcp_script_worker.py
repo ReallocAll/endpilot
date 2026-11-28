@@ -46,12 +46,27 @@ class _Snapshot(SimpleNamespace):
     __slots__ = ()
 
 
+class _ItemSnapshot(_Snapshot):
+    __slots__ = ()
+
+    @property
+    def user_data_hex(self) -> str:
+        return self.user_data_buffer
+
+    @property
+    def user_data_bytes(self) -> bytes:
+        return bytes.fromhex(self.user_data_buffer)
+
+
 def _decode(value):
     if isinstance(value, list):
         return [_decode(item) for item in value]
     if isinstance(value, dict):
-        if value.get("$endpilot") == "record" and value.keys() == {"$endpilot", "fields"}:
-            return _Snapshot(**{key: _decode(item) for key, item in value["fields"].items()})
+        if value.keys() == {"$endpilot", "fields"}:
+            kind = value["$endpilot"]
+            if kind in ("record", "item-record"):
+                record = _ItemSnapshot if kind == "item-record" else _Snapshot
+                return record(**{key: _decode(item) for key, item in value["fields"].items()})
         return {key: _decode(item) for key, item in value.items()}
     return value
 
@@ -63,7 +78,7 @@ def _argument(value):
                 "fields": {field.name: getattr(value, field.name) for field in fields(value)}}
     if kind is range:
         return {"$endpilot": "range", "start": value.start, "stop": value.stop, "step": value.step}
-    if kind in (SimpleNamespace, _Snapshot):
+    if kind in (SimpleNamespace, _Snapshot, _ItemSnapshot):
         return {"$endpilot": "record", "fields": vars(value)}
     if callable(value):
         raise TypeError("Bot calls cannot receive Python callbacks or predicates. Use a Bot subscription for events.")
@@ -83,7 +98,7 @@ def _terrain_columns(columns):
 
 
 def _result(value):
-    if type(value) is _Snapshot:
+    if type(value) in (_Snapshot, _ItemSnapshot):
         return vars(value)
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 

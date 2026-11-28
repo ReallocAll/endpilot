@@ -192,11 +192,11 @@ class _Observation(_Status):
     error: _Error | None
 
 
-def _record(values):
-    return {"$endpilot": "record", "fields": values}
+def _record(values, *, item_buffer=False):
+    return {"$endpilot": "item-record" if item_buffer else "record", "fields": values}
 
 
-def _feedback_fields(event):
+def _feedback_fields(event, registry):
     packet = event.packet
     if isinstance(event, SoundEvent):
         values = {"volume": event.volume, "pitch": event.pitch}
@@ -227,10 +227,10 @@ def _feedback_fields(event):
         data = getattr(packet, "data", None)
         values["data"] = data if type(data) is int else None
     values.update((name, getattr(packet, name, None)) for name in names)
-    return {name: _project(value) for name, value in values.items()}
+    return {name: _project(value, registry) for name, value in values.items()}
 
 
-def _project(value):
+def _project(value, registry=None):
     """Project owned gameplay data without exposing SDK or native objects."""
     if isinstance(value, Enum):
         return value.name
@@ -241,30 +241,35 @@ def _project(value):
     if type(value) is Fraction:
         return _record({"numerator": value.numerator, "denominator": value.denominator})
     if type(value) in (tuple, list, frozenset):
-        return [_project(item) for item in value]
+        return [_project(item, registry) for item in value]
     if type(value) in (dict, MappingProxyType) and all(type(key) in (str, int) for key in value):
-        return {str(key): _project(item) for key, item in value.items()}
+        return {str(key): _project(item, registry) for key, item in value.items()}
     kind = type(value)
     if (kind.__module__, kind.__name__) in _RECORDS or _INPUT_RECORDS.get(kind.__name__) is kind:
-        output = {field.name: _project(getattr(value, field.name))
+        output = {field.name: _project(getattr(value, field.name), registry)
                   for field in fields(value) if not field.name.startswith("_") and field.name != "packet"}
+        item_id = output.get("item_id")
+        item_buffer = False
+        if type(item_id) is int:
+            output["item_name"] = None if registry is None else registry.name_for_id(item_id)
+            item_buffer = type(getattr(value, "user_data_buffer", None)) is bytes
         if kind.__name__ == "BlockCollection":
             output["pickup_confirmed"] = value.pickup_confirmed
         elif kind.__name__ == "NavigationPlan":
-            output["endpoint"] = _project(value.endpoint)
+            output["endpoint"] = _project(value.endpoint, registry)
         elif kind is WorldTime:
             output.update(daytime=value.daytime, day=value.day, observed_moon_phase=value.observed_moon_phase)
         elif kind is EntityState:
-            output["visible_effect_ids"] = _project(value.visible_effect_ids)
+            output["visible_effect_ids"] = _project(value.visible_effect_ids, registry)
         elif kind in (RangeTransferResult, TradeManyResult):
             output["confirmed_count"] = value.confirmed_count
         elif isinstance(value, (SoundEvent, ParticleEvent, BlockEvent)):
-            output.update(_feedback_fields(value))
-        return _record(output)
+            output.update(_feedback_fields(value, registry))
+        return _record(output, item_buffer=item_buffer)
     raise TypeError(f"{kind.__name__} is unavailable through the MCP script Bot")
 
 
-def _snapshot(name, value):
+def _snapshot(name, value, registry):
     if name in _SLOT_MAPS and value is not None:
         value = {slot: _stack_snapshot(item) for slot, item in value.items()}
     elif name == "offhand_item":
@@ -283,7 +288,7 @@ def _snapshot(name, value):
                                       "params": _project(message.params)}) for message in output.messages],
             }),
         })
-    return _project(value)
+    return _project(value, registry)
 
 
 def _input_record(value):
@@ -394,16 +399,16 @@ def _read(pipe):
     return frame
 
 
-def _error(error):
+def _error(error, registry):
     detail = {"type": type(error).__name__, "message": str(error)}
     attributes = {}
     field = _ERROR_FIELDS.get(type(error))
     if field is not None and type(value := getattr(error, field, None)) is str:
-        attributes[field] = _project(value)
+        attributes[field] = _project(value, registry)
     for name, kinds in _ERROR_PROGRESS.items():
         value = getattr(error, name, None)
         if type(value) in kinds:
-            attributes[name] = _project(value)
+            attributes[name] = _project(value, registry)
     if attributes:
         detail["attributes"] = attributes
     return detail
@@ -478,7 +483,7 @@ class _Run:
 
     def _fail(self, error):
         if self.error is None and not self.stopping:
-            self.error = _reported_error(_error(error))
+            self.error = _reported_error(_error(error, getattr(self.bot, "item_registry", None)))
         self._kill_worker()
 
     def _send(self, frame):
@@ -515,7 +520,8 @@ class _Run:
     def _notify(self, request_id, *values):
         try:
             if not self.stopping and not self._settling and self.error is None:
-                self._send({"op": "event", "id": request_id, "args": [_project(value) for value in values]})
+                registry = getattr(self.bot, "item_registry", None)
+                self._send({"op": "event", "id": request_id, "args": [_project(value, registry) for value in values]})
         except (TypeError, ValueError, RecursionError) as error:
             self._fail(error)
 
@@ -543,7 +549,7 @@ class _Run:
         transfer = _RANGE_TRANSFERS.get(name)
         member = getattr(self.bot, name) if transfer is None else partial(transfer, self.bot)
         if op == "get":
-            return _snapshot(name, member)
+            return _snapshot(name, member, getattr(self.bot, "item_registry", None))
         if op == "subscribe":
             if len(self._subscriptions) >= _MAX_PENDING:
                 raise RuntimeError("too many MCP script subscriptions")
@@ -560,7 +566,7 @@ class _Run:
         value = member(*bound.args, **bound.kwargs)
         if kind == "async":
             value = await value
-        return _snapshot(name, value)
+        return _snapshot(name, value, getattr(self.bot, "item_registry", None))
 
     def _dispatch(self, frame):
         key = frame.get("id")
@@ -585,7 +591,7 @@ class _Run:
                     except (Exception, asyncio.CancelledError) as error:
                         if self.stopping or self._settling or self.error is not None:
                             return
-                        response = {"error": _error(error)}
+                        response = {"error": _error(error, getattr(self.bot, "item_registry", None))}
                     self._send({"op": "reply", "id": key, **response})
                 except Exception as error:
                     self._fail(error)

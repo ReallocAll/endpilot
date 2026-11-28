@@ -1499,6 +1499,8 @@ async def main(bot):
     available, = bot.recipes_for('minecraft:crafting_table', grid_size=2)
     plan = bot.plan_recipe_delta(available.net_id)
     assert plan.recipe.shape[1] is None and plan.recipe.results[0].user_data_buffer == '00' * 10
+    assert plan.recipe.results[0].user_data_hex == '00' * 10
+    assert plan.recipe.results[0].user_data_bytes == bytes(10)
     assert plan.materials[1][0].name == 'minecraft:birch_planks'
     assert bot.recipes_for('minecraft:crafting_table', min_result_count=2) == []
     assert bot.plan_recipe_delta(recipe.recipe_id, times=2) is None
@@ -1537,16 +1539,18 @@ async def main(bot):
         second = {"name": "minecraft:birch_planks", "tag": None, "count": 2, "aux_value": 0}
         recipe = {"recipe_id": "test:mcp_craft", "net_id": 40, "kind": "shaped_recipes", "tag": "crafting_table",
                   "ingredients": [first, second], "results": [
-                      {"item_id": 3, "name": "minecraft:crafting_table", "count": 1, "aux_value": 0,
+                      {"item_id": 3, "name": "minecraft:crafting_table", "item_name": "minecraft:crafting_table",
+                       "count": 1, "aux_value": 0,
                        "block_runtime_id": 0, "user_data_buffer": data.hex()},
                   ], "width": 2, "height": 2, "shape": [first, None, second, None]}
-        oak_amount = {"item_id": 1, "count": 1, "aux_value": 0, "name": first["name"]}
-        birch_amount = {"item_id": 2, "count": 2, "aux_value": 0, "name": second["name"]}
+        oak_amount = {"item_id": 1, "count": 1, "aux_value": 0, "name": first["name"], "item_name": first["name"]}
+        birch_amount = {"item_id": 2, "count": 2, "aux_value": 0, "name": second["name"], "item_name": second["name"]}
         self.assertEqual(final["result"], {
             "recipe": recipe, "available": recipe, "replies": replies, "output": 1, "player_id": 7,
             "plan": {"recipe": recipe, "times": 1, "materials": [[oak_amount], [birch_amount]], "delta": [
                 oak_amount | {"count": -1}, birch_amount | {"count": -2},
-                {"item_id": 3, "aux_value": 0, "count": 1, "name": "minecraft:crafting_table"},
+                {"item_id": 3, "aux_value": 0, "count": 1, "name": "minecraft:crafting_table",
+                 "item_name": "minecraft:crafting_table"},
             ]},
         })
 

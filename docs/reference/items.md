@@ -27,6 +27,25 @@ unregistered item ID or an item name outside the catalog yields `None` in
 this example. The mapping describes vanilla behavior. A server may use
 different limits, so check its transfer verdict when moving items.
 
+## Read item snapshots in MCP scripts
+
+For `run_script`, the worker's Bot proxy exposes snapshots such as
+`bot.held_item.observed_item` and `bot.inventory_slots[slot]`. Each item
+keeps its numeric `item_id`, including negative IDs. Its `item_name`
+comes from the connection's item registry at projection time and is `None`
+when the registry or that entry is unavailable. Earlier snapshots retain
+their names when the registry changes.
+
+For an item with a buffer, `user_data_buffer` and `user_data_hex` both expose
+the same lowercase hex string. The read-only `user_data_bytes` decodes it
+locally as Python `bytes`, so `b"\xff" in item.user_data_bytes` works. An observed
+empty buffer yields `""` or `b""`. An unobserved item has no snapshot.
+Script results are JSON. To return the bytes from a script, use
+`item.user_data_hex` or `item.user_data_bytes.hex()`.
+
+The built-in JSON `place_block` tool continues to report its inventory
+change with `user_data_hex` on each observed stack.
+
 ## Move items within a storage window
 
 Call `transfer_container_range()` with two non-overlapping ranges in an
@@ -288,7 +307,8 @@ recipe snapshots. Call `bot.plan_recipe_delta(recipe.net_id, times=1)` to
 inspect the grouped `materials` and signed `delta`, or receive `None` when
 the catalog and inventory cannot establish a plan. These queries send no
 packets. A recipe's ingredients, results and shape are available by
-attribute. The result's `user_data_buffer` is a hex string.
+attribute. A recipe result retains its catalog `name` alongside the
+session registry's `item_name`.
 
 With the personal inventory screen open, call
 `await bot.craft_recipe_auto(recipe.net_id, destination_slot, times=1)`.

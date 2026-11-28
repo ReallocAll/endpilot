@@ -796,6 +796,209 @@ class MCPPlacementHandoffTests(_PlacementHarness):
 
 @unittest.skipUnless(find_spec("mcp") is not None, "optional MCP SDK unavailable")
 class MCPStdioTests(unittest.IsolatedAsyncioTestCase):
+    async def test_session_item_projection_preserves_worker_and_json_contracts(self):
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+
+        source = Path(endpilot.__file__).resolve().parents[1]
+        peer = """
+import asyncio
+from unittest.mock import patch
+
+from endpilot.inventory import HeldItemStack
+from endpilot.mcp_server import create_server
+from endpilot.placement import PlacementInventoryChange, PlacementResult
+from endpilot.protocol import Protocol, write_batch
+
+protocol = Protocol(2225)
+b = protocol.binding
+data = bytes.fromhex('00ffc3a9')
+
+def stack(item_id, count=1, data=b''):
+    return b.SerializedNetworkItemStackDescriptor(id=item_id, stack_size=count, user_data_buffer=data)
+
+class Transport:
+    def __init__(self):
+        self.incoming = asyncio.Queue()
+        self.deliver(b.NetworkSettingsPacket(compression_algorithm=b.PacketCompressionAlgorithm.NONE))
+        self.deliver(b.StartGamePacket(runtime_id=7, entity_id=27),
+                     b.InventoryContentPacket(inventory_id=b.ContainerID.INVENTORY, slots=[
+                         stack(-321, 2, data), b.SerializedNetworkItemStackDescriptor(), stack(412), stack(261)]),
+                     b.PlayStatusPacket(status=b.PlayStatus.PLAYER_SPAWN))
+
+    def deliver(self, *packets):
+        self.incoming.put_nowait(write_batch(map(protocol.encode, packets)))
+
+    async def recv(self):
+        return await self.incoming.get()
+
+    async def send(self, data):
+        pass
+
+    async def close(self):
+        pass
+
+wire = Transport()
+
+def register(server, player):
+    @server.tool()
+    async def fixture_install():
+        bot = player.connected_bot()
+        bot.nearest_entity = lambda: {'item_id': -321, 'user_data_buffer': data}
+
+        async def place_block(position, **options):
+            before = HeldItemStack(-321, 4, 0, 41, 42, data)
+            after = HeldItemStack(0, 0, 0, None, 0, b'')
+            return PlacementResult(0, position, 0, True, 'observations_complete', None,
+                                   PlacementInventoryChange(before, after))
+
+        bot.place_block = place_block
+
+    @server.tool()
+    async def fixture_inventory(phase: int):
+        bot = player.connected_bot()
+        labels = ('test:old', 'test:new')
+        items = b.ItemRegistryPacket(items=[b.ItemData(id=-321, name=labels[phase - 1]),
+                                           b.ItemData(id=261, name='minecraft:bread')])
+        slot = b.InventorySlotPacket(inventory_id=b.ContainerID.INVENTORY, slot=0, item=stack(-321, 2 + phase, data))
+        packets = [items]
+        if phase == 1:
+            packets.append(b.CraftingDataPacket(shapeless_recipes=[b.ShapelessRecipePayload(
+                recipe_id='test:projection', net_id=8, tag='crafting_table',
+                ingredients=[b.SerializedRecipeIngredient(descriptor={'name': 'minecraft:bread'}, stack_size=1)],
+                results=[b.SerializedNetworkItemInstanceDescriptor(id=-321, stack_size=1, user_data_buffer=data)],
+            )]))
+        else:
+            original_recipes = bot.recipes_all
+            retained = original_recipes('test:old')
+
+            def recipes_all(item, *args, **options):
+                return retained if item == 'test:retained_recipe' else original_recipes(item, *args, **options)
+
+            bot.recipes_all = recipes_all
+        wait = asyncio.create_task(bot.packets.wait_for_packet(b.InventorySlotPacket.ID, timeout=5))
+        await asyncio.sleep(0)
+        wire.deliver(*packets, slot)
+        await wait
+        return bot.item_registry.name_for_id(-321)
+
+with patch('endpilot.transport.nethernet.connect', return_value=wire):
+    create_server(register).run(transport='stdio')
+"""
+        script = """
+import asyncio
+
+def inspect_buffer(item, expected):
+    assert isinstance(item.user_data_buffer, str) and item.user_data_buffer == expected.hex()
+    assert item.user_data_hex == expected.hex()
+    assert type(item.user_data_bytes) is bytes and item.user_data_bytes == expected
+
+async def main(bot):
+    expected = bytes.fromhex('00ffc3a9')
+    slots = bot.inventory_slots
+    no_registry = bot.held_item.observed_item
+    assert no_registry.item_id == -321 and no_registry.item_name is None
+    assert slots.get(9) is None and bot.offhand_item is None
+    assert slots[1].item_id == 0 and slots[1].count == 0 and slots[1].item_name is None
+    inspect_buffer(slots[1], b'')
+    inspect_buffer(no_registry, expected)
+    _, pending = bot._channel.start('get', 'held_item', (), {})
+    fields = pending.result(timeout=5)['value']['fields']['observed_item']['fields']
+    assert {key for key in fields if key.startswith('user_data_')} == {'user_data_buffer'}
+    assert fields['user_data_buffer'] == expected.hex()
+    try:
+        no_registry.user_data_bytes = b'x'
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError('mutable bytes view')
+    mapping = bot.nearest_entity()
+    assert type(mapping) is dict and mapping == {'item_id': -321, 'user_data_buffer': expected.hex()}
+
+    queue = asyncio.Queue()
+    unsubscribe = bot.subscribe_inventory_changes(queue.put_nowait, slot=0)
+    try:
+        print('observing')
+        old = await queue.get()
+        assert old.after.item_name == 'test:old' and old.after.item_id == -321
+        inspect_buffer(old.after, expected)
+        print('first registry observed')
+        updated_event = await queue.get()
+        current = bot.held_item.observed_item
+        assert bot.inventory_slots[2].item_id == 412 and bot.inventory_slots[2].item_name is None
+        assert bot.inventory_slots[3].item_id == 261 and bot.inventory_slots[3].item_name == 'minecraft:bread'
+        assert current.item_name == updated_event.after.item_name == 'test:new'
+        assert no_registry.item_name is None and old.after.item_name == 'test:old'
+        recipe, = bot.recipes_all('test:retained_recipe')
+        result, = recipe.results
+        assert result.name == 'test:old' and result.item_id == -321 and result.item_name == 'test:new'
+        inspect_buffer(result, expected)
+        placement = await bot.place_block((2, 100, 0), expected_runtime_id=42)
+        assert placement.inventory_change.before.item_name == 'test:new'
+        inspect_buffer(placement.inventory_change.before, expected)
+        inspect_buffer(placement.inventory_change.after, b'')
+        return {'held': current, 'event': old, 'result': result, 'bytes_as_hex': current.user_data_bytes.hex()}
+    finally:
+        unsubscribe()
+"""
+        params = StdioServerParameters(command=sys.executable, args=["-B", "-c", peer], env={"PYTHONPATH": str(source)})
+        async with stdio_client(params) as (incoming, outgoing), ClientSession(
+            incoming, outgoing, read_timeout_seconds=10,
+        ) as session:
+            await session.initialize()
+
+            async def call(tool, **arguments):
+                response = await session.call_tool(tool, arguments)
+                self.assertFalse(response.is_error, response)
+                return response.structured_content
+
+            async def observe(run_id, marker=None):
+                async with asyncio.timeout(10):
+                    while True:
+                        report = await call("observe_script", run_id=run_id)
+                        if report["state"] != "running" or (marker is not None and any(
+                            marker in entry["text"] for entry in report["output"]
+                        )):
+                            return report
+                        await asyncio.sleep(.01)
+
+            await call("connect", url="http://127.0.0.1")
+            await call("fixture_install")
+            run_id = (await call("run_script", source=script))["run_id"]
+            observing = await observe(run_id, "observing")
+            self.assertEqual(observing["state"], "running", observing)
+            await call("fixture_inventory", phase=1)
+            first = await observe(run_id, "first registry observed")
+            self.assertEqual(first["state"], "running", first)
+            await call("fixture_inventory", phase=2)
+            final = await observe(run_id)
+            self.assertEqual(final["state"], "succeeded", final)
+            result = final["result"]
+            self.assertEqual(result["bytes_as_hex"], "00ffc3a9")
+            self.assertEqual(result["held"], {"item_id": -321, "item_name": "test:new", "count": 4, "aux_value": 0,
+                                             "net_id": None, "block_runtime_id": 0, "user_data_buffer": "00ffc3a9"})
+            self.assertEqual(result["event"]["after"]["item_name"], "test:old")
+            self.assertEqual((result["result"]["name"], result["result"]["item_name"]), ("test:old", "test:new"))
+
+            binary_return = (await call("run_script", source="""
+async def main(bot):
+    return bot.held_item.observed_item.user_data_bytes
+"""))["run_id"]
+            rejected = await observe(binary_return)
+            self.assertEqual(rejected["state"], "failed", rejected)
+            self.assertEqual(rejected["error"]["error_type"], "TypeError")
+            self.assertIn("bytes is not JSON serializable", rejected["error"]["message"])
+
+            built_in = await call("place_block", x=2, y=100, z=0, expected_runtime_id=42)
+            self.assertEqual(built_in, {"dimension_id": 0, "target": [2, 100, 0], "slot": 0, "submitted": True,
+                                        "reason": "observations_complete", "world_change": None, "inventory_change": {
+                "before": {"item_id": -321, "count": 4, "aux_value": 0, "net_id": 41,
+                           "block_runtime_id": 42, "user_data_hex": "00ffc3a9"},
+                "after": {"item_id": 0, "count": 0, "aux_value": 0, "net_id": None,
+                          "block_runtime_id": 0, "user_data_hex": ""},
+            }})
+            await call("disconnect")
+
     async def test_host_chat_language_reaches_worker_through_stdio_connect(self):
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import stdio_client

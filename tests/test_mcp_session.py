@@ -484,6 +484,8 @@ async def main(bot, host_pid, method, position, complete):
         (event,) = events
         assert event == result and event is not result and event.spawn is not result.spawn
         assert event.inventory_change.before is not result.inventory_change.before
+        assert event.inventory_change.before.user_data_bytes == bytes.fromhex('0102')
+        assert event.inventory_change.before.user_data_hex == event.inventory_change.before.user_data_buffer == '0102'
         event.inventory_change.before.count += 10
         assert event.inventory_change.before.count != result.inventory_change.before.count
         event.inventory_change.before.count -= 10
@@ -566,7 +568,8 @@ async def main(bot):
                     self.assertEqual(result["spawn"], {"entity_id": -80-index, "runtime_id": 80+index,
                                                      "actor_type": actor_type, "position": [4.5, 90+height, 7.5]})
                     self.assertEqual(response["events"], [result] if complete else [])
-                    expected = {name: {"item_id": item_id, "count": count, "aux_value": 0, "net_id": net_id,
+                    item_name = "minecraft:minecart" if item_id == cart else "minecraft:oak_boat"
+                    expected = {name: {"item_id": item_id, "item_name": item_name, "count": count, "aux_value": 0, "net_id": net_id,
                                        "block_runtime_id": 0, "user_data_buffer": "0102"}
                                 for name, count, net_id in (("before", 2, 21), ("after", 1, 22))}
                     self.assertEqual(result["inventory_change"], expected if complete else None)
