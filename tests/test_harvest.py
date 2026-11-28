@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from endpilot import Bot
+from endpilot.blocks import HASHED_AIR_RUNTIME_ID, HASHED_UNKNOWN_RUNTIME_ID
 from endpilot.compression import PacketConnection
 from endpilot.harvest import HarvestTool
 from endpilot.login import JoinSession
@@ -18,6 +19,9 @@ DEEPSLATE_DIAMOND_ORE = 0x3057FA73
 IRON_ORE = 0x79275ADE
 DEEPSLATE_IRON_ORE = 0x3E6F3450
 DIRT = 0x824EEF86
+NETHERRACK = 0x803389C0
+STONE = 0x80310E21
+WATER = 0x483B8B2A
 OAK_LOG = 0xF253CAD8
 NETHER_WART_BLOCK = 0x22A97687
 HAY_BLOCK = 0x5A4A90AB
@@ -39,6 +43,7 @@ class HarvestTests(unittest.IsolatedAsyncioTestCase):
     async def connect(self, *, protocol=2225, hashed=True, custom=False, native_writes=False):
         bot = Bot("HarvestTest", protocol=protocol)
         self.stream = PacketStream(bot.protocol)
+        self.stream._reader_task = None
         self.binding = bot.protocol.binding
         if native_writes:
             wire = Wire(bot.protocol)
@@ -87,11 +92,39 @@ class HarvestTests(unittest.IsolatedAsyncioTestCase):
         self.stream.emit(self.stream.protocol.encode(packet))
 
     def block(self, runtime_id):
-        x, y, z = POSITION
+        self.world_block(POSITION, runtime_id)
+
+    def world_block(self, position, runtime_id, *, layer=0):
+        x, y, z = position
         self.emit(self.binding.UpdateBlockPacket(
             pos=self.binding.BlockPos(x=x, y=y, z=z), runtime_id=runtime_id,
-            update_flags=0, layer=0,
+            update_flags=0, layer=layer,
         ))
+
+    def ordinary_pose(self, *, on_ground=True, size=True):
+        b = self.binding
+        abilities = b.SerializedAbilitiesData
+        self.emit(b.SetPlayerGameTypePacket(player_game_type=b.GameType.SURVIVAL))
+        self.emit(b.UpdateAbilitiesPacket(data=abilities(target_player=1, layers=[abilities.SerializedLayer(
+            serialized_layer=abilities.SerializedAbilitiesLayer.BASE, abilities_set=1 << int(b.AbilitiesIndex.FLYING),
+        )])))
+        entries = [b.DataItemEntry(id=key, payload=b.DataItemInt64Payload(value=0)) for key in (0, 92)]
+        if size:
+            entries.append(b.DataItemEntry(id=b.ActorDataIDs.COLLISION_BOX,
+                                          payload=b.DataItemVec3Payload(value=b.Vec3(x=0.6, y=1.8))))
+        self.emit(b.SetActorDataPacket(id=1, packed_items=b.SynchedActorData.CopyableDataList(data=entries)))
+        self.emit(b.MovePlayerPacket(player_id=1, pos=b.Vec3(x=.5, y=101.62, z=.5), on_ground=on_ground))
+        self.emit(b.SubChunkPacket(dimension_type=0, center_pos=b.SubChunkPos(x=0, y=6, z=0),
+                                   sub_chunk_data=[b.SubChunkPacket.SubChunkPacketData(
+                                       result=b.SubChunkPacket.SubChunkRequestResult.SUCCESS_ALL_AIR,
+                                   )]))
+        self.world_block((0, 99, 0), STONE)
+
+    def effect(self, amplifier=0, *, effect_id=3, runtime_id=1, remove=False):
+        b = self.binding
+        self.emit(b.MobEffectPacket(runtime_id=runtime_id, effect_id=effect_id, effect_amplifier=amplifier,
+                                    effect_duration_ticks=200, event_id=(b.MobEffectPacket.Event.REMOVE if remove
+                                                                        else b.MobEffectPacket.Event.ADD)))
 
     def inventory_slot(self, slot, item_id, count=1, *, user_data=b"", net_id=None):
         b = self.binding
@@ -170,6 +203,128 @@ class HarvestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.best_harvest_tool(POSITION), HarvestTool(12, "minecraft:iron_pickaxe", 6))
         self.block(0x80310E21)  # Stone admits the faster gold tool.
         self.assertEqual(bot.best_harvest_tool(POSITION), HarvestTool(0, "minecraft:golden_pickaxe", 12))
+
+    async def test_haste_retains_the_confirmed_eligible_current_first_tick_tool(self):
+        bot = await self.connect()
+        self.ordinary_pose()
+        self.block(NETHERRACK)
+        self.inventory_slot(0, 1201, user_data=enchantment_data(self.binding, 2))
+        self.inventory_slot(1, 1200, user_data=enchantment_data(self.binding, 1))
+        await bot.select_hotbar(0)
+        self.stream.sent.clear()
+        iron = HarvestTool(0, "minecraft:iron_pickaxe", 6)
+        gold = HarvestTool(1, "minecraft:golden_pickaxe", 12)
+
+        self.effect(runtime_id=2)
+        self.assertEqual(bot.best_harvest_tool(POSITION), gold)
+        self.assertEqual(await bot.equip_harvest_tool(POSITION), gold)
+        self.assertEqual([packet.selected_slot for packet in self.stream.sent], [1])
+        await bot.select_hotbar(0)
+        self.stream.sent.clear()
+        self.effect()
+        self.assertEqual(bot.best_harvest_tool(POSITION), iron)
+        self.assertEqual(await bot.equip_harvest_tool(POSITION), iron)
+        self.assertEqual(self.stream.sent, [])
+        self.effect(remove=True)
+        self.assertEqual(bot.best_harvest_tool(POSITION), gold)
+
+    async def test_haste_keeps_legacy_ranking_across_the_first_tick_threshold(self):
+        bot = await self.connect()
+        self.ordinary_pose()
+        self.block(DIRT)
+        self.inventory_slot(0, 1208, user_data=EMPTY_USER_DATA)
+        self.inventory_slot(1, 1206, user_data=enchantment_data(self.binding, 2))
+        await bot.select_hotbar(0)
+        self.stream.sent.clear()
+        self.effect()
+        iron = HarvestTool(1, "minecraft:iron_shovel", 6)
+        self.assertEqual(bot.best_harvest_tool(POSITION), iron)
+        self.assertEqual(await bot.equip_harvest_tool(POSITION), iron)
+        packet, = self.stream.sent
+        self.assertEqual((packet.selected_slot, packet.item.id), (1, 1206))
+
+    async def test_haste_uses_legacy_ranking_when_context_or_stack_is_uncertain(self):
+        bot = await self.connect()
+        self.ordinary_pose()
+        self.block(NETHERRACK)
+        self.inventory_slot(0, 1201, user_data=enchantment_data(self.binding, 2))
+        self.inventory_slot(1, 1200, user_data=enchantment_data(self.binding, 1))
+        await bot.select_hotbar(0)
+        self.stream.sent.clear()
+        self.effect()
+        gold = HarvestTool(1, "minecraft:golden_pickaxe", 12)
+        self.assertEqual(bot.best_harvest_tool(POSITION).slot, 0)
+
+        for layer, state in ((0, WATER), (1, HASHED_UNKNOWN_RUNTIME_ID)):
+            with self.subTest(layer=layer, state=state):
+                self.world_block((0, 101, 0), state, layer=layer)
+                self.assertEqual(bot.best_harvest_tool(POSITION), gold)
+                self.world_block((0, 101, 0), HASHED_AIR_RUNTIME_ID, layer=layer)
+        self.effect(effect_id=4)
+        self.assertEqual(bot.best_harvest_tool(POSITION), gold)
+        self.effect(effect_id=4, remove=True)
+        self.effect(amplifier=1)
+        self.assertEqual(bot.best_harvest_tool(POSITION), gold)
+        self.effect()
+        self.ordinary_pose(on_ground=False)
+        self.assertEqual(bot.best_harvest_tool(POSITION), gold)
+        self.ordinary_pose()
+        self.assertEqual(bot.best_harvest_tool(POSITION).slot, 0)
+        self.inventory_slot(0, 1201, user_data=enchantment_data(self.binding, 2), net_id=200)
+        self.assertEqual(bot.best_harvest_tool(POSITION), gold)
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_haste_uses_legacy_ranking_on_an_unverified_hashed_registry(self):
+        bot = await self.connect(custom=True)
+        self.ordinary_pose()
+        self.block(NETHERRACK)
+        self.inventory_slot(0, 1201, user_data=enchantment_data(self.binding, 2))
+        self.inventory_slot(1, 1200, user_data=enchantment_data(self.binding, 1))
+        await bot.select_hotbar(0)
+        self.stream.sent.clear()
+        self.effect()
+        self.assertEqual(bot.best_harvest_tool(POSITION), HarvestTool(1, "minecraft:golden_pickaxe", 12))
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_ordinary_equipping_resends_when_selected_stack_identity_changes(self):
+        bot = await self.connect()
+        self.block(DIAMOND_ORE)
+        self.inventory_slot(0, 1201, user_data=EMPTY_USER_DATA)
+        await bot.select_hotbar(0)
+        self.stream.sent.clear()
+        expected = HarvestTool(0, "minecraft:iron_pickaxe", 6)
+        self.assertEqual(await bot.equip_harvest_tool(POSITION), expected)
+        self.assertEqual(self.stream.sent, [])
+        self.inventory_slot(0, 1201, user_data=EMPTY_USER_DATA, net_id=200)
+        self.assertEqual(await bot.equip_harvest_tool(POSITION), expected)
+        packet, = self.stream.sent
+        self.assertEqual((packet.selected_slot, packet.item.net_id_variant), (0, 200))
+
+    async def test_ordinary_equipping_sends_while_another_selection_is_in_flight(self):
+        bot = await self.connect()
+        self.block(DIAMOND_ORE)
+        self.inventory_slot(0, 1201, user_data=EMPTY_USER_DATA)
+        self.inventory_slot(1, 1200, user_data=EMPTY_USER_DATA)
+        await bot.select_hotbar(0)
+        self.stream.sent.clear()
+        send, entered, finish = self.stream.send, asyncio.Event(), asyncio.Event()
+
+        async def pending(packet, *, _before_send=None):
+            await send(packet, _before_send=_before_send)
+            if packet.selected_slot == 1:
+                entered.set()
+                await finish.wait()
+
+        with patch.object(self.stream, "send", pending):
+            changing = asyncio.create_task(bot.select_hotbar(1))
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                self.assertEqual(await bot.equip_harvest_tool(POSITION), HarvestTool(0, "minecraft:iron_pickaxe", 6))
+                self.assertEqual([packet.selected_slot for packet in self.stream.sent], [1, 0])
+            finally:
+                finish.set()
+                await changing
+        self.assertEqual(bot.held_item.slot, 0)
 
     async def test_requested_ore_drop_constrains_both_tool_query_and_equip(self):
         bot = await self.connect()

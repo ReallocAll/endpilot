@@ -5,7 +5,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from functools import partial
 from inspect import isasyncgenfunction, isawaitable, iscoroutinefunction
-from math import inf
+from math import inf, isclose
 from re import Pattern, fullmatch
 from typing import Any, Literal
 from uuid import UUID
@@ -499,6 +499,7 @@ class Bot:
         session.form_packets.clear()
         self._harvest_tools = HarvestTools(
             self._blocks, self._inventory, self._containers, session.item_names,
+            ordinary_haste=self._ordinary_haste_mining,
         )
         self._signs = Signs(session.packets, self._blocks, self._movement, self._inventory, session.player_id)
         self._chat = Chat(session.packets, identity.name, resource_pack_index=session.resource_pack_index, _xuid=xuid)
@@ -2681,6 +2682,20 @@ class Bot:
             targets, count=count, ticks=ticks, search_radius=search_radius, timeout=timeout,
         )
 
+    def _ordinary_haste_mining(self) -> bool:
+        state = self._player_state
+        if (self.protocol.number != 2225 or self.game_mode != GameType.SURVIVAL
+                or state is None or state._closed or state._disconnected or state.is_dead
+                or state.abilities.flying is not False or state.flight_target(require_permission=False)[0] is not False):
+            return False
+        width, height = state._collision_size
+        if (width is None or height is None or not isclose(width, 0.6, abs_tol=.001)
+                or not isclose(height, 1.8, abs_tol=.001)):
+            return False
+        effects = state.status_effects()
+        return (len(effects) == 1 and (effects[0].id, effects[0].amplifier) == (3, 0)
+                and effects[0].duration_ticks > 0)
+
     def best_harvest_tool(
         self, position: tuple[int, int, int], *, require_harvest: bool = True, requested_drop_id: int | None = None,
     ) -> HarvestTool | None:
@@ -2691,6 +2706,9 @@ class Bot:
         choices that yield no drop. Pickaxes, axes, shovels, hoes and shears
         receive the Efficiency I–V bonus where their base speed exceeds bare
         hands. The returned speed_multiplier is the base speed.
+        With confirmed dry, grounded survival input and Haste I, retain the
+        observed eligible held tool if it and the best tool both break on the
+        first tick under the known vanilla rules.
         A requested_drop_id must be a current session item ID. It restricts
         selection to tools supported for that drop from the observed block and
         requires require_harvest=True.
@@ -2715,6 +2733,8 @@ class Bot:
         best_harvest_tool. Await inventory transfers if needed and close any
         inventory screen opened for the transfer. The returned slot is the
         requested hotbar slot.
+        An ordinary selection already confirmed with the same stack sends no
+        equipment packet.
         Return None when no candidate or usable slot is known. A changed stack
         or a rejected or unconfirmed transfer raises RuntimeError, except that
         a requested drop returns None when the observed target or tool changes
@@ -2728,7 +2748,7 @@ class Bot:
             raise RuntimeError("player has not joined")
         return await self._harvest_tools.equip(
             position, timeout=timeout, require_harvest=require_harvest,
-            requested_drop_id=requested_drop_id, strict_drop=True,
+            requested_drop_id=requested_drop_id, strict_drop=True, _keep_equipped=True,
         )
 
     async def place_against(

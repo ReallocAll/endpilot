@@ -18,6 +18,13 @@ returns the observed `BlockUpdate`.
 
 ## Choose a tool for a specific drop
 
+The ordinary tool ranking can retain a confirmed held pickaxe or shovel in
+dry, grounded survival with Haste I when it and the best eligible tool both
+cross the known vanilla block's first-tick threshold. If any required
+observation is unavailable, the normal speed ranking applies. Equipping an
+ordinary selection that already matches the full confirmed hand stack sends
+no equipment packet.
+
 Pass `requested_drop_id` to `bot.best_harvest_tool(position)` or
 `await bot.equip_harvest_tool(position)` to choose for an observed block and a
 specific drop. Look up the item network ID with the current session's

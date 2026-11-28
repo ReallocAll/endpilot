@@ -200,6 +200,7 @@ class Inventory:
         self._selection_revision = 0
         self._selection_order = count(1)
         self._applied_selection_order = 0
+        self._selection_writes = 0
         self._events = {}
         self._changed = asyncio.Event()
         self._count_observation_gaps: set[int] = set()
@@ -513,6 +514,15 @@ class Inventory:
     def _observed_stack(self, slot: int) -> HeldItemStack | None:
         return _stack_snapshot(self._slots.get(slot))
 
+    def _has_confirmed_selection(self, slot: int, item) -> bool:
+        expected = _stack_snapshot(item)
+        return (expected is not None and bool(expected.item_id) == (expected.count > 0)
+                and (expected.item_id == 0 or len(expected.user_data_buffer) >= 10)
+                and not self._request_stream_ended and not self._selection_writes
+                and slot == self._selected_slot and self._selected_equipment == self._observed_stack(slot) == expected
+                and slot not in self._unconfirmed_transfer_slots and slot not in self._drop_key_counts
+                and not self._requests_for_endpoints(((None, slot),)))
+
     def _observed_damage_equipment(self) -> tuple[tuple[HeldItemStack, ...], tuple[HeldItemStack, ...]] | None:
         """Read complete armor and possible hand stacks for an equipment-dependent estimate."""
         if self._request_stream_ended:
@@ -786,11 +796,15 @@ class Inventory:
         # Reserve order before handing the packet to the transport. Only
         # successful sends and received corrections can advance the selection.
         order = next(self._selection_order)
-        if _before_send is None:
-            await self.packets.send(packet)
-        else:
-            await self.packets.send(packet, _before_send=_before_send)
-        self._apply_selection(slot, order, "local", equipment=equipment)
+        self._selection_writes += 1
+        try:
+            if _before_send is None:
+                await self.packets.send(packet)
+            else:
+                await self.packets.send(packet, _before_send=_before_send)
+            self._apply_selection(slot, order, "local", equipment=equipment)
+        finally:
+            self._selection_writes -= 1
 
     def item_or_empty(self, slot: int):
         """Return the client's item for input, using the last known stack identity.

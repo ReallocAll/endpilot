@@ -612,9 +612,8 @@ class JoinSession:
                     and packs.plain_pack_info and stack_allows_vanilla_recipe_tags
                     and _experiments_allow_vanilla_recipe_tags(game.settings.experiments)
                 )
-                if protocol.number == 2225 and not self.block_network_ids_are_hashes:
-                    # Vanilla also announces data-driven blocks. Use the static
-                    # sequential palette only when the registry is confirmed.
+                if protocol.number == 2225:
+                    # Vanilla announces data-driven blocks in both ID modes.
                     self.has_custom_blocks = not matches_vanilla_palette(
                         game.server_block_type_registry_checksum, game.block_properties,
                     )

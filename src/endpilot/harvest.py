@@ -6,10 +6,11 @@ import asyncio
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from math import dist, isfinite
+from math import dist, floor, isfinite
 from typing import TYPE_CHECKING
 
 from .block_data import MiningRule, VanillaBlockState
+from .block_catalog import vanilla_blocks
 from .blocks import BlockObservation, Blocks, _ORDINARY_MINING_REACH
 from .containers import Containers, ContainerWindow, _same_slot
 from .inventory import (
@@ -219,11 +220,13 @@ def _check_max_tools(max_tools):
 class HarvestTools:
     def __init__(
         self, blocks: Blocks, inventory: Inventory, containers: Containers, item_names: dict[int, str],
+        *, ordinary_haste: Callable[[], bool] | None = None,
     ):
         self._blocks = blocks
         self._inventory = inventory
         self._containers = containers
         self._item_names = item_names
+        self._ordinary_haste = ordinary_haste
         self._equip_lock = asyncio.Lock()
 
     def best(
@@ -238,10 +241,80 @@ class HarvestTools:
         self, position: tuple[int, int, int], slots: dict[int, object], *, requested_drop_id: int | None = None,
         require_harvest: bool = True, strict_drop: bool = False,
     ) -> HarvestTool | None:
-        rule = self._mining_rule(
-            self._blocks.observed_block(position), requested_drop_id=requested_drop_id, strict_drop=strict_drop,
+        target = self._blocks.observed_block(position)
+        rule = self._mining_rule(target, requested_drop_id=requested_drop_id, strict_drop=strict_drop)
+        return None if rule is None else self._rank_tools(
+            target, rule, slots, require_harvest=require_harvest, keep_current=requested_drop_id is None,
         )
-        return None if rule is None else self._best_in_inventory(rule, slots, require_harvest=require_harvest)
+
+    def _rank_tools(self, target, rule, slots, *, require_harvest, keep_current):
+        best = self._best_in_inventory(rule, slots, require_harvest=require_harvest)
+        if not keep_current or best is None or best.item_name is None:
+            return best
+        if (held := self._first_tick_held_tool(target, rule, slots, best)) is not None:
+            return held
+        return best
+
+    def _first_tick_held_tool(self, target, rule, slots, best) -> HarvestTool | None:
+        blocks, inventory = self._blocks, self._inventory
+        slot = inventory.selected_slot
+        if (slot == best.slot or blocks._custom_blocks or self._ordinary_haste is None
+                or not self._ordinary_haste()):
+            return None
+        current = slots.get(slot)
+        if not inventory._has_confirmed_selection(slot, current):
+            return None
+        name = self._item_names.get(int(current.id), "")
+        family = name.rpartition("_")[2]
+        if family not in ("pickaxe", "shovel") or not best.item_name.endswith("_" + family):
+            return None
+        state = blocks._vanilla_state(target.runtime_id)
+        known = None if state is None else vanilla_blocks().get(state.name)
+        if known is None or not isfinite(known.hardness) or known.hardness <= 0:
+            return None
+        efficiency_id = int(inventory.packets.protocol.binding.Enchant.Type.EFFICIENCY)
+        # Both eligible tools must cross the first-tick threshold in ordinary
+        # dry survival. Haste I's 1.44 factor is from the 2225 stock comparison.
+        for item, item_name in ((current, name), (slots[best.slot], best.item_name)):
+            props = known.tool_properties(item_name)
+            if (props is None or props.qualifies_for_drops is not True
+                    or (rule.required is not None and item_name not in rule.required)
+                    or props.speed_multiplier <= 1 or props.speed_multiplier != rule.speeds.get(item_name)):
+                return None
+            data = bytes(item.user_data_buffer)
+            if len(data) < 10:
+                return None
+            try:
+                nbt_data = read_item_user_data(data, _strict_enchantments=True)
+            except ValueError:
+                return None
+            enchants = nbt_data.get("ench", [])
+            enchant = enchants[0] if len(enchants) == 1 else None
+            if (nbt_data.keys() - {"ench", "Damage"} or (enchants and (
+                enchant is None or enchant["id"] != efficiency_id or not 1 <= enchant["lvl"] <= 5
+            ))):
+                return None
+            speed = props.speed_multiplier + _efficiency_bonus(data, efficiency_id)
+            if speed * 1.44 < known.hardness * 30:
+                return None
+        movement = blocks.movement
+        if movement is None or movement._entity_cursor_pose() is None or movement._stationary_mining_pose() is None:
+            return None
+        motion = movement.state
+        observed_feet = movement.observed_feet_position
+        if (motion.moving or motion.sneaking or motion.feet_position is None
+                or dist(observed_feet, motion.feet_position) > .01):
+            return None
+        x, y, z = observed_feet
+        feet = floor(x), round(y), floor(z)
+        # Keep the observed ordinary player body within its known clear column.
+        if abs(y - feet[1]) > .01 or any(abs(value - cell - .5) >= .19 for value, cell in ((x, feet[0]), (z, feet[2]))):
+            return None
+        support = (feet[0], feet[1] - 1, feet[2])
+        if (blocks._flat_stance(feet) is not True
+                or blocks._stance_air(blocks.observed_block(support, layer=1)) is not True):
+            return None
+        return HarvestTool(slot, name, rule.speeds[name])
 
     def _mining_rule(
         self, block: BlockObservation | None, *, requested_drop_id: int | None = None,
@@ -799,17 +872,17 @@ class HarvestTools:
 
     async def equip(
         self, position: tuple[int, int, int], *, timeout: float, requested_drop_id: int | None = None,
-        require_harvest: bool = True, strict_drop: bool = False,
+        require_harvest: bool = True, strict_drop: bool = False, _keep_equipped: bool = False,
     ) -> HarvestTool | None:
         async with self._equip_lock:
             return await self._equip(
                 position, timeout=timeout, requested_drop_id=requested_drop_id, require_harvest=require_harvest,
-                strict_drop=strict_drop,
+                strict_drop=strict_drop, keep_equipped=_keep_equipped,
             )
 
     async def _equip(
         self, position: tuple[int, int, int], *, timeout: float, requested_drop_id: int | None = None,
-        require_harvest: bool = True, strict_drop: bool = False,
+        require_harvest: bool = True, strict_drop: bool = False, keep_equipped: bool = False,
     ) -> HarvestTool | None:
         blocks, inventory = self._blocks, self._inventory
         target = blocks.observed_block(position)
@@ -817,9 +890,16 @@ class HarvestTools:
         if rule is None:
             return None
         slots = inventory.slots
-        tool = self._best_in_inventory(rule, slots, require_harvest=require_harvest)
+        ordinary = keep_equipped and requested_drop_id is None
+        tool = self._rank_tools(target, rule, slots, require_harvest=require_harvest, keep_current=ordinary)
         if tool is None:
             return None
+        if ordinary:
+            slot = inventory.selected_slot if tool.slot is None else tool.slot
+            item = slots.get(slot)
+            if (item is not None and (tool.slot is not None or item.id == 0)
+                    and inventory._has_confirmed_selection(slot, item)):
+                return replace(tool, slot=slot)
         if not strict_drop or requested_drop_id is None:
             return await self._equip_tool(tool, slots, timeout=timeout)
 
