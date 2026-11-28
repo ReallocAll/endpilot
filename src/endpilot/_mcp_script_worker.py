@@ -1,6 +1,7 @@
 """Execute one MCP script against the host player's local RPC connection."""
 
 import asyncio
+from collections.abc import Mapping
 from concurrent.futures import Future
 from dataclasses import fields
 import inspect
@@ -18,7 +19,7 @@ from ._mcp_scripts import (
     _COLLECTION_STORAGE_CALLS, _CURSOR_TRANSFERS, _ERROR_FIELDS, _ERROR_PROGRESS, _INPUT_RECORDS, _MAX_FRAME,
     _MAX_OUTGOING_FRAMES, _RANGE_TRANSFERS, _SLOT_MAPS, _read,
 )
-from .blocks import MiningAborted
+from .blocks import Blocks, MiningAborted
 from .bot import Bot
 from .collection_storage import CollectionStorage
 
@@ -67,6 +68,18 @@ def _argument(value):
     if callable(value):
         raise TypeError("Bot calls cannot receive Python callbacks or predicates. Use a Bot subscription for events.")
     raise TypeError(f"{kind.__name__} cannot cross the MCP script Bot connection")
+
+
+def _terrain_columns(columns):
+    if not isinstance(columns, Mapping):
+        raise TypeError("columns must be a mapping of column coordinates to section ranges")
+    entries = []
+    for column, sections in columns.items():
+        Blocks._validate_column(column)
+        if type(sections) is not range:
+            raise ValueError("sections must be a nonempty ascending range within [-128, 128)")
+        entries.append((column, sections))
+    return {"$endpilot": "terrain_columns", "entries": entries}
 
 
 def _result(value):
@@ -207,6 +220,10 @@ class _Channel:
         return self.reply(future.result(), name)
 
     async def call(self, name, args, kwargs):
+        if name == "wait_for_terrain_coverage":
+            bound = inspect.signature(Bot.wait_for_terrain_coverage).bind(None, *args, **kwargs)
+            bound.arguments["columns"] = _terrain_columns(bound.arguments["columns"])
+            args, kwargs = bound.args[1:], bound.kwargs
         request_id, future = self.start("call", name, args, kwargs)
         response = asyncio.wrap_future(future)
         try:

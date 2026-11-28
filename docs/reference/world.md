@@ -228,6 +228,10 @@ sections count. Announcements, requests and individual block updates leave
 section coverage pending. Both waits send zero packets and return immediately
 when coverage is already ready, including with `timeout=0`.
 
+MCP scripts accept the same mapping with tuple keys and `range` values. One
+`bot.wait_for_terrain_coverage` call waits for the columns together and exposes
+the ordered snapshots as a list.
+
 A selected column outside the known publication area or evicted during the
 wait raises `ColumnCoverageInvalidated` with reason `"unloaded"`, even if
 that column was already ready. A `ChangeDimension` packet raises the same

@@ -17,7 +17,7 @@ from uuid import uuid4
 
 from . import navigation
 from .beds import SleepRejected
-from .blocks import BlockObservation, BlockUpdate, ColumnCoverageInvalidated, MiningFaceUnavailable
+from .blocks import BlockObservation, Blocks, BlockUpdate, ColumnCoverageInvalidated, MiningFaceUnavailable
 from .collection import BlockCollectionBatch, CountedBlockCollection, MixedCollectionBatch
 from .collection_storage import CollectionStorage
 from .entities import EntityState
@@ -316,6 +316,23 @@ def _input_range(value, name):
     return range(*bounds)
 
 
+def _input_terrain_columns(value):
+    if not isinstance(value, dict) or value.get("$endpilot") != "terrain_columns":
+        return _tuples(value)
+    if value.keys() != {"$endpilot", "entries"} or not isinstance(value["entries"], list):
+        raise TypeError("invalid MCP terrain column selection")
+    columns = {}
+    for entry in value["entries"]:
+        if not isinstance(entry, list) or len(entry) != 2 or not isinstance(entry[0], list):
+            raise TypeError("invalid MCP terrain column entry")
+        column = tuple(entry[0])
+        Blocks._validate_column(column)
+        if column in columns:
+            raise ValueError("duplicate terrain column")
+        columns[column] = _input_range(entry[1], "sections")
+    return columns
+
+
 def _collection_storage(value):
     if (not isinstance(value, dict) or value.keys() != {"$endpilot", "type", "fields"}
             or value["$endpilot"] != "record" or value["type"] != "CollectionStorage"
@@ -333,7 +350,7 @@ def _collection_storage(value):
     })
 
 
-def _bind(member, args, kwargs, *, allow_storage=False):
+def _bind(member, args, kwargs, *, allow_storage=False, allow_terrain_columns=False):
     bound = inspect.signature(member).bind(*args, **kwargs)
     for name, value in bound.arguments.items():
         if name in _UNSUPPORTED_PARAMETERS and value is not None:
@@ -342,6 +359,8 @@ def _bind(member, args, kwargs, *, allow_storage=False):
             value = _input_record(value)
         elif name in {"sections", "source_slots", "destination_slots"}:
             value = _input_range(value, name)
+        elif name == "columns" and allow_terrain_columns:
+            value = _input_terrain_columns(value)
         elif name == "storage" and value is not None:
             if not allow_storage:
                 raise TypeError("storage is unavailable through the MCP script Bot")
@@ -536,7 +555,8 @@ class _Run:
             self._subscriptions[request_id] = member(*bound.args, **bound.kwargs)
             return
 
-        bound = _bind(member, args, kwargs, allow_storage=name in _COLLECTION_STORAGE_CALLS)
+        bound = _bind(member, args, kwargs, allow_storage=name in _COLLECTION_STORAGE_CALLS,
+                      allow_terrain_columns=name == "wait_for_terrain_coverage")
         value = member(*bound.args, **bound.kwargs)
         if kind == "async":
             value = await value

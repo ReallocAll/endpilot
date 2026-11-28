@@ -643,6 +643,58 @@ async def main(bot):
         self.assertEqual(report["result"], ["ColumnCoverageInvalidated", "dimension_changed",
                                             "column coverage invalidated: dimension_changed"])
 
+    async def test_joint_terrain_coverage_crosses_the_worker_in_mapping_order(self):
+        from test_world_observation import WorldObservationTests
+
+        terrain = WorldObservationTests()
+        terrain.b = self.bot.protocol.binding
+        first, second = (7, 7), (7, 8)
+        run = await self.start("""
+import asyncio
+from types import MappingProxyType
+
+async def main(bot):
+    for invalid, error_type in (
+        ([((7, 7), range(4, 6))], TypeError),
+        ({}, ValueError),
+        ({(True, 8): range(4, 5)}, ValueError),
+        ({'7,7': range(4, 6)}, ValueError),
+        ({(7, 7): [4, 5]}, ValueError),
+        ({(7, 7): {'$endpilot': 'range', 'start': 4, 'stop': 6, 'step': 1}}, ValueError),
+        ({(7, 7): range(4, 7, 2)}, ValueError),
+        ({(7, 7): range(-129, 6)}, ValueError),
+    ):
+        try:
+            await bot.wait_for_terrain_coverage(invalid, timeout=0)
+        except error_type:
+            pass
+        else:
+            raise AssertionError('invalid terrain selection accepted')
+    columns = MappingProxyType({(7, 8): range(4, 5), (7, 7): range(4, 6)})
+    waiting = asyncio.create_task(bot.wait_for_terrain_coverage(columns=columns, timeout=5))
+    await asyncio.sleep(0)
+    bot.get_tick()
+    print('terrain armed', flush=True)
+    return await waiting
+""")
+        await self.wait_for(run, lambda status: "terrain armed\n" in self.text(status))
+        waiters = self.bot._blocks._column_waiters
+        entry, = waiters[first]
+        self.assertIs(waiters[second][0], entry)
+        self.assertEqual(len(waiters[second]), 1)
+        observe = test_scheduled_input.ScheduledInputTests().observe
+        await observe(self.bot, self.wire, terrain.air(4, column=second))
+        await observe(self.bot, self.wire, terrain.air(5, column=first, dimension=1))
+        await observe(self.bot, self.wire, terrain.air(4, column=first))
+        self.assertFalse(entry[1].done())
+        await observe(self.bot, self.wire, terrain.air(5, column=first))
+        final = await self.completed(run)
+        self.assertEqual(final["state"], "succeeded", final)
+        self.assertEqual([(row["column"], row["dimension_id"], row["received_section_ys"]) for row in final["result"]],
+                         [([7, 8], 0, [4]), ([7, 7], 0, [4, 5])])
+        self.assertFalse(waiters)
+        self.assertFalse(any(isinstance(packet, terrain.b.SubChunkRequestPacket) for packet in self.wire.sent))
+
     async def test_imported_and_subscribed_callback_loops_are_stoppable(self):
         source = """
 import asyncio
