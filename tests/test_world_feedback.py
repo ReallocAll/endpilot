@@ -86,6 +86,60 @@ class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(changed.result().packet, volume)
         self.assertEqual(changed.result().volume, 0.25)
 
+    async def test_level_event_feedback_filters_and_keeps_separate_packet_waves(self):
+        b = self.b
+        position = (-1.5, 220.25, 4.5)
+        pos = b.Vec3(x=position[0], y=position[1], z=position[2])
+        ignite = b.LevelEventPacket(event_id=1005, pos=pos, data=-2147483648)
+        explosion = b.LevelEventPacket(event_id=2025, pos=pos, data=4)
+        explode_sound = b.LevelSoundEventPacket(sound_event="explode", pos=pos, data=-1)
+        same_name = b.LevelSoundEventPacket(sound_event="sound_ignite", pos=pos)
+        generic = b.LevelEventGenericPacket(event_id=1005)
+        other = [b.LevelEventPacket(event_id=value, pos=pos) for value in (1006, 3001, 3500, 3602, 3615, 3616, 90000)]
+        ordered, filtered = [], []
+        self.bot.subscribe_sound(ordered.append)
+        self.bot.subscribe_particle(ordered.append)
+        self.bot.subscribe_sound(filtered.append, kind="level_event", name="sound_ignite")
+        self.bot.subscribe_particle(filtered.append, name="particle_explosion")
+
+        async with asyncio.TaskGroup() as group:
+            sound = group.create_task(self.bot.wait_for_sound("sound_ignite", kind="level_event", timeout=1))
+            level = group.create_task(self.bot.wait_for_sound("sound_ignite", kind="level", timeout=1))
+            particle = group.create_task(self.bot.wait_for_particle("particle_explosion", timeout=1))
+            await asyncio.sleep(0)
+            self.push(generic, *other, same_name, ignite, explosion, explode_sound,
+                      b.ChangeDimensionPacket(dimension_id=1, pos=pos), ignite, explosion, explode_sound)
+
+        self.assertEqual([event.packet for event in ordered],
+                         [same_name, ignite, explosion, explode_sound, ignite, explosion, explode_sound])
+        self.assertEqual([event.dimension_id for event in ordered], [0, 0, 0, 0, 1, 1, 1])
+        self.assertEqual([event.position for event in ordered], [position] * 7)
+        self.assertEqual(filtered, [ordered[index] for index in (1, 2, 4, 5)])
+        self.assertEqual((sound.result(), level.result(), particle.result()), (ordered[1], ordered[0], ordered[2]))
+        event = sound.result()
+        self.assertEqual((event.kind, event.event_id, event.data, event.volume, event.pitch),
+                         ("level_event", 1005, -2147483648, None, None))
+        event = particle.result()
+        self.assertEqual((event.name, event.event_id, event.data), ("particle_explosion", 2025, 4))
+        self.assertEqual((ordered[3].kind, ordered[3].event_id, ordered[3].data), ("level", None, -1))
+
+    async def test_classified_level_events_are_only_added_for_protocol_2225(self):
+        await self.bot.close()
+        self.bot = Bot("OlderFeedbackObserver", protocol=2193)
+        self.b = self.bot.protocol.binding
+        self.addAsyncCleanup(self.bot.close)
+        await self.join()
+        sounds, particles = [], []
+        self.bot.subscribe_sound(sounds.append)
+        self.bot.subscribe_particle(particles.append)
+        spawn = self.b.SpawnParticleEffectPacket(effect_name="fixture.done")
+        pending = asyncio.create_task(self.bot.wait_for_particle("fixture.done", timeout=1))
+        await asyncio.sleep(0)
+        self.push(self.b.LevelEventPacket(event_id=1005), self.b.LevelEventPacket(event_id=2025), spawn)
+        self.assertEqual((await pending).packet, spawn)
+        self.assertEqual([event.packet for event in particles], [spawn])
+        self.assertEqual(sounds, [])
+
     async def test_particle_keeps_wire_dimension_attachment_and_dispatch_dimension(self):
         b = self.b
         pos = b.Vec3(x=-1.375, y=221.25, z=3.75)
@@ -100,6 +154,8 @@ class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
         event = await wait
         self.assertEqual((event.dimension_id, event.position), (1, (-1.375, 221.25, 3.75)))
         self.assertEqual(event.packet, particle)
+        self.assertIsNone(event.event_id)
+        self.assertIsNone(event.data)
 
     async def test_block_particles_are_opt_in_and_keep_wire_fields(self):
         b = self.b
@@ -133,8 +189,8 @@ class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(event.kind, event.position, event.packet) for event in ordinary],
                          [("crack_progress", position, crack), ("crack_end", None, stop)])
         self.assertEqual(legacy.result(), ordinary[0])
-        self.assertEqual([event.packet for event in particles], [flame])
-        self.assertEqual(named.result(), particles[0])
+        self.assertEqual([event.packet for event in particles], [other_position, unrelated, flame, *native])
+        self.assertEqual(named.result(), particles[2])
         self.assertEqual([event.packet for event in sounds], [hit])
 
     async def test_block_particle_wait_only_decodes_level_event_packets(self):
@@ -299,7 +355,8 @@ class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
         last = b.StopSoundPacket(name="late")
         waiting = asyncio.create_task(self.bot.wait_for_sound("late", timeout=1))
         await asyncio.sleep(0)
-        self.push(b.DisconnectPacket(), b.SpawnParticleEffectPacket(effect_name="late"), b.BlockEventPacket(), last)
+        self.push(b.DisconnectPacket(), b.SpawnParticleEffectPacket(effect_name="late"), b.BlockEventPacket(),
+                  b.LevelEventPacket(event_id=1005), b.LevelEventPacket(event_id=2025), last)
         self.assertEqual((await waiting).packet, last)
         self.assertEqual(len(errors), 1)
         self.assertEqual(seen, [])
@@ -412,13 +469,15 @@ class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.bot.protocol.decode(raw), late)
             await drain_player_state()
 
-        waiting = asyncio.create_task(self.bot.wait_for_sound("pending"))
+        waiting = asyncio.create_task(self.bot.wait_for_sound("sound_ignite", kind="level_event"))
+        particle = asyncio.create_task(self.bot.wait_for_particle("particle_explosion"))
         await asyncio.sleep(0)
         with patch.object(player_state, "aclose", side_effect=drain_with_packet):
             await self.bot.close()
         self.assertEqual(sounds, [])
-        with self.assertRaises(ConnectionError):
-            await asyncio.wait_for(waiting, 1)
+        for task in (waiting, particle):
+            with self.assertRaises(ConnectionError):
+                await asyncio.wait_for(task, 1)
         with self.assertRaises(ConnectionError):
             feedback.subscribe_sound(lambda _: None)
         with self.assertRaises(RuntimeError):

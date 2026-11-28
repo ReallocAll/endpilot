@@ -16,10 +16,100 @@ if TYPE_CHECKING:
     from .login import _SessionEndState
 
 
-SoundKind = Literal["play", "stop", "level", "update"]
+SoundKind = Literal["play", "stop", "level", "level_event", "update"]
 _Position = tuple[float, float, float]
 _Cell = tuple[int, int, int]
 _CRACK_EVENTS = {3600: "crack_start", 3601: "crack_end", 3602: "crack_progress"}
+# Names from minecraft-data bedrock/1.26.60 packet_level_event. IDs are classified
+# by corroborated protocol definitions. This table covers ordinary effect IDs.
+_LEVEL_EVENT_SOUNDS_2225 = MappingProxyType({
+    1000: "sound_click",
+    1001: "sound_click_fail",
+    1002: "sound_shoot",
+    1003: "sound_door",
+    1004: "sound_fizz",
+    1005: "sound_ignite",
+    1007: "sound_ghast",
+    1008: "sound_ghast_shoot",
+    1009: "sound_blaze_shoot",
+    1010: "sound_door_bump",
+    1012: "sound_door_crash",
+    1018: "sound_enderman_teleport",
+    1020: "sound_anvil_break",
+    1021: "sound_anvil_use",
+    1022: "sound_anvil_fall",
+    1030: "sound_pop",
+    1032: "sound_portal",
+    1040: "sound_itemframe_add_item",
+    1041: "sound_itemframe_remove",
+    1042: "sound_itemframe_place",
+    1043: "sound_itemframe_remove_item",
+    1044: "sound_itemframe_rotate_item",
+    1050: "sound_camera",
+    1051: "sound_orb",
+    1052: "sound_totem",
+    1060: "sound_armor_stand_break",
+    1061: "sound_armor_stand_hit",
+    1062: "sound_armor_stand_fall",
+    1063: "sound_armor_stand_place",
+    1064: "pointed_dripstone_land",
+    1065: "dye_used",
+    1066: "ink_sack_used",
+})
+_LEVEL_EVENT_PARTICLES_2225 = MappingProxyType({
+    2000: "particle_shoot",
+    2001: "particle_destroy",
+    2002: "particle_splash",
+    2003: "particle_eye_despawn",
+    2004: "particle_spawn",
+    2005: "particle_crop_growth",
+    2006: "particle_guardian_curse",
+    2007: "particle_death_smoke",
+    2008: "particle_block_force_field",
+    2009: "particle_projectile_hit",
+    2010: "particle_dragon_egg_teleport",
+    2011: "particle_crop_eaten",
+    2012: "particle_critical",
+    2013: "particle_enderman_teleport",
+    2014: "particle_punch_block",
+    2015: "particle_bubble",
+    2016: "particle_evaporate",
+    2017: "particle_destroy_armor_stand",
+    2018: "particle_breaking_egg",
+    2019: "particle_destroy_egg",
+    2020: "particle_evaporate_water",
+    2021: "particle_destroy_block_no_sound",
+    2022: "particle_knockback_roar",
+    2023: "particle_teleport_trail",
+    2024: "particle_point_cloud",
+    2025: "particle_explosion",
+    2026: "particle_block_explosion",
+    2027: "particle_vibration_signal",
+    2028: "particle_dripstone_drip",
+    2029: "particle_fizz_effect",
+    2030: "particle_wax_on",
+    2031: "particle_wax_off",
+    2032: "particle_scrape",
+    2033: "particle_electric_spark",
+    2034: "particle_turtle_egg",
+    2035: "particle_sculk_shriek",
+    2036: "sculk_catalyst_bloom",
+    2040: "dust_plume",
+    3603: "particle_punch_block_down",
+    3604: "particle_punch_block_up",
+    3605: "particle_punch_block_north",
+    3606: "particle_punch_block_south",
+    3607: "particle_punch_block_west",
+    3608: "particle_punch_block_east",
+    3609: "particle_shoot_white_smoke",
+    3610: "particle_breeze_wind_explosion",
+    3611: "particle_trial_spawner_detection",
+    3612: "particle_trial_spawner_spawning",
+    3613: "particle_trial_spawner_ejecting",
+    3614: "particle_wind_explosion",
+    9815: "add_particle_smash_attack_ground_dust",
+    9816: "add_particle_creaking_heart_trail",
+})
 _BLOCK_PARTICLE_EVENTS_2225 = frozenset((2001, 3603, 3604, 3605, 3606, 3607, 3608))
 _PISTON_STATES = {0: "piston_retracted", 1: "piston_extending", 2: "piston_extended", 3: "piston_retracting"}
 _PAIRABLE_CHESTS = frozenset((
@@ -113,15 +203,31 @@ class SoundEvent:
     def pitch(self) -> float | None:
         return getattr(getattr(self.packet, "event", self.packet), "pitch", None)
 
+    @property
+    def event_id(self) -> int | None:
+        return getattr(self.packet, "event_id", None)
+
+    @property
+    def data(self) -> int | None:
+        return getattr(self.packet, "data", None)
+
 
 @dataclass(frozen=True, slots=True)
 class ParticleEvent:
-    """A named particle with the source packet's dimension, attachment and Molang fields."""
+    """A named particle spawn or classified level event with its decoded packet."""
 
     dimension_id: int
     name: str
     position: _Position
     packet: object
+
+    @property
+    def event_id(self) -> int | None:
+        return getattr(self.packet, "event_id", None)
+
+    @property
+    def data(self) -> int | None:
+        return getattr(self.packet, "data", None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +290,8 @@ class WorldFeedback:
         self._particle_ids = (b.SpawnParticleEffectPacket.ID,)
         self._block_ids = (b.BlockEventPacket.ID,)
         if self._is_2225:
+            self._sound_ids += (b.LevelEventPacket.ID,)
+            self._particle_ids += (b.LevelEventPacket.ID,)
             self._block_ids += (b.BlockActorDataPacket.ID, b.LevelEventPacket.ID, b.LevelSoundEventPacket.ID)
         self._end_state = end_state
         self._closed = False
@@ -253,7 +361,7 @@ class WorldFeedback:
             self._unsubscribe_reader_end = self.packets.subscribe_reader_end(self.close)
         return unsubscribe
 
-    def _sound(self, packet, dimension: int) -> SoundEvent:
+    def _sound(self, packet, dimension: int) -> SoundEvent | None:
         b = self.binding
         if packet.ID == b.PlaySoundPacket.ID:
             # Vanilla 2225 encodes PlaySound positions in eighths of a block.
@@ -264,6 +372,9 @@ class WorldFeedback:
         if packet.ID == b.LevelSoundEventPacket.ID:
             name = packet.sound_event if isinstance(packet.sound_event, str) else None
             return SoundEvent("level", dimension, packet, name, _xyz(packet.pos))
+        if self._is_2225 and packet.ID == b.LevelEventPacket.ID:
+            name = _LEVEL_EVENT_SOUNDS_2225.get(packet.event_id)
+            return None if name is None else SoundEvent("level_event", dimension, packet, name, _xyz(packet.pos))
         return SoundEvent("update", dimension, packet)
 
     async def wait_for_sound(self, name: str | None, kind: SoundKind | None, timeout: float) -> SoundEvent:
@@ -274,9 +385,11 @@ class WorldFeedback:
     ) -> Callable[[], None]:
         return self._subscribe(self._sound_ids, self._sound, callback, name=name, kind=kind)
 
-    @staticmethod
-    def _particle(packet, dimension: int) -> ParticleEvent:
-        return ParticleEvent(dimension, packet.effect_name, _xyz(packet.pos), packet)
+    def _particle(self, packet, dimension: int) -> ParticleEvent | None:
+        if packet.ID == self.binding.SpawnParticleEffectPacket.ID:
+            return ParticleEvent(dimension, packet.effect_name, _xyz(packet.pos), packet)
+        name = _LEVEL_EVENT_PARTICLES_2225.get(packet.event_id)
+        return None if name is None else ParticleEvent(dimension, name, _xyz(packet.pos), packet)
 
     async def wait_for_particle(self, name: str | None, timeout: float) -> ParticleEvent:
         return await self._wait(self._particle_ids, self._particle, timeout, name=name)

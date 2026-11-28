@@ -204,6 +204,8 @@ def _feedback_fields(event):
             names = ("sound_event", "data", "actor_identifier", "actor", "is_global", "is_baby")
             fire = getattr(packet, "fire_at_position", None)
             values["fire_at_position"] = None if fire is None else (fire.x, fire.y, fire.z)
+        elif event.kind == "level_event":
+            names = ("event_id", "data")
         else:
             names = ("server_sound_handle",)
             update = packet.event
@@ -212,6 +214,8 @@ def _feedback_fields(event):
     elif isinstance(event, ParticleEvent):
         values = {}
         names = ("vanilla_dimension_id", "actor_id", "molang_variables")
+        if event.event_id is not None:
+            names += ("event_id", "data")
     else:
         values = {"note_pitch": event.note_pitch, "instrument_id": event.instrument_id,
                   "instrument_sound": event.instrument_sound}

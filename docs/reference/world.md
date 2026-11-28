@@ -438,6 +438,16 @@ in `event.packet.pos` and exposes world coordinates in `event.position`.
 spawn event. The decoded packet provides `vanilla_dimension_id`, `actor_id`
 and `molang_variables`. All observations carry the bot's dimension at receipt.
 
+In protocol 2225, `await bot.wait_for_sound("sound_anvil_use", kind="level_event")`
+waits for a classified `LevelEventPacket` sound. Use
+`await bot.wait_for_particle("particle_explosion")` for a classified level
+particle event. These names are event identifiers from the 1.26.60
+`packet_level_event` vocabulary. Each event exposes its original `event_id`,
+signed `data`, and floating-point position. Level event sounds have
+`volume=None` and `pitch=None`. The same fields are available to MCP script
+waits and callbacks. Unknown IDs and control events produce no sound or
+particle observation. Separate effect packets each produce their own event.
+
 `await bot.wait_for_block_event(position, kind="chest_open")` can filter by
 position and kind. Supported feedback includes raw block events, note sounds,
 chest lid changes, piston arm states and start, progress and end of cracking.
@@ -471,8 +481,8 @@ block-mining particles (`3603`–`3608`) and block-breaking particles (`2001`).
 The event keeps the floating-point position and the bot's dimension at receipt.
 `event.packet.event_id` and `event.packet.data` expose the native event ID and
 signed data. In MCP scripts these are `event.event_id` and `event.data`.
-Omitting `kind` preserves the usual block-feedback stream. Named particle
-spawns continue to use `wait_for_particle` and `subscribe_particle`.
+Omitting `kind` preserves the usual block-feedback stream. The same particle
+packet can also be observed through `wait_for_particle` and `subscribe_particle`.
 
 Use `bot.subscribe_sound(callback, name=..., kind=...)`,
 `bot.subscribe_particle(callback, name=...)`, or

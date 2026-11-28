@@ -802,6 +802,16 @@ def particle(event):
     assert not hasattr(event, 'packet')
     return [event.name, event.position, event.vanilla_dimension_id, event.actor_id, event.molang_variables]
 
+def level_sound(event):
+    assert not hasattr(event, 'packet')
+    return [event.kind, event.name, event.position, event.dimension_id, event.event_id, event.data,
+            event.volume, event.pitch]
+
+def level_particle(event):
+    assert not hasattr(event, 'packet')
+    return [event.name, event.position, event.dimension_id, event.event_id, event.data,
+            event.vanilla_dimension_id, event.actor_id, event.molang_variables]
+
 def block(event):
     assert not hasattr(event, 'packet')
     return [event.kind, event.position, event.note_pitch, event.note_tuning, event.instrument_id,
@@ -812,15 +822,19 @@ async def main(bot):
     notifications = []
     def report(project, event):
         notifications.append(project(event))
-        if len(notifications) == 4:
+        if len(notifications) == 6:
             delivered.set()
 
     stop_sound = bot.subscribe_sound(lambda event: report(sound, event), name='fixture.pop', kind='play')
     stop_particle = bot.subscribe_particle(lambda event: report(particle, event), name='fixture.flame')
     stop_block = bot.subscribe_block_events(lambda event: report(block, event), kind='note')
     stop_tuning = bot.subscribe_block_events(lambda event: report(block, event), kind='note_tuning')
+    stop_level_sound = bot.subscribe_sound(lambda event: report(level_sound, event), kind='level_event')
+    stop_level_particle = bot.subscribe_particle(lambda event: report(level_particle, event), name='particle_explosion')
     waits = asyncio.gather(bot.wait_for_sound('fixture.pop', kind='play'), bot.wait_for_particle('fixture.flame'),
-                           bot.wait_for_block_event(kind='note'), bot.wait_for_block_event(kind='note_tuning'))
+                           bot.wait_for_block_event(kind='note'), bot.wait_for_block_event(kind='note_tuning'),
+                           bot.wait_for_sound('sound_anvil_use', kind='level_event'),
+                           bot.wait_for_particle('particle_explosion'))
     await asyncio.sleep(0)
     bot.get_tick()   # Wait for admission of preceding requests before triggering the fixture.
     print('feedback ready')
@@ -830,8 +844,10 @@ async def main(bot):
     stop_particle()
     stop_block()
     stop_tuning()
+    stop_level_sound()
+    stop_level_particle()
     return {'waits': [sound(results[0]), particle(results[1]), block(results[2]), block(results[3])],
-            'notifications': notifications}
+            'level_waits': [level_sound(results[4]), level_particle(results[5])], 'notifications': notifications}
 """)
         await self.wait_for(run, lambda status: "feedback ready" in self.text(status))
         b = self.bot.protocol.binding
@@ -843,14 +859,19 @@ async def main(bot):
         # Vanilla 2225 skeleton head above a note block after its second click.
         note = RawPacket(123, bytes.fromhex("046e6f7465000040c000005c43000088419254000000ffffffffffffffff00"))
         tuning = RawPacket(26, bytes.fromhex("05b803222a04"))
-        self.wire.incoming.put_nowait(write_batch((note, tuning)))
+        anvil = RawPacket(25, bytes.fromhex("fa0f0000204100005c430000004100"))
+        explosion = self.bot.protocol.encode(b.LevelEventPacket(event_id=2025, pos=spot, data=-23))
+        self.wire.incoming.put_nowait(write_batch((note, tuning, anvil, explosion)))
         status = await self.completed(run)
         self.assertEqual(status["state"], "succeeded", status)
         expected = [["fixture.pop", [1, 100, 2], 0.75, 1.25, 3],
                     ["fixture.flame", [1, 100, 2], 2, 91, '{"a":1}'],
                     ["note", [-3, 220, 17], 9, None, 21, 5385, "note.skeleton", None, None],
                     ["note_tuning", [-3, 220, 17], None, 2, 21, None, "note.skeleton", 21, 2]]
-        self.assertEqual(status["result"], {"waits": expected, "notifications": expected})
+        levels = [["level_event", "sound_anvil_use", [10, 220, 8], 0, 1021, 0, None, None],
+                  ["particle_explosion", [1, 100, 2], 0, 2025, -23, None, None, None]]
+        self.assertEqual(status["result"], {"waits": expected, "level_waits": levels,
+                                             "notifications": expected + levels})
 
     async def test_stop_drains_host_action_before_original_bot_is_released(self):
         began, cancelled, cleanup = asyncio.Event(), asyncio.Event(), asyncio.Event()
