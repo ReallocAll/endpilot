@@ -4,6 +4,7 @@ import asyncio
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from struct import Struct
 from typing import Literal
 
 from .protocol import RawPacket
@@ -19,11 +20,13 @@ VITAL_ATTRIBUTES = {
 }
 # Bedrock movement effects: speed, slowness, jump boost, levitation, slow falling.
 _JUMP_MOVEMENT_EFFECTS = frozenset((1, 2, 8, 24, 27))
+_FLOAT32 = Struct("<f")
+_MAX_EXPERIENCE_LEVEL_2225 = 24791
 
 
 @dataclass(frozen=True, slots=True)
 class PlayerVitals:
-    """Latest local-player vitals. None means the server has yet to report a field."""
+    """Latest local-player vitals. None means a field has no usable observation."""
 
     health: float | None = None
     hunger: float | None = None
@@ -32,6 +35,39 @@ class PlayerVitals:
     air_supply_max: int | None = None
     experience_level: int | None = None
     experience_progress: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExperienceBalance:
+    """Points derived from the latest Bedrock experience attributes."""
+
+    full_level_cost: int
+    current_level_points: int | None
+    total_points: int | None
+
+
+def _experience_balance(vitals: PlayerVitals) -> ExperienceBalance | None:
+    level = vitals.experience_level
+    if type(level) is not int or not 0 <= level <= _MAX_EXPERIENCE_LEVEL_2225:
+        return None
+
+    # The balance at the start of this level sums all the preceding full bars.
+    if level <= 15:
+        cost = 2 * level + 7
+        base = level * (level + 6)
+    elif level <= 30:
+        cost = 5 * level - 38
+        base = (level * (5 * level - 81) + 720) // 2
+    else:
+        cost = 9 * level - 158
+        base = (level * (9 * level - 325) + 4440) // 2
+
+    progress = vitals.experience_progress
+    if progress is None or not 0 <= progress <= 1:
+        return ExperienceBalance(cost, None, None)
+    product, = _FLOAT32.unpack(_FLOAT32.pack(progress * cost))
+    earned = math.floor(product + 0.5)
+    return ExperienceBalance(cost, earned, base + earned)
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,9 +331,17 @@ class PlayerState:
         elif raw.packet_id == b.UpdateAttributesPacket.ID:
             for attribute in self._attributes(raw):
                 field_name = VITAL_ATTRIBUTES.get(attribute.name)
-                if field_name is not None:
-                    value = attribute.current_value
-                    setattr(self, field_name, int(value) if field_name == "experience_level" else float(value))
+                if field_name is None:
+                    continue
+                value = attribute.current_value
+                if field_name != "experience_level":
+                    setattr(self, field_name, float(value))
+                elif getattr(self.packets.protocol, "number", None) != 2225:
+                    self.experience_level = int(value)
+                elif 0 <= value <= _MAX_EXPERIENCE_LEVEL_2225 and value == math.floor(value):
+                    self.experience_level = int(value)
+                else:
+                    self.experience_level = None
         elif raw.packet_id == b.SetActorDataPacket.ID:
             packet = self.packets.protocol.decode(raw)
             if packet.id == self.runtime_id:

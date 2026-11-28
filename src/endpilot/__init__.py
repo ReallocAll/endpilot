@@ -44,7 +44,7 @@ from .navigation import (
     NavigationEvent, NavigationGoal, NavigationPlan, NavigationResult, NavigationRules, NearGoal, NearXZGoal, XZGoal, YGoal,
 )
 from .placement import BoatPlacementResult, EntityPlacementResult, PlacementInventoryChange, PlacementResult, WaterBucketFillResult
-from .player_state import DeathEvent, GlideBoostEvent, PlayerAbilities, PlayerEffect, PlayerVitals
+from .player_state import DeathEvent, ExperienceBalance, GlideBoostEvent, PlayerAbilities, PlayerEffect, PlayerVitals
 from .range_transfer import (
     RangeTransferResult, RangeTransferStep, transfer_container_range, transfer_inventory_range, transfer_item,
     transfer_range,
@@ -139,6 +139,7 @@ __all__ = [
     "EntitySwing",
     "EntityVisibilityGoal",
     "EntityVisibleEffectUpdate",
+    "ExperienceBalance",
     "FootGoal",
     "ForwardInput",
     "FurnaceProgress",

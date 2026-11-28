@@ -63,7 +63,10 @@ from .placement import (
     BoatPlacementResult, EntityPlacementResult, PlacementResult, observe_entity_placement, observe_placement,
     WaterBucketFillResult, observe_water_bucket_fill,
 )
-from .player_state import DeathEvent, GlideBoostEvent, PlayerAbilities, PlayerEffect, PlayerState, PlayerVitals
+from .player_state import (
+    DeathEvent, ExperienceBalance, GlideBoostEvent, PlayerAbilities, PlayerEffect, PlayerState, PlayerVitals,
+    _experience_balance,
+)
 from .qa import PacketTimeline
 from .qa_terrain import _TerrainObserver
 from .recipes import Recipe, Recipes
@@ -2899,6 +2902,15 @@ class Bot:
         if self._player_state is None:
             raise RuntimeError("player has not joined")
         return self._player_state.vitals()
+
+    @property
+    def experience_balance(self) -> ExperienceBalance | None:
+        """Derive the current protocol 2225 experience balance from observed vitals."""
+        player_state, state = self._player_state, self._session_end_state
+        if (self.protocol.number != 2225 or player_state is None or (state is not None and state.result is not None)
+                or player_state.packets._reader_end_result()[0]):
+            return None
+        return _experience_balance(player_state.vitals())
 
     async def wait_for_vitals_update(self, *, timeout: float = 15) -> PlayerVitals:
         """Wait for the next change in local-player vitals."""

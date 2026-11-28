@@ -1,9 +1,11 @@
 import asyncio
 import unittest
+from dataclasses import FrozenInstanceError
+from math import inf, nan
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from endpilot import Bot, DeathEvent, PlayerEffect, PlayerVitals, Weather, WorldRule
+from endpilot import Bot, DeathEvent, ExperienceBalance, PlayerEffect, PlayerVitals, Weather, WorldRule
 from endpilot.compression import PacketConnection
 from endpilot.login import JoinSession
 from endpilot.player_state import PlayerState
@@ -590,6 +592,90 @@ class VitalSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await rules, (WorldRule("randomTickSpeed", 4, True),))
         self.assertEqual(self.bot.world_rules, (WorldRule("randomTickSpeed", 5, True),))
 
+    async def test_experience_balance_requires_a_valid_local_level_and_bar(self):
+        self.assertIsNone(self.bot.experience_balance)
+        await self.join(self.attributes(43, level=23, experience=0.5))
+        self.assertIsNone(self.bot.experience_balance)
+        await self.processed(self.attributes(level=23))
+        self.assertEqual(self.bot.experience_balance, ExperienceBalance(77, None, None))
+        for bar in (nan, -inf, inf, -0.01, 1.01):
+            with self.subTest(bar=bar):
+                await self.processed(self.attributes(experience=bar))
+                self.assertEqual(self.bot.experience_balance, ExperienceBalance(77, None, None))
+        await self.processed(self.attributes(level=0, experience=0))
+        self.assertEqual(self.bot.experience_balance, ExperienceBalance(7, 0, 0))
+        await self.processed(self.attributes(level=24791, experience=1))
+        self.assertEqual(self.bot.experience_balance, ExperienceBalance(222961, 222961, 2761868208))
+        for level in (-1, 24792):
+            with self.subTest(level=level):
+                await self.processed(self.attributes(level=level))
+                self.assertIsNone(self.bot.experience_balance)
+
+    async def test_experience_balance_rounds_the_float32_product_and_preserves_integer_totals(self):
+        await self.join(self.attributes(level=16, experience=0.5))
+        await self.processed(self.attributes(level=23))
+        sent = self.transport.outgoing.qsize()
+        half = self.bot.experience_balance
+        self.assertEqual(half, ExperienceBalance(77, 39, 790))
+        self.assertEqual(self.bot.experience_balance, half)
+        self.assertEqual(self.transport.outgoing.qsize(), sent)
+        with self.assertRaises(FrozenInstanceError):
+            half.total_points = 0
+
+        for level, bar, expected in (
+            (23, 0.6428571343421936, ExperienceBalance(77, 50, 801)),
+            (3, 0.038461536169052124, ExperienceBalance(13, 0, 27)),  # Product is one float below 0.5.
+            (1949, 5.752746801590547e-05, ExperienceBalance(17383, 1, 16779213)),
+            (21864, 5.086004421173129e-06, ExperienceBalance(196618, 1, 2147604553)),
+        ):
+            with self.subTest(level=level, bar=bar):
+                await self.processed(self.attributes(level=level, experience=bar))
+                self.assertEqual(self.bot.experience_balance, expected)
+        self.assertEqual(half, ExperienceBalance(77, 39, 790))
+
+    async def test_invalid_experience_level_packets_clear_the_level_until_a_valid_report(self):
+        await self.join(self.attributes(level=23, experience=0.5))
+        self.assertEqual(self.bot.experience_balance, ExperienceBalance(77, 39, 790))
+        for index, level in enumerate((-0.25, 23.5, 24791.5, nan, inf, -inf)):
+            with self.subTest(level=level):
+                health = 18 - index
+                progress = self.bot.vitals.experience_progress
+                await self.processed(self.attributes(level=level, health=health))
+                self.assertIsNone(self.bot.experience_balance)
+                self.assertEqual(self.bot.vitals, PlayerVitals(health=health, experience_progress=progress))
+
+                await self.processed(self.attributes(experience=0.6428571343421936))
+                self.assertIsNone(self.bot.experience_balance)
+                await self.processed(self.attributes(level=23))
+                self.assertEqual(self.bot.experience_balance, ExperienceBalance(77, 50, 801))
+
+    async def test_experience_balance_follows_session_end_and_rejoin(self):
+        await self.join(self.attributes(level=23, experience=0.5))
+        self.assertEqual(self.bot.experience_balance, ExperienceBalance(77, 39, 790))
+        await self.processed(self.b.DisconnectPacket())
+        self.assertIsNone(self.bot.experience_balance)
+        await self.bot.close()
+        self.assertIsNone(self.bot.experience_balance)
+
+        self.transport = Transport()
+        await self.join(self.attributes(level=3))
+        self.assertEqual(self.bot.experience_balance, ExperienceBalance(13, None, None))
+        await self.processed(self.attributes(experience=0.23076923191547394))
+        self.assertEqual(self.bot.experience_balance, ExperienceBalance(13, 3, 30))
+        self.transport.incoming.put_nowait(ConnectionError("experience reader lost"))
+        await self.bot.wait_for_session_end(timeout=1)
+        self.assertIsNone(self.bot.experience_balance)
+        with self.assertRaisesRegex(ConnectionError, "experience reader lost"):
+            await self.bot.close()
+
+    async def test_experience_balance_rejects_other_protocol_versions(self):
+        self.bot = Bot("LegacyExperience", protocol=2193)
+        self.addAsyncCleanup(self.bot.close)
+        self.b = self.bot.protocol.binding
+        await self.join(self.attributes(level=3.5, experience=0.5))
+        self.assertEqual(self.bot.vitals, PlayerVitals(experience_level=3, experience_progress=0.5))
+        self.assertIsNone(self.bot.experience_balance)
+
     async def test_dimension_and_respawn_follow_the_reported_updates(self):
         b = self.b
         await self.join(
@@ -605,6 +691,7 @@ class VitalSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.vitals, PlayerVitals(health=0, saturation=12, air_supply=80,
                                                      air_supply_max=300, experience_level=3,
                                                      experience_progress=0.25))
+        self.assertEqual(self.bot.experience_balance, ExperienceBalance(13, 3, 30))
         await self.processed(
             b.RespawnPacket(state=b.PlayerRespawnState.READY_TO_SPAWN), self.effect("REMOVE"),
             self.attributes(health=20, saturation=5, level=0, experience=0), self.air(AIR_SUPPLY=300),
@@ -613,6 +700,7 @@ class VitalSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.vitals, PlayerVitals(health=20, saturation=5, air_supply=300,
                                                      air_supply_max=300, experience_level=0,
                                                      experience_progress=0))
+        self.assertEqual(self.bot.experience_balance, ExperienceBalance(7, 0, 0))
 
     def scalar_waits(self):
         return (self.bot.wait_for_health_update, self.bot.wait_for_hunger_update,

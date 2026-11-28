@@ -80,6 +80,29 @@ An awaitable result raises `TypeError` and remains under its creator's
 management. The caller can retry after the plugin cleans up its own side
 effects.
 
+## Read the local player's experience balance
+
+On vanilla Bedrock protocol 2225, `bot.experience_balance` derives an immutable
+`ExperienceBalance` from the last level and bar attributes in `bot.vitals`.
+The property sends no packets. It returns `None` without a readable session
+or a known integer level from 0 through 24791. An invalid level report makes
+the balance unknown until the next valid level report.
+
+- `full_level_cost` is the number of points from the start of the current
+  level to the next level. The difference from the rounded
+  `current_level_points` estimates how much of the bar remains.
+- `current_level_points` is the observed bar times that cost, with the product
+  rounded to float32 and then to the nearest integer, rounding positive halves
+  up.
+- `total_points` adds those points to the integer cost of all preceding levels.
+
+A missing, non-finite, or out-of-range bar leaves both point counts as `None`.
+`bot.vitals` still exposes the raw progress fraction. Java's experience packet
+carries an independent total field. This Bedrock calculation uses the two
+latest observed attributes. Sparse updates can change either value on its
+own. Death and respawn follow the received attributes, so a snapshot can
+reflect values received in different packets.
+
 ## Observe advertised entity types
 
 `bot.entity_registry` is an immutable snapshot of the entity types advertised
