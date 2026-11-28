@@ -292,6 +292,9 @@ async def _transfer_range(
             if utility_layout is not None and not utility_is_current():
                 return result("window_changed")
             slot_count = containers._observed_window_slot_count(window)
+        tracked_pair = containers._observed_paired_chest_halves(window) is not None
+        if tracked_pair and not containers._paired_chest_window_is_current(window):
+            return result("window_changed")
         if utility_layout is not None:
             if slot_count is None:
                 return result("unobserved")
@@ -337,6 +340,7 @@ async def _transfer_range(
         def window_is_current():
             return (bot._containers is containers and bot._inventory is inventory
                     and containers.window is window and containers._layout_token is layout
+                    and (not tracked_pair or containers._paired_chest_window_is_current(window))
                     and (utility_layout is None or utility_is_current())
                     and (entity is None or (containers._entity_container is entity and entity.is_visible())))
 
@@ -413,7 +417,7 @@ async def _transfer_range(
                     _expected_slots=(source_stack, destination_stack),
                     _expected_slot_count=slot_count,
                     _on_unconfirmed=mark_unconfirmed,
-                    _range_window_current=(window_is_current if whole_window or utility_layout is not None
+                    _range_window_current=(window_is_current if tracked_pair or whole_window or utility_layout is not None
                                            or entity is not None or match is not None or before_write is not None else None),
                     _before_range_write=before_write,
                 )
@@ -482,7 +486,9 @@ async def transfer_container_range(
     """Move a registered item between disjoint ranges in an open storage window.
 
     Use an observed 27-slot ordinary chest, trapped chest, barrel or shulker
-    box. Fill compatible stacks before empty slots and count only moves
+    box, or an ordinary double chest with both halves observed and paired.
+    Use the server's 54-slot order for double chests. Fill compatible
+    stacks before empty slots and count only moves
     confirmed by matching corrections to both slots. The optional
     synchronous match and transfer_progress follow transfer_inventory_range.
     """
@@ -501,7 +507,7 @@ async def _transfer_within(bot, *, item, count, source_slots, destination_slots,
         raise ValueError("timeout must be finite and nonnegative")
     if match is not None and not callable(match):
         raise TypeError("match must be callable")
-    slot_limit = _SINGLE_CONTAINER_SIZE if in_container else _PLAYER_SIZE
+    slot_limit = _DOUBLE_CHEST_SIZE if in_container else _PLAYER_SIZE
     _check_range(source_slots, slot_limit, "source_slots")
     _check_range(destination_slots, slot_limit, "destination_slots")
     if (source_slots and destination_slots and source_slots.start < destination_slots.stop
@@ -536,22 +542,33 @@ async def _transfer_within(bot, *, item, count, source_slots, destination_slots,
             target = "a block storage window" if in_container else "the player inventory"
             raise RuntimeError(f"open {target} before transferring items")
         name = domain = None
+        paired = False
         if in_container:
             if window.position is None or window.entity_unique_id != -1:
                 raise RuntimeError("open a block storage window before transferring items")
+            if containers._window_chest_pair_changed:
+                return result("window_changed")
             name = containers._observed_window_block_name(window)
             current_name = containers._current_window_block_name(window)
             slot_count = containers._observed_window_slot_count(window)
             if name is None or slot_count is None or current_name is None:
                 return result("unobserved")
             domain = _shared_storage_domain(name)
-            if (domain is None or slot_count != _SINGLE_CONTAINER_SIZE
+            paired = name == "minecraft:chest" and slot_count == _DOUBLE_CHEST_SIZE
+            if (domain is None or (slot_count != _SINGLE_CONTAINER_SIZE and not paired)
                     or (name != "minecraft:chest" and bot.protocol.number != 2225)):
-                raise RuntimeError("the active window must match a supported storage block with 27 slots")
+                raise RuntimeError("open a supported storage block with 27 slots or an ordinary double chest")
+            _check_range(source_slots, slot_count, "source_slots")
+            _check_range(destination_slots, slot_count, "destination_slots")
             if current_name != name or containers._shared_storage_replaced:
                 return result("window_changed")
             if name != "minecraft:chest" and containers._shared_storage_replaced is None:
                 return result("unobserved")
+            if paired:
+                if containers._window_chest_halves is None:
+                    return result("unobserved")
+                if not containers._paired_chest_window_is_current(window):
+                    return result("window_changed")
         layout = containers._layout_token
 
         target_replaced = False
@@ -565,6 +582,7 @@ async def _transfer_within(bot, *, item, count, source_slots, destination_slots,
             return (bot._inventory is inventory and bot._containers is containers
                     and containers.window is window and containers._layout_token is layout
                     and not target_replaced
+                    and (not paired or containers._paired_chest_window_is_current(window))
                     and (not in_container or (not containers._shared_storage_replaced
                                               and containers._current_window_block_name(window) == name)))
 

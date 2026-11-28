@@ -4,6 +4,8 @@ from copy import copy
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+from bedrock_protocol import nbt
+
 from endpilot import (
     Bot, HeldItemStack, ItemRegistrySnapshot, RangeTransferResult, RangeTransferStep, transfer_container_range,
     transfer_item, transfer_range,
@@ -25,6 +27,9 @@ IRON_PICKAXE = 1233
 DIAMOND = 1234
 STICK = 1235
 POSITION = (1, 100, 0)
+EAST = (2, 100, 0)
+NORTH_CHEST = 3162850062
+WEST_CHEST = 1429214429
 POWERED_HOPPER = 1981605110
 UNPOWERED_HOPPER = 3036911681
 UTILITY_LAYOUTS = (
@@ -187,6 +192,253 @@ class RangeTransferTests(unittest.IsolatedAsyncioTestCase):
         slots = [self.stack() for _ in range(22)]
         slots[3], slots[20], slots[21] = self.stack(PAPER, 62, 51), self.stack(PAPER, 5, 52), self.stack(PAPER, 8, 53)
         self.open_chest(*slots)
+
+    def observe_chest_pair_root(self, position, partner=None, *, lead=0):
+        x, y, z = position
+        fields = {"id": nbt.StringTag("Chest"), "x": nbt.IntTag(x), "y": nbt.IntTag(y), "z": nbt.IntTag(z)}
+        if partner is not None:
+            fields.update(pairx=nbt.IntTag(partner[0]), pairz=nbt.IntTag(partner[2]), pairlead=nbt.ByteTag(lead))
+        self.emit(self.b.BlockActorDataPacket(pos=self.b.BlockPos(x=x, y=y, z=z), data=nbt.CompoundTag(fields)))
+
+    def observe_chest_pair(self, lead=POSITION, follower=EAST, *, runtime_id=NORTH_CHEST):
+        for position in (lead, follower):
+            self.observe_block("minecraft:chest", position, runtime_id=runtime_id)
+        self.observe_chest_pair_root(lead, follower, lead=1)
+        self.observe_chest_pair_root(follower, lead)
+
+    def open_double_for_move(self, position=POSITION, *, extra_slots=()):
+        slots = [self.stack() for _ in range(54)]
+        for index, amount, net_id in ((20, 5, 52), (21, 8, 53), (30, 62, 51), *extra_slots):
+            slots[index] = self.stack(PAPER, amount, net_id)
+        self.open_chest(*slots, position=position, width=54)
+
+    async def test_double_uses_the_same_cross_half_order_from_either_side(self):
+        south = (POSITION[0], POSITION[1], POSITION[2] + 1)
+        pending = self.hold_requests()
+        for follower, runtime in ((EAST, NORTH_CHEST), (south, WEST_CHEST)):
+            for clicked in (POSITION, follower):
+                with self.subTest(clicked=clicked, runtime=runtime):
+                    self.observe_chest_pair(follower=follower, runtime_id=runtime)
+                    self.open_double_for_move(clicked)
+                    moving = self.start(self.within_chest(6, destination=range(29, 31)))
+                    for action, receipts in (
+                        ((20, 30, 2, 52, 51), [(CHEST, 20, 3, 52), (CHEST, 30, 64, 51)]),
+                        ((20, 29, 3, 52, 0), [(CHEST, 20, 0, None), (CHEST, 29, 3, 52)]),
+                        ((21, 29, 1, 53, 52), [(CHEST, 21, 7, 53), (CHEST, 29, 4, 52)]),
+                    ):
+                        request = await asyncio.wait_for(pending.get(), 1)
+                        self.assertEqual(self.action(request), action)
+                        self.assertEqual(self.action_addresses(request), (CHEST, CHEST))
+                        self.reply(request, receipts)
+                    result = await moving
+                    self.assertEqual((result.stop_reason, result.confirmed_count), ("complete", 6))
+                    self.assertEqual([self.bot.container_slots[i].stack_size for i in (20, 21, 29, 30)],
+                                     [0, 7, 4, 64])
+
+    async def test_double_requires_opening_reciprocal_pair_proof(self):
+        self.observe_block("minecraft:chest", POSITION, runtime_id=NORTH_CHEST)
+        self.observe_block("minecraft:chest", EAST, runtime_id=NORTH_CHEST)
+        self.observe_chest_pair_root(POSITION, EAST, lead=1)
+        self.open_double_for_move()
+        self.assertEqual(await self.within_chest(2, destination=range(29, 31)), RangeTransferResult(2, (), "unobserved"))
+        self.observe_chest_pair_root(EAST, POSITION)
+        self.assertEqual(await self.within_chest(2, destination=range(29, 31)), RangeTransferResult(2, (), "unobserved"))
+        self.assertEqual(self.outgoing(), [])
+
+    async def test_double_stays_invalid_after_observed_other_half_or_pair_round_trip(self):
+        send = self.stream.send
+        for change in ("block", "unknown", "actor", "width"):
+            with self.subTest(change=change):
+                self.observe_chest_pair()
+                self.open_double_for_move(EAST)
+                window = self.bot.open_window
+                entered, release = asyncio.Event(), asyncio.Event()
+
+                async def pause(packet, **kwargs):
+                    entered.set()
+                    await release.wait()
+                    await send(packet, **kwargs)
+                    self.reply(packet.requests[0], [(CHEST, 20, 3, 52), (CHEST, 30, 64, 51)])
+
+                self.stream.send = pause
+                task = self.start(self.within_chest(2, destination=range(29, 31)))
+                await asyncio.wait_for(entered.wait(), 1)
+                if change == "block":
+                    self.observe_block("minecraft:air", POSITION)
+                    self.observe_chest_pair()
+                elif change == "unknown":
+                    self.observe_block("minecraft:chest", POSITION, runtime_id=123456789)
+                    self.assertIsNone(self.bot.observed_block_state(POSITION))
+                    self.observe_chest_pair()
+                elif change == "actor":
+                    self.observe_chest_pair_root(POSITION)
+                    self.observe_chest_pair_root(POSITION, EAST, lead=1)
+                else:
+                    slots = tuple(self.bot.container_slots.values())
+                    self.content(*slots[:27], width=27)
+                    self.content(*slots, width=54)
+                release.set()
+                self.assertEqual(await task, RangeTransferResult(2, (), "window_changed"))
+                self.assertIs(self.bot.open_window, window)
+                self.assertEqual(len(self.bot.container_slots), 54)
+                self.assertEqual(await self.within_chest(2, destination=range(29, 31)),
+                                 RangeTransferResult(2, (), "window_changed"))
+        self.assertEqual(self.outgoing(), [])
+        self.stream.send = send
+        self.open_double_for_move(EAST)
+        self.answer(((20, 30, 2, 52, 51), [(CHEST, 20, 3, 52), (CHEST, 30, 64, 51)]))
+        self.assertEqual((await self.within_chest(2, destination=range(29, 31))).confirmed_count, 2)
+
+    async def test_double_access_checks_both_halves_at_the_write_boundary(self):
+        send = self.stream.send
+        for action in ("take", "put", "range"):
+            with self.subTest(action=action):
+                self.observe_chest_pair()
+                self.open_double_for_move()
+                self.player_slot(9, self.stack(PAPER, 5, 61) if action == "put" else self.stack())
+                entered, release = asyncio.Event(), asyncio.Event()
+
+                async def pause(packet, **kwargs):
+                    entered.set()
+                    await release.wait()
+                    await send(packet, **kwargs)
+                    corrections = ([(CHEST, 30, 63, 51), (PLAYER, 9, 4, 61)] if action == "put"
+                                   else [(CHEST, 30, 61, 51), (PLAYER, 9, 1, 62)])
+                    self.reply(packet.requests[0], corrections)
+
+                self.stream.send = pause
+                if action == "take":
+                    operation = self.bot.take_from_container(30, 9, 1)
+                elif action == "put":
+                    operation = self.bot.put_into_container(9, 30, 1)
+                else:
+                    operation = self.transfer(1, chest=range(30, 31), player=range(9, 10))
+                moving = self.start(operation)
+                await asyncio.wait_for(entered.wait(), 1)
+                self.observe_block("minecraft:air", EAST)
+                self.observe_chest_pair()
+                release.set()
+                if action == "range":
+                    self.assertEqual(await moving, RangeTransferResult(1, (), "window_changed"))
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "container transfer endpoint changed"):
+                        await moving
+                self.assertEqual(self.outgoing(), [])
+
+    async def test_double_access_accepts_identical_runtime_and_pair_echoes(self):
+        self.observe_chest_pair()
+        self.open_double_for_move()
+        self.player_slot(9, self.stack())
+        send = self.stream.send
+
+        async def echo_before_write(packet, **kwargs):
+            self.observe_block("minecraft:air", EAST, layer=1)
+            self.observe_chest_pair()
+            await send(packet, **kwargs)
+            self.reply(packet.requests[0], [(CHEST, 30, 61, 51), (PLAYER, 9, 1, 62)])
+
+        self.stream.send = echo_before_write
+        receipt = await self.bot.take_from_container(30, 9, 1)
+        self.assertEqual(receipt.result.name, "SUCCESS")
+        self.assertEqual((self.bot.container_slots[30].stack_size, self.bot.inventory_slots[9].stack_size), (61, 1))
+        self.assertEqual(len(self.outgoing()), 1)
+
+    async def test_double_abandoned_access_receipt_updates_only_the_player_after_replacement(self):
+        pending = self.hold_requests()
+        for put in (False, True):
+            with self.subTest(put=put):
+                self.observe_chest_pair()
+                self.open_double_for_move()
+                window = self.bot.open_window
+                self.player_slot(9, self.stack(PAPER, 5, 61) if put else self.stack())
+                operation = (self.bot.put_into_container(9, 20, 2) if put
+                             else self.bot.take_from_container(20, 9, 2))
+                moving = self.start(operation)
+                request = await asyncio.wait_for(pending.get(), 1)
+                moving.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await moving
+                self.observe_block("minecraft:air", EAST)
+                self.observe_chest_pair()
+                self.reply(request, [(CHEST, 20, 7 if put else 3, 52), (CHEST, 30, 61, 51),
+                                     (PLAYER, 9, 3 if put else 2, 61 if put else 62)])
+                self.assertIs(self.bot.open_window, window)
+                self.assertEqual([self.bot.container_slots[i].stack_size for i in (20, 30)], [5, 62])
+                self.assertEqual(self.bot.inventory_slots[9].stack_size, 3 if put else 2)
+
+    async def test_double_shrunken_window_reports_change_before_actual_slot_bounds(self):
+        self.observe_chest_pair()
+        self.open_double_for_move()
+        self.content(*tuple(self.bot.container_slots.values())[:27], width=27)
+        self.player_slot(9, self.stack())
+        self.assertEqual(await self.within_chest(1, destination=range(30, 31)),
+                         RangeTransferResult(1, (), "window_changed"))
+        self.assertEqual(await self.transfer(1, chest=range(30, 31), player=range(9, 10)),
+                         RangeTransferResult(1, (), "window_changed"))
+
+        self.observe_block("minecraft:air", EAST)
+        self.observe_chest_pair_root(POSITION)
+        self.open_chest()
+        with self.assertRaisesRegex(ValueError, "0..27"):
+            await self.within_chest(1, destination=range(30, 31))
+        with self.assertRaisesRegex(ValueError, "0..27"):
+            await self.transfer(1, chest=range(30, 31), player=range(9, 10))
+        self.assertEqual(self.outgoing(), [])
+
+    async def test_double_replacement_during_later_receipt_preserves_only_first_step(self):
+        self.observe_chest_pair()
+        self.open_double_for_move()
+        pending = self.hold_requests()
+        moving = self.start(self.within_chest(6, destination=range(29, 31)))
+        first = await asyncio.wait_for(pending.get(), 1)
+        self.reply(first, [(CHEST, 20, 3, 52), (CHEST, 30, 64, 51)])
+        second = await asyncio.wait_for(pending.get(), 1)
+        self.assertEqual(self.action(second), (20, 29, 3, 52, 0))
+        self.observe_block("minecraft:air", EAST)
+        self.observe_chest_pair()
+        self.reply(second, [(CHEST, 20, 0, None), (CHEST, 29, 3, 52)])
+        result = await moving
+        self.assertEqual((result.stop_reason, result.confirmed_count), ("window_changed", 2))
+        self.assertEqual([step.confirmed for step in result.steps], [2, None])
+        self.assertEqual([self.bot.container_slots[i].stack_size for i in (20, 21, 29, 30)], [3, 8, 0, 64])
+        self.assertEqual(len(self.outgoing()), 2)
+
+    async def test_old_double_extra_slot_uses_physical_half_after_repairing_and_reopening(self):
+        far = (EAST[0] + 1, EAST[1], EAST[2])
+        pending = self.hold_requests()
+        for new_source, overlap, abandon, old_take in (
+            (22, True, "cancel", False), (49, False, "timeout", False), (22, True, "cancel", True),
+        ):
+            with self.subTest(new_source=new_source, abandon=abandon, old_take=old_take):
+                self.observe_chest_pair()
+                self.open_double_for_move(extra_slots=((49, 8, 61),))
+                timeout = 0.15 if abandon == "timeout" else 1
+                if old_take:
+                    self.player_slot(9, self.stack())
+                    old = self.start(self.bot.take_from_container(20, 9, 2, timeout=timeout))
+                else:
+                    old = self.start(self.within_chest(2, destination=range(30, 31), timeout=timeout))
+                request = await asyncio.wait_for(pending.get(), 1)
+                if abandon == "cancel":
+                    old.cancel()
+                with self.assertRaises(asyncio.CancelledError if abandon == "cancel" else TimeoutError):
+                    await old
+                self.observe_block("minecraft:air", POSITION)
+                self.observe_chest_pair(EAST, far)
+                self.open_double_for_move(far, extra_slots=((4, 61, 70), (22, 9, 71), (49, 9, 72)))
+                next_move = self.start(self.within_chest(2, source=range(new_source, new_source + 1),
+                                                       destination=range(4, 5)))
+                next_request = await asyncio.wait_for(pending.get(), 1)
+                counterpart = (PLAYER, 9, 2, 69) if old_take else (CHEST, 30, 64, 51)
+                self.reply(request, [(CHEST, 20, 3, 52), counterpart, (CHEST, 49, 4, 61)])
+                self.assertEqual([self.bot.container_slots[i].stack_size for i in (4, 20, 22, 30, 49)],
+                                 [61, 5, 9, 62, 9])
+                self.reply(next_request, [(CHEST, new_source, 7, 71 if overlap else 72), (CHEST, 4, 63, 70)])
+                result = await next_move
+                self.assertEqual((result.stop_reason, result.confirmed_count),
+                                 ("unconfirmed", 0) if overlap else ("complete", 2))
+                self.assertEqual([self.bot.container_slots[i].stack_size for i in (4, new_source)],
+                                 [61, 9] if overlap else [63, 7])
 
     async def test_same_chest_places_into_compatible_then_empty_without_touching_player(self):
         self.seed_chest_move()
@@ -502,8 +754,7 @@ class RangeTransferTests(unittest.IsolatedAsyncioTestCase):
         self.open_chest(width=None)
         self.assertEqual((await self.within_chest(1)).stop_reason, "unobserved")
         self.open_chest(width=54)
-        with self.assertRaisesRegex(RuntimeError, "27 slots"):
-            await self.within_chest(1)
+        self.assertEqual((await self.within_chest(1)).stop_reason, "unobserved")
         self.observe_block("minecraft:ender_chest")
         self.open_chest()
         with self.assertRaisesRegex(RuntimeError, "27 slots"):
@@ -513,8 +764,10 @@ class RangeTransferTests(unittest.IsolatedAsyncioTestCase):
             await self.within_chest(1)
         with self.assertRaisesRegex(ValueError, "must not overlap"):
             await self.within_chest(source=range(2, 5))
+        self.observe_block("minecraft:chest")
+        self.open_chest()
         with self.assertRaisesRegex(ValueError, "0..27"):
-            await self.within_chest(destination=range(2, 28))
+            await self.within_chest(destination=range(27, 28))
         self.assertEqual(self.outgoing(), [])
 
     async def test_shared_storage_reports_progress_after_merge_empty_and_rejection(self):

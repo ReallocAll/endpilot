@@ -193,6 +193,8 @@ class Containers:
         self._layout_token = object()
         self._window_block_name: str | None = None
         self._shared_storage_replaced: bool | None = None
+        self._window_chest_halves: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None
+        self._window_chest_pair_changed = False
         self._window_slot_count: int | None = None
         self._transfer_block_watches: set[Callable[[], None]] = set()
         self._slots: dict[int, object] | None = None
@@ -242,6 +244,8 @@ class Containers:
         self._layout_token = object()
         self._window_block_name = None
         self._shared_storage_replaced = None
+        self._window_chest_halves = None
+        self._window_chest_pair_changed = False
         self._window_slot_count = None
         self._entity_container = None
         self._slots = None
@@ -389,10 +393,15 @@ class Containers:
             self._slots[index] = updated
         self._slots_updated.set()
 
-    def _mark_late_single_container_overlap(self, anchor, index, *, except_request):
+    def _mark_late_container_overlap(self, anchor, index, *, halves, except_request):
         # A late extra correction still identifies the old physical slot.
         # The replacement window has its own observations of that slot.
-        endpoint = replace(anchor, slot=index, local_slot=index)
+        if halves is None:
+            endpoint = replace(anchor, slot=index, local_slot=index)
+        else:
+            half_index, local_slot = divmod(index, 27)
+            half = halves[half_index]
+            endpoint = replace(anchor, slot=index, local_slot=local_slot, half=half, possible_halves=frozenset((half,)))
         for pending in self.inventory._requests_for_endpoints((endpoint,), allow_possible=False):
             if pending is not except_request and pending.submitted and pending.on_unconfirmed is not None:
                 pending.on_unconfirmed()
@@ -485,14 +494,66 @@ class Containers:
         return (root["pairx"].value, position[1], root["pairz"].value), int(root["pairlead"].value)
 
     def _verified_chest_halves(self, position, facing):
-        # The north-facing X-axis sample proved that the lead half occupies slots 0–26.
-        if facing != "north" or (pair := self._chest_pair_observation(position)) is None:
+        if facing is None or (pair := self._chest_pair_observation(position)) is None:
             return None
         other, lead = pair
-        if (abs(position[0] - other[0]) != 1 or position[2] != other[2] or self._chest_facing(other) != facing
+        width_axis = 0 if facing in ("north", "south") else 2
+        depth_axis = 2 - width_axis
+        if (abs(position[width_axis] - other[width_axis]) != 1 or position[depth_axis] != other[depth_axis]
+                or self._chest_facing(other) != facing
                 or self._chest_pair_observation(other) != (position, 1 - lead)):
             return None
+        # Either half opens the same server ordering with the lead at slots 0–26.
         return (position, other) if lead else (other, position)
+
+    def _observed_paired_chest_halves(self, window):
+        if self.window is window and (self._window_slot_count == 54 or self._window_chest_pair_changed):
+            return self._window_chest_halves
+        return None
+
+    def _paired_chest_window_is_current(self, window):
+        halves = self._window_chest_halves
+        return (self.window is window and self._window_slot_count == 54
+                and not self._window_chest_pair_changed and halves is not None
+                and self._verified_chest_halves(window.position, self._chest_facing(window.position)) == halves)
+
+    def _watch_paired_chest(self, halves):
+        blocks = self._blocks
+        b = self.packets.protocol.binding
+        lead, follower = halves
+        expected = {lead: (follower, 1), follower: (lead, 0)}
+        opening_ids = {position: blocks.observed_block(position).runtime_id for position in halves}
+
+        def observe(position):
+            block = blocks.observed_block(position)
+            if block is not None and (block.is_air is True or (
+                block.runtime_id is not None and block.runtime_id != opening_ids[position]
+            )):
+                self._window_chest_pair_changed = True
+            if (blocks._block_entity(position) is not None
+                    and self._chest_pair_observation(position) != expected[position]):
+                self._window_chest_pair_changed = True
+
+        def observe_block(change):
+            position = change.after.position
+            if position in expected:
+                observe(position)
+
+        def observe_world_packet(raw):
+            # Blocks applies these roots before this watcher reads them.
+            if raw.packet_id in (b.BlockActorDataPacket.ID, b.SubChunkPacket.ID, b.LevelChunkPacket.ID):
+                for position in halves:
+                    observe(position)
+
+        stop_updates = blocks.subscribe_block_changes(observe_block, layer=0, dimension_id=blocks.dimension_id)
+        stop_packets = self.packets.subscribe_raw(observe_world_packet)
+
+        def stop():
+            self._transfer_block_watches.remove(stop)
+            stop_updates()
+            stop_packets()
+
+        self._transfer_block_watches.add(stop)
 
     def _block_transfer_endpoint(self, index: int) -> _BlockTransferEndpoint | None:
         window = self.window
@@ -566,6 +627,12 @@ class Containers:
             window = self._decode_open(raw)
             self._set_window(window)
             block_name = self._observed_window_block_name(window)
+            if block_name == "minecraft:chest":
+                facing = self._chest_facing(window.position)
+                halves = self._verified_chest_halves(window.position, facing)
+                if halves is not None:
+                    self._window_chest_halves = halves
+                    self._watch_paired_chest(halves)
             if (block_name != "minecraft:chest" and _shared_storage_domain(block_name) is not None
                     and self.packets.protocol.number == 2225):
                 self._shared_storage_replaced = False
@@ -628,6 +695,8 @@ class Containers:
                     return
                 before = (self._slots or {}) if self._slot_observers else None
                 if self._window_slot_count != count:
+                    if self._window_slot_count == 54 and self._window_chest_halves is not None:
+                        self._window_chest_pair_changed = True
                     self._layout_token = object()
                     self._window_slot_count = count
                 self._slots = dict(enumerate(packet.slots))
@@ -1447,6 +1516,13 @@ class Containers:
             raise RuntimeError("container window or its server-reported slots are unavailable")
         layout = self._layout_token
         observed_slot_count = self._observed_window_slot_count(window)
+        opening_pair = self._observed_paired_chest_halves(window)
+        if opening_pair is not None and not self._paired_chest_window_is_current(window):
+            if _range_window_current is not None:
+                raise _InventoryMoveNotSubmitted("window_changed")
+            if _expected_slots is not None:
+                return None
+            raise RuntimeError("container transfer endpoint changed before submission")
         if _expected_slot_count is not None and observed_slot_count != _expected_slot_count:
             raise RuntimeError("container slot count changed before transfer")
         strict_slot_count = None
@@ -1528,8 +1604,12 @@ class Containers:
         brewing = window.container_type == "BREWING_STAND"
         player_endpoint = (None, player_slot)
         block_endpoint = self._block_transfer_endpoint(chest_slot)
-        shared_anchor = (block_endpoint if observed_slot_count == 27
-                         and _shared_storage_domain(self._window_block_name) == container_name else None)
+        paired_halves = opening_pair
+        if paired_halves is None and observed_slot_count == 54 and self._window_block_name == "minecraft:chest":
+            paired_halves = self._verified_chest_halves(window.position, self._chest_facing(window.position))
+        shared_anchor = block_endpoint if (paired_halves is not None or (
+            observed_slot_count == 27 and _shared_storage_domain(self._window_block_name) == container_name
+        )) else None
         chest_endpoint = block_endpoint if entity_container is None else (entity_container.instance, chest_slot)
         endpoints = {player_endpoint}
         if chest_endpoint is not None:
@@ -1690,6 +1770,7 @@ class Containers:
 
         def window_is_current():
             return (self.window is window and self._layout_token is layout
+                    and (opening_pair is None or self._paired_chest_window_is_current(window))
                     and (entity_container is None or
                          (self._entity_container is entity_container and entity_container.is_visible())))
 
@@ -1830,8 +1911,9 @@ class Containers:
                     elif (success and matches_window and shared_anchor is not None and index != chest_slot
                           and 0 <= index < observed_slot_count and slot.requested_slot == index
                           and container.full_container_name.dynamic_id is None):
-                        self._mark_late_single_container_overlap(
-                            shared_anchor, index, except_request=self.inventory._pending_requests[request_id],
+                        self._mark_late_container_overlap(
+                            shared_anchor, index, halves=paired_halves,
+                            except_request=self.inventory._pending_requests[request_id],
                         )
                     elif name in _PLAYER_CONTAINERS:
                         if preserve_player_slot:
@@ -1934,7 +2016,8 @@ class Containers:
 
         if exact_block and not _queued:
             stop_watching = self._watch_transfer_block(window.position, observe_target)
-        check_at_write = stop_watching is not None or _range_window_current is not None or strict_slot_count is not None
+        check_at_write = (stop_watching is not None or _range_window_current is not None
+                          or strict_slot_count is not None or opening_pair is not None)
         try:
             return await self.inventory._request_item_stack(
                 request, apply_horse if horse else apply, timeout=timeout, queued=_queued, before_send=before_send,
@@ -1961,6 +2044,7 @@ class Containers:
         if None in endpoints:
             raise _InventoryMoveNotSubmitted("window_changed")
         slot_count = self._window_slot_count
+        halves = self._window_chest_halves if slot_count == 54 else None
         inventory = self.inventory
         if inventory._requests_for_endpoints(endpoints):
             raise _InventoryMoveNotSubmitted("unconfirmed")
@@ -2023,7 +2107,7 @@ class Containers:
             own = inventory._pending_requests[request_id]
             if not window_is_current():
                 for index in corrections.keys() - originals.keys():
-                    self._mark_late_single_container_overlap(anchor, index, except_request=own)
+                    self._mark_late_container_overlap(anchor, index, halves=halves, except_request=own)
                 return
             current = {index: self._slots.get(index) for index in indices}
             before = {} if self._slot_observers else None
