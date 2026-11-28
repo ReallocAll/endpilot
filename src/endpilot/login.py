@@ -28,7 +28,7 @@ from .entity_registry import EntityRegistrySnapshot, _read_entity_registry
 from .forms import FORM_PACKET_IDS
 from .item_registry import ItemRegistrySnapshot
 from .player_state import VITAL_ATTRIBUTES, air_metadata, movement_speed_attribute, swimming_metadata
-from .protocol import Protocol, RawPacket, read_batch, write_batch
+from .protocol import Protocol, RawPacket, _supports_feature, read_batch, write_batch
 from .qa import PacketTimeline
 from .resource_packs import PackDecisionHandler, ResourcePackExchange, ResourcePackIndex
 from .scoreboard import SCOREBOARD_PACKET_IDS
@@ -114,7 +114,7 @@ def _validate_chunk_radius(radius: int) -> None:
 
 
 def _validate_join(protocol: Protocol, chunk_radius: int, locale: str, timeout: float, *, online: bool) -> None:
-    if online and protocol.number != 2225:
+    if online and not _supports_feature(protocol.number, "xbox_login"):
         raise ValueError("online login requires protocol 2225")
     _validate_chunk_radius(chunk_radius)
     _validate_locale(locale)

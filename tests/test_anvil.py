@@ -352,7 +352,10 @@ class AnvilTests(unittest.IsolatedAsyncioTestCase):
 class AnvilSessionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.enterContext(ManualClock().patch_scheduler())
-        self.bot = Bot("PreviewAnvil", protocol=2225)
+        await self.join(2225)
+
+    async def join(self, number):
+        self.bot = Bot("PreviewAnvil", protocol=number)
         self.addAsyncCleanup(self.bot.close)
         self.b = b = self.bot.protocol.binding
         self.wire = Wire(self.bot.protocol)
@@ -418,6 +421,36 @@ class AnvilSessionTests(unittest.IsolatedAsyncioTestCase):
         verdict = stack_response(self.b, request, *rows, result=result)
         await self.deliver(self.b.ItemStackResponsePacket(responses=[verdict]))
         self.assertEqual((await pending).result.name, result)
+
+    async def test_protocol_feature_matches_survival_material_preview(self):
+        for number, expected in ((2225, AnvilPreview(3, 3)), (2193, None)):
+            with self.subTest(protocol=number):
+                if self.bot.protocol.number != number:
+                    await self.bot.close()
+                    await self.join(number)
+                b = self.b
+                protocol = self.bot.protocol
+                self.assertIs(protocol.supports_feature("preview_anvil"), expected is not None)
+                self.assertIsNone(self.bot.open_window)
+                self.assertIsNone(self.bot.preview_anvil())
+
+                pickaxe = item(b, 299, 1, 1)
+                pickaxe.user_data_buffer = bytes.fromhex("ffff010a000003060044616d6167657d000000000000000000000000")
+                ingots = item(b, 307, 4, 2)
+                ingots.user_data_buffer = bytes(10)
+                registry = b.ItemRegistryPacket(items=[
+                    b.ItemData(id=299, name="minecraft:iron_pickaxe"),
+                    b.ItemData(id=307, name="minecraft:iron_ingot"),
+                ])
+                await self.deliver(registry, self.window_packet(), self.ui_packet(pickaxe, ingots))
+                self.assertEqual(self.bot.game_mode, b.GameType.SURVIVAL)
+                self.assertEqual(self.bot.open_window.container_type, "ANVIL")
+                self.assertEqual([self.bot.container_slots[index].stack_size for index in (1, 2)], [1, 4])
+                self.assertEqual(self.bot.preview_anvil(), expected)
+                await self.deliver(b.SetPlayerGameTypePacket(player_game_type=b.GameType.CREATIVE))
+                self.assertIsNone(self.bot.preview_anvil())
+                self.assertIs(protocol.supports_feature("preview_anvil"), expected is not None)
+                self.assertEqual(self.wire.sent, [])
 
     async def test_anvil_mode_change_while_waiting_to_write_leaves_staging_intact(self):
         b = self.b

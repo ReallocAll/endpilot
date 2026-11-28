@@ -7,11 +7,22 @@ import bedrock_protocol
 from bedrock_protocol import v898, v2168, v2193, v2225
 from cramjam import snappy
 
+from endpilot import Bot
 from endpilot.compression import PacketConnection
 from endpilot.protocol import Protocol, RawPacket, read_batch, write_batch
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_bot_protocol_reports_features_before_join(self):
+        for number, expected in ((1001, False), (2193, False), (2225, True)):
+            with self.subTest(protocol=number):
+                protocol = Bot(protocol=number).protocol
+                self.assertIs(protocol.supports_feature("preview_anvil"), expected)
+                self.assertIs(protocol.supports_feature("xbox_login"), expected)
+                with self.assertRaises(KeyError) as unknown:
+                    protocol.supports_feature("unknown")
+                self.assertEqual(unknown.exception.args, ("unknown",))
+
     def test_network_settings_and_unmodelled_packet_in_one_batch(self):
         for protocol, number, wire_version in (
             (Protocol(2193), 2193, "08 91"),

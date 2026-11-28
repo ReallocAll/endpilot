@@ -2,6 +2,25 @@
 
 See the [login tutorial](../tutorials/login.md) for transport setup and Xbox sign-in.
 
+## Check SDK features for a protocol
+
+`bot.protocol.supports_feature(name)` is a synchronous query for the selected
+protocol. It is available before joining and sends no packets. The names
+`"preview_anvil"` and `"xbox_login"` return `True` on protocol 2225 and
+`False` on other available protocols. Unknown names raise `KeyError`.
+
+```python
+from endpilot import Bot
+
+bot = Bot(protocol=2225)
+can_preview = bot.protocol.supports_feature("preview_anvil")
+can_sign_in = bot.protocol.supports_feature("xbox_login")
+```
+
+A `True` result describes the SDK implementation. The server's login
+requirements and the game mode, window and observed inputs needed for an
+anvil preview are still determined during play. [Anvil preview](items.md#preview-anvil-costs)
+
 ## Accept server resource packs
 
 Either join method accepts an `on_resource_packs` callback. For a nonempty

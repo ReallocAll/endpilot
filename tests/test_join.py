@@ -187,6 +187,7 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(transport=transport, protocol=protocol, options=options):
                     bot = Bot("Retry", protocol=protocol)
                     self.addAsyncCleanup(bot.close)
+                    self.assertIs(bot.protocol.supports_feature("xbox_login"), protocol == 2225)
                     join = getattr(bot, f"join_{transport}")
                     with (
                         patch("endpilot.bot.acquire_online_identity", return_value=_online_identity()) as acquire,

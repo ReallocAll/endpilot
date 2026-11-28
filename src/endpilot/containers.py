@@ -20,6 +20,7 @@ from .inventory import (
     _TransferEndpoint,
     _correct_observed_item, _response_item, _stack_snapshot,
 )
+from .protocol import _supports_feature
 
 
 @dataclass(frozen=True, slots=True)
@@ -1432,7 +1433,7 @@ class Containers:
     ) -> AnvilPreview | None:
         _validate_anvil_name(new_name)
         protocol = self.packets.protocol
-        if protocol.number != 2225 or game_mode != protocol.binding.GameType.SURVIVAL:
+        if not _supports_feature(protocol.number, "preview_anvil") or game_mode != protocol.binding.GameType.SURVIVAL:
             return None
         window, slots = self.window, self._slots
         if window is None or window.container_type != "ANVIL" or slots is None:

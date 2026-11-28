@@ -10,6 +10,16 @@ from bedrock_protocol import v712, v924, v2168
 
 DEFAULT_PROTOCOL = 2225
 
+_FEATURE_PROTOCOLS = {
+    "preview_anvil": (2225,),
+    "xbox_login": (2225,),
+}
+
+
+def _supports_feature(number: int, name: str) -> bool:
+    return number in _FEATURE_PROTOCOLS[name]
+
+
 # These packet constructors use helper types declared in earlier codec modules.
 _HELPER_OWNERS = {
     "ActorDataFlagComponent": {2193: v2168, 2225: v2168},
@@ -122,6 +132,14 @@ class Protocol:
     def __init__(self, number: int = DEFAULT_PROTOCOL):
         self.number = number
         self.binding = _Binding(number)
+
+    def supports_feature(self, name: str) -> bool:
+        """Report SDK support for a feature on this protocol.
+
+        Supported names are `preview_anvil` and `xbox_login`. An unknown
+        name raises KeyError. The query needs only the selected protocol number.
+        """
+        return _supports_feature(self.number, name)
 
     def encode(self, packet) -> RawPacket:
         return RawPacket(type(packet).ID, self.binding.encode(packet))
