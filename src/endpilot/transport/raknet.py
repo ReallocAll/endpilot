@@ -9,7 +9,8 @@ import raknet.asyncio
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from .._join_failure import (
-    _cleanup_failed_candidate, _join_progress, _record_connection_failure, _record_join_failure, _symbol_code,
+    _cleanup_failed_candidate, _join_progress, _mark_candidate_cleanup_failed, _record_connection_failure,
+    _record_join_failure, _symbol_code,
 )
 
 
@@ -35,9 +36,11 @@ async def _create_peer() -> raknet.asyncio.Peer:
     except asyncio.CancelledError as cancellation:
         try:
             peer = await _drain_task(startup)
-            await _drain_task(asyncio.create_task(peer.close(0)))
         except BaseException as error:
             cancellation.add_note(f"RakNet startup cleanup failed: {error!r}")
+        else:
+            await _cleanup_failed_candidate(_drain_task(asyncio.create_task(peer.close(0))), cancellation,
+                                            "RakNet startup cleanup failed")
         raise
 
 
@@ -49,7 +52,11 @@ async def _close_peer(peer: raknet.asyncio.Peer, timeout: float) -> None:
         try:
             await _drain_task(closing)
         except BaseException as error:
+            _mark_candidate_cleanup_failed()
             cancellation.add_note(f"RakNet peer close failed: {error!r}")
+        raise
+    except Exception:
+        _mark_candidate_cleanup_failed()
         raise
 
 

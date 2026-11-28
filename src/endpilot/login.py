@@ -345,6 +345,9 @@ class JoinSession:
                 try:
                     number = await advertised_protocol(host, port, timeout=ping_timeout)
                 except (TimeoutError, ValueError, RakNetError):
+                    progress = _join_progress.get()
+                    if progress is not None and progress.cleanup_failed:
+                        raise
                     number = None
                 await _on_protocol(number)
                 _set_join_stage("transport_connect")
@@ -406,7 +409,7 @@ class JoinSession:
                     _record_candidate_failure(error.error, _candidate_transport, progress.stage, _transport_closed)
                     return error
             _record_candidate_failure(error, _candidate_transport, progress.stage, _transport_closed)
-            if _retry_before_link and transport is None:
+            if _retry_before_link and transport is None and not progress.cleanup_failed:
                 if isinstance(error, TimeoutError) and deadline.expired():
                     cancelled = error.__cause__
                     # The deadline can interrupt the library while it is unwinding a refusal.

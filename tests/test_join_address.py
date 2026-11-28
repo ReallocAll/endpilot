@@ -193,9 +193,6 @@ class JoinAddressTests(unittest.IsolatedAsyncioTestCase):
                     connection = self._mock_connection()
                     timeout = ConnectionFailed(SessionError.NEGOTIATION_TIMEOUT_WAITING_FOR_ACCEPT)
                     connection._await_connected.side_effect = timeout
-                    cleanup = OSError(errno.EBADF, "failed to close the unavailable NetherNet candidate")
-                    if not explicit:
-                        connection._session.aclose.side_effect = cleanup
                     with (
                         patch("endpilot.transport._nethernet_http._make_http_session", return_value=connection),
                         self.assertRaises(ConnectionFailed if explicit else _NetherNetUnavailable) as caught,
@@ -206,10 +203,52 @@ class JoinAddressTests(unittest.IsolatedAsyncioTestCase):
                         )
                     error = caught.exception if explicit else caught.exception.error
                     self.assertIs(error, timeout)
-                    if not explicit:
-                        self.assertIn(repr(cleanup), " ".join(error.__notes__))
                     connection._session.accept_answer.assert_awaited_once_with("v=0")
                     connection._session.aclose.assert_awaited_once_with(SessionError.GENERIC_FAILURE)
+
+    async def test_nethernet_https_pre_link_failure_only_allows_http_after_successful_cleanup(self):
+        cleanup_failure = OSError(errno.EBADF, "failed to close the HTTPS candidate")
+        for cleanup in (None, cleanup_failure):
+            with self.subTest(cleanup=cleanup):
+                bot = Bot("Knight")
+                self.addAsyncCleanup(bot.close)
+                wire = _spawn_transport(bot.protocol, 42)
+                failed = ConnectionFailed(SessionError.NEGOTIATION_TIMEOUT_WAITING_FOR_ACCEPT)
+                connection = self._mock_connection()
+                connection._await_connected.side_effect = failed
+                connection._session.aclose.side_effect = cleanup
+
+                async def dial(url, **options):
+                    if url.startswith("https://"):
+                        return await connect_http(url, **options)
+                    return wire
+
+                with (
+                    patch("endpilot.transport.nethernet._check_signaling_endpoint") as get,
+                    patch("endpilot.transport.nethernet.connect_http", side_effect=dial) as connect,
+                    patch("endpilot.transport._nethernet_http._make_http_session", return_value=connection),
+                    patch("endpilot.transport._nethernet_http._request_answer", return_value="v=0"),
+                    patch("endpilot.transport.raknet.connect") as raknet,
+                ):
+                    if cleanup is None:
+                        await bot.join_address("127.0.0.1:19132")
+                        self.assertEqual(bot.player_id, 42)
+                        await bot.close()
+                        candidates = ["https://127.0.0.1:19132", "http://127.0.0.1:19132"]
+                    else:
+                        with self.assertRaises(ConnectionFailed) as caught:
+                            await bot.join_address("127.0.0.1:19132")
+                        self.assertIs(caught.exception, failed)
+                        self.assertEqual(failed.join_failure, JoinFailureDetails(
+                            "nethernet_https", "transport_connect", "timeout", "nethernet_session_error",
+                            "NEGOTIATION_TIMEOUT_WAITING_FOR_ACCEPT",
+                        ))
+                        self.assertIn(repr(cleanup), " ".join(failed.__notes__))
+                        candidates = ["https://127.0.0.1:19132"]
+                self.assertEqual([call.args[0] for call in get.await_args_list], candidates)
+                self.assertEqual([call.args[0] for call in connect.await_args_list], candidates)
+                connection._session.aclose.assert_awaited_once_with(SessionError.GENERIC_FAILURE)
+                raknet.assert_not_awaited()
 
     @staticmethod
     def _mock_connection():

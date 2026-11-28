@@ -22,6 +22,7 @@ class JoinFailureDetails:
 class _JoinProgress:
     stage: str | None = "transport_connect"
     transport: object | None = None
+    cleanup_failed: bool = False
 
 
 _join_progress: ContextVar[_JoinProgress | None] = ContextVar("join_progress", default=None)
@@ -33,6 +34,12 @@ def _set_join_stage(stage: str) -> None:
         progress.stage = stage
 
 
+def _mark_candidate_cleanup_failed() -> None:
+    progress = _join_progress.get()
+    if progress is not None and progress.stage is not None:
+        progress.cleanup_failed = True
+
+
 def _note_join_cleanup_failure(primary: BaseException, cleanup_error: BaseException, activity: str) -> None:
     if cleanup_error is primary:
         return
@@ -41,13 +48,17 @@ def _note_join_cleanup_failure(primary: BaseException, cleanup_error: BaseExcept
         primary.add_note(note)
 
 
-async def _cleanup_failed_candidate(cleanup: Awaitable[None], primary: BaseException, activity: str) -> None:
+async def _cleanup_failed_candidate(cleanup: Awaitable[None], primary: BaseException,
+                                    activity: str) -> BaseException | None:
     try:
         await cleanup
     except (Exception, asyncio.CancelledError) as cleanup_error:
+        _mark_candidate_cleanup_failed()
         if isinstance(cleanup_error, asyncio.CancelledError) and not isinstance(primary, asyncio.CancelledError):
             raise
         _note_join_cleanup_failure(primary, cleanup_error, activity)
+        return cleanup_error
+    return None
 
 
 def _nethernet_transport(url: str) -> str | None:

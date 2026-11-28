@@ -35,8 +35,9 @@ Join exceptions can carry an immutable `endpilot.JoinFailureDetails` in
 explicit cause remain available. Use `getattr` because errors before a candidate
 is selected, such as Xbox authorization failures, may have no join details.
 The details describe the candidate's join through spawn. Gameplay sends after
-join use their original transport errors. Cleanup failures may appear in the
-primary exception's Python notes.
+join use their original transport errors. If a candidate fails to clean up,
+automatic selection stops. Cleanup failures may appear in the primary
+exception's Python notes or in the notes of an exception in its cause chain.
 
 ```python
 try:

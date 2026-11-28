@@ -190,6 +190,45 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(getattr(caught.exception, "join_failure", None))
         self.assertIn(repr(cleanup), " ".join(caught.exception.__notes__))
 
+    async def test_raknet_probe_timeout_only_allows_dial_after_successful_cleanup(self):
+        from endpilot.login import _prepare_block_palette
+
+        await _prepare_block_palette()
+        cleanup_failure = OSError(errno.EBADF, "failed to close the discovery peer")
+        for cleanup in (None, cleanup_failure):
+            with self.subTest(cleanup=cleanup):
+                bot = Bot(protocol=None)
+                self.addAsyncCleanup(bot.close)
+                wire = _spawn_transport(bot.protocol, 42)
+                probe_cancellations = []
+
+                async def ping(_address):
+                    try:
+                        await asyncio.Future()
+                    except asyncio.CancelledError as error:
+                        probe_cancellations.append(error)
+                        raise
+
+                peer = SimpleNamespace(ping=ping, close=AsyncMock(side_effect=cleanup))
+                with (
+                    patch("endpilot.transport.raknet._create_peer", return_value=peer),
+                    patch("endpilot.transport.raknet.connect", return_value=wire) as dial,
+                ):
+                    if cleanup is None:
+                        await bot.join_raknet("127.0.0.1", timeout=1)
+                        dial.assert_awaited_once_with("127.0.0.1", 19132)
+                        self.assertEqual(bot.player_id, 42)
+                        await bot.close()
+                    else:
+                        with self.assertRaises(TimeoutError) as caught:
+                            await bot.join_raknet("127.0.0.1", timeout=1)
+                        dial.assert_not_awaited()
+                        error = caught.exception
+                        self.assertEqual(error.join_failure, JoinFailureDetails("raknet", "transport_discovery", "timeout"))
+                        self.assertIs(error.__cause__.__cause__, probe_cancellations[0])
+                        self.assertIn(repr(cleanup), " ".join(probe_cancellations[0].__notes__))
+                peer.close.assert_awaited_once_with(0)
+
     async def test_raknet_chat_from_first_post_join_tick_has_no_join_diagnostic(self):
         from endpilot.transport.raknet import RakNetTransport
 

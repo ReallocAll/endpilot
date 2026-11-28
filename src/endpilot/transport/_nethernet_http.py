@@ -243,6 +243,8 @@ async def connect_http(
         if isinstance(error, InvalidIdentity):
             _record_join_failure(error, _nethernet_transport(url), "transport_connect", "identity_verification")
         primary = error.error if isinstance(error, _NetherNetUnavailable) else error
-        await _cleanup_failed_candidate(session.aclose(SessionError.GENERIC_FAILURE), primary,
-                                        "NetherNet cleanup after failed dial")
-        raise
+        cleanup_error = await _cleanup_failed_candidate(session.aclose(SessionError.GENERIC_FAILURE), primary,
+                                                        "NetherNet cleanup after failed dial")
+        if cleanup_error is None or primary is error:
+            raise
+    raise primary
