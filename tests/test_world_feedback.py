@@ -5,7 +5,7 @@ import weakref
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from bedrock_protocol import nbt
+from bedrock_protocol import ServerBlockProperty, nbt
 
 from endpilot import BlockEvent, Bot, vanilla_note_instruments
 from endpilot.block_data import vanilla_block_state
@@ -45,12 +45,13 @@ class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.bot.close)
         await self.join()
 
-    async def join(self, *before_spawn, hashed=True):
+    async def join(self, *before_spawn, hashed=True, block_properties=()):
         b = self.b
         self.incoming = asyncio.Queue()
         transport = SimpleNamespace(recv=self.incoming.get, send=AsyncMock(), close=AsyncMock())
         self.push(b.NetworkSettingsPacket(compression_algorithm=b.PacketCompressionAlgorithm.NONE))
-        self.push(b.StartGamePacket(runtime_id=7, entity_id=4, block_network_ids_are_hashes=hashed),
+        self.push(b.StartGamePacket(runtime_id=7, entity_id=4, block_network_ids_are_hashes=hashed,
+                                   block_properties=list(block_properties)),
                   *before_spawn, b.PlayStatusPacket(status=b.PlayStatus.PLAYER_SPAWN))
         with patch("endpilot.transport.nethernet.connect", return_value=transport):
             await self.bot.join_nethernet("http://127.0.0.1:19132")
@@ -460,6 +461,55 @@ class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
             event = waiter.result()
             self.assertEqual((event.kind, event.position, event.chest_partner), (kind, position, None))
             self.assertEqual(self.bot.protocol.encode(event.packet), raw)
+
+    async def test_ender_and_shulker_lids_keep_the_packet_position_and_never_pair(self):
+        b = self.b
+        for index, state_id in enumerate((1239582919, 2647010207, 670752730)):
+            # Main-layer runtime IDs captured for the ender, undyed and red containers.
+            target, neighbor = (0, 220, index), (1, 220, index)
+            opened = b.BlockEventPacket(pos=self.pos(target), b0=1, b1=1)
+            closed = b.BlockEventPacket(pos=self.pos(target), b0=1, b1=0)
+            next_door = b.BlockEventPacket(pos=self.pos(neighbor), b0=1, b1=1)
+            events = []
+            unsubscribe = self.bot.subscribe_block_events(events.append, position=target)
+            try:
+                event = await self.block_event(
+                    b.UpdateBlockPacket(pos=self.pos(target), runtime_id=state_id),
+                    b.UpdateBlockPacket(pos=self.pos(neighbor), runtime_id=state_id),
+                    self.chest_root(target, neighbor, 1), self.chest_root(neighbor, target, 0),
+                    next_door, opened, opened, closed, position=target, kind="chest_close",
+                )
+            finally:
+                unsubscribe()
+            self.assertEqual(event, events[-1])
+            self.assertEqual([(row.kind, row.position, row.chest_partner, row.packet) for row in events], [
+                ("chest_open", target, None, opened), ("chest_open", target, None, opened),
+                ("chest_close", target, None, closed),
+            ])
+
+    async def test_lid_feedback_uses_observed_main_layer_and_vanilla_names(self):
+        b = self.b
+        target = (0, 220, 5)
+        await self.bot.close()
+        await self.join(block_properties=(ServerBlockProperty(name="fixture:red_shulker_box"),))
+        event = b.BlockEventPacket(pos=self.pos(target), b0=1, b1=1)
+        stone, custom_id, red = 2150698529, 0xD15C0000, 670752730
+        for state_id in (None, stone, custom_id):
+            with self.subTest(state_id=state_id):
+                update = [] if state_id is None else [b.UpdateBlockPacket(pos=self.pos(target), runtime_id=state_id)]
+                feedback = await self.block_event(
+                    b.UpdateBlockPacket(pos=self.pos(target), runtime_id=red, layer=1), *update, event,
+                    position=target,
+                )
+                self.assertEqual((feedback.kind, feedback.chest_partner, feedback.packet), ("block", None, event))
+                self.assertEqual(self.bot.observed_block_state(target, layer=1).name, "minecraft:red_shulker_box")
+                if state_id is None:
+                    self.assertIsNone(self.bot.observed_block(target))
+                else:
+                    self.assertEqual(self.bot.observed_block(target).runtime_id, state_id)
+                    if state_id == stone:
+                        self.assertEqual(self.bot.observed_block_state(target).name, "minecraft:stone")
+        self.assertIsNone(self.bot.observed_block_state(target))
 
     async def test_chest_partner_needs_two_current_reciprocal_roots_and_filters_original_position(self):
         b = self.b

@@ -10,6 +10,7 @@ from bedrock_protocol import nbt
 
 from .blocks import Blocks
 from .compression import PacketConnection
+from .containers import _ENDER_CHEST, _SHULKER_BOXES
 
 if TYPE_CHECKING:
     from .login import _SessionEndState
@@ -21,6 +22,8 @@ _Cell = tuple[int, int, int]
 _CRACK_EVENTS = {3600: "crack_start", 3601: "crack_end", 3602: "crack_progress"}
 _BLOCK_PARTICLE_EVENTS_2225 = frozenset((2001, 3603, 3604, 3605, 3606, 3607, 3608))
 _PISTON_STATES = {0: "piston_retracted", 1: "piston_extending", 2: "piston_extended", 3: "piston_retracting"}
+_PAIRABLE_CHESTS = frozenset(("minecraft:chest", "minecraft:trapped_chest"))
+_LID_BLOCKS = _SHULKER_BOXES.union(_PAIRABLE_CHESTS, (_ENDER_CHEST,))
 _CHEST_ROOT_TAGS = {"id": nbt.StringTag, "x": nbt.IntTag, "y": nbt.IntTag, "z": nbt.IntTag,
                     "pairx": nbt.IntTag, "pairz": nbt.IntTag, "pairlead": nbt.ByteTag}
 _NOTE_INSTRUMENTS_2225 = MappingProxyType({
@@ -303,9 +306,10 @@ class WorldFeedback:
             kind = "block"
             if self._is_2225 and packet.b0 == 1 and packet.b1 in (0, 1):
                 state = self._block_state(position)
-                if state is not None and state.name in ("minecraft:chest", "minecraft:trapped_chest"):
+                if state is not None and state.name in _LID_BLOCKS:
                     kind = "chest_open" if packet.b1 == 1 else "chest_close"
-                    chest_partner = self._chest_partner(position, state.name)
+                    if state.name in _PAIRABLE_CHESTS:
+                        chest_partner = self._chest_partner(position, state.name)
         elif packet.ID == b.BlockActorDataPacket.ID:
             tag = packet.data
             actor_id = tag["id"] if "id" in tag else None
