@@ -1588,29 +1588,41 @@ class Blocks:
         # Limit the low-speed approach to the ordinary dry grass surface on
         # which its acceleration and braking have been measured.
         required = [self._descent_landing(landing), self._flat_stance(source)]
-        for x, y, z in (source, landing, buffer):
-            floor = (x, y - 1, z)
-            block = self.observed_block(floor)
-            state = None if block is None else self._vanilla_state(block.runtime_id)
-            grass = (False if block is not None and block.is_air is True else
-                     None if state is None else state.name == "minecraft:grass_block" and state.unit_cube
-                     and state.outline == _UNIT_BOX and not state.unsafe_support)
-            required.extend((grass, self._stance_air(self.observed_block(floor, layer=1))))
-        # The third column is never a landing target. The only obstructions
-        # admitted there have the measured, entirely in-cell geometry.
+        # The bounded descent stops before this column. Admit dry masonry
+        # only when its geometry stays inside the cell, outside that sweep.
+        covered_floor = None
         x, y, z = buffer
         for height in range(y, y + 3):
             cell = (x, height, z)
             block = self.observed_block(cell)
             primary = self._stance_air(block)
+            masonry = None if primary is None else False
             if primary is False:
                 state = self._vanilla_state(block.runtime_id)
-                primary = not state.unsafe_support and not state.unresolved_overhang and (
-                    (height == y and state.name == "minecraft:leaf_litter")
-                    or (height == y + 2 and state.name == "minecraft:birch_leaves"
-                        and state.unit_cube and state.outline == _UNIT_BOX)
-                )
+                solid = (state.unit_cube and state.outline == _UNIT_BOX
+                         and not state.unsafe_support and not state.unresolved_overhang)
+                masonry = solid and state.plain_masonry
+                primary = (masonry
+                           or (height == y and state.name == "minecraft:leaf_litter"
+                               and not state.unsafe_support and not state.unresolved_overhang)
+                           or (height == y + 2 and solid and state.name == "minecraft:birch_leaves"))
             required.extend((primary, self._stance_air(self.observed_block(cell, layer=1))))
+            if height == y:
+                covered_floor = masonry
+        for x, y, z in (source, landing, buffer):
+            floor = (x, y - 1, z)
+            block = self.observed_block(floor)
+            state = None if block is None else self._vanilla_state(block.runtime_id)
+            floor_ok = None
+            if block is not None and block.is_air is True:
+                floor_ok = False
+            elif state is not None:
+                floor_ok = state.unit_cube and state.outline == _UNIT_BOX and not state.unsafe_support
+                if floor_ok and state.name != "minecraft:grass_block":
+                    # The masonry wall keeps the player off the covered floor.
+                    floor_ok = (covered_floor if (x, y, z) == buffer
+                                and state.name in ("minecraft:dirt", "minecraft:stone") else False)
+            required.extend((floor_ok, self._stance_air(self.observed_block(floor, layer=1))))
         if False in required:
             return False
         return True if all(required) else None

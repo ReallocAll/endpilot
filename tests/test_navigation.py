@@ -3003,6 +3003,25 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((plans, self.stream.sent), ([], []))
                 self.set_block(cell, self.AIR)
 
+    async def test_can_descend_then_turn_without_entering_a_known_masonry_runout(self):
+        self.prepare_descent()
+        self.blocks._player_game_type = "SURVIVAL"
+        self.movement._gap_jump_allowed = lambda: True
+        source, landing, goal = (0, 100, 0), (1, 99, 0), (1, 99, 1)
+        for cell in ((0, 99, 0), (1, 98, 0)):
+            self.set_block(cell, 3727763636)  # grass block
+        self.set_block((1, 98, 1), self.STONE)
+        for y in range(99, 102):
+            self.set_block((2, y, 0), self.STONE)
+        self.correct_position(0.5, 101.62, 0.5, on_ground=True, tick=0)
+
+        for floor in (self.STONE, 2186211206):  # stone or dirt under masonry
+            with self.subTest(floor=floor):
+                self.set_block((2, 98, 0), floor)
+                plan = self.bot.plan_navigation(FootGoal(goal), rules=NavigationRules(3, 2))
+                self.assertEqual((plan.status, plan.nodes), ("found", (source, landing, goal)))
+                self.assertEqual(self.stream.sent, [])
+
     async def test_descent_does_not_switch_to_short_runout_after_launch(self):
         self.prepare_descent()
         self.blocks._player_game_type = "SURVIVAL"
