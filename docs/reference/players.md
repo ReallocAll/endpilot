@@ -144,6 +144,32 @@ preserves announcement order, including duplicate entries. The type ID
 identifies a kind of entity. `bot.observed_entities` reports visible instances
 with their own `runtime_id` values.
 
+## Look up vanilla entity type families
+
+`vanilla_entity_type_families(protocol=2225)` returns a read-only mapping from
+exact namespaced entity names to immutable sets of engine family names. The
+families come from measured default forms on vanilla BDS 1.26.66.1. An absent
+name has unknown families, including types whose measured families vary with
+state. A measured set without a particular family means that the sampled
+default form lacked that family. An unsupported protocol raises `ValueError`.
+The lookup sends no packets.
+
+```python
+from endpilot import vanilla_entity_type_families
+
+registry = bot.entity_registry
+if registry is not None:
+    families = vanilla_entity_type_families(bot.protocol.number)
+    for entry in registry.entries:
+        labels = families.get(entry.name)
+        if labels is not None and "monster" in labels:
+            print(entry.name)
+```
+
+`zombie`, `creeper`, and `enderman` are among the measured `monster` types.
+Family membership describes an engine category. An individual entity's current
+attack intent depends on its behavior and circumstances.
+
 ## Look up vanilla entity base dimensions
 
 `vanilla_entity_dimensions(protocol=2225)` returns a read-only mapping of

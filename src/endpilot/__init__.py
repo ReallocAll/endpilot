@@ -35,7 +35,10 @@ from .entities import (
     EntitySwing, EntityVisibleEffectUpdate, ItemPickup, PaintingSnapshot, PlayerEquipmentSnapshot,
     PlayerListChange, PlayerListEntry, ShieldBlockEvent, VehicleLink, VehicleLinkChange,
 )
-from .entity_registry import EntityRegistryEntry, EntityRegistrySnapshot, VanillaEntityDimensions, vanilla_entity_dimensions
+from .entity_registry import (
+    EntityRegistryEntry, EntityRegistrySnapshot, VanillaEntityDimensions, vanilla_entity_dimensions,
+    vanilla_entity_type_families,
+)
 from .fishing import FishingResult
 from .game_hp_estimate import TntDamageEstimate
 from .inventory import CursorObservation, HeldItemSnapshot, HeldItemStack, InventorySlotChange
@@ -248,6 +251,7 @@ __all__ = [
     "vanilla_biomes",
     "vanilla_blocks",
     "vanilla_entity_dimensions",
+    "vanilla_entity_type_families",
     "vanilla_item_stack_limits",
     "vanilla_note_instruments",
 ]

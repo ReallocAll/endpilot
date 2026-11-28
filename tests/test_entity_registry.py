@@ -5,7 +5,10 @@ from unittest.mock import patch
 
 from bedrock_protocol import nbt
 
-from endpilot import Bot, EntityRegistryEntry, EntityRegistrySnapshot, VanillaEntityDimensions, vanilla_entity_dimensions
+from endpilot import (
+    Bot, EntityRegistryEntry, EntityRegistrySnapshot, VanillaEntityDimensions,
+    vanilla_entity_dimensions, vanilla_entity_type_families,
+)
 from endpilot.protocol import RawPacket, write_batch
 
 from test_scheduled_input import Wire
@@ -60,6 +63,28 @@ class VanillaEntityDimensionsTests(unittest.TestCase):
                 vanilla_entity_dimensions(protocol)
 
 
+class VanillaEntityTypeFamiliesTests(unittest.TestCase):
+    def test_observed_type_families_are_immutable_and_names_are_exact(self):
+        families = vanilla_entity_type_families()
+        self.assertEqual(families["minecraft:zombie"], frozenset({"zombie", "undead", "monster", "mob"}))
+        self.assertEqual(families["minecraft:creeper"], frozenset({"creeper", "monster", "mob"}))
+        self.assertEqual(families["minecraft:cow"], frozenset({"cow", "mob"}))
+        self.assertEqual(vanilla_entity_type_families(2225), families)
+        for name in ("cow", "Minecraft:cow", "custom:cow", "minecraft:ender_dragon", "minecraft:ender_crystal",
+                     "minecraft:villager_v2", "minecraft:zombie_villager_v2", "minecraft:parrot", "minecraft:strider"):
+            with self.subTest(name=name):
+                self.assertIsNone(families.get(name))
+        with self.assertRaises(TypeError):
+            families["minecraft:cow"] = frozenset({"monster"})
+        with self.assertRaises(AttributeError):
+            families["minecraft:cow"].add("monster")
+
+    def test_unsupported_protocols_and_nonintegers_are_rejected(self):
+        for protocol in (2168, 2224, 2226, "2225", 2225.0, True, None):
+            with self.subTest(protocol=protocol), self.assertRaisesRegex(ValueError, "unsupported vanilla entity type families"):
+                vanilla_entity_type_families(protocol)
+
+
 class EntityRegistryTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.bot = Bot("ActorRegistry", protocol=2225)
@@ -104,6 +129,18 @@ class EntityRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(vanilla_entity_dimensions()["minecraft:sheep"], dims["minecraft:sheep"])
         self.assertEqual(self.bot.observed_entities, ())
         self.assertEqual(self.wire.sent, sent)
+
+    async def test_type_family_filter_uses_current_announced_names_without_sending(self):
+        names = "ender_dragon", "cow", "zombie", "creeper", "pig", "enderman"
+        await self.join(self.registry(*(self.row(f"minecraft:{name}", slot) for slot, name in enumerate(names))))
+        current = self.bot.entity_registry
+        before = list(self.wire.sent)
+        families = vanilla_entity_type_families(self.bot.protocol.number)
+        labels = {entry.name: families.get(entry.name) for entry in current.entries}
+        monsters = tuple(name for name, found in labels.items() if found is not None and "monster" in found)
+        self.assertEqual(monsters, ("minecraft:zombie", "minecraft:creeper", "minecraft:enderman"))
+        self.assertEqual({name for name, found in labels.items() if found is None}, {"minecraft:ender_dragon"})
+        self.assertEqual(self.wire.sent, before)
 
     async def test_exact_lookups_and_independent_immutable_entries_in_wire_order(self):
         self.assertIsNone(self.bot.entity_registry)

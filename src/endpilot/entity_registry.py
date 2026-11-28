@@ -1,4 +1,4 @@
-"""Server-advertised entity types and versioned vanilla base dimensions."""
+"""Server-advertised entity types and versioned vanilla entity properties."""
 
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -8,6 +8,7 @@ from typing import NamedTuple
 from bedrock_protocol import nbt
 
 from ._entity_dimensions_2225 import ENTITY_DIMENSIONS as _DIMENSIONS_2225
+from ._entity_type_families_2225 import ENTITY_TYPE_FAMILIES as _FAMILIES_2225
 
 
 class VanillaEntityDimensions(NamedTuple):
@@ -27,6 +28,16 @@ def vanilla_entity_dimensions(protocol: int = 2225) -> Mapping[str, VanillaEntit
     if type(protocol) is not int or protocol != 2225:
         raise ValueError(f"unsupported vanilla entity dimensions protocol {protocol!r}")
     return _VANILLA_DIMENSIONS_2225
+
+
+_VANILLA_FAMILIES_2225 = MappingProxyType({name: frozenset(families) for name, families in _FAMILIES_2225.items()})
+
+
+def vanilla_entity_type_families(protocol: int = 2225) -> Mapping[str, frozenset[str]]:
+    """Return observed default vanilla type families by exact namespaced entity name."""
+    if type(protocol) is not int or protocol != 2225:
+        raise ValueError(f"unsupported vanilla entity type families protocol {protocol!r}")
+    return _VANILLA_FAMILIES_2225
 
 
 @dataclass(frozen=True, slots=True)
