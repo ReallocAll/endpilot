@@ -231,9 +231,11 @@ class _MiningOperation:
     epoch: int
     interrupted: asyncio.Future[None]
     released: asyncio.Future[tuple[bool, int | None, Exception | None]]
+    attempt: _MiningAttempt | None = None
     accepts_stop: bool = True
     interruption: Literal["stopped", "replaced"] | None = None
     release_requested: bool = False
+    release_previous_hold: MiningTarget | None = None
     pending_release: asyncio.Task | None = None
     successor: asyncio.Future[bool] | None = None
 
@@ -2150,7 +2152,8 @@ class Blocks:
             operation.interruption = reason
             operation.release_requested = True
             operation.interrupted.set_result(None)
-            self._end_mining_attempt(reason=reason)
+            if operation.attempt is not None and self._mining_attempt is operation.attempt:
+                self._end_mining_attempt(reason=reason)
 
     def _finish_mining_turn(self) -> None:
         operation = self._mining_operation
@@ -2201,21 +2204,31 @@ class Blocks:
         operation.successor = None
 
     async def stop_mining(self) -> int | None:
+        epoch = self._mining_epoch
+        previous_hold = None
         operation = self._mining_operation
         if operation is not None:
             self._check_mining_epoch(operation.epoch)
             self._cancel_mining_successor(operation)
+            if operation.attempt is None:
+                # An explicit stop also releases a hold that predates this call.
+                previous_hold = self._mining_target
+                operation.release_previous_hold = previous_hold
+                operation.release_requested = True
+                self._end_mining_attempt(reason="stopped")
             self._interrupt_mining(operation, "stopped")
             submitted, tick, failure = await asyncio.shield(operation.released)
             if not submitted:
                 self._check_mining_epoch(operation.epoch)
             if failure is not None:
                 raise failure
-            return tick
+            if submitted or previous_hold is None:
+                return tick
 
-        epoch = self._mining_epoch
         async with self._mining_lock:
             self._check_mining_epoch(epoch)
+            if previous_hold is not None and self._mining_target is not previous_hold:
+                return None
             actions = self._release_mining_actions()
             if not actions:
                 self._end_mining_attempt(reason="stopped")
@@ -2379,23 +2392,23 @@ class Blocks:
         epoch = operation.epoch
         owner = asyncio.current_task()
         initial_cancellations = owner.cancelling()
-        started = False
 
         def start():
-            nonlocal started
             check_interruption()
             if deadline is not None and loop.time() >= deadline:
                 raise TimeoutError("mining timed out before submitting START")
             if before_start is not None:
                 before_start()
-            started = True
+
+        def remember_attempt():
+            operation.attempt = self._mining_attempt
 
         def matches(raw):
             if raw.packet_id == b.RespawnPacket.ID:
                 return self._own_ready_respawn(raw)
             if raw.packet_id != b.UpdateBlockPacket.ID:
                 return True
-            if not started or operation.interrupted.done():
+            if operation.attempt is None or operation.interrupted.done():
                 return False
             packet = self.packets.protocol.decode(raw)
             accepted = (
@@ -2426,8 +2439,7 @@ class Blocks:
                 prepare_start()
 
         def end_attempt(error=None):
-            attempt = self._mining_attempt
-            if attempt is not None and attempt.target is target:
+            if operation.attempt is not None and self._mining_attempt is operation.attempt:
                 self._end_mining_attempt(reason=None if error is None else self._mining_abort_reason(error))
 
         waiter = asyncio.create_task(self.packets.wait_for_packet(
@@ -2445,7 +2457,7 @@ class Blocks:
                 actions = self._release_mining_actions()
                 actions.append(("START_DESTROY_BLOCK", position, face))
                 submission = asyncio.create_task(self._submit_mining(
-                    actions, target, epoch, validate=start, build_item_use=prepare,
+                    actions, target, epoch, validate=start, build_item_use=prepare, on_commit=remember_attempt,
                 ))
                 await asyncio.wait((submission, operation.interrupted), return_when=asyncio.FIRST_COMPLETED)
                 if submission.done():
@@ -2471,7 +2483,7 @@ class Blocks:
             for task in pending:
                 task.cancel()
             try:
-                await self._settle_mining(operation, pending, target if started else None, update is not None, error)
+                await self._settle_mining(operation, pending, update is not None, error)
             except (Exception, asyncio.CancelledError) as cleanup_error:
                 end_attempt(cleanup_error)
                 raise
@@ -2481,7 +2493,7 @@ class Blocks:
 
     async def _settle_mining(
         self, operation: _MiningOperation, pending: tuple[asyncio.Task, ...],
-        target: MiningTarget | None, succeeded: bool, error: BaseException | None,
+        succeeded: bool, error: BaseException | None,
     ) -> None:
         submitted = False
 
@@ -2493,8 +2505,9 @@ class Blocks:
         async def release_input():
             await asyncio.gather(*pending, return_exceptions=True)
             held = self._mining_target
+            target = None if operation.attempt is None else operation.attempt.target
             if (self._mining_epoch != operation.epoch or held is None
-                    or (target is not held and not (target is None and operation.interruption is not None))):
+                    or (held is not target and held is not operation.release_previous_hold)):
                 return None
             # The observed break can end before the server's held input is released.
             release = held if succeeded or operation.release_requested else None

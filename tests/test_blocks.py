@@ -650,6 +650,117 @@ class BlocksTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await blocks.stop_mining())
             self.assertEqual(len(stream.sent), 2)
 
+    async def check_replacement_of_unstarted_break_preserves_existing_mining(self, *, creative):
+        protocol, stream, blocks, observe = self.mining_fixture()
+        x, a, b = (1, 100, 0), (2, 100, 0), (1, 100, 1)
+        for target in (x, a, b):
+            observe(target)
+        events = []
+        self.addCleanup(blocks.subscribe_mining_events(events.append))
+        if creative:
+            game_type = protocol.binding.SetPlayerGameTypePacket(player_game_type=protocol.binding.GameType.CREATIVE)
+            stream.emit(protocol.encode(game_type))
+            await blocks.finish_mining(x, face=4)
+        else:
+            await blocks.start_mining(x, face=4)
+        original_frame, = stream.sent
+        tasks = []
+        input_lock = blocks.movement._action_lock
+        acquire_input = input_lock.acquire
+        waiting_for_input = asyncio.Event()
+
+        async def mark_input_wait():
+            waiting_for_input.set()
+            return await acquire_input()
+
+        async with asyncio.timeout(3):
+            try:
+                async with input_lock:
+                    with patch.object(input_lock, "acquire", side_effect=mark_input_wait):
+                        first = asyncio.create_task(blocks.mine_block(a, face=4))
+                        tasks.append(first)
+                        await waiting_for_input.wait()
+                        operation = blocks._mining_operation
+                        self.assertIsNotNone(operation)
+                        self.assertEqual(stream.sent, [original_frame])
+                        replacing = asyncio.create_task(blocks.mine_block(b, face=4, replace_current=True))
+                        tasks.append(replacing)
+                        await asyncio.sleep(0)
+                        self.assertEqual(operation.interruption, "replaced")
+                        replacing.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await replacing
+                with self.assertRaises(MiningAborted):
+                    await first
+                self.assertEqual(stream.sent, [original_frame])
+                self.assertEqual(events, [])
+                if not creative:
+                    self.assertEqual(blocks.mining_target, MiningTarget(x, 4))
+                    await blocks.continue_mining(x, face=4)
+                    action, = stream.sent[-1].player_block_actions
+                    self.assertEqual(action.player_action_type.name, "CONTINUE_DESTROY_BLOCK")
+                observe(x, HASHED_AIR_RUNTIME_ID)
+                await asyncio.sleep(0)
+                self.assertEqual(events, [
+                    MiningEvent("completed", 0, MiningTarget(x, 4), BlockObservation(x, HASHED_AIR_RUNTIME_ID, 0, True)),
+                ])
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_replacing_unstarted_break_preserves_creative_finish_observation(self):
+        await self.check_replacement_of_unstarted_break_preserves_existing_mining(creative=True)
+
+    async def test_replacing_unstarted_break_preserves_phased_hold(self):
+        await self.check_replacement_of_unstarted_break_preserves_existing_mining(creative=False)
+
+    async def test_stop_releases_phased_hold_when_unstarted_owner_has_granted_its_turn(self):
+        _, stream, blocks, observe = self.mining_fixture()
+        x, a, b = (1, 100, 0), (2, 100, 0), (1, 100, 1)
+        for target in (x, a, b):
+            observe(target)
+        await blocks.start_mining(x, face=4)
+        finish_turn = blocks._finish_mining_turn
+        stop_after_handoff = True
+        stopping = None
+        tasks = []
+
+        def finish_and_stop():
+            nonlocal stop_after_handoff, stopping
+            finish_turn()
+            if stop_after_handoff:
+                stop_after_handoff = False
+                stopping = asyncio.eager_task_factory(asyncio.get_running_loop(), blocks.stop_mining())
+                tasks.append(stopping)
+
+        async with asyncio.timeout(3):
+            try:
+                with patch.object(blocks, "_finish_mining_turn", side_effect=finish_and_stop):
+                    async with blocks.movement._action_lock:
+                        first = asyncio.create_task(blocks.mine_block(a, face=4))
+                        tasks.append(first)
+                        await asyncio.sleep(0)
+                        replacement = asyncio.create_task(blocks.mine_block(b, face=4, replace_current=True))
+                        tasks.append(replacement)
+                        with self.assertRaises(MiningAborted):
+                            await first
+                        with self.assertRaises(MiningAborted):
+                            await replacement
+                        self.assertFalse(stopping.done())
+                        self.assertEqual(len(stream.sent), 1)
+                    self.assertEqual(await stopping, stream.sent[-1].client_tick)
+                self.assertEqual(len(stream.sent), 2)
+                abort, stop = stream.sent[-1].player_block_actions
+                self.assertEqual((abort.player_action_type.name, stop.player_action_type.name),
+                                 ("ABORT_DESTROY_BLOCK", "STOP_DESTROY_BLOCK"))
+                self.assertEqual((abort.pos.x, abort.pos.y, abort.pos.z), x)
+                self.assertIsNone(blocks.mining_target)
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
     async def test_replacement_waits_for_one_release_and_rejects_unusable_successors(self):
         for outcome in ("invalid", "superseded", "stopped", "failed", "cancelled", "timeout", "stale",
                         "out_of_reach", "dimension", "respawn", "disconnect"):
