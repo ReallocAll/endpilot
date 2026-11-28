@@ -2781,7 +2781,7 @@ class Movement:
         async def descend(source, landing):
             nonlocal remaining, submitted, release_input, accepted_level, use_ground_velocity
             buffer = _runout(source, landing)
-            short = blocks._descent_landing(buffer) is not True
+            short = blocks._descent_landing(buffer, runout=True) is not True
             x, _, z = self._input_position
             direct_stop = not short and (isinstance(goal, FootGoal)
                       and goal.position == landing and at_center(source, x, z)
@@ -2871,9 +2871,9 @@ class Movement:
                 if short:
                     clear = blocks._short_descent(source, landing, buffer)
                     if direct_stop and clear is True:
-                        clear = blocks._descent_landing(buffer)
+                        clear = blocks._descent_landing(buffer, runout=True)
                 else:
-                    clear = blocks._descent_landing(buffer)
+                    clear = blocks._descent_landing(buffer, runout=True)
                     if clear is True:
                         clear = graph.edge(source, landing, check_descent_source=False)
                 if clear is not True:

@@ -1575,10 +1575,16 @@ class Blocks:
             known = known and clear is True
         return True if known else None
 
-    def _descent_landing(self, position: tuple[int, int, int]) -> bool | None:
+    def _descent_landing(self, position: tuple[int, int, int], *, runout: bool = False) -> bool | None:
         """Check the standing column and the head space while crossing above it."""
         x, y, z = position
         standing = self._flat_stance(position)
+        if runout and standing is False:
+            # A dry vanilla fern can be walked through after landing.
+            feet = self.observed_block(position)
+            state = None if feet is None else self._vanilla_state(feet.runtime_id)
+            if state is not None and state.name == "minecraft:fern":
+                standing = self._flat_stance(position, allow_vegetation=True)
         overhead = self._stance_clearance((x, y + 2, z))
         if standing is False or overhead is False:
             return False

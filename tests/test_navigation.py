@@ -3022,6 +3022,31 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((plan.status, plan.nodes), ("found", (source, landing, goal)))
                 self.assertEqual(self.stream.sent, [])
 
+    async def test_descent_allows_observed_fern_only_in_the_runout(self):
+        self.prepare_descent()
+        landing, runout = (1, 99, 0), (2, 99, 0)
+        fern = 3148548874
+        goal = FootGoal(landing)
+        rules = NavigationRules(search_radius=2, vertical_radius=1)
+        self.set_block(runout, fern)
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "found")
+        self.assertEqual(self.stream.sent, [])
+
+        def obstruct_runout():
+            if self.up in self.stream.sent[-1].input_data:
+                self.set_block(runout, self.STONE)
+                self.stream.on_send = None
+
+        self.stream.on_send = obstruct_runout
+        result = await self.bot.navigate(goal, rules=rules)
+        self.assertEqual((result.status, result.frames), ("unreachable", 1))
+        self.assert_released()
+
+        self.set_block(runout, self.AIR)
+        self.set_block(landing, fern)
+        self.set_position(0.5, 0.5, y=101.62, teleport=True)
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unreachable")
+
     async def test_descent_does_not_switch_to_short_runout_after_launch(self):
         self.prepare_descent()
         self.blocks._player_game_type = "SURVIVAL"

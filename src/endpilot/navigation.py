@@ -677,7 +677,7 @@ class _StandingGraph:
         )
         if False in required:
             return False
-        clearance = self.blocks._descent_landing(buffer)
+        clearance = self.blocks._descent_landing(buffer, runout=True)
         if clearance is not True and self.allow_short_descent:
             short = self.blocks._short_descent(source, destination, buffer)
             if short is not False:
