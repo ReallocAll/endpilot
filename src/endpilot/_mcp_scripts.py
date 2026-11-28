@@ -67,7 +67,7 @@ _MEMBERS = {
             find_blocks find_block find_block_vein raycast_block raycast_player_view raycast_block_towards
             column_coverage observed_bed inventory_count mining_face best_harvest_tool
             observed_player_equipment entity_at_cursor nearest_player nearest_entity switch_follow_target
-            complete_command_name complete_command
+            complete_command_name complete_command recipes_all recipes_for plan_recipe_delta
         """,
         "async": """
             wait_ticks wait_for_dimension_change wait_for_world_time_update wait_for_weather_update
@@ -86,6 +86,7 @@ _MEMBERS = {
             drop_selected_item use_item consume release_using_item
             wait_for_container_slots wait_for_furnace_progress wait_for_brewing_progress take_from_container
             put_into_container open_inventory_screen close_container open_container open_entity_container
+            craft_recipe_auto
             use_item_on place_block place_against place_entity place_oak_boat
             start_mining continue_mining stop_mining finish_mining
             mine_block collect_block collect_targets collect_by_count collect_vein_by_count equip_harvest_tool
@@ -129,6 +130,7 @@ _RECORDS = {
     "placement": "PlacementResult PlacementInventoryChange EntityPlacementResult BoatPlacementResult",
     "player_state": "PlayerVitals PlayerEffect PlayerAbilities DeathEvent",
     "range_transfer": "RangeTransferResult RangeTransferStep",
+    "recipes": "Recipe RecipeIngredient RecipeResult RecipeItemAmount RecipeDeltaPlan",
     "world_environment": "WorldClock WorldTime Weather WorldRule WorldSpawn",
     "world_feedback": "SoundEvent ParticleEvent BlockEvent",
 }
@@ -143,7 +145,7 @@ _UNSUPPORTED_PARAMETERS = frozenset({"predicate", "match", "on_plan", "on_event"
 _SLOT_MAPS = frozenset({"inventory_slots", "armor_slots", "container_slots", "wait_for_container_slots"})
 _ITEM_VERDICTS = frozenset({
     "move_inventory_item", "swap_inventory_items", "equip_armor", "unequip_armor", "equip_offhand",
-    "unequip_offhand", "drop_inventory_item", "take_from_container", "put_into_container",
+    "unequip_offhand", "drop_inventory_item", "take_from_container", "put_into_container", "craft_recipe_auto",
 })
 _ERROR_FIELDS = {SleepRejected: "translation_key", ColumnCoverageInvalidated: "reason", MiningFaceUnavailable: "status"}
 _ERROR_PROGRESS = {"collection_progress": (BlockCollectionBatch, CountedBlockCollection, MixedCollectionBatch),

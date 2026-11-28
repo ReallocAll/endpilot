@@ -165,6 +165,23 @@ item from workbench grid slot 32 to main inventory slot 9 if BDS accepts the
 request. Use grid slots 28–31 in the personal inventory or 32–40 in a
 workbench, and check the returned server verdict before continuing to craft.
 
+### Query and craft recipes from MCP scripts
+
+In a script started with `run_script`, call `bot.recipes_all(output, grid_size=2)`
+for catalog matches and `bot.recipes_for(output, grid_size=2)` for recipes
+with observed materials and crafting access. Both queries return lists of
+recipe snapshots. Call `bot.plan_recipe_delta(recipe.net_id, times=1)` to
+inspect the grouped `materials` and signed `delta`, or receive `None` when
+the catalog and inventory cannot establish a plan. These queries send no
+packets. A recipe's ingredients, results and shape are available by
+attribute. The result's `user_data_buffer` is a hex string.
+
+With the personal inventory screen open, call
+`await bot.craft_recipe_auto(recipe.net_id, destination_slot, times=1)`.
+The response carries `reply.result.name` and
+`reply.client_request_id.raw_id`. Inspect the verdict and read
+`bot.inventory_slots` for the observed result.
+
 ## Observe enchanting choices
 
 `bot.enchantment_seed_at_join` is the signed 32-bit seed reported when the bot joined

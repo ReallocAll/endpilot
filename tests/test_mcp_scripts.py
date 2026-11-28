@@ -17,6 +17,7 @@ from endpilot.entities import EntityState
 from endpilot.protocol import RawPacket, write_batch
 from endpilot.world_environment import WorldClock, WorldTime
 import test_placement
+import test_recipe_auto_tags
 import test_scheduled_input
 
 
@@ -813,6 +814,98 @@ async def main(bot):
         await self.wait_for(run, lambda status: "ready\n" in self.text(status))
         async with asyncio.timeout(2):
             self.assertEqual((await self.scripts.stop_script(run))["state"], "stopped")
+
+
+class MCPScriptRecipeTests(unittest.IsolatedAsyncioTestCase):
+    join = test_recipe_auto_tags.RecipeAutoTagTests.join
+    deliver = test_recipe_auto_tags.RecipeAutoTagTests.deliver
+    item = test_recipe_auto_tags.RecipeAutoTagTests.item
+    verdict = test_recipe_auto_tags.RecipeAutoTagTests.verdict
+    start = MCPScriptTests.start
+    wait_for = MCPScriptTests.wait_for
+    completed = MCPScriptTests.completed
+
+    async def asyncSetUp(self):
+        self.enterContext(test_scheduled_input.ManualClock().patch_scheduler())
+        await self.join()
+        self.scripts = MCPScripts(SimpleNamespace(connected_bot=lambda: self.bot))
+        self.addAsyncCleanup(self.scripts.close)
+
+    async def test_recipe_queries_copy_nested_plans_and_crafting_returns_matched_verdict(self):
+        b = self.b
+        oak = b.SerializedRecipeIngredient(descriptor={"name": "minecraft:oak_planks"}, stack_size=1, aux_value=0)
+        birch = b.SerializedRecipeIngredient(descriptor={"name": "minecraft:birch_planks"}, stack_size=2, aux_value=0)
+        blank = b.SerializedRecipeIngredient(stack_size=0, aux_value=32767)
+        data = b"\0" * 10
+        output = b.SerializedNetworkItemInstanceDescriptor(id=3, stack_size=1, user_data_buffer=data)
+        catalog = b.CraftingDataPacket(shaped_recipes=[b.ShapedRecipePayload(
+            recipe_id="test:mcp_craft", net_id=40, width=2, height=2, tag="crafting_table",
+            ingredients=[oak, blank, birch, blank], results=[output],
+        )])
+        await self.deliver(catalog, b.InventoryContentPacket(inventory_id=b.ContainerID.INVENTORY,
+                                                            slots=[self.item(1, 1, net_id=21),
+                                                                   self.item(2, 2, net_id=22), self.item()]))
+        baseline = len(self.wire.sent)
+        sent = asyncio.Queue()
+        self.addCleanup(self.bot.packets.subscribe_sent(
+            lambda packet_id: sent.put_nowait(None) if packet_id == b.ItemStackRequestPacket.ID else None,
+        ))
+        run = await self.start("""
+async def main(bot):
+    recipe, = bot.recipes_all('minecraft:crafting_table', grid_size=2)
+    available, = bot.recipes_for('minecraft:crafting_table', grid_size=2)
+    plan = bot.plan_recipe_delta(available.net_id)
+    assert plan.recipe.shape[1] is None and plan.recipe.results[0].user_data_buffer == '00' * 10
+    assert plan.materials[1][0].name == 'minecraft:birch_planks'
+    assert bot.recipes_for('minecraft:crafting_table', min_result_count=2) == []
+    assert bot.plan_recipe_delta(recipe.recipe_id, times=2) is None
+    try:
+        await bot.craft_recipe_auto(recipe.recipe_id, 2, times=2)
+    except ValueError as error:
+        assert 'not enough' in str(error)
+    else:
+        raise AssertionError('unexpected craft with insufficient materials')
+    rejected = await bot.craft_recipe_auto(recipe.recipe_id, 2)
+    accepted = await bot.craft_recipe_auto(available.net_id, 2)
+    assert rejected.result.name == 'ERROR' and accepted.result.name == 'SUCCESS'
+    assert bot.recipes_for('minecraft:crafting_table') == []
+    assert bot.plan_recipe_delta(recipe.net_id) is None
+    return {'recipe': recipe, 'available': available, 'plan': plan, 'replies': [rejected, accepted],
+            'output': bot.inventory_slots[2].count, 'player_id': bot.player_id}
+""")
+        replies = []
+        for name in ("ERROR", "SUCCESS"):
+            await self.wait_for(run, lambda _: not sent.empty())
+            sent.get_nowait()
+            packet = self.wire.sent[-1]
+            self.assertIsInstance(packet, b.ItemStackRequestPacket)
+            request, = packet.requests
+            request_id = request.client_request_id.raw_id
+            self.assertEqual(request.actions[0].recipe_net_id, 40)
+            self.assertEqual(request.actions[0].num_crafts, 1)
+            corrections = ((0, 0, None), (1, 0, None), (2, 1, 23)) if name == "SUCCESS" else ()
+            await self.deliver(b.ItemStackResponsePacket(responses=[self.verdict(request_id, *corrections, result=name)]))
+            replies.append({"result": {"name": name}, "client_request_id": {"raw_id": request_id}})
+        final = await self.completed(run)
+        self.assertEqual(final["state"], "succeeded", final)
+        self.assertEqual([type(packet) for packet in self.wire.sent[baseline:]], [b.ItemStackRequestPacket] * 2)
+        self.assertEqual(self.wire.closed, False)
+        first = {"name": "minecraft:oak_planks", "tag": None, "count": 1, "aux_value": 0}
+        second = {"name": "minecraft:birch_planks", "tag": None, "count": 2, "aux_value": 0}
+        recipe = {"recipe_id": "test:mcp_craft", "net_id": 40, "kind": "shaped_recipes", "tag": "crafting_table",
+                  "ingredients": [first, second], "results": [
+                      {"item_id": 3, "name": "minecraft:crafting_table", "count": 1, "aux_value": 0,
+                       "block_runtime_id": 0, "user_data_buffer": data.hex()},
+                  ], "width": 2, "height": 2, "shape": [first, None, second, None]}
+        oak_amount = {"item_id": 1, "count": 1, "aux_value": 0, "name": first["name"]}
+        birch_amount = {"item_id": 2, "count": 2, "aux_value": 0, "name": second["name"]}
+        self.assertEqual(final["result"], {
+            "recipe": recipe, "available": recipe, "replies": replies, "output": 1, "player_id": 7,
+            "plan": {"recipe": recipe, "times": 1, "materials": [[oak_amount], [birch_amount]], "delta": [
+                oak_amount | {"count": -1}, birch_amount | {"count": -2},
+                {"item_id": 3, "aux_value": 0, "count": 1, "name": "minecraft:crafting_table"},
+            ]},
+        })
 
 
 class MCPScriptPlacementTests(test_placement._PlacementHarness):
