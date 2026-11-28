@@ -12,6 +12,34 @@ move items across multiple stacks. Check `confirmed_count` and
 `stop_reason` before continuing, especially after a partial move.
 [Choose ranges and interpret partial results](../tutorials/containers.md#choose-ranges-and-interpret-partial-results)
 
+### Move ranges from MCP scripts
+
+In a script started with `run_script`, use the worker's Bot proxy.
+
+```python
+async def main(bot):
+    return await bot.transfer_container_range(
+        item="minecraft:paper", count=6, source_slots=range(20, 22), destination_slots=range(29, 31),
+    )
+```
+
+This example uses the server's slot order in a double chest. With the player
+inventory screen open, use `await bot.transfer_inventory_range(...)` with
+the same keyword arguments and slots within `range(36)`. Both methods accept
+`timeout` and use the SDK's default matching with `match=None`. The proxy
+rejects Python predicate callbacks before sending a transfer.
+
+The returned snapshot includes `requested`, `steps`, `confirmed_count`, and
+`stop_reason`. Each ordered step reports its slots, requested quantity,
+confirmed quantity, request ID, and verdict. A `confirmed` value of `None`
+means the amount is unknown. A rejected step can confirm zero. When the SDK
+supplies progress on a timeout or local cancellation, the script can read
+`error.transfer_progress`. If the host's result has already arrived when
+the script cancels the call, the cancellation carries that result. An uncaught
+error reports the snapshot under
+`error.attributes.transfer_progress` in `observe_script`. Use `stop_script`
+to terminate the worker and drain its actions on the resident connection.
+
 ## Move a horse saddle
 
 Stand near a tamed horse while holding sneak with an empty hand. Open it

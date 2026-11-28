@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields
 from enum import Enum
 from fractions import Fraction
+from functools import partial
 import inspect
 import json
 import multiprocessing
@@ -21,6 +22,7 @@ from .collection import BlockCollectionBatch, CountedBlockCollection, MixedColle
 from .entities import EntityState
 from .inventory import _stack_snapshot
 from .placement import BoatPlacementResult, EntityPlacementResult, PlacementResult
+from .range_transfer import RangeTransferResult, transfer_container_range, transfer_inventory_range
 from .world_environment import WorldTime
 from .world_feedback import BlockEvent, ParticleEvent, SoundEvent
 
@@ -41,6 +43,10 @@ _CHUNK_SIZE = 2048
 _State = Literal["running", "succeeded", "failed", "stopped"]
 _Stream = Literal["stdout", "stderr", "log"]
 
+_RANGE_TRANSFERS = {
+    "transfer_container_range": transfer_container_range,
+    "transfer_inventory_range": transfer_inventory_range,
+}
 
 # The bridge owns this allowlist independently of the worker. Listed methods
 # have data-only parameters and copyable results, subject to the checks below.
@@ -100,7 +106,7 @@ _MEMBERS = {
         """,
     }.items()
     for name in names.split()
-}
+} | dict.fromkeys(_RANGE_TRANSFERS, "async")
 
 _RECORDS = {
     "beds": "BedObservation PlayerRespawnPoint",
@@ -122,6 +128,7 @@ _RECORDS = {
     "navigation": "NavigationPlan NavigationResult BlockFaceMatch BlockInteractionMatch BlockPlacementMatch",
     "placement": "PlacementResult PlacementInventoryChange EntityPlacementResult BoatPlacementResult",
     "player_state": "PlayerVitals PlayerEffect PlayerAbilities DeathEvent",
+    "range_transfer": "RangeTransferResult RangeTransferStep",
     "world_environment": "WorldClock WorldTime Weather WorldRule WorldSpawn",
     "world_feedback": "SoundEvent ParticleEvent BlockEvent",
 }
@@ -140,7 +147,8 @@ _ITEM_VERDICTS = frozenset({
 })
 _ERROR_FIELDS = {SleepRejected: "translation_key", ColumnCoverageInvalidated: "reason", MiningFaceUnavailable: "status"}
 _ERROR_PROGRESS = {"collection_progress": (BlockCollectionBatch, CountedBlockCollection, MixedCollectionBatch),
-                   "placement_progress": (PlacementResult, EntityPlacementResult, BoatPlacementResult)}
+                   "placement_progress": (PlacementResult, EntityPlacementResult, BoatPlacementResult),
+                   "transfer_progress": (RangeTransferResult,)}
 _ERROR_ATTRIBUTES = frozenset((*_ERROR_FIELDS.values(), *_ERROR_PROGRESS))
 
 
@@ -231,6 +239,8 @@ def _project(value):
             output.update(daytime=value.daytime, day=value.day, observed_moon_phase=value.observed_moon_phase)
         elif kind is EntityState:
             output["visible_effect_ids"] = _project(value.visible_effect_ids)
+        elif kind is RangeTransferResult:
+            output["confirmed_count"] = value.confirmed_count
         elif isinstance(value, (SoundEvent, ParticleEvent, BlockEvent)):
             output.update(_feedback_fields(value))
         return _record(output)
@@ -286,10 +296,13 @@ def _bind(member, args, kwargs):
             raise TypeError(f"{name} is unavailable through the MCP script Bot")
         if name in {"goal", "rules"}:
             value = _input_record(value)
-        elif name == "sections" and isinstance(value, dict) and value.get("$endpilot") == "range":
+        elif name in {"sections", "source_slots", "destination_slots"} and (
+            isinstance(value, dict) and value.get("$endpilot") == "range"
+        ):
             bounds = tuple(value.get(key) for key in ("start", "stop", "step"))
             if not all(type(bound) is int for bound in bounds):
-                raise TypeError("expected integer section range bounds")
+                label = "section" if name == "sections" else name
+                raise TypeError(f"expected integer {label} range bounds")
             value = range(*bounds)
         elif name == "against" and isinstance(value, dict):
             if value.get("$endpilot") != "record" or not isinstance(value.get("fields"), dict):
@@ -466,7 +479,8 @@ class _Run:
             raise AttributeError(f"{name!r} is unavailable through the MCP script Bot")
         if op == "get" and (args or kwargs):
             raise TypeError("Bot properties take no arguments")
-        member = getattr(self.bot, name)
+        transfer = _RANGE_TRANSFERS.get(name)
+        member = getattr(self.bot, name) if transfer is None else partial(transfer, self.bot)
         if op == "get":
             return _snapshot(name, member)
         if op == "subscribe":

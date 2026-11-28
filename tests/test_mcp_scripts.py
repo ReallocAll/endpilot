@@ -568,6 +568,113 @@ async def main(bot):
 """)
             self.assertEqual((await self.completed(run))["result"], "denied")
 
+    async def test_inventory_range_exposes_ordered_host_verdicts_and_rejects_bad_inputs(self):
+        b = self.bot.protocol.binding
+        paper = 389
+        slots = [b.SerializedNetworkItemStackDescriptor() for _ in range(36)]
+        slots[9] = b.SerializedNetworkItemStackDescriptor(id=paper, stack_size=5, net_id_variant=20)
+        slots[18] = b.SerializedNetworkItemStackDescriptor(id=paper, stack_size=62, net_id_variant=21)
+        self.bot._session._replace_item_registry(b.ItemRegistryPacket(items=[
+            b.ItemData(id=paper, name="minecraft:paper"),
+        ]))
+        for packet in (
+            b.ContainerOpenPacket(container_id=7, type=b.ContainerType.INVENTORY,
+                                  pos=b.BlockPos(x=0, y=0, z=0), entity_unique_id=-1),
+            b.InventoryContentPacket(inventory_id=b.ContainerID.INVENTORY, slots=slots),
+        ):
+            await test_scheduled_input.ScheduledInputTests().observe(self.bot, self.wire, packet)
+
+        sent = asyncio.Queue()
+        self.addCleanup(self.bot.packets.subscribe_sent(
+            lambda packet_id: sent.put_nowait(None) if packet_id == b.ItemStackRequestPacket.ID else None,
+        ))
+        run = await self.start("""
+async def main(bot):
+    for source, target, match, expected, message in (
+        (range(9, 10), range(18, 20), lambda item: True, TypeError, 'callbacks'),
+        (range(9, 10, 2), range(18, 20), None, ValueError, 'forward half-open range'),
+        (range(9, 19), range(18, 20), None, ValueError, 'must not overlap'),
+        (range(9, 10), range(36, 37), None, ValueError, 'within 0..36'),
+    ):
+        try:
+            await bot.transfer_inventory_range(item='minecraft:paper', count=4, source_slots=source,
+                                               destination_slots=target, match=match)
+        except expected as error:
+            assert message in str(error), str(error)
+        else:
+            raise AssertionError('invalid input accepted')
+    result = await bot.transfer_inventory_range(item='minecraft:paper', count=4, source_slots=range(9, 10),
+                                               destination_slots=range(18, 20), match=None)
+    assert result.steps[0].confirmed == 2 and result.steps[1].confirmed == 0
+    return result
+""")
+        async with asyncio.timeout(7):
+            requests = []
+            for target, verdict in ((18, "SUCCESS"), (19, "ERROR")):
+                await self.wait_for(run, lambda _: not sent.empty())
+                sent.get_nowait()
+                packet = next(packet for packet in reversed(self.wire.sent)
+                              if isinstance(packet, b.ItemStackRequestPacket))
+                request, = packet.requests
+                requests.append(request.client_request_id.raw_id)
+                action, = request.actions
+                self.assertEqual((action.source.slot, action.destination.slot, action.amount), (9, target, 2))
+                containers = [b.ItemStackResponseContainerInfo(
+                    full_container_name=b.FullContainerName(name=b.ContainerEnumName.COMBINED_HOTBAR_AND_INVENTORY_CONTAINER),
+                    slots=[b.ItemStackResponseSlotInfo(requested_slot=slot, slot=slot, amount=count,
+                                                       item_stack_net_id=b.ItemStackNetId(raw_id=net_id))
+                           for slot, count, net_id in ((9, 3, 20), (18, 64, 21))],
+                )] if verdict == "SUCCESS" else None
+                response = b.ItemStackResponseInfo(client_request_id=request.client_request_id,
+                                                   result=b.ItemStackNetResult[verdict], containers=containers)
+                self.wire.push(b.ItemStackResponsePacket(responses=[response]))
+        final = await self.completed(run)
+        self.assertEqual(final["state"], "succeeded", final)
+        self.assertEqual(final["result"], {"requested": 4, "stop_reason": "rejected", "confirmed_count": 2, "steps": [
+            {"source_slot": 9, "destination_slot": 18, "requested": 2, "confirmed": 2,
+             "request_id": requests[0], "verdict": "SUCCESS"},
+            {"source_slot": 9, "destination_slot": 19, "requested": 2, "confirmed": 0,
+             "request_id": requests[1], "verdict": "ERROR"},
+        ]})
+        self.assertTrue(sent.empty())
+
+    async def test_range_reply_received_before_local_cancellation_keeps_progress_and_cancel_message(self):
+        script = """
+import asyncio
+
+async def main(bot, count):
+    channel = bot._channel
+    start = channel.start
+    replies = []
+    def capture(*args, **kwargs):
+        started = start(*args, **kwargs)
+        replies.append(started[1])
+        return started
+    channel.start = capture
+
+    task = asyncio.create_task(bot.transfer_container_range(item='minecraft:paper', count=count,
+                                                           source_slots=range(20, 22),
+                                                           destination_slots=range(29, 31)))
+    await asyncio.sleep(0)
+    frame = replies[0].result(timeout=5)
+    if count:
+        assert frame['error']['type'] == 'RuntimeError', frame
+    else:
+        assert 'value' in frame, frame
+    task.cancel('worker cancelled after reply')
+    await task
+"""
+        for count, reason in ((0, "complete"), (1, "unconfirmed")):
+            with self.subTest(count=count):
+                run = await self.start(script, args=[count])
+                final = await self.completed(run)
+                self.assertEqual(final["state"], "failed", final)
+                self.assertEqual(final["error"], {
+                    "error_type": "CancelledError", "message": "worker cancelled after reply",
+                    "attributes": {"transfer_progress": {"requested": count, "steps": [], "stop_reason": reason,
+                                                          "confirmed_count": 0}},
+                })
+
     async def test_stalled_pipe_does_not_block_stop_and_reports_overflow(self):
         offered = []
         released = []

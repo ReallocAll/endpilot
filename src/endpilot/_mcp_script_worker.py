@@ -15,7 +15,8 @@ from threading import BoundedSemaphore, Lock, Thread
 from types import SimpleNamespace
 
 from ._mcp_scripts import (
-    _ERROR_FIELDS, _ERROR_PROGRESS, _INPUT_RECORDS, _MAX_FRAME, _MAX_OUTGOING_FRAMES, _SLOT_MAPS, _read,
+    _ERROR_FIELDS, _ERROR_PROGRESS, _INPUT_RECORDS, _MAX_FRAME, _MAX_OUTGOING_FRAMES, _RANGE_TRANSFERS, _SLOT_MAPS,
+    _read,
 )
 from .blocks import MiningAborted
 from .bot import Bot
@@ -220,7 +221,14 @@ class _Channel:
                     continue  # A repeated local cancel cannot abandon host cleanup.
                 except ConnectionError:
                     raise error from None
-            if (detail := frame.get("error")) is not None and detail["type"] == "CancelledError":
+            detail = frame.get("error")
+            if name in _RANGE_TRANSFERS:
+                # Keep the host's settled progress even if local cancellation wins the await.
+                if detail is None:
+                    error.transfer_progress = self.reply(frame, name)
+                else:
+                    _restore(error, detail, ("transfer_progress",))
+            elif detail is not None and detail["type"] == "CancelledError":
                 _restore(error, detail, _ERROR_PROGRESS)
             raise
         return self.reply(frame, name)
