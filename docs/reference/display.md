@@ -21,6 +21,28 @@ wait before the final message arrives. Registrations repeat by default. Use
 remove all registrations with that name. For chat observations by author, use
 `wait_for_chat(author=...)` as in the [two-player example](../../examples/chat.py).
 
+## Subscribe to chat entries
+
+Use `bot.subscribe_chat(callback, author=...)` to observe new chat entries on
+the current connection. The optional author filter matches the available
+sender name. The callback runs synchronously in receive order. Call the
+returned function to unsubscribe or register again after reconnecting.
+
+`ChatMessage.kind` identifies the entry as `chat`, `whisper`, `join`, `leave`,
+`death`, or `server`. A public player chat keeps its separate `author` and
+verbatim message body. A received whisper also carries its author and body.
+An entry whose sender is unavailable has `author=None`. Repeated messages
+are delivered separately. Tips, popups, jukebox notices, titles, subtitles,
+and action bar updates are outside this stream. A death announcement comes
+from a received chat text packet.
+
+Translation entries preserve `translation_key` and `params`. Load local
+base language bytes using `Bot(chat_languages={"en_US": lang_bytes})`. The bot
+selects the locale of each login and applies the effective `.lang` file from
+that connection's resource pack stack. When a translation cannot be resolved,
+the callback receives the original key and parameters with `message=None`.
+Use `subscribe_text()` for the original wire fields, including text objects.
+
 ## Match display text
 
 Use `add_display_pattern()` to match incoming player chat formatted as

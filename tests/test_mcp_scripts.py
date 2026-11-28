@@ -29,7 +29,8 @@ class MCPScriptTests(unittest.IsolatedAsyncioTestCase):
         self.bot = Bot("ScriptFixture")
         self.addAsyncCleanup(self.bot.close)
         self.wire = await test_scheduled_input.ScheduledInputTests().join(self.bot, position=(0.5, 101.62, 0.5))
-        self.scripts = MCPScripts(SimpleNamespace(connected_bot=lambda: self.bot))
+        self.player = SimpleNamespace(connected_bot=lambda: self.bot)
+        self.scripts = MCPScripts(self.player)
         self.addAsyncCleanup(self.scripts.close)
 
     async def start(self, source=None, **kwargs):
@@ -684,6 +685,85 @@ async def main(bot):
         self.assertEqual(status["state"], "succeeded", status)
         self.assertGreaterEqual(status["result"][1], status["result"][0])
         self.assertEqual(notices, ["unsubscribed"])
+
+    async def test_chat_subscription_replays_ordered_history_for_each_resident_player(self):
+        witness = Bot("ChatWitness", chat_languages={"en_US": b"death.attack.lava=%s fell into lava\n"})
+        self.addAsyncCleanup(witness.close)
+        witness_wire = await test_scheduled_input.ScheduledInputTests().join(witness)
+        receiver_connection = self.bot.packets
+        witness_connection = witness.packets
+        script = """
+import asyncio
+import os
+
+async def main(bot, host_pid, marker):
+    assert os.getpid() != host_pid
+    entries = []
+
+    def record(event):
+        entries.append([event.author, event.message, event.kind, event.translation_key, event.params])
+
+    markers = asyncio.Queue()
+
+    def find_marker(event):
+        if event.message == marker:
+            markers.put_nowait(None)
+
+    unsubscribe = bot.subscribe_chat(record)
+    release_marker = bot.subscribe_chat(find_marker, author="ChatSender")
+    print("ready")
+    await markers.get()
+    unsubscribe()
+    unsubscribe()
+    print("unsubscribed")
+    await markers.get()
+    release_marker()
+    return entries
+"""
+        marker = "whisper-match delivery barrier"
+        args = [os.getpid(), marker]
+        recipient_run = await self.start(script, args=args)
+        with patch.object(self.player, "connected_bot", return_value=witness):
+            witness_run = await self.start(script, args=args)
+        runs = (recipient_run, witness_run)
+        await asyncio.gather(*(self.wait_for(run, lambda status: self.text(status) == "ready\n") for run in runs))
+
+        # Protocol 2225 TextPacket bodies from the three-player whisper and vanilla death captures.
+        def text_packet(body):
+            return RawPacket(self.bot.protocol.binding.TextPacket.ID, bytes.fromhex(body))
+
+        public = text_packet("0001010d4368617453656e646572c2a77217776869737065722d6d6174636820746172676574203432000000")
+        private = text_packet("0001070a4368617453656e64657217776869737065722d6d6174636820746172676574203432000000")
+        barrier = text_packet(
+            "0001010d4368617453656e646572c2a7721e776869737065722d6d617463682064656c69766572792062617272696572000000",
+        )
+        death = text_packet("0102021164656174682e61747461636b2e6c617661010c5265737061776e50696c6f74000000")
+        self.wire.incoming.put_nowait(write_batch([public, public, private, barrier]))
+        witness_wire.incoming.put_nowait(write_batch([public, public, death, barrier]))
+        await asyncio.gather(*(self.wait_for(run, lambda status: "unsubscribed\n" in self.text(status)) for run in runs))
+
+        self.wire.incoming.put_nowait(write_batch([private, barrier]))
+        witness_wire.incoming.put_nowait(write_batch([public, barrier]))
+        received, witnessed = await asyncio.gather(*(self.completed(run) for run in runs))
+        expected_public = ["ChatSender", "whisper-match target 42", "chat", None, None]
+        expected_marker = ["ChatSender", marker, "chat", None, None]
+        self.assertEqual(received["state"], "succeeded", received)
+        self.assertEqual(received["result"], [
+            expected_public, expected_public,
+            ["ChatSender", "whisper-match target 42", "whisper", None, None], expected_marker,
+        ])
+        self.assertEqual(witnessed["state"], "succeeded", witnessed)
+        first, second, translated, last = witnessed["result"]
+        self.assertEqual([first, second, last], [expected_public, expected_public, expected_marker])
+        self.assertEqual(translated, [None, "RespawnPilot fell into lava", "death", "death.attack.lava",
+                                      ["RespawnPilot"]])
+
+        followup = await self.completed(await self.start("async def main(bot): return bot.player_id"))
+        self.assertEqual(followup["state"], "succeeded", followup)
+        self.assertEqual(followup["result"], self.bot.player_id)
+        self.assertIs(self.bot.packets, receiver_connection)
+        self.assertIs(witness.packets, witness_connection)
+        self.assertFalse(self.wire.closed or witness_wire.closed)
 
     async def test_world_feedback_waits_and_notifications_copy_wire_fields(self):
         await self.update_block((-3, 220, 17), 2359)  # Sequential vanilla note block runtime ID.

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from bedrock_protocol import TextPacketType
-from endpilot import Bot, TextEvent
+from endpilot import Bot, ResourcePackIndex, TextEvent
 from endpilot.chat import Chat, ChatMessage
 from endpilot.compression import PacketConnection
 from endpilot.login import JoinSession
@@ -59,7 +59,7 @@ class PublicChatPatternTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.bot.close)
         await self.join()
 
-    async def join(self):
+    async def join(self, *, locale="en_US", resource_pack_index=None):
         self.incoming = asyncio.Queue()
         self.transport = SimpleNamespace(recv=self.incoming.get, send=AsyncMock(), close=AsyncMock())
         settings = self.protocol.binding.NetworkSettingsPacket(
@@ -69,8 +69,9 @@ class PublicChatPatternTests(unittest.IsolatedAsyncioTestCase):
         packets = PacketConnection(self.transport, self.protocol, settings)
         session = JoinSession(packets, self.bot.identity, "http://127.0.0.1:19132")
         session.player_id = session.player_unique_id = 1
+        session.resource_pack_index = resource_pack_index
         with patch.object(JoinSession, "connect_nethernet", return_value=session):
-            await self.bot.join_nethernet(session.address)
+            await self.bot.join_nethernet(session.address, locale=locale)
 
     def player_chat(self, message, author="Player\u00a7r"):
         text = self.protocol.binding.packets[9]
@@ -414,7 +415,7 @@ class PublicChatPatternTests(unittest.IsolatedAsyncioTestCase):
             self.player_chat("start 2"), self.player_chat("end blue"),
         )
         self.assertEqual(events, [
-            ("text", "start 1"), ("chat", "start 1"), ("text", "start 0"),
+            ("text", "start 1"), ("chat", "start 1"), ("text", "start 0"), ("chat", "start 0"),
             ("text", "end red"), ("chat", "end red"), ("match", "1"),
             ("text", "start 2"), ("chat", "start 2"),
             ("text", "end blue"), ("chat", "end blue"), ("match", "2"),
@@ -426,6 +427,88 @@ class PublicChatPatternTests(unittest.IsolatedAsyncioTestCase):
                          [["1", "red"], ["2", "blue"]])
         with self.assertRaises(FrozenInstanceError):
             completions[0].messages = ()
+
+    async def test_history_keeps_wire_order_and_repeats_without_synthesizing_hud_or_death(self):
+        b = self.protocol.binding
+        text = b.TextPacket
+        history, authored, wire = [], [], []
+        self.bot.subscribe_chat(history.append)
+        self.bot.subscribe_chat(authored.append, author="Player")
+        self.bot.subscribe_text(wire.append)
+
+        def packet(kind, message, *, author=None, params=None, localize=False):
+            if author is not None:
+                body = text.AuthorAndMessage(type=kind, author=author, message=message)
+            elif params is not None:
+                body = text.MessageAndParams(type=kind, message=message, params=params)
+            else:
+                body = text.MessageOnly(type=kind, message=message)
+            return text(body=body, localize=localize)
+
+        public = text(body=self.player_chat("same"))
+        whisper = packet(TextPacketType.WHISPER, "same", author="Player")
+        server = packet(TextPacketType.ANNOUNCEMENT, "[Server] notice", author="Server")
+        joined = packet(TextPacketType.TRANSLATE, "§e%multiplayer.player.joined", params=["Jo"], localize=True)
+        death = packet(TextPacketType.TRANSLATE, "death.attack.lava", params=["Jo"], localize=True)
+        rawtext = packet(TextPacketType.TEXT_OBJECT, '{"rawtext":[{"text":"server object"}]}')
+        excluded = [packet(TextPacketType.TIP, "tip"), packet(TextPacketType.POPUP, "pop", params=[]),
+                    packet(TextPacketType.JUKEBOX_POPUP, "song", params=[])]
+        titles = [b.SetTitlePacket(type=kind, title_text="display only")
+                  for kind in (b.SetTitlePacket.TitleType.TITLE, b.SetTitlePacket.TitleType.SUBTITLE,
+                               b.SetTitlePacket.TitleType.ACTIONBAR)]
+        death_info = b.DeathInfoPacket(death_cause_message=b.DeathInfoPacket.DeathCauseMessage(
+            attack_name="death.attack.lava", message_list=["Jo"],
+        ))
+        packets = [public, *excluded, whisper, joined, death_info, rawtext, server, *titles, death, public]
+        self.incoming.put_nowait(b"\xff" + write_batch(self.protocol.encode(value) for value in packets))
+        await asyncio.sleep(0)
+
+        self.assertEqual(history, [ChatMessage("Player", "same"), ChatMessage("Player", "same", "whisper"),
+                                   ChatMessage(None, None, "join", "§e%multiplayer.player.joined", ("Jo",)),
+                                   ChatMessage(None, "server object", "server"),
+                                   ChatMessage("Server", "[Server] notice", "server"),
+                                   ChatMessage(None, None, "death", "death.attack.lava", ("Jo",)),
+                                   ChatMessage("Player", "same")])
+        self.assertEqual(authored, [history[0], history[1], history[-1]])
+        self.assertEqual([event.kind for event in wire], [value.body.type for value in packets if isinstance(value, text)])
+        with self.assertRaises(FrozenInstanceError):
+            history[2].params = ()
+
+    async def test_history_uses_actual_join_locale_and_current_resource_pack(self):
+        await self.bot.close()
+        self.bot = Bot("PatternObserver", chat_languages={
+            "en_US": b"death.attack.lava=English %s\n",
+            "fr_FR": "death.attack.lava=Le joueur %s\nmultiplayer.player.left=%s a quitté la partie\n".encode(),
+        })
+        self.addAsyncCleanup(self.bot.close)
+        self.protocol = self.bot.protocol
+
+        async def show(overlay):
+            pack = ResourcePackIndex((), {"texts/fr_FR.lang": overlay})
+            await self.join(locale="fr_FR", resource_pack_index=pack)
+            entries = []
+            self.bot.subscribe_chat(entries.append)
+            text = self.protocol.binding.TextPacket
+            messages = [
+                text(body=text.MessageAndParams(type=TextPacketType.TRANSLATE, message="death.attack.lava",
+                                                params=["Player"]), localize=True),
+                text(body=text.MessageAndParams(type=TextPacketType.TRANSLATE, message="death.attack.lava",
+                                                params=[]), localize=True),
+                text(body=text.MessageOnly(type=TextPacketType.TEXT_OBJECT,
+                                           message='{"rawtext":[{"translate":"§e%multiplayer.player.left",'
+                                                   '"with":{"rawtext":[{"text":"Player"}]}}]}')),
+            ]
+            self.incoming.put_nowait(b"\xff" + write_batch(self.protocol.encode(value) for value in messages))
+            await asyncio.sleep(0)
+            await self.bot.close()
+            return entries
+
+        old = await show(b"death.attack.lava=Overlay A %s\n")
+        new = await show(b"death.attack.lava=Overlay B %s\n")
+        common = [ChatMessage(None, None, "death", "death.attack.lava", ()),
+                  ChatMessage(None, "§ePlayer a quitté la partie", "leave", "§e%multiplayer.player.left", ("Player",))]
+        self.assertEqual(old, [ChatMessage(None, "Overlay A Player", "death", "death.attack.lava", ("Player",)), *common])
+        self.assertEqual(new, [ChatMessage(None, "Overlay B Player", "death", "death.attack.lava", ("Player",)), *common])
 
     async def test_callback_exceptions_do_not_interrupt_other_callbacks_or_waiters(self):
         pattern = self.bot.add_chat_pattern("signal", "^signal")

@@ -171,6 +171,17 @@ class NativeTextTranslationsTests(unittest.TestCase):
         self.assertEqual(translations.resolve(TextEvent(TextPacketType.CHAT, " hi ", False, author="Peer§r")),
                          "<Peer>  hi ")
 
+    def test_numbered_decimal_template_resolves_command_count(self):
+        translations = TextTranslations.from_lang(locale="en_US", vanilla_lang=(
+            b"commands.players.list=There are %1$d/%2$d players online:\n"
+        ))
+        key = "commands.players.list"
+        self.assertEqual(translations.resolve(self.native(key, "1", "7")), "There are 1/7 players online:")
+        self.assertEqual(translations.resolve(text_object({"translate": key, "with": ["0", "7"]})),
+                         "There are 0/7 players online:")
+        self.assertIsNone(translations.resolve(self.native(key, "1", "many")))
+        self.assertIsNone(translations.resolve(self.native(key, "1")))
+
     def test_base_bom_and_unrelated_bad_entries_with_locale_overlay(self):
         base = (b"\xef\xbb\xbf\r\nkey=Base %s\r\nkept=100% done\r\nbad=\xff\n"
                 b"dup=first\ndup=second\nmissing delimiter\nambiguous=valid\nambiguous=\xff\n")

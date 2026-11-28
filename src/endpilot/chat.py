@@ -34,8 +34,9 @@ _TEXT_OBJECT_KINDS = (
 _LITERAL_TEXT_KINDS = (TextPacketType.RAW, TextPacketType.SYSTEM_MESSAGE, TextPacketType.TIP)
 _TRANSLATION_SLOT = re.compile(r"%%[0-9]*|%[A-Za-z0-9]")
 _NATIVE_TRANSLATION_SLOT = re.compile(
-    r"%(?:s|(?P<position>[1-9][0-9]*)\$s|%(?:[1-9][0-9]*)|(?=[%A-Za-z0-9.$+\-#]))",
+    r"%(?:s|(?P<position>[1-9][0-9]*)\$(?P<format>[sd])|%(?:[1-9][0-9]*)|(?=[%A-Za-z0-9.$+\-#]))",
 )
+_DECIMAL_ARGUMENT = re.compile(r"0|-?[1-9][0-9]*")
 _MAX_LANG_BYTES = 2 * 1024 * 1024
 _MAX_RAWTEXT_CHARS = 128 * 1024
 _MAX_RAWTEXT_DEPTH = 32
@@ -54,8 +55,13 @@ def _author_without_reset(author: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class ChatMessage:
-    author: str
-    message: str
+    """A chat entry observed by the current player."""
+
+    author: str | None
+    message: str | None
+    kind: Literal["chat", "whisper", "join", "leave", "death", "server", "command"] = "chat"
+    translation_key: str | None = None
+    params: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +178,30 @@ def _literal_rawtext(message: str) -> str | None:
     return "".join(parts)
 
 
+def _rawtext_translation(message: str) -> tuple[str, tuple[str, ...]] | None:
+    if len(message) > _MAX_RAWTEXT_CHARS:
+        return None
+    try:
+        value = json.loads(message, object_pairs_hook=_rawtext_object)
+    except (ValueError, RecursionError):
+        return None
+    if not (isinstance(value, dict) and value.keys() == {"rawtext"}
+            and isinstance(nodes := value["rawtext"], list) and len(nodes) == 1):
+        return None
+    node = nodes[0]
+    if not (isinstance(node, dict) and node.keys() in ({"translate"}, {"translate", "with"})
+            and isinstance(key := node["translate"], str)):
+        return None
+    args = node.get("with", [])
+    if isinstance(args, list) and all(isinstance(arg, str) for arg in args):
+        return key, tuple(args)
+    if (isinstance(args, dict) and args.keys() == {"rawtext"} and isinstance(nodes := args["rawtext"], list)
+            and all(isinstance(part, dict) and part.keys() == {"text"} and isinstance(part["text"], str)
+                    for part in nodes)):
+        return key, tuple(part["text"] for part in nodes)
+    return None
+
+
 def _read_translations(locale: str, index: ResourcePackIndex | None, *, vanilla_syntax: bool = False) -> dict[str, str]:
     _validate_locale(locale)
     if index is None:
@@ -245,6 +275,8 @@ def _fill_translation(template: str, args: Sequence[str], budget: int, *,
         if index >= len(args):
             raise ValueError("missing translation argument")
         value = args[index]
+        if syntax != "pack" and match["format"] == "d" and _DECIMAL_ARGUMENT.fullmatch(value) is None:
+            raise ValueError("unresolved decimal translation argument")
         budget -= match.start() - end + len(value)
         if budget < 0:
             raise ValueError("expanded translation exceeds the text limit")
@@ -372,6 +404,43 @@ class _IncomingText:
             self._contents[source] = content
         return self._contents[source]
 
+    def chat_message(self, translations: TextTranslations | None) -> ChatMessage | None:
+        event = self.event
+        author = _author_without_reset(event.author) if event.author is not None else None
+        if event.kind == TextPacketType.CHAT:
+            return ChatMessage(author, event.message)
+        if event.kind == TextPacketType.WHISPER and not event.localize:
+            return ChatMessage(author, event.message, "whisper")
+        if event.kind in (TextPacketType.RAW, TextPacketType.SYSTEM_MESSAGE, TextPacketType.ANNOUNCEMENT):
+            if not event.localize:
+                return ChatMessage(author, event.message, "server")
+            return None
+        if event.kind == TextPacketType.TRANSLATE and event.localize:
+            translation = (event.message, event.params or ())
+        elif event.kind in _TEXT_OBJECT_KINDS and not event.localize:
+            translation = _rawtext_translation(event.message)
+            if translation is None:
+                message = self.content(translations)
+                if message is None:
+                    return None
+                kind = "whisper" if event.kind == TextPacketType.TEXT_OBJECT_WHISPER else "server"
+                return ChatMessage(author, message, kind)
+        else:
+            return None
+        key, params = translation
+        normalized_key = key.removeprefix("§e%").removeprefix("%")
+        if normalized_key.startswith("commands."):
+            return None  # Command feedback needs a confirmed chat display path.
+        if normalized_key == "multiplayer.player.joined":
+            kind = "join"
+        elif normalized_key == "multiplayer.player.left":
+            kind = "leave"
+        elif normalized_key.startswith("death."):
+            kind = "death"
+        else:
+            kind = "whisper" if event.kind == TextPacketType.TEXT_OBJECT_WHISPER else "server"
+        return ChatMessage(author, self.content(translations), kind, key, params)
+
 
 @dataclass(slots=True)
 class _RegisteredPattern[T]:
@@ -385,12 +454,14 @@ class _RegisteredPattern[T]:
 
 class Chat:
     def __init__(
-        self, packets, name: str, *, resource_pack_index: ResourcePackIndex | None = None, _xuid: str = "",
+        self, packets, name: str, *, resource_pack_index: ResourcePackIndex | None = None,
+        translations: TextTranslations | None = None, _xuid: str = "",
     ):
         self.packets = packets
         self.name = name
         self._xuid = _xuid
         self._resource_pack_index = resource_pack_index
+        self._translations = translations
         self._text = packets.protocol.binding.packets[9]
         self._pattern_ids = count(1)
         self._patterns: dict[int, _RegisteredPattern[ChatMessage]] = {}
@@ -734,14 +805,14 @@ class Chat:
         message = self._chat_message(packet.body)
         if message is not None and self._patterns:
             self._advance_patterns(self._patterns, self._completed, message, lambda _: message.message, ChatMatch)
-        if self._display_patterns or self._text_observers:
+        if self._display_patterns or self._text_observers or self._message_observers:
             incoming = _IncomingText(self._text_event(packet), self._resource_pack_index)
             self._advance_patterns(
                 self._display_patterns, self._display_completed, incoming.event, incoming.content, DisplayMatch,
             )
             self._notify(self._text_observers, incoming)
-        if message is not None:
-            self._notify(self._message_observers, message)
+            if self._message_observers and (entry := incoming.chat_message(self._translations)) is not None:
+                self._notify(self._message_observers, entry)
         for completed in self._completed:
             self._notify(self._match_observers, completed)
         for completed in self._display_completed:

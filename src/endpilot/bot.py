@@ -112,7 +112,8 @@ class Bot:
     def __init__(self, name: str = "EndPilot", protocol: int = DEFAULT_PROTOCOL, *,
                  input_source: Callable[[], ForwardInput] | None = None,
                  on_input_sent: Callable[[int, int], None] | None = None,
-                 auto_respawn: bool = False, skin: Skin | None = None):
+                 auto_respawn: bool = False, skin: Skin | None = None,
+                 chat_languages: Mapping[str, bytes] | None = None):
         """Create a bot with an optional classic skin for each login.
 
         Optionally supply forward input for the regular 50 ms movement clock.
@@ -121,10 +122,12 @@ class Bot:
         frames. After each successful scheduled send, the synchronous observer
         receives the client tick and monotonic nanoseconds. Explicit player
         actions use the same lock.
+        Supply local Bedrock .lang bytes by locale to render translated chat.
         """
         if skin is not None and not isinstance(skin, Skin):
             raise TypeError("skin must be a Skin")
         self._skin = skin
+        self._chat_languages = dict(chat_languages or {})
         self._offline_identity = OfflineIdentity(name)
         self.protocol = Protocol(protocol)
         self._auto_respawn = auto_respawn
@@ -372,7 +375,7 @@ class Bot:
                 raise error
             try:
                 session.packets._defer_receiving_until(start_complete)
-                self._start_session(session, load_announced_terrain=load_announced_terrain,
+                self._start_session(session, locale=locale, load_announced_terrain=load_announced_terrain,
                                     terrain_storage=terrain_storage)
             except BaseException as error:
                 await _close_after_failed_join(self, error, "session cleanup after failed join")
@@ -431,7 +434,7 @@ class Bot:
         if self._terrain is None:
             self._terrain = _TerrainObserver(self._blocks)
 
-    def _start_session(self, session: JoinSession, *, load_announced_terrain: bool = False,
+    def _start_session(self, session: JoinSession, *, locale: str = DEFAULT_LOCALE, load_announced_terrain: bool = False,
                        terrain_storage: TerrainStorage | None = None) -> None:
         self._clock = session.clock
         self._session = session
@@ -507,7 +510,14 @@ class Bot:
             ordinary_haste=self._ordinary_haste_mining,
         )
         self._signs = Signs(session.packets, self._blocks, self._movement, self._inventory, session.player_id)
-        self._chat = Chat(session.packets, identity.name, resource_pack_index=session.resource_pack_index, _xuid=xuid)
+        pack_index = session.resource_pack_index
+        base_language = self._chat_languages.get(locale)
+        translations = None
+        if base_language is not None or pack_index is not None and f"texts/{locale}.lang" in pack_index.resources:
+            translations = TextTranslations.from_lang(locale=locale, vanilla_lang=base_language or b"",
+                                                       resource_pack_index=pack_index)
+        self._chat = Chat(session.packets, identity.name, resource_pack_index=pack_index,
+                          translations=translations, _xuid=xuid)
         self._titles = Titles(session.packets, session._end_state, _publish_error=publish_error)
         self._commands = Commands(
             session.packets, session.identity.uuid, session.player_unique_id,
@@ -2816,7 +2826,7 @@ class Bot:
     def subscribe_chat(
         self, callback: Callable[[ChatMessage], None], *, author: str | None = None,
     ) -> Callable[[], None]:
-        """Run a synchronous callback for matching chat and return an idempotent unsubscribe."""
+        """Observe chat entries in order and return an idempotent unsubscribe."""
         if self._chat is None:
             raise RuntimeError("player has not joined")
         return self._chat.subscribe_message(callback, author=author)
