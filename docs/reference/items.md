@@ -42,20 +42,22 @@ error reports the snapshot under
 `error.attributes.transfer_progress` in `observe_script`. Use `stop_script`
 to terminate the worker and drain its actions on the resident connection.
 
-## Move a horse saddle
+## Move horse equipment
 
 Stand near a tamed horse while holding sneak with an empty hand. Open it
 with `await bot.open_entity_container(horse.runtime_id)` and wait for the
 two reported equipment slots with `await bot.wait_for_container_slots()`.
-Slot `0` holds the saddle. Use `await bot.take_from_container(0, player_slot, 1)`
-to remove it into a confirmed empty main inventory slot (`0`–`35`), or
-`await bot.put_into_container(player_slot, 0, 1)` to install one saddle
-in an empty saddle slot. Check the returned server verdict before making
-another move.
+Slot `0` holds the saddle and slot `1` holds horse armor. For example, use
+`await bot.take_from_container(1, player_slot, 1)` to remove the armor into
+a confirmed empty main inventory slot (`0`–`35`), or
+`await bot.put_into_container(player_slot, 1, 1)` to equip it in an observed
+empty armor slot. Check the returned server verdict before making another move.
 
-Both actions require the server to have registered the source item as
-`minecraft:saddle`. Horse armor, range transfers and horse windows that
-arrive outside a matching `open_entity_container` call support observation only.
+The server must identify the source stack by its network ID and register its
+item as `minecraft:saddle` for slot `0` or as leather, iron, golden, diamond,
+copper, or netherite horse armor for slot `1`. Equipment moves use the
+single-item calls. Horse windows that arrive outside a matching
+`open_entity_container` call support observation only.
 
 ## Read donkey equipment and storage
 

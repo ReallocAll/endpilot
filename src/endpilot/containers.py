@@ -80,9 +80,19 @@ _CHEST_BOAT = "minecraft:chest_boat"
 _HORSE = "minecraft:horse"
 _DONKEY = "minecraft:donkey"
 _HORSE_SLOT_COUNT = 2
-_HORSE_SADDLE_SLOT = 0
 _HORSE_EQUIP_CONTAINER = "HORSE_EQUIP_CONTAINER"
-_SADDLE = "minecraft:saddle"
+# Canonical item registry names from the stock protocol 2225 horse slot declarations.
+_HORSE_SLOT_ITEMS = {
+    0: frozenset({"minecraft:saddle"}),
+    1: frozenset({
+        "minecraft:copper_horse_armor",
+        "minecraft:diamond_horse_armor",
+        "minecraft:golden_horse_armor",
+        "minecraft:iron_horse_armor",
+        "minecraft:leather_horse_armor",
+        "minecraft:netherite_horse_armor",
+    }),
+}
 _ENTITY_CONTAINER_LAYOUTS = {
     "minecraft:chest_minecart": ("CONTAINER", 27),
     "minecraft:hopper_minecart": ("HOPPER", 5),
@@ -640,7 +650,7 @@ class Containers:
             if entity.actor_type == _DONKEY:
                 return
             if entity.actor_type == _HORSE and (
-                self._window_slot_count != _HORSE_SLOT_COUNT or index != _HORSE_SADDLE_SLOT
+                self._window_slot_count != _HORSE_SLOT_COUNT or index not in _HORSE_SLOT_ITEMS
             ):
                 return
             if entity.actor_type == _CHEST_BOAT:
@@ -1608,9 +1618,10 @@ class Containers:
             raise ValueError("item-stack request amount must be between 1 and 255")
         chest_slot, player_slot = (destination_slot, source_slot) if into_container else (source_slot, destination_slot)
         if horse:
-            if (type(chest_slot) is not int or chest_slot != _HORSE_SADDLE_SLOT or type(amount) is not int or amount != 1
-                    or type(player_slot) is not int or not 0 <= player_slot < _MAIN_INVENTORY_SIZE):
-                raise ValueError("horse transfers require one saddle in slot 0 and a main inventory slot")
+            if (type(chest_slot) is not int or chest_slot not in _HORSE_SLOT_ITEMS
+                    or type(amount) is not int or amount != 1 or type(player_slot) is not int
+                    or not 0 <= player_slot < _MAIN_INVENTORY_SIZE):
+                raise ValueError("horse transfers require one item between equipment slot 0 or 1 and a main inventory slot")
             strict_slot_count = _HORSE_SLOT_COUNT
         if strict_slot_count is not None:
             if not 0 <= chest_slot < strict_slot_count:
@@ -1731,15 +1742,17 @@ class Containers:
             strings_to_filter=[],
             strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
         )
-        source = original_chest = original_player = None
+        source = original_chest = original_player = original_horse_item_name = None
 
         def horse_layout_is_known():
             return (self._window_slot_count == _HORSE_SLOT_COUNT and self._slots is not None
                     and self._slots.keys() == {0, 1} and all(item is not None for item in self._slots.values()))
 
-        def is_saddle(item):
-            return (item is not None and int(item.id) != 0 and int(item.stack_size) == 1 and item.net_id_variant
-                    and self._item_names.get(int(item.id)) == _SADDLE)
+        def horse_source_name(item):
+            if item is not None and int(item.id) != 0 and int(item.stack_size) == 1 and item.net_id_variant:
+                name = self._item_names.get(int(item.id))
+                if name in _HORSE_SLOT_ITEMS[chest_slot]:
+                    return name
 
         def horse_player_slot_is_known(item, *, correction=None):
             equipment = self.inventory._damage_descriptors.get(player_endpoint)
@@ -1748,7 +1761,7 @@ class Containers:
                     and (equipment is None or _same_slot(item, equipment) or _same_slot(correction, equipment)))
 
         def prepare_request():
-            nonlocal source, original_chest, original_player
+            nonlocal source, original_chest, original_player, original_horse_item_name
             original_chest = self._slots.get(chest_slot)
             original_player = self.inventory.slots.get(player_slot)
             if into_container:
@@ -1765,8 +1778,10 @@ class Containers:
                 observed_destination = original_chest if into_container else original_player
                 if not horse_layout_is_known() or not horse_player_slot_is_known(original_player):
                     raise RuntimeError("horse transfer requires observed horse equipment and main inventory slots")
-                if not is_saddle(source):
-                    raise ValueError("horse transfer source must be one server-registered saddle")
+                original_horse_item_name = horse_source_name(source)
+                if original_horse_item_name is None:
+                    equipment = "saddle" if chest_slot == 0 else "piece of horse armor"
+                    raise ValueError(f"horse transfer source must be one server-registered {equipment}")
                 if observed_destination is None or (observed_destination.id or observed_destination.stack_size
                                                     or observed_destination.net_id_variant):
                     raise ValueError("horse transfer destination must be an observed empty slot")
@@ -1884,7 +1899,8 @@ class Containers:
 
             known = (self._slots[chest_slot], current_player)
             originals = (original_chest, original_player)
-            if all(map(receipt_matches, wanted)) and not horse_overlap and is_saddle(source):
+            if (all(map(receipt_matches, wanted)) and not horse_overlap
+                    and horse_source_name(source) == original_horse_item_name):
                 corrected = tuple(
                     _response_item(b, original, source, receipts[name][0])
                     for name, original in zip(wanted, originals)
@@ -2051,7 +2067,8 @@ class Containers:
                     if horse:
                         own_request = self.inventory._pending_requests[request_id]
                         current_player = self.inventory.slots.get(player_slot)
-                        if (not horse_layout_is_known() or slots_unconfirmed() or not is_saddle(source)
+                        if (not horse_layout_is_known() or slots_unconfirmed()
+                                or horse_source_name(source) != original_horse_item_name
                                 or not _same_slot(original_chest, self._slots.get(chest_slot))
                                 or not _same_slot(original_player, current_player)
                                 or not horse_player_slot_is_known(current_player)

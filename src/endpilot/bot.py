@@ -2155,7 +2155,8 @@ class Bot:
         """Return the server's item-stack verdict; response slots update observed state.
 
         For a horse opened with open_entity_container(), take one saddle from
-        slot 0 into a confirmed empty main inventory slot.
+        slot 0 or one piece of horse armor from slot 1 into a confirmed empty
+        main inventory slot.
         """
         if self._containers is None:
             raise RuntimeError("player has not joined")
@@ -2188,8 +2189,9 @@ class Bot:
     ):
         """Return the server's verdict for inventory-to-container transfer.
 
-        For a horse opened with open_entity_container(), put one saddle from
-        main inventory into its confirmed empty slot 0.
+        For a horse opened with open_entity_container(), put one saddle into
+        slot 0 or one piece of horse armor into slot 1 from main inventory.
+        The equipment slot must be confirmed empty.
         """
         if self._containers is None:
             raise RuntimeError("player has not joined")
@@ -2405,8 +2407,9 @@ class Bot:
         The click waits for server-reported sneaking within the same timeout.
         The method leaves your pose alone.
         Return the matching server-opened window. Use wait_for_container_slots
-        for its contents. Exact saddle transfers use slot 0 on a horse opened
-        through this method. Horse armor and range transfers are unsupported.
+        for its contents. A horse opened through this method supports single-item
+        transfers of a saddle in slot 0 or horse armor in slot 1. Equipment transfers
+        use take_from_container() or put_into_container().
         Donkey windows are read-only. Full server contents report slot 0 for
         the saddle and slots 1–15 when the donkey has a chest.
         Chest watercraft and hopper minecart transfers require matching

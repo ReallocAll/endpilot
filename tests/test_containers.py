@@ -403,6 +403,10 @@ class ContainerTests(unittest.IsolatedAsyncioTestCase):
 
 class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
     SADDLE_ID = 1234
+    HORSE_ARMOR_NAMES = (
+        "minecraft:leather_horse_armor", "minecraft:iron_horse_armor", "minecraft:golden_horse_armor",
+        "minecraft:diamond_horse_armor", "minecraft:copper_horse_armor", "minecraft:netherite_horse_armor",
+    )
 
     async def asyncSetUp(self):
         self.enterContext(ManualClock().patch_scheduler())
@@ -719,12 +723,15 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
 
     def horse_equipment(self, unique=-205, *, window_id=2):
         b = self.b
+        declarations = [nbt.CompoundTag({
+            "slotNumber": nbt.IntTag(index),
+            "acceptedItems": nbt.ListTag([nbt.CompoundTag({"slotItem": nbt.CompoundTag({
+                "Name": nbt.StringTag(name), "Aux": nbt.ShortTag(32767),
+            })}) for name in names]),
+        }) for index, names in enumerate((("minecraft:saddle",), self.HORSE_ARMOR_NAMES))]
         return b.UpdateEquipPacket(
             container_id=window_id, type=b.ContainerType.HORSE, size=0, entity_unique_id=unique,
-            data=nbt.CompoundTag({"slots": nbt.ListTag([nbt.CompoundTag({
-                "slotNumber": nbt.IntTag(1),
-                "item": nbt.CompoundTag({"Name": nbt.StringTag("minecraft:horsearmoriron")}),
-            })])}),
+            data=nbt.CompoundTag({"slots": nbt.ListTag(declarations)}),
         )
 
     async def prepare_donkey(self, held_item=None):
@@ -817,10 +824,17 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
     def saddle(self, *, count=1, net=70, item_id=SADDLE_ID):
         return self.b.SerializedNetworkItemStackDescriptor(id=item_id, stack_size=count, net_id_variant=net)
 
-    def horse_content(self, item=None, *, count=2):
+    def horse_armor(self, *, item_id=759, count=1, net=90):
+        damage_nbt = bytes.fromhex("ffff010a000003060044616d61676507000000000000000000000000")
+        return self.b.SerializedNetworkItemStackDescriptor(id=item_id, stack_size=count, net_id_variant=net,
+                                                          user_data_buffer=damage_nbt)
+
+    def horse_content(self, item=None, *, count=2, armor=None):
         slots = [self.b.SerializedNetworkItemStackDescriptor() for _ in range(count)]
         if item is not None:
             slots[0] = item
+        if armor is not None:
+            slots[1] = armor
         return self.b.InventoryContentPacket(inventory_id=2, slots=slots)
 
     async def open_horse(self, inventory, *, runtime_id=35, unique=-205):
@@ -828,9 +842,10 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
         await self.deliver(self.horse_equipment(unique), inventory)
         return await opening
 
-    async def prepare_horse(self, *, confirmed=True):
+    async def prepare_horse(self, *, confirmed=True, extra_items=()):
         b = self.b
-        registry = b.ItemRegistryPacket(items=[b.ItemData(id=self.SADDLE_ID, name="minecraft:saddle")])
+        registry = b.ItemRegistryPacket(items=[b.ItemData(id=self.SADDLE_ID, name="minecraft:saddle"),
+                                              *(b.ItemData(id=item_id, name=name) for item_id, name in extra_items)])
         await self.deliver(registry, self.horse(), self.position(), self.main_slot(), self.main_slot(1),
                            self.sneak_pose(False))
         await self.bot.set_sneaking(True)
@@ -943,8 +958,8 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
         await self.prepare_horse()
         await self.open_horse(self.horse_content(self.saddle()))
         requests_before = list(self.wire.sent)
-        for slots in ((1, 1, 1), (0, 1, 2), (0, 36, 1)):
-            with self.assertRaisesRegex(ValueError, "one saddle in slot 0"):
+        for slots in ((2, 1, 1), (0, 1, 2), (1, 1, 2), (0, 36, 1)):
+            with self.assertRaisesRegex(ValueError, "equipment slot 0 or 1"):
                 await self.bot.take_from_container(*slots)
         with self.assertRaisesRegex(RuntimeError, "observed horse equipment and main inventory"):
             await self.bot.take_from_container(0, 2)
@@ -961,6 +976,121 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "an observed empty slot"):
             await self.bot.put_into_container(1, 0)
         self.assertEqual(self.wire.sent, requests_before)
+
+    async def test_horse_armor_round_trip_encodes_all_declared_registry_names_and_keeps_stack_data(self):
+        b = self.b
+        registry = tuple(enumerate(self.HORSE_ARMOR_NAMES, 1400))
+        await self.prepare_horse(extra_items=registry)
+        await self.open_horse(self.horse_content(self.saddle()))
+        player, horse = "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", "HORSE_EQUIP_CONTAINER"
+        for item_id, name in registry:
+            with self.subTest(item=name):
+                armor = self.horse_armor(item_id=item_id)
+                await self.deliver(self.main_slot(1, armor))
+                for into_horse in (True, False):
+                    if into_horse:
+                        operation = self.bot.put_into_container(1, 1)
+                        source, destination, before_net, after_net = player, horse, 90, 91
+                        action_type = b.ItemStackRequestCereal.PlaceActionData
+                    else:
+                        operation = self.bot.take_from_container(1, 1)
+                        source, destination, before_net, after_net = horse, player, 91, 92
+                        action_type = b.ItemStackRequestCereal.TakeActionData
+                    task, request = await self.submit_stack(operation)
+                    action, = request.actions
+                    self.assertIsInstance(action, action_type)
+                    self.assertEqual(action.amount, 1)
+                    self.assertEqual([(end.full_container_name.name.name, end.full_container_name.dynamic_id,
+                                       end.slot, end.net_id_variant) for end in (action.source, action.destination)],
+                                     [(source, None, 1, before_net), (destination, None, 1, 0)])
+                    await self.reply_stack(request, (source, 1, 0, 0), (destination, 1, 1, after_net))
+                    self.assertEqual((await task).result.name, "SUCCESS")
+                    equipment, inventory = self.bot.container_slots[1], self.bot.inventory_slots[1]
+                    item, empty = (equipment, inventory) if into_horse else (inventory, equipment)
+                    self.assertEqual((item.id, item.stack_size, item.net_id_variant, item.user_data_buffer),
+                                     (item_id, 1, after_net, armor.user_data_buffer))
+                    self.assertEqual((empty.id, empty.stack_size), (0, 0))
+                    self.assertEqual((self.bot.container_slots[0].id, self.bot.container_slots[0].net_id_variant),
+                                     (self.SADDLE_ID, 70))
+
+    async def test_horse_armor_rejects_unknown_wrong_slot_and_unconfirmed_stacks(self):
+        await self.prepare_horse(extra_items=((760, "minecraft:copper_horse_armor"),
+                                             (761, "minecraft:emerald_horse_armor"),
+                                             (762, "minecraft:horsearmoriron"),
+                                             (763, "example:copper_horse_armor"),
+                                             (764, "minecraft:iron_chestplate")))
+        await self.open_horse(self.horse_content(self.saddle()))
+        sent = list(self.wire.sent)
+        wrong = [self.horse_armor(item_id=item_id) for item_id in (759, 761, 762, 763, 764)]
+        wrong.extend((self.horse_armor(item_id=760, count=2), self.horse_armor(item_id=760, net=None), self.saddle()))
+        for item in wrong:
+            with self.subTest(item=item.id, count=item.stack_size, net=item.net_id_variant):
+                await self.deliver(self.horse_content(self.saddle(), armor=item), self.main_slot(1))
+                with self.assertRaisesRegex(ValueError, "one server-registered piece of horse armor"):
+                    await self.bot.take_from_container(1, 1)
+                await self.deliver(self.horse_content(self.saddle()), self.main_slot(1, item))
+                with self.assertRaisesRegex(ValueError, "one server-registered piece of horse armor"):
+                    await self.bot.put_into_container(1, 1)
+
+        armor = self.horse_armor(item_id=760)
+        await self.deliver(self.horse_content(armor, armor=armor), self.main_slot(1, armor))
+        with self.assertRaisesRegex(ValueError, "one server-registered saddle"):
+            await self.bot.take_from_container(0, 1)
+        with self.assertRaisesRegex(ValueError, "one server-registered saddle"):
+            await self.bot.put_into_container(1, 0)
+        with self.assertRaisesRegex(ValueError, "an observed empty slot"):
+            await self.bot.take_from_container(1, 1)
+        with self.assertRaisesRegex(ValueError, "an observed empty slot"):
+            await self.bot.put_into_container(1, 1)
+        self.assertEqual(self.wire.sent, sent)
+
+    async def test_horse_armor_success_after_overlapping_slot_updates_keeps_server_observations(self):
+        b = self.b
+        armor = self.horse_armor()
+        await self.prepare_horse(extra_items=((759, "minecraft:copper_horse_armor"),))
+        await self.open_horse(self.horse_content(self.saddle(), armor=armor))
+        take, request = await self.submit_stack(self.bot.take_from_container(1, 1))
+        await self.deliver(self.main_slot(2))
+        sent = list(self.wire.sent)
+        with self.assertRaisesRegex(RuntimeError, "no pending item request"):
+            await self.bot.take_from_container(1, 2)
+        self.assertEqual(self.wire.sent, sent)
+        await self.deliver(b.InventorySlotPacket(inventory_id=2, slot=1, item=self.main_slot().item),
+                           b.InventorySlotPacket(inventory_id=2, slot=1, item=armor))
+        await self.reply_stack(request, ("HORSE_EQUIP_CONTAINER", 1, 0, 0),
+                               ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 1, 1, 90))
+        self.assertEqual((await take).result.name, "SUCCESS")
+        self.assertEqual((self.bot.container_slots[1].net_id_variant, self.bot.inventory_slots[1].id), (90, 0))
+        with self.assertRaisesRegex(RuntimeError, "fresh server observation"):
+            await self.bot.take_from_container(1, 1)
+        self.assertEqual(self.wire.sent, sent)
+
+    async def test_late_horse_armor_success_does_not_populate_player_slot_after_horse_changes(self):
+        await self.prepare_horse(extra_items=((759, "minecraft:copper_horse_armor"),))
+        await self.open_horse(self.horse_content(self.saddle(), armor=self.horse_armor()))
+        take, request = await self.submit_stack(self.bot.take_from_container(1, 1))
+        await self.deliver(self.horse_closed(), self.horse(-206, runtime_id=36))
+        await self.open_horse(self.horse_content(self.saddle(), armor=self.horse_armor(net=91)),
+                              runtime_id=36, unique=-206)
+        await self.reply_stack(request, ("HORSE_EQUIP_CONTAINER", 1, 0, 0),
+                               ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 1, 1, 90))
+        self.assertEqual((await take).result.name, "SUCCESS")
+        self.assertEqual((self.bot.container_slots[1].net_id_variant, self.bot.inventory_slots[1].id), (91, 0))
+        sent = list(self.wire.sent)
+        with self.assertRaisesRegex(RuntimeError, "fresh server observation"):
+            await self.bot.take_from_container(1, 1)
+        self.assertEqual(self.wire.sent, sent)
+
+    async def test_horse_armor_receipt_does_not_apply_after_registry_reassigns_source_id(self):
+        b = self.b
+        await self.prepare_horse(extra_items=((759, "minecraft:copper_horse_armor"),))
+        await self.open_horse(self.horse_content(self.saddle(), armor=self.horse_armor()))
+        take, request = await self.submit_stack(self.bot.take_from_container(1, 1))
+        await self.deliver(b.ItemRegistryPacket(items=[b.ItemData(id=759, name="minecraft:iron_horse_armor")]))
+        await self.reply_stack(request, ("HORSE_EQUIP_CONTAINER", 1, 0, 0),
+                               ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 1, 1, 90))
+        self.assertEqual((await take).result.name, "SUCCESS")
+        self.assertEqual((self.bot.container_slots[1].net_id_variant, self.bot.inventory_slots[1].id), (90, 0))
 
     async def test_horse_native_replacement_does_not_inherit_transfer_ownership_or_late_verdict(self):
         await self.prepare_horse()
