@@ -577,6 +577,7 @@ class Entities:
         self._players_by_uuid: dict[UUID, PlayerListEntry] = {}
         self._player_list_observers: list[Callable[[tuple[PlayerListChange, ...]], None]] = []
         self._player_skin_observers: list[Callable[[PlayerListEntry], None]] = []
+        self._player_change_observers: list[Callable[[PlayerListEntry], None]] = []
         self._last_skin_update: tuple[RawPacket, UUID] | None = None
         self._player_runtime_by_uuid: dict[UUID, int] = {}
         self._player_uuid_by_runtime: dict[int, UUID] = {}
@@ -642,6 +643,7 @@ class Entities:
         self._last_skin_update = None
         self._player_list_observers.clear()
         self._player_skin_observers.clear()
+        self._player_change_observers.clear()
         self._lifecycle_observers.clear()
         self._movement_observers.clear()
         self._end_movement_waiters(ConnectionError, "entity session is closed", _cause)
@@ -669,7 +671,10 @@ class Entities:
     def player_list(self) -> tuple[PlayerListEntry, ...]:
         return tuple(self._players_by_uuid.values())
 
-    def _record_player_list_add(self, player: PlayerListEntry, runtime_id: int | None) -> None:
+    def _record_player_list_add(
+        self, player: PlayerListEntry, runtime_id: int | None,
+        observers: tuple[Callable[[PlayerListEntry], None], ...],
+    ) -> None:
         previous = self._players_by_uuid.get(player.uuid)
         instance = self._actor_instances.get(runtime_id)
         pending = None
@@ -681,7 +686,18 @@ class Entities:
             mode = previous.game_mode
         elif previous is None and pending is not None and pending[0] == player.entity_id:
             mode = pending[1]
-        self._players_by_uuid[player.uuid] = replace(player, game_mode=mode) if mode is not None else player
+        updated = replace(player, game_mode=mode) if mode is not None else player
+        self._players_by_uuid[player.uuid] = updated
+        if observers and previous is not None and updated != previous:
+            self.packets._notify(observers, updated)
+
+    def _record_player_game_mode(self, player: PlayerListEntry, mode: GameType, *, startup: bool) -> None:
+        if player.game_mode == mode:
+            return
+        updated = replace(player, game_mode=mode)
+        self._players_by_uuid[player.uuid] = updated
+        if not startup and self._player_change_observers:
+            self.packets._notify(self._player_change_observers, updated)
 
     async def wait_for_player_list_update(
         self, *, action: Literal["add", "remove"] | None, player_uuid: UUID | None, timeout: float,
@@ -752,6 +768,17 @@ class Entities:
                 callback(player)
 
         return self.packets._subscribe(self._player_skin_observers, observe)
+
+    def subscribe_player_changes(
+        self, callback: Callable[[PlayerListEntry], None], *, player_uuid: UUID | None,
+    ) -> Callable[[], None]:
+        self._require_live()
+
+        def observe(player: PlayerListEntry) -> None:
+            if player_uuid is None or player.uuid == player_uuid:
+                callback(player)
+
+        return self.packets._subscribe(self._player_change_observers, observe)
 
     def snapshot(self) -> tuple[EntityState, ...]:
         """Snapshot actors observed since subscription; not a world entity scan."""
@@ -1722,6 +1749,7 @@ class Entities:
         elif packet_id == b.PlayerListPacket.ID:
             packet = self.packets.protocol.decode(raw)
             observers = tuple(self._player_list_observers)
+            player_observers = () if startup else tuple(self._player_change_observers)
             observed_changes = [] if observers else None
             for entry in packet.entries:
                 change = _player_list_change(entry)
@@ -1729,7 +1757,7 @@ class Entities:
                     observed_changes.append(change)
                 runtime_id = self._player_runtime_by_uuid.get(change.uuid)
                 if change.player is not None:
-                    self._record_player_list_add(change.player, runtime_id)
+                    self._record_player_list_add(change.player, runtime_id, player_observers)
                     state = self._by_runtime.get(runtime_id)
                     if state is not None:
                         entity_id = change.player.entity_id
@@ -1784,9 +1812,7 @@ class Entities:
             if entity_id and entity_id != self._own_entity_id and mode in _EXPLICIT_GAME_MODES:
                 players = [player for player in self._players_by_uuid.values() if player.entity_id == entity_id]
                 if len(players) == 1 and players[0].uuid != self._own_uuid:
-                    player = players[0]
-                    if player.game_mode != mode:
-                        self._players_by_uuid[player.uuid] = replace(player, game_mode=mode)
+                    self._record_player_game_mode(players[0], mode, startup=startup)
         elif packet_id == b.PlayerSkinPacket.ID:
             packet = self.packets.protocol.decode(raw)
             listed = self._players_by_uuid.get(packet.uuid)
@@ -1795,7 +1821,10 @@ class Entities:
                 updated = replace(listed, skin=skin)
                 self._players_by_uuid[packet.uuid] = updated
                 self._last_skin_update = raw, packet.uuid
+                player_observers = () if startup else tuple(self._player_change_observers)
                 self.packets._notify(self._player_skin_observers, updated)
+                if player_observers and skin != listed.skin:
+                    self.packets._notify(player_observers, updated)
         elif packet_id == b.AddPlayerPacket.ID:
             player = self.packets.protocol.decode(raw)
             for link in player.links:
@@ -1829,8 +1858,8 @@ class Entities:
                     and mode in _EXPLICIT_GAME_MODES):
                 if listed is None:
                     self._actor_instances[runtime_id].unlisted_game_mode = entity_id, mode
-                elif listed_id == entity_id and listed.game_mode != mode:
-                    self._players_by_uuid[player_uuid] = replace(listed, game_mode=mode)
+                elif listed_id == entity_id:
+                    self._record_player_game_mode(listed, mode, startup=startup)
             if getattr(self.packets.protocol, "number", None) == 2225:
                 self._cursor_bodies[runtime_id] = _cursor_body(metadata, b)
             if identity_matches:

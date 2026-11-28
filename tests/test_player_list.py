@@ -209,6 +209,84 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
         await self.join(initial)
         self.assertEqual(self.player_modes(), {peer: None})
 
+    async def test_player_changes_follow_mode_updates_and_uuid_membership(self):
+        b = self.binding
+        mode = b.GameType
+        local, peer, other = self.bot.identity.uuid, UUID(int=110), UUID(int=111)
+        initial = self.add(peer, "Peer", id=301)
+        await self.join(self.roster(entries=[self.add(local, "Self", id=17), initial]))
+        saved_local, saved_peer = self.bot.observed_players
+        changes, matching = [], []
+
+        def observe(entry):
+            current = next(player for player in self.bot.observed_players if player.uuid == entry.uuid)
+            changes.append((entry, current))
+
+        self.bot.subscribe_player_changes(observe)
+        self.bot.subscribe_player_changes(matching.append, uuid=peer)
+        await self.deliver_through(
+            self.mode_update(17, mode.CREATIVE),
+            self.mode_update(301, mode.SURVIVAL),
+            self.mode_update(301, mode.SURVIVAL),
+            self.roster(entries=[self.add(other, "Other", id=401)]),
+            self.mode_update(401, mode.CREATIVE),
+            b.SetTimePacket(),
+        )
+        self.assertEqual(self.bot.observed_entities, ())
+        await self.deliver_through(
+            self.player_spawn(peer, 201, 301, mode.CREATIVE),
+            self.player_spawn(peer, 202, 301, mode.CREATIVE),
+            self.roster(entries=[self.remove(peer)]),
+            self.mode_update(301, mode.ADVENTURE),
+            self.roster(entries=[initial]),
+            self.roster(entries=[initial]),
+            b.SetTimePacket(),
+        )
+        self.assertIsNone(self.player_modes()[peer])
+        await self.deliver_through(
+            b.ChangeDimensionPacket(dimension_id=1),
+            self.mode_update(301, mode.ADVENTURE),
+            self.roster(entries=[self.add(local, "Renamed self", id=17)]),
+        )
+        final_players = {entry.uuid: entry for entry in self.bot.observed_players}
+        self.assertEqual(final_players[other].game_mode, mode.CREATIVE)
+        first = replace(saved_peer, game_mode=mode.SURVIVAL)
+        visible = replace(saved_peer, game_mode=mode.CREATIVE)
+        rejoined = replace(saved_peer, game_mode=mode.ADVENTURE)
+        expected = [first, final_players[other], visible, rejoined, replace(saved_local, name="Renamed self")]
+        self.assertEqual(changes, [(entry, entry) for entry in expected])
+        self.assertTrue(all(entry is current for entry, current in changes))
+        self.assertEqual(matching, [first, visible, rejoined])
+        self.assertIsNone(saved_peer.game_mode)
+        self.assertIsNone(final_players[local].game_mode)
+        with self.assertRaises(FrozenInstanceError):
+            matching[0].name = "Changed"
+
+    async def test_player_changes_apply_each_roster_row_and_keep_raw_packet_observations(self):
+        peer, other = UUID(int=112), UUID(int=113)
+        await self.join(self.roster(entries=[self.add(peer, "Original", id=301)]),
+                        self.mode_update(301, self.binding.GameType.SURVIVAL))
+        original, = self.bot.observed_players
+        changes, raw = [], []
+
+        def observe(entry):
+            changes.append((entry, self.bot.observed_players[0]))
+
+        self.bot.subscribe_player_changes(observe)
+        self.bot.subscribe_player_list_updates(lambda rows: raw.append((rows, self.bot.observed_players)))
+        first = self.add(peer, "First", id=301, color=4)
+        second = self.add(peer, "Second", id=301, color=4)
+        new = self.add(other, "New", id=402)
+        await self.deliver_through(self.roster(entries=[first, first, new, second]))
+        expected = [replace(original, name="First", color=4), replace(original, name="Second", color=4)]
+        self.assertEqual(changes, [(entry, entry) for entry in expected])
+        self.assertTrue(all(entry is current for entry, current in changes))
+        (raw_rows, raw_roster), = raw
+        self.assertEqual([row.player.name for row in raw_rows], ["First", "First", "New", "Second"])
+        self.assertTrue(all(row.player.game_mode is None for row in raw_rows))
+        self.assertEqual(raw_roster, self.bot.observed_players)
+        self.assertEqual(raw_roster[0], expected[-1])
+
     async def test_mode_update_requires_a_single_current_remote_target(self):
         mode = self.binding.GameType
         local, peer, other, without_id = self.bot.identity.uuid, UUID(int=110), UUID(int=111), UUID(int=112)
@@ -375,10 +453,11 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
         )
         saved = self.bot.observed_players
         self.assertEqual(tuple(player.skin for player in saved), (startup, None))
-        lists, skins = [], []
+        lists, skins, changes = [], [], []
         self.bot.subscribe_player_list_updates(lists.append)
         self.bot.subscribe_player_skin_updates(skins.append)
-        self.assertEqual((lists, skins), ([], []))
+        self.bot.subscribe_player_changes(changes.append)
+        self.assertEqual((lists, skins, changes), ([], [], []))
 
         # The reader starts after join publishes the replayed roster. Waiting
         # immediately lets the already queued packet complete this live wait.
@@ -387,6 +466,7 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved[0].skin, startup)
         self.assertEqual(lists, [(PlayerListChange("add", late, replace(saved[1], name="Live")),)])
         self.assertEqual(skins, [replace(saved[0], skin=queued)])
+        self.assertEqual(changes, [lists[0][0].player, skins[0]])
 
     async def test_live_wait_captures_first_skin_in_batch_and_accepts_repeats_and_empty_reports(self):
         peer, other = UUID(int=120), UUID(int=121)
@@ -400,7 +480,7 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
             self.add(other, "Other"),
         ]))
         old = self.bot.observed_players
-        all_skins, peer_skins = [], []
+        all_skins, peer_skins, changes = [], [], []
 
         def observe_skin(player):
             listed = next(entry for entry in self.bot.observed_players if entry.uuid == player.uuid)
@@ -408,6 +488,7 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
 
         self.bot.subscribe_player_skin_updates(observe_skin)
         self.bot.subscribe_player_skin_updates(peer_skins.append, player_uuid=peer)
+        self.bot.subscribe_player_changes(changes.append)
         waiting = asyncio.create_task(self.bot.wait_for_player_skin_update(peer, timeout=1))
         waiting_list = asyncio.create_task(self.bot.wait_for_player_list_update(timeout=1))
         await asyncio.sleep(0)
@@ -440,6 +521,7 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
         expected_skins = (other_latest, peer_first, peer_latest, peer_latest, peer_empty)
         self.assertEqual(all_skins, [(entry, entry) for entry in expected_skins])
         self.assertEqual(peer_skins, [peer_first, peer_latest, peer_latest, peer_empty])
+        self.assertEqual(changes, [other_latest, peer_first, peer_latest, peer_empty])
         with self.assertRaises(FrozenInstanceError):
             peer_skins[0].skin = None
 
@@ -587,9 +669,10 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(TimeoutError):
             await self.bot.wait_for_player_list_update(timeout=0.05)
 
-        old_lists, old_skins = [], []
+        old_lists, old_skins, old_changes = [], [], []
         stop_list = self.bot.subscribe_player_list_updates(old_lists.append)
         stop_skin = self.bot.subscribe_player_skin_updates(old_skins.append)
+        stop_changes = self.bot.subscribe_player_changes(old_changes.append, uuid=uuid)
         waiting = asyncio.create_task(self.bot.wait_for_player_list_update(timeout=15))
         waiting_skin = asyncio.create_task(self.bot.wait_for_player_skin_update(uuid, timeout=15))
         await asyncio.sleep(0)
@@ -604,13 +687,14 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
         await self.join()
         self.assertEqual(self.bot.observed_players, ())
         self.assertEqual(saved[0].name, "First session")
-        new_lists, new_skins = [], []
+        new_lists, new_skins, new_changes = [], [], []
         self.bot.subscribe_player_list_updates(new_lists.append)
         self.bot.subscribe_player_skin_updates(new_skins.append)
+        self.bot.subscribe_player_changes(new_changes.append, uuid=uuid)
         rejoined = self.roster(entries=[self.add(uuid, "Second session")])
         skin = self.binding.PlayerSkinPacket(uuid=uuid)
         await self.deliver_through(rejoined, skin)
-        for stop in (stop_list, stop_skin):
+        for stop in (stop_list, stop_skin, stop_changes):
             stop()
             stop()
         await self.deliver_through(rejoined, skin)
@@ -618,6 +702,10 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(new_lists, [(PlayerListChange("add", uuid, new_player),)] * 2)
         self.assertEqual(new_skins, [new_player] * 2)
         self.assertEqual((old_lists, old_skins), ([], []))
+        self.assertEqual(new_changes, [])
+        await self.deliver_through(self.roster(entries=[self.add(uuid, "Changed")]))
+        self.assertEqual(new_changes, [replace(new_player, name="Changed")])
+        self.assertEqual(old_changes, [])
 
     async def test_subscription_changes_take_effect_on_next_packet_and_failures_are_isolated(self):
         peer = UUID(int=145)
@@ -648,6 +736,7 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
 
         lists = register(self.bot.subscribe_player_list_updates)
         skins = register(self.bot.subscribe_player_skin_updates)
+        changes = register(self.bot.subscribe_player_changes)
         with patch.object(asyncio.get_running_loop(), "call_exception_handler") as report:
             await self.deliver_through(
                 self.roster(entries=[self.add(peer, "First")]), self.roster(entries=[self.add(peer, "Second")]),
@@ -660,8 +749,15 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
         first_skin = replace(second_player, skin=skin)
         self.assertEqual(lists, ([first_list, first_list, second_list], [second_list], [first_list, second_list]))
         self.assertEqual(skins, ([first_skin, first_skin, second_player], [second_player], [first_skin, second_player]))
+        first_player = first_list[0].player
+        self.assertEqual(changes, ([first_player, first_player, second_player, first_skin, second_player],
+                                  [second_player, first_skin, second_player],
+                                  [first_player, second_player, first_skin, second_player]))
         self.assertEqual([type(call.args[0]["exception"]) for call in report.call_args_list],
-                         [ValueError, asyncio.CancelledError, asyncio.CancelledError] * 2)
+                         [ValueError, asyncio.CancelledError, ValueError, asyncio.CancelledError,
+                          asyncio.CancelledError, asyncio.CancelledError,
+                          ValueError, asyncio.CancelledError, asyncio.CancelledError,
+                          asyncio.CancelledError, asyncio.CancelledError])
 
     async def test_reader_failure_releases_subscription_callbacks(self):
         await self.join()
@@ -672,6 +768,7 @@ class PlayerListTests(unittest.IsolatedAsyncioTestCase):
         callback = weakref.ref(observe)
         self.bot.subscribe_player_list_updates(observe)
         self.bot.subscribe_player_skin_updates(observe)
+        self.bot.subscribe_player_changes(observe)
         del observe
         self.transport.incoming.put_nowait(b"\x02\x00")
         self.assertEqual((await self.bot.wait_for_session_end(timeout=1)).kind, "reader_end")

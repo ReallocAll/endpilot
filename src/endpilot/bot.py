@@ -3100,6 +3100,21 @@ class Bot:
             raise RuntimeError("player has not joined")
         return self._entities.subscribe_player_skin_updates(callback, player_uuid=player_uuid)
 
+    def subscribe_player_changes(
+        self, callback: Callable[[PlayerListEntry], None], *, uuid: UUID | None = None,
+    ) -> Callable[[], None]:
+        """Observe changed snapshots for members already on this session's roster.
+
+        The synchronous callback receives the applied member snapshot in wire
+        order. Initial adds, removals, and unchanged entries emit no snapshots.
+        An optional UUID filter also matches future reentries. The returned
+        unsubscribe function is idempotent and the subscription ends with
+        the session.
+        """
+        if self._entities is None:
+            raise RuntimeError("player has not joined")
+        return self._entities.subscribe_player_changes(callback, player_uuid=uuid)
+
     @property
     def observed_entities(self) -> tuple[EntityState, ...]:
         """Server-observed actors, including other players; not a complete world scan."""

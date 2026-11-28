@@ -194,7 +194,16 @@ Repeated and empty reports are delivered, with `entry.skin` set to `None`
 for an empty report. Skins carried by a player-list add are available in the
 add entry and through `observed_players`.
 
-Both subscriptions receive future packets during the joined session. Use
+`bot.subscribe_player_changes(callback, uuid=...)` calls back with an updated
+`PlayerListEntry` when an already-listed member's remote game mode, skin, or
+roster metadata changes. Omit `uuid` to observe all listed members. Initial
+adds, removals, and repeated values emit no snapshot. The callback runs after
+each changed member snapshot is applied to `observed_players`. If a roster
+packet updates the same UUID more than once, each change has its own snapshot
+in packet order. A player-list packet subscription still sees the whole
+applied packet.
+
+All three subscriptions receive future observations during the joined session. Use
 `observed_players` to read the roster and skins already observed during join.
 Callbacks run synchronously on the packet reader, and the immutable snapshots
 can be retained. Callback failures go to the event loop's exception handler.
