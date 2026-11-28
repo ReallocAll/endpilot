@@ -345,19 +345,23 @@ async def _store_at_chest(
 
 async def _put_whole_source(bot, item, count, source_slots, destination_slots, timeout, before_write, source_matches):
     inventory, containers = bot._inventory, bot._containers
-    source_slot = source_slots.start
-    source = inventory.slots.get(source_slot)
-    expected_source = _stack_snapshot(source)
-    observed = _known_slots(bot.container_slots or {}, destination_slots)
-    if not source_matches(expected_source) or len(observed) != len(destination_slots):
+    source = inventory.slots.get(source_slots.start)
+    if source is None or not source_matches(_stack_snapshot(source)):
         return RangeTransferResult(count, (), "unobserved")
-    endpoints = tuple(containers._block_transfer_endpoint(index) for index in destination_slots)
-    if None in endpoints or inventory._requests_for_endpoints(endpoints):
-        return RangeTransferResult(count, (), "unobserved")
+
+    observed = {}
+    endpoints = {}
+    for index, stack in _known_slots(bot.container_slots or {}, destination_slots).items():
+        if not containers._can_plan_container_slot(index):
+            continue
+        endpoint = containers._block_transfer_endpoint(index)
+        if endpoint is not None and not inventory._requests_for_endpoints((endpoint,)):
+            observed[index] = stack
+            endpoints[index] = endpoint
 
     limit = STACK_LIMITS.get(item) if bot.protocol.number == 2225 else None
     capacity = {}
-    unknown_capacity = False
+    unknown_capacity = len(observed) != len(destination_slots)
     for index, stack in observed.items():
         if stack.id == 0:
             capacity[index] = count
@@ -368,41 +372,71 @@ async def _put_whole_source(bot, item, count, source_slots, destination_slots, t
                 capacity[index] = max(0, limit - stack.stack_size)
     single = next((index for index, spare in capacity.items() if spare >= count), None)
     if single is not None:
-        destination_slots = range(single, single + 1)
-    elif sum(capacity.values()) < count:
-        return RangeTransferResult(count, (), "unobserved" if unknown_capacity else "destination_full")
+        plan = [(single, count)]
+    else:
+        if sum(capacity.values()) < count:
+            return RangeTransferResult(count, (), "unobserved" if unknown_capacity else "destination_full")
+        plan = []
+        remaining = count
+        for index, spare in capacity.items():
+            amount = min(remaining, spare)
+            if amount:
+                plan.append((index, amount))
+                remaining -= amount
+            if not remaining:
+                break
 
-    expected = {index: _stack_snapshot(stack) for index, stack in observed.items()}
+    # The trusted destinations can be separated by slots that cannot be planned.
+    expected = {index: _stack_snapshot(observed[index]) for index, _ in plan}
+    planned_endpoints = tuple(endpoints[index] for index in expected)
 
-    def validate(request_id):
-        nonlocal expected_source
-        before_write(request_id)
-        own = inventory._pending_requests[request_id]
-        if any(request is not own for request in inventory._requests_for_endpoints(endpoints)):
+    def require_destinations(own=None):
+        if (any(not containers._can_plan_container_slot(index) for index in expected)
+                or any(request is not own for request in inventory._requests_for_endpoints(planned_endpoints))):
             raise _InventoryMoveNotSubmitted("unobserved")
+        if any(containers._block_transfer_endpoint(index) != endpoints[index] for index in expected):
+            raise _InventoryMoveNotSubmitted("window_changed")
         slots = bot.container_slots or {}
         if any(_stack_snapshot(slots.get(index)) != stack for index, stack in expected.items()):
             raise _InventoryMoveNotSubmitted("destination_changed")
-        expected_source = inventory._observed_stack(source_slot)
+
+    def validate(request_id):
+        require_destinations(inventory._pending_requests[request_id])
+        before_write(request_id)
 
     def confirmed(slot, stack):
-        moved = stack.count - expected[slot].count
-        if moved != min(expected_source.count, capacity[slot]):
+        if stack.count - expected[slot].count != amount:
             raise _InventoryMoveNotSubmitted("partial_transfer")
         expected[slot] = stack
-        capacity[slot] -= moved
 
+    steps = []
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
     try:
-        result = await _transfer_range(
-            bot, direction="put", item=item, count=count, source_slots=source_slots,
-            destination_slots=destination_slots, match=source_matches, timeout=timeout,
-            before_write=validate, on_confirmed=confirmed,
-        )
-    except _InventoryMoveNotSubmitted as stopped:
-        return replace(stopped.transfer_progress, stop_reason=str(stopped))
-    if result.stop_reason == "destination_full":
-        return replace(result, stop_reason="destination_changed")
-    return result
+        for target, amount in plan:
+            require_destinations()
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError("preflight storage timed out before the next step")
+            result = await _transfer_range(
+                bot, direction="put", item=item, count=amount, source_slots=source_slots,
+                destination_slots=range(target, target + 1), match=source_matches, timeout=remaining,
+                before_write=validate, on_confirmed=confirmed,
+            )
+            steps.extend(result.steps)
+            if result.stop_reason != "complete":
+                reason = "destination_changed" if result.stop_reason == "destination_full" else result.stop_reason
+                return RangeTransferResult(count, tuple(steps), reason)
+    except (Exception, asyncio.CancelledError) as error:
+        attempted = getattr(error, "transfer_progress", None)
+        if attempted is not None:
+            steps.extend(attempted.steps)
+        if isinstance(error, _InventoryMoveNotSubmitted):
+            return RangeTransferResult(count, tuple(steps), str(error))
+        reason = "cancelled" if isinstance(error, asyncio.CancelledError) else "unconfirmed"
+        error.transfer_progress = RangeTransferResult(count, tuple(steps), reason)
+        raise
+    return RangeTransferResult(count, tuple(steps), "complete")
 
 
 async def _store_for_collection(

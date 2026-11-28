@@ -1145,6 +1145,114 @@ class CollectionTests(unittest.IsolatedAsyncioTestCase):
             ("LEVEL_ENTITY_CONTAINER", destination, stored, 21 + destination - 4),
         ])
 
+    def hold_preflight_before_planning(self, bot):
+        ready, release = asyncio.Event(), asyncio.Event()
+        original = bot._containers.wait_for_slots
+
+        async def wait_for_slots(*args, **options):
+            result = await original(*args, **options)
+            ready.set()
+            await release.wait()
+            return result
+
+        self.enterContext(patch.object(bot._containers, "wait_for_slots", side_effect=wait_for_slots))
+        self.addCleanup(release.set)
+        return ready, release
+
+    async def preflight_invalidate_destination_five(self, bot, *first_packets):
+        other = asyncio.create_task(bot.put_into_container(12, 5, 1, timeout=2))
+        request = await self.preflight_request((12, 5, 1))
+        missing_destination = self.stack_response(request, [
+            ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 12, 63, 112),
+        ])
+        await self.emit(*first_packets, missing_destination)
+        self.assertEqual((await other).result.name, "SUCCESS")
+        self.assertFalse(bot._inventory._pending_requests)
+        self.assertEqual(bot.container_slots[5].stack_size, 32)
+        self.assertFalse(bot._containers._can_plan_container_slot(5))
+
+    async def test_preflight_does_not_count_a_settled_request_with_missing_destination_correction(self):
+        far = (-4, 100, 3)
+        bot, task = await self.start_preflight(chest=far, additional_positions=(REFILL_CHEST,),
+                                              terrain=(self.pose(eye=(-2.5, 101.62, 3.4)),))
+        ready, release = self.hold_preflight_before_planning(bot)
+        await self.preflight_window((32, 32))
+        await asyncio.wait_for(ready.wait(), 1)
+        await self.preflight_invalidate_destination_five(bot)
+        release.set()
+        await self.refill_close()
+
+        (result,) = (await task).results
+        ((chest, attempt),) = result.storage_attempts
+        self.assertEqual((result.status, chest, attempt.stop_reason), ("storage_unconfirmed", REFILL_CHEST, "unobserved"))
+        self.assertEqual(attempt.transfer.steps, ())
+        self.assertEqual(bot.inventory_slots[2].stack_size, 64)
+        self.assertEqual(bot.observed_block(TARGET).runtime_id, ORE)
+        self.assert_no_storage_followup()
+
+    async def test_preflight_can_split_across_trusted_slots_on_either_side_of_an_unconfirmed_slot(self):
+        bot, task = await self.start_preflight(destinations=range(4, 7))
+        ready, release = self.hold_preflight_before_planning(bot)
+        await self.preflight_window((32, 32, 32))
+        await asyncio.wait_for(ready.wait(), 1)
+        await self.preflight_invalidate_destination_five(bot)
+        release.set()
+        first = await self.preflight_request((2, 4, 32))
+        await self.emit(self.preflight_receipt(first, source=2, destination=4, remaining=32, stored=64))
+        second = await self.preflight_request((2, 6, 32))
+        await self.emit(self.preflight_receipt(second, source=2, destination=6, remaining=0, stored=64))
+        await self.refill_close()
+        await self.expect_batch_start(TARGET)
+        await self.finish_batch_break(TARGET, runtime_id=101, total=1, net_id=25)
+
+        (result,) = (await task).results
+        self.assertEqual(result.status, "collected")
+        self.assertEqual([(step.destination_slot, step.confirmed) for step in result.storage_attempt.transfer.steps],
+                         [(4, 32), (6, 32)])
+        self.assert_no_storage_followup()
+
+    async def test_preflight_keeps_confirmed_prefix_when_later_destination_becomes_unconfirmed(self):
+        bot, task = await self.start_preflight()
+        await self.preflight_window((32, 32))
+        first = await self.preflight_request((2, 4, 32))
+        matching = self.preflight_receipt(first, source=2, destination=4, remaining=32, stored=64)
+        await self.preflight_invalidate_destination_five(bot, matching)
+        await self.refill_close()
+
+        (result,) = (await task).results
+        self.assertEqual((result.status, result.storage_attempt.stop_reason), ("storage_unconfirmed", "unobserved"))
+        (step,) = result.storage_attempt.transfer.steps
+        self.assertEqual((step.request_id, step.confirmed), (first.client_request_id.raw_id, 32))
+        self.assertEqual(bot.inventory_slots[2].stack_size, 32)
+        self.assertEqual(bot.observed_block(TARGET).runtime_id, ORE)
+        self.assert_no_storage_followup()
+
+    async def test_preflight_rechecks_other_planned_destination_at_the_first_write(self):
+        bot, task = await self.start_preflight()
+        ready, release = asyncio.Event(), asyncio.Event()
+        original = bot._inventory._request_item_stack
+
+        async def request_item_stack(request, *args, **options):
+            if request.actions[0].source.slot == 2:
+                ready.set()
+                await release.wait()
+            return await original(request, *args, **options)
+
+        self.enterContext(patch.object(bot._inventory, "_request_item_stack", side_effect=request_item_stack))
+        self.addCleanup(release.set)
+        await self.preflight_window((32, 32))
+        await asyncio.wait_for(ready.wait(), 1)
+        await self.preflight_invalidate_destination_five(bot)
+        release.set()
+        await self.refill_close()
+
+        (result,) = (await task).results
+        self.assertEqual((result.status, result.storage_attempt.stop_reason), ("storage_unconfirmed", "unobserved"))
+        self.assertEqual(result.storage_attempt.transfer.steps, ())
+        self.assertEqual(bot.inventory_slots[2].stack_size, 64)
+        self.assertEqual(bot.observed_block(TARGET).runtime_id, ORE)
+        self.assert_no_storage_followup()
+
     async def test_preflight_retains_two_whole_source_receipts_for_the_same_chest(self):
         bot, task = await self.start_preflight(sources=range(2, 13))
         await self.preflight_window((0, 0))
