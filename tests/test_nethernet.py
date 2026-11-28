@@ -1,14 +1,18 @@
 import asyncio
 import hashlib
+import json
 import unittest
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from importlib.util import find_spec
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from endpilot.login import request_network_settings
+from endpilot import Bot, TerrainStorage
+from endpilot.login import _prepare_block_palette, request_network_settings
 from endpilot.protocol import Protocol, read_batch, write_batch
 
 
@@ -166,6 +170,102 @@ class NetherNetTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(settings.compression_threshold, 256)
             finally:
                 await client.close()
+
+    async def test_join_reads_protocol_from_the_existing_signaling_get(self):
+        from aiohttp import ClientResponse, web
+        from nethernet import serve_http
+        from nethernet.signaling.http import HttpSignalingServer
+
+        directory = self.enterContext(TemporaryDirectory())
+        storage = TerrainStorage.sqlite(Path(directory) / "terrain.sqlite3", world_key="protocol-fixture")
+        version_text = " 1.26.52-fixture+wire "
+        for route, configured, announcement, expected in (
+            ("nethernet", None, 2193, 2193),
+            ("bare", None, "2193", 2193),
+            ("url", None, None, 2225),
+            ("nethernet", 2225, 2193, 2225),
+        ):
+            with self.subTest(route=route, configured=configured, announcement=announcement):
+                protocol = Protocol(expected)
+                binding = protocol.binding
+                bot = Bot("ProtocolProbe", protocol=configured)
+                initial = bot.protocol
+                requests = []
+                spawns = []
+                opening = []
+                initialized = asyncio.Event()
+                bot.subscribe_spawns(lambda kind: spawns.append((kind, bot.protocol, bot.reported_server_version)))
+
+                async def announce(_server, request):
+                    requests.append(request.method)
+                    return web.Response(status=204) if announcement is None else web.json_response(
+                        {"protocol": announcement},
+                    )
+
+                async def peer(connection):
+                    async def receive():
+                        raw, = read_batch(await connection.recv())
+                        return protocol.decode(raw)
+
+                    async def send(*packets):
+                        await connection.send(write_batch(protocol.encode(packet) for packet in packets))
+
+                    opening.append(await receive())
+                    await send(binding.NetworkSettingsPacket(compression_algorithm=binding.PacketCompressionAlgorithm.NONE))
+                    opening.append(await receive())
+                    await send(
+                        binding.StartGamePacket(runtime_id=13, entity_id=27, server_version=version_text),
+                        binding.PlayStatusPacket(status=binding.PlayStatus.PLAYER_SPAWN),
+                    )
+                    while not isinstance(packet := await receive(), binding.SetLocalPlayerAsInitializedPacket):
+                        pass
+                    opening.append(packet)
+                    initialized.set()
+                    async for _ in connection:
+                        pass
+
+                with (
+                    patch.object(HttpSignalingServer, "_handle_capability", announce),
+                    patch("aioice.ice.get_host_addresses", return_value=["127.0.0.1"]),
+                    patch("endpilot.login._prepare_block_palette", wraps=_prepare_block_palette) as prepare,
+                    patch.object(ClientResponse, "json", side_effect=AssertionError(
+                        "fixed protocol must not read discovery metadata",
+                    )) if configured is not None else nullcontext(),
+                ):
+                    async with asyncio.timeout(12), serve_http(peer, host="127.0.0.1") as server:
+                        address = f"127.0.0.1:{server.bound_port}"
+                        try:
+                            if route == "nethernet":
+                                await bot.join_nethernet(f"http://{address}", terrain_storage=storage)
+                            else:
+                                await bot.join_address(
+                                    address if route == "bare" else f"http://{address}", terrain_storage=storage,
+                                )
+                            await initialized.wait()
+                            request, login, player_initialized = opening
+                            self.assertEqual(requests, ["GET"])
+                            self.assertIsInstance(request, binding.RequestNetworkSettingsPacket)
+                            self.assertIsInstance(login, binding.LoginPacket)
+                            self.assertEqual((request.client_network_version, login.client_network_version),
+                                             (expected, expected))
+                            auth_length = int.from_bytes(login.connection_request[:4], "little")
+                            auth = json.loads(login.connection_request[4:4 + auth_length])
+                            self.assertEqual(auth["AuthenticationType"], 2)
+                            self.assertEqual(player_initialized.player_id, 13)
+                            self.assertEqual(bot.protocol.number, expected)
+                            self.assertIs(bot.protocol, bot.packets.protocol)
+                            self.assertEqual(bot.protocol.supports_feature("xbox_login"), expected == 2225)
+                            self.assertEqual(bot.protocol.supports_feature("preview_anvil"), expected == 2225)
+                            self.assertEqual(storage._writer.protocol, expected)
+                            self.assertEqual(spawns, [("initial", bot.protocol, version_text)])
+                            self.assertEqual(prepare.await_count, int(configured is None and expected == 2225))
+                            if configured is not None:
+                                self.assertIs(bot.protocol, initial)
+                            active = bot.protocol
+                        finally:
+                            await bot.close()
+                        self.assertIs(bot.protocol, active)
+                        self.assertIsNone(bot.reported_server_version)
 
     async def test_optional_server_identity_pinning(self):
         from nethernet import IdentitySigner, InvalidIdentity, serve_http

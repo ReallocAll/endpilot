@@ -25,6 +25,7 @@
 
 import errno
 import inspect
+from collections.abc import Awaitable, Callable
 
 from nethernet import Connection, ConnectionFailed, NetworkID, SessionError, new_connection_id
 from nethernet.api import _make_http_session
@@ -58,7 +59,15 @@ def _connection_unavailable(error: BaseException) -> bool:
     return False
 
 
-async def _request(client, method: str, url: str, **options) -> str:
+def _protocol_number(advertisement) -> int | None:
+    try:
+        number = int(str(advertisement["protocol"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+async def _request(client, method: str, url: str, *, read_protocol: bool = False, **options) -> str | int | None:
     import aiohttp
 
     async with client.request(method, url, allow_redirects=False, **options) as response:
@@ -69,24 +78,34 @@ async def _request(client, method: str, url: str, **options) -> str:
             )
         if method == "POST":
             return await response.text()
+        if read_protocol:
+            try:
+                advertisement = await response.json(content_type=None)
+            except (ValueError, LookupError):
+                return None
+            return _protocol_number(advertisement)
         return ""
 
 
-async def _check_signaling_endpoint(url: str) -> None:
+async def _check_signaling_endpoint(url: str, *, read_protocol: bool = False) -> int | None:
     _require_aiohttp()
     import aiohttp
 
     try:
         async with aiohttp.ClientSession() as client:
-            await _request(client, "GET", f"{url.rstrip('/')}/v1/join")
+            number = await _request(client, "GET", f"{url.rstrip('/')}/v1/join", read_protocol=read_protocol)
     except (aiohttp.ClientError, OSError) as error:
         missing = isinstance(error, aiohttp.ClientResponseError) and error.status in (404, 405)
         if missing or _connection_unavailable(error):
             raise _NetherNetUnavailable(error) from error
         raise
+    return number if read_protocol else None
 
 
-async def _request_answer(url: str, local_id: NetworkID, offer: str, *, capability_check: bool) -> str:
+async def _request_answer(
+    url: str, local_id: NetworkID, offer: str, *, capability_check: bool,
+    on_protocol: Callable[[int | None], Awaitable[None]] | None = None,
+) -> str:
     _require_aiohttp()
     import aiohttp
 
@@ -95,9 +114,11 @@ async def _request_answer(url: str, local_id: NetworkID, offer: str, *, capabili
     async with aiohttp.ClientSession(timeout=timeout) as client:
         if capability_check:
             try:
-                await _request(client, "GET", endpoint)
+                number = await _request(client, "GET", endpoint, read_protocol=on_protocol is not None)
             except (aiohttp.ClientError, OSError) as error:
                 raise ConnectionFailed(SessionError.NO_SIGNALING_CHANNEL) from error
+            if on_protocol is not None:
+                await on_protocol(number)
         try:
             body = await _request(
                 client, "POST", f"{endpoint}/{local_id}",
@@ -110,7 +131,10 @@ async def _request_answer(url: str, local_id: NetworkID, offer: str, *, capabili
     return _parse_answer(body)
 
 
-async def connect_http(url: str, *, identity_signer, on_server_identity, capability_check: bool) -> Connection:
+async def connect_http(
+    url: str, *, identity_signer, on_server_identity, capability_check: bool,
+    _on_protocol: Callable[[int | None], Awaitable[None]] | None = None,
+) -> Connection:
     """Dial one URL. The selector has already probed it when capability_check is false."""
     local = NetworkID.p2p(new_connection_id())
     conn = _make_http_session(
@@ -126,7 +150,9 @@ async def connect_http(url: str, *, identity_signer, on_server_identity, capabil
             session.close(SessionError.DATA_CHANNEL_CLOSED)
 
         offer = identity_signer.sign(await session.offer())
-        answer = await _request_answer(url, local, offer, capability_check=capability_check)
+        answer = await _request_answer(
+            url, local, offer, capability_check=capability_check, on_protocol=_on_protocol,
+        )
         if on_server_identity is not None:
             answer, server_identity = verify_server_identity(answer)
             result = on_server_identity(server_identity)

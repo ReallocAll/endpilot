@@ -20,6 +20,7 @@ from .authentication import DEFAULT_LOCALE, _OnlineIdentity, _validate_locale
 from .beds import invalidates_bed_respawn
 from .biome_data import BiomeDefinition, _read_biome_definitions
 from .block_data import matches_vanilla_palette
+from .blocks import _prepare_block_palette
 from .client_clock import ClientClock
 from .compression import PacketConnection
 from .creative_inventory import creative_packet_ids
@@ -28,7 +29,7 @@ from .entity_registry import EntityRegistrySnapshot, _read_entity_registry
 from .forms import FORM_PACKET_IDS
 from .item_registry import ItemRegistrySnapshot
 from .player_state import VITAL_ATTRIBUTES, air_metadata, movement_speed_attribute, swimming_metadata
-from .protocol import Protocol, RawPacket, _supports_feature, read_batch, write_batch
+from .protocol import DEFAULT_PROTOCOL, Protocol, RawPacket, _supports_feature, read_batch, write_batch
 from .qa import PacketTimeline
 from .resource_packs import PackDecisionHandler, ResourcePackExchange, ResourcePackIndex
 from .scoreboard import SCOREBOARD_PACKET_IDS
@@ -113,8 +114,8 @@ def _validate_chunk_radius(radius: int) -> None:
         raise ValueError("chunk_radius must be in 1..96")
 
 
-def _validate_join(protocol: Protocol, chunk_radius: int, locale: str, timeout: float, *, online: bool) -> None:
-    if online and not _supports_feature(protocol.number, "xbox_login"):
+def _validate_join(protocol: Protocol | None, chunk_radius: int, locale: str, timeout: float, *, online: bool) -> None:
+    if online and protocol is not None and not _supports_feature(protocol.number, "xbox_login"):
         raise ValueError("online login requires protocol 2225")
     _validate_chunk_radius(chunk_radius)
     _validate_locale(locale)
@@ -234,7 +235,7 @@ class JoinSession:
 
     @classmethod
     async def _connect_address(
-        cls, target: _JoinAddress, identity, protocol: Protocol, timeout: float,
+        cls, target: _JoinAddress, identity, protocol: Protocol | None, timeout: float,
         *, server_key_sha256: str | None = None, **options,
     ):
         from importlib.util import find_spec
@@ -263,7 +264,7 @@ class JoinSession:
 
     @classmethod
     async def connect_nethernet(
-        cls, url: str, identity, protocol: Protocol, timeout: float = 30,
+        cls, url: str, identity, protocol: Protocol | None, timeout: float = 30,
         *, server_key_sha256: str | None = None, timeline: PacketTimeline | None = None,
         chunk_radius: int = 8, locale: str = DEFAULT_LOCALE, load_screen: bool = True,
         retain_initial_chunks: bool = False,
@@ -292,18 +293,33 @@ class JoinSession:
 
     @classmethod
     async def connect_raknet(
-        cls, host: str, port: int, identity, protocol: Protocol, timeout: float = 30,
+        cls, host: str, port: int, identity, protocol: Protocol | None, timeout: float = 30,
         *, timeline: PacketTimeline | None = None, clock: ClientClock | None = None,
         chunk_radius: int = 8, locale: str = DEFAULT_LOCALE, retain_initial_chunks: bool = False,
         on_resource_packs: PackDecisionHandler | None = None,
         _online_join: _PendingOnlineJoin | None = None,
         _address: str | None = None,
     ):
-        from .transport.raknet import connect
+        from .transport.raknet import advertised_protocol, connect
 
         _validate_chunk_radius(chunk_radius)
+        dial = partial(connect, host, port)
+        if protocol is None:
+            from raknet import RakNetError
+
+            async def discover_and_dial(*, _on_protocol):
+                # Reserve part of this candidate's deadline for the connection and login.
+                ping_timeout = 5 if timeout is None else min(5, timeout / 2)
+                try:
+                    number = await advertised_protocol(host, port, timeout=ping_timeout)
+                except (TimeoutError, ValueError, RakNetError):
+                    number = None
+                await _on_protocol(number)
+                return await connect(host, port)
+
+            dial = discover_and_dial
         return await cls._connect_transport(
-            partial(connect, host, port), identity, _address or f"{host}:{port}", protocol, timeout, timeline, clock,
+            dial, identity, _address or f"{host}:{port}", protocol, timeout, timeline, clock,
             _online_join=_online_join, chunk_radius=chunk_radius, locale=locale,
             retain_initial_chunks=retain_initial_chunks, on_resource_packs=on_resource_packs,
         )
@@ -316,9 +332,24 @@ class JoinSession:
     ):
         transport = None
         deadline = asyncio.timeout(timeout)
+
+        async def select_protocol(number: int | None) -> None:
+            nonlocal protocol
+            number = DEFAULT_PROTOCOL if number is None else number
+            try:
+                protocol = Protocol(number)
+            except ModuleNotFoundError as error:
+                if error.name != f"bedrock_protocol.v{number}":
+                    raise
+                raise ValueError(f"server advertised unsupported Bedrock protocol {number}") from error
+            if isinstance(identity, _OnlineIdentity) and not _supports_feature(number, "xbox_login"):
+                raise ValueError(f"online login requires protocol 2225, server advertised {number}")
+            if number == DEFAULT_PROTOCOL:
+                await _prepare_block_palette()
+
         try:
             async with deadline:
-                transport = await dial()
+                transport = await (dial(_on_protocol=select_protocol) if protocol is None else dial())
                 if _online_join is not None:
                     _online_join.transport = transport
                 session = await cls._join_connected(

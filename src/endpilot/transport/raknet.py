@@ -13,9 +13,46 @@ def _checksum(counter: int, payload: bytes, key: bytes) -> bytes:
     return hashlib.sha256(struct.pack("<Q", counter) + payload + key).digest()[:8]
 
 
+async def _drain_task[T](task: asyncio.Task[T]) -> T:
+    while not task.done():
+        try:
+            await asyncio.wait((task,))
+        except asyncio.CancelledError:
+            continue
+    return task.result()
+
+
+async def _create_peer() -> raknet.asyncio.Peer:
+    # The RakNet 0.4.0 factory constructs the peer in a worker thread. Keep
+    # the task alive until we can take ownership of the resulting bound peer.
+    startup = asyncio.create_task(raknet.asyncio.Peer._create([("", 0)], max_connections=1))
+    try:
+        return await asyncio.shield(startup)
+    except asyncio.CancelledError as cancellation:
+        try:
+            peer = await _drain_task(startup)
+            await _drain_task(asyncio.create_task(peer.close(0)))
+        except BaseException as error:
+            cancellation.add_note(f"RakNet startup cleanup failed: {error!r}")
+        raise
+
+
+async def _close_peer(peer: raknet.asyncio.Peer, timeout: float) -> None:
+    closing = asyncio.create_task(peer.close(timeout))
+    try:
+        await asyncio.shield(closing)
+    except asyncio.CancelledError as cancellation:
+        try:
+            await _drain_task(closing)
+        except BaseException as error:
+            cancellation.add_note(f"RakNet peer close failed: {error!r}")
+        raise
+
+
 class RakNetTransport:
-    def __init__(self, connection):
+    def __init__(self, connection, *, peer: raknet.asyncio.Peer | None = None):
         self._connection = connection
+        self._peer = peer
         self._key = None
         self._encryptor = None
         self._decryptor = None
@@ -58,18 +95,32 @@ class RakNetTransport:
             return data
 
     async def close(self) -> None:
-        await self._connection.close()
+        try:
+            await self._connection.close()
+        finally:
+            if self._peer is not None:
+                await _close_peer(self._peer, 0.5)
 
 
 async def connect(host: str, port: int) -> RakNetTransport:
-    return RakNetTransport(await raknet.asyncio.create_connection((host, port)))
+    peer = await _create_peer()
+    try:
+        connection = await peer.connect((host, port))
+    except BaseException:
+        await _close_peer(peer, 0)
+        raise
+    return RakNetTransport(connection, peer=peer)
 
 
 async def advertised_protocol(host: str, port: int, *, timeout: float = 5) -> int:
-    """Read the Bedrock protocol from an unconnected RakNet pong."""
+    """Read the protocol from an unconnected pong. Peer cleanup can outlast the timeout."""
     try:
         async with asyncio.timeout(timeout):
-            pong = await raknet.asyncio.ping((host, port))
+            peer = await _create_peer()
+            try:
+                pong = await peer.ping((host, port))
+            finally:
+                await _close_peer(peer, 0)
     except TimeoutError as error:
         raise TimeoutError(f"RakNet protocol discovery timed out after {timeout:g}s for {host}:{port}") from error
 

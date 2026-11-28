@@ -18,9 +18,10 @@ from nethernet import ConnectionFailed, InvalidIdentity, SessionError
 
 from endpilot import Bot
 from endpilot._join_address import _parse_join_address
+from endpilot.protocol import Protocol
 from endpilot.transport._nethernet_http import _NetherNetUnavailable, _request, connect_http
 from endpilot.transport.nethernet import _check_signaling_endpoint
-from test_join import _spawn_transport
+from test_join import _online_identity, _spawn_transport
 
 
 @asynccontextmanager
@@ -319,3 +320,93 @@ class JoinAddressTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(asyncio.CancelledError):
                     await joining
             probe.assert_awaited_once_with("https://localhost:19132")
+
+    async def test_protocol_announcement_is_scoped_to_one_nethernet_candidate(self):
+        bot = Bot(protocol=None)
+        self.addAsyncCleanup(bot.close)
+        wire = _spawn_transport(Protocol(2225), 42)
+        failure = _NetherNetUnavailable(ConnectionError("fixture transport did not open"))
+        with (
+            patch("endpilot.transport.nethernet._check_signaling_endpoint", side_effect=[2193, None]) as get,
+            patch("endpilot.transport.nethernet.connect_http", side_effect=[failure, wire]) as dial,
+            patch("endpilot.transport.raknet.connect") as raknet,
+        ):
+            await bot.join_address("127.0.0.1:19132")
+        self.assertEqual([call.args for call in get.await_args_list], [
+            ("https://127.0.0.1:19132",), ("http://127.0.0.1:19132",),
+        ])
+        self.assertEqual([call.kwargs for call in get.await_args_list], [{"read_protocol": True}] * 2)
+        self.assertEqual(dial.await_count, 2)
+        raknet.assert_not_awaited()
+        self.assertIs(bot.protocol, bot.packets.protocol)
+        self.assertEqual((bot.protocol.number, bot.player_id), (2225, 42))
+
+    async def test_nethernet_rejects_unsupported_announcements_without_posting_an_offer(self):
+        from aiortc import RTCIceGatherer
+
+        self.enterContext(patch.object(RTCIceGatherer, "getDefaultIceServers", return_value=[]))
+        self.enterContext(patch("aioice.ice.get_host_addresses", return_value=["127.0.0.1"]))
+        for number, online, message in (
+            (99999, False, "unsupported Bedrock protocol 99999"),
+            (2193, True, "online login requires protocol 2225, server advertised 2193"),
+        ):
+            with self.subTest(number=number, online=online):
+                requests = []
+
+                async def announce(request):
+                    requests.append((request.method, request.headers.get("Authorization")))
+                    return web.json_response({"protocol": number})
+
+                async def offer(request):
+                    requests.append((request.method, request.headers.get("Authorization")))
+                    return web.Response(status=403)
+
+                bot = Bot(protocol=None)
+                self.addAsyncCleanup(bot.close)
+                initial = bot.protocol
+                provider = object() if online else None
+                async with _listen([web.get("/v1/join", announce), web.post("/v1/join/{id}", offer)]) as authority:
+                    with (
+                        patch("endpilot.bot.acquire_online_identity", return_value=_online_identity()) as acquire,
+                        patch("endpilot.transport.raknet.connect") as raknet,
+                        self.assertRaisesRegex(ValueError, message),
+                    ):
+                        if online:
+                            await bot.join_address(authority, credential_provider=provider)
+                        else:
+                            await bot.join_nethernet(f"http://{authority}")
+                self.assertEqual(requests, [("GET", None)])
+                self.assertEqual(acquire.await_count, int(online))
+                raknet.assert_not_awaited()
+                self.assertIs(bot.protocol, initial)
+
+    async def test_closing_automatic_nethernet_join_cancels_the_get_and_closes_the_session(self):
+        entered, released = asyncio.Event(), asyncio.Event()
+
+        async def announce(_request):
+            entered.set()
+            await released.wait()
+            return web.json_response({"protocol": 2193})
+
+        connection = self._mock_connection()
+        bot = Bot(protocol=None)
+        self.addAsyncCleanup(bot.close)
+        async with _listen([web.get("/v1/join", announce)]) as authority:
+            with (
+                patch("endpilot.transport._nethernet_http._make_http_session", return_value=connection),
+                patch("endpilot.transport.nethernet.PlayerSigner", return_value=Mock(sign=str)),
+            ):
+                joining = asyncio.create_task(bot.join_nethernet(f"http://{authority}"))
+                try:
+                    async with asyncio.timeout(3):
+                        await entered.wait()
+                        await bot.close()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await joining
+                finally:
+                    released.set()
+                    joining.cancel()
+                    await asyncio.gather(joining, return_exceptions=True)
+        connection._session.accept_answer.assert_not_awaited()
+        connection._session.aclose.assert_awaited_once_with(SessionError.GENERIC_FAILURE)
+        self.assertEqual(bot.protocol.number, 2225)

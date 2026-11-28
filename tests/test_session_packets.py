@@ -1,5 +1,6 @@
 import asyncio
 from importlib.util import find_spec
+import json
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -10,9 +11,11 @@ from bedrock_protocol import EncodeError, TextPacketType, nbt
 from endpilot import Bot
 from endpilot.blocks import Blocks
 from endpilot.compression import PacketConnection
+from endpilot.login import LoginRefused
 from endpilot.protocol import Protocol, RawPacket, read_batch
 from endpilot.qa import PacketTimeline
 from endpilot.qa_terrain import _TerrainObserver
+from test_join import _online_identity
 from test_scheduled_input import ManualClock, Wire
 
 
@@ -25,7 +28,8 @@ class SessionProtocolTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(transport=transport):
                 bot = Bot("Probe", protocol=version)
                 self.addAsyncCleanup(bot.close)
-                wire = Wire(bot.protocol)
+                configured = bot.protocol
+                wire = Wire(configured)
                 b = wire.protocol.binding
                 for packet in (
                     b.NetworkSettingsPacket(compression_algorithm=b.PacketCompressionAlgorithm.NONE),
@@ -39,23 +43,98 @@ class SessionProtocolTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     await connect(bot, *address)
                 advertise.assert_not_awaited()
-                request, = (packet for packet in wire.sent if isinstance(packet, b.RequestNetworkSettingsPacket))
-                self.assertEqual(request.client_network_version, version)
+                request, login = wire.sent[:2]
+                self.assertIsInstance(request, b.RequestNetworkSettingsPacket)
+                self.assertIsInstance(login, b.LoginPacket)
+                self.assertEqual((request.client_network_version, login.client_network_version), (version, version))
+                self.assertIs(bot.protocol, configured)
+                self.assertIs(bot.packets.protocol, configured)
                 await bot.close()
                 self.assertTrue(wire.closed)
+
+    async def test_automatic_raknet_reselects_and_only_publishes_successful_sessions(self):
+        host, port = "127.0.0.1", 20232
+        bot = Bot("Probe", protocol=None)
+        self.addAsyncCleanup(bot.close)
+        initial_protocol = bot.protocol
+        self.assertEqual(initial_protocol.number, 2225)
+
+        def wire_for(number, *, refused=False):
+            wire = Wire(Protocol(number))
+            binding = wire.protocol.binding
+            wire.push(binding.NetworkSettingsPacket(compression_algorithm=binding.PacketCompressionAlgorithm.NONE))
+            if refused:
+                wire.push(binding.DisconnectPacket(reason=binding.DisconnectFailReason.KICKED))
+            else:
+                wire.push(binding.StartGamePacket(runtime_id=13, entity_id=27))
+                wire.push(binding.PlayStatusPacket(status=binding.PlayStatus.PLAYER_SPAWN))
+            return wire
+
+        def check_packets(wire, number):
+            request, login = wire.sent[:2]
+            self.assertIsInstance(request, wire.protocol.binding.RequestNetworkSettingsPacket)
+            self.assertIsInstance(login, wire.protocol.binding.LoginPacket)
+            self.assertEqual((request.client_network_version, login.client_network_version), (number, number))
+
+        older = wire_for(2193)
+        refused = wire_for(2225, refused=True)
+        fallback = wire_for(2225)
+        with (
+            patch("endpilot.transport.raknet.advertised_protocol",
+                  side_effect=[99999, 2193, 2225, TimeoutError("no pong")]) as discover,
+            patch("endpilot.transport.raknet.connect", side_effect=[older, refused, fallback]) as dial,
+        ):
+            with self.assertRaisesRegex(ValueError, "unsupported Bedrock protocol 99999"):
+                await bot.join_raknet(host, port)
+            self.assertIs(bot.protocol, initial_protocol)
+            dial.assert_not_awaited()
+
+            await bot.join_address(f"raknet://{host}:{port}")
+            check_packets(older, 2193)
+            last_joined = bot.protocol
+            self.assertIs(last_joined, bot.packets.protocol)
+            self.assertEqual(last_joined.number, 2193)
+            await bot.close()
+            self.assertTrue(older.closed)
+            self.assertIs(bot.protocol, last_joined)
+
+            with self.assertRaises(LoginRefused):
+                await bot.join_raknet(host, port)
+            check_packets(refused, 2225)
+            self.assertTrue(refused.closed)
+            self.assertIs(bot.protocol, last_joined)
+            self.assertIsNone(bot.reported_server_version)
+
+            identity = _online_identity()
+            provider = object()
+            with patch("endpilot.bot.acquire_online_identity", return_value=identity) as acquire:
+                await bot.join_raknet(host, port, timeout=4, credential_provider=provider)
+            acquire.assert_awaited_once_with(provider)
+            check_packets(fallback, 2225)
+            login = fallback.sent[1]
+            auth_length = int.from_bytes(login.connection_request[:4], "little")
+            auth = json.loads(login.connection_request[4:4 + auth_length])
+            self.assertEqual(auth["AuthenticationType"], 0)
+            self.assertIs(bot.identity, identity)
+            self.assertEqual(bot.protocol.number, 2225)
+            self.assertIs(bot.protocol, bot.packets.protocol)
+            self.assertEqual(discover.await_count, 4)
+            discover.assert_awaited_with(host, port, timeout=2)
 
     async def test_raknet_protocol_discovery_reads_the_pong_and_propagates_timeout(self):
         from endpilot.transport.raknet import advertised_protocol
 
         host, port = "127.0.0.1", 20232
         pong = SimpleNamespace(data=b"MCPE;Local world;2193;1.26.0")
-        with patch("raknet.asyncio.ping", return_value=pong) as ping:
+        ping = AsyncMock(side_effect=[pong, TimeoutError])
+        peer = SimpleNamespace(ping=ping, close=AsyncMock())
+        with patch("endpilot.transport.raknet._create_peer", return_value=peer):
             self.assertEqual(await advertised_protocol(host, port), 2193)
             ping.assert_awaited_once_with((host, port))
-        with patch("raknet.asyncio.ping", side_effect=TimeoutError) as ping:
             with self.assertRaisesRegex(TimeoutError, "RakNet protocol discovery timed out"):
                 await advertised_protocol(host, port)
-            ping.assert_awaited_once_with((host, port))
+            self.assertEqual(ping.await_count, 2)
+            self.assertEqual(peer.close.await_count, 2)
 
     @unittest.skipUnless(find_spec("aiohttp"), "install the nethernet extra")
     async def test_nethernet_protocol_discovery_rejects_missing_metadata(self):

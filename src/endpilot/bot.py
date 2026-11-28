@@ -109,13 +109,14 @@ def _validate_plugin(plugin: object) -> None:
 
 
 class Bot:
-    def __init__(self, name: str = "EndPilot", protocol: int = DEFAULT_PROTOCOL, *,
+    def __init__(self, name: str = "EndPilot", protocol: int | None = DEFAULT_PROTOCOL, *,
                  input_source: Callable[[], ForwardInput] | None = None,
                  on_input_sent: Callable[[int, int], None] | None = None,
                  auto_respawn: bool = False, skin: Skin | None = None,
                  chat_languages: Mapping[str, bytes] | None = None):
         """Create a bot with an optional classic skin for each login.
 
+        Pass protocol=None to use the target's protocol advertisement at each join.
         Optionally supply forward input for the regular 50 ms movement clock.
         The synchronous source runs after the server provides a position. The
         clock keeps one monotonic schedule for the session and skips missed
@@ -129,7 +130,8 @@ class Bot:
         self._skin = skin
         self._chat_languages = dict(chat_languages or {})
         self._offline_identity = OfflineIdentity(name)
-        self.protocol = Protocol(protocol)
+        self._auto_protocol = protocol is None
+        self.protocol = Protocol(DEFAULT_PROTOCOL if protocol is None else protocol)
         self._auto_respawn = auto_respawn
         self._plugins: dict[int, Callable[["Bot"], object]] = {}
         self._spawn_observers: dict[object, Callable[[Literal["initial", "respawn"]], None]] = {}
@@ -346,7 +348,8 @@ class Bot:
             raise RuntimeError("player is already connecting or connected")
         if terrain_storage is not None and not isinstance(terrain_storage, TerrainStorage):
             raise TypeError("terrain_storage must be a TerrainStorage")
-        _validate_join(self.protocol, chunk_radius, locale, timeout, online=credential_provider is not None)
+        protocol = None if self._auto_protocol else self.protocol
+        _validate_join(protocol, chunk_radius, locale, timeout, online=credential_provider is not None)
         self._session_end_state = None
         clock = ClientClock()
         self._clock = clock
@@ -360,13 +363,13 @@ class Bot:
                     raise ConnectionError("player closed while joining")
             if self._skin is not None:
                 identity = identity._with_skin(self._skin)
-            if self.protocol.number == 2225:
+            if protocol is not None and protocol.number == DEFAULT_PROTOCOL:
                 # Prepare local block state lookups before the session starts.
                 await _prepare_block_palette()
                 if self._clock is not clock:
                     raise ConnectionError("player closed while joining")
             session = await connect(
-                *endpoint, identity, self.protocol, timeout, clock=clock, chunk_radius=chunk_radius, locale=locale,
+                *endpoint, identity, protocol, timeout, clock=clock, chunk_radius=chunk_radius, locale=locale,
                 **kwargs,
             )
             if self._clock is not clock:
@@ -385,6 +388,8 @@ class Bot:
 
         def finish_join() -> None:
             session = self._session
+            if self._auto_protocol:
+                self.protocol = session.packets.protocol
             self._session_end_state = session._end_state
             if session.spawned:
                 self._player_state._start_spawn_observation(self._publish_spawn)
@@ -392,7 +397,7 @@ class Bot:
             start_complete.set()
 
         try:
-            if credential_provider is None and not _track_join:
+            if credential_provider is None and not (_track_join or self._auto_protocol):
                 await connect_and_start()
                 finish_join()
                 return
@@ -439,7 +444,7 @@ class Bot:
         self._clock = session.clock
         self._session = session
         if terrain_storage is not None:
-            self._terrain_writer = terrain_storage._bind(self.protocol.number)
+            self._terrain_writer = terrain_storage._bind(session.packets.protocol.number)
         identity = session.identity
         xuid = identity._xuid if isinstance(identity, _OnlineIdentity) else ""
         session._observe_session_end()

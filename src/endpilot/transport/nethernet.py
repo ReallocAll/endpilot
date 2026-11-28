@@ -1,13 +1,14 @@
 """NetherNet HTTP signaling for a Bedrock server."""
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives.asymmetric import ec
 from nethernet import ConnectionFailed, InvalidIdentity, PlayerSigner, SessionError
 from nethernet.identity import build_envelope, insert_identity, sign_fingerprints
 
-from ._nethernet_http import _check_signaling_endpoint, connect_http
+from ._nethernet_http import _check_signaling_endpoint, _protocol_number, connect_http
 
 
 class _OnlinePlayerSigner:
@@ -42,12 +43,9 @@ async def advertised_protocol(url: str, *, timeout: float = 5) -> int:
     except ValueError as error:
         raise ValueError(f"NetherNet advertisement at {endpoint} is not JSON") from error
 
-    try:
-        protocol = int(str(advertisement["protocol"]))
-        if protocol <= 0:
-            raise ValueError("nonpositive protocol")
-    except (KeyError, TypeError, ValueError) as error:
-        raise ValueError(f"NetherNet advertisement at {endpoint} has no valid protocol") from error
+    protocol = _protocol_number(advertisement)
+    if protocol is None:
+        raise ValueError(f"NetherNet advertisement at {endpoint} has no valid protocol")
     return protocol
 
 
@@ -56,9 +54,14 @@ async def connect(
     server_key_sha256: str | None = None,
     multiplayer_token: str | None = None, issuer: str | None = None,
     _check_endpoint: bool = False,
+    _on_protocol: Callable[[int | None], Awaitable[None]] | None = None,
 ):
     if _check_endpoint:
-        await _check_signaling_endpoint(url)
+        if _on_protocol is None:
+            await _check_signaling_endpoint(url)
+        else:
+            await _on_protocol(await _check_signaling_endpoint(url, read_protocol=True))
+            _on_protocol = None
     if multiplayer_token is None and issuer is None:
         key = private_key or ec.generate_private_key(ec.SECP384R1())
         signer = PlayerSigner(key, domain="self")
@@ -75,7 +78,7 @@ async def connect(
         return await connect_http(
             url, identity_signer=signer,
             on_server_identity=verify_pin if server_key_sha256 is not None else None,
-            capability_check=not _check_endpoint,
+            capability_check=not _check_endpoint, _on_protocol=_on_protocol,
         )
     except ConnectionFailed as error:
         if _check_endpoint and error.error == SessionError.SIGNALING_FAILED_TO_SEND:

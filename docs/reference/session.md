@@ -2,6 +2,32 @@
 
 See the [login tutorial](../tutorials/login.md) for transport setup and Xbox sign-in.
 
+## Select a protocol for one server
+
+`Bot()` uses protocol 2225. Pass an integer to select a fixed protocol, or pass
+`None` to select from the target's advertisement on each join.
+
+```python
+bot = Bot("Knight", protocol=None)
+await bot.join_address("raknet://127.0.0.1:19132")
+```
+
+Automatic selection works with `join_address`, `join_raknet`, and
+`join_nethernet`. RakNet uses part of the candidate's timeout to check for a
+pong. NetherNet reads the optional `protocol` field from its existing signaling
+response. A candidate with no usable announcement uses 2225. If the server
+announces a protocol number missing from the installed codec, the join raises
+`ValueError` with that number. Xbox login requires protocol 2225. Older packet
+bindings can support the opening exchange, with gameplay support depending on
+the selected protocol.
+
+Before the first successful automatic join, `bot.protocol.number` is 2225.
+The joined protocol is available in initial spawn callbacks and stays available
+after close or a failed reconnect. `bot.reported_server_version` holds the
+version string as sent in the active session's `StartGame`, or `None` if
+unavailable. RakNet startup and shutdown cleanup can extend the time
+before a cancelled or timed-out join returns.
+
 ## Check SDK features for a protocol
 
 `bot.protocol.supports_feature(name)` is a synchronous query for the selected

@@ -3,8 +3,9 @@ import base64
 from hashlib import sha256
 import json
 import struct
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -207,11 +208,12 @@ class SentPacketTests(unittest.IsolatedAsyncioTestCase):
             await send(b.StartGamePacket(runtime_id=7, entity_id=11))
             await send(b.PlayStatusPacket(status=b.PlayStatus.PLAYER_SPAWN))
 
-        with patch("raknet.asyncio.create_connection", return_value=client) as connect:
+        peer = SimpleNamespace(connect=AsyncMock(return_value=client), close=AsyncMock())
+        with patch("endpilot.transport.raknet._create_peer", return_value=peer):
             async with asyncio.timeout(2), asyncio.TaskGroup() as tasks:
                 tasks.create_task(handshake())
                 await bot.join_raknet("127.0.0.1", 19132, timeline=timeline)
-            connect.assert_awaited_once_with(("127.0.0.1", 19132))
+            peer.connect.assert_awaited_once_with(("127.0.0.1", 19132))
         self.assertEqual(timeline.sent_count("RequestNetworkSettingsPacket"), 1)
         self.assertEqual(timeline.sent_count("LoginPacket"), 1)
         self.assertEqual(timeline.sent_count("ClientToServerHandshakePacket"), 1)
