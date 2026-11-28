@@ -157,30 +157,55 @@ def _receipt_stack(stack: HeldItemStack, slot) -> HeldItemStack:
 
 
 async def _transfer_cursor(
-    bot: Bot, slots: int | range, *, mode: Literal["take", "take_half", "place_one", "return"], timeout: float,
+    bot: Bot, slots: int | range, *, mode: Literal["take", "take_half", "place_one", "return"],
+    area: Literal["inventory", "container"] = "inventory", timeout: float,
 ) -> RangeTransferResult:
     if not isfinite(timeout) or timeout < 0:
         raise ValueError("timeout must be finite and nonnegative")
     take = mode in ("take", "take_half")
     place_one = mode == "place_one"
+    if area not in ("inventory", "container"):
+        raise ValueError("destination_area must be 'inventory' or 'container'")
+    to_chest_slot = area == "container"
+    slot_limit = _DOUBLE_CHEST_SIZE if to_chest_slot else _PLAYER_SIZE
     if take or place_one:
-        if type(slots) is not int or not 0 <= slots < _PLAYER_SIZE:
+        if type(slots) is not int or not 0 <= slots < slot_limit:
             name = "source_slot" if take else "destination_slot"
-            raise ValueError(f"{name} must be a main inventory slot within 0..35")
+            slot_area = "chest" if to_chest_slot else "main inventory"
+            raise ValueError(f"{name} must be a {slot_area} slot within 0..{slot_limit - 1}")
         if place_one:
             slots = range(slots, slots + 1)
     else:
-        _check_range(slots, _PLAYER_SIZE, "destination_slots")
+        _check_range(slots, slot_limit, "destination_slots")
 
     inventory, window = bot._inventory, bot.open_window
-    if (inventory is None or window is None or window.container_type != "WORKBENCH"
+    containers = bot._containers
+    chest = (window is not None and window.container_type == "CONTAINER" and containers is not None
+             and containers._window_open_block_name == "minecraft:chest")
+    workbench = window is not None and window.container_type == "WORKBENCH" and not to_chest_slot
+    if (inventory is None or not (chest or workbench)
             or window.position is None or window.entity_unique_id != -1 or bot.protocol.number != 2225):
-        raise RuntimeError("open a protocol 2225 workbench before transferring cursor items")
+        raise RuntimeError("open a protocol 2225 workbench or observed ordinary chest for cursor transfers")
+    chest_width = containers._cursor_chest_width(window) if chest else None
+    layout = containers._layout_token if chest else None
+    if to_chest_slot and chest_width is not None:
+        if take and slots >= chest_width:
+            raise ValueError(f"source_slot must be within 0..{chest_width - 1} for this chest")
+        if not take:
+            _check_range(slots, chest_width, "destination_slot" if place_one else "destination_slots")
+
+    def window_is_current():
+        return (inventory._cursor_window is window and (not chest or (
+            containers._layout_token is layout and containers._cursor_chest_width(window) == chest_width
+            and chest_width is not None
+        )))
 
     steps = []
-    player_item = inventory._known_main_transfer_slot(slots) if take else None
+    read_peer = containers._known_container_cursor_slot if to_chest_slot else inventory._known_main_transfer_slot
+    writable = containers._can_plan_container_slot_write if to_chest_slot else inventory._can_plan_main_slot_write
+    peer_item = read_peer(slots) if take and (not chest or chest_width is not None) else None
     cursor_item = inventory._cursor_item
-    source_item = player_item if take else cursor_item
+    source_item = peer_item if take else cursor_item
     source_count = 0 if source_item is None else int(source_item.stack_size)
     requested = source_count
     if mode == "take_half":
@@ -195,6 +220,10 @@ async def _transfer_cursor(
         return result("window_changed")
     if inventory._requests_for_endpoints(((id(window), 0),)):
         return result("unconfirmed")
+    if chest and (containers._ordinary_chest_replaced() or containers._window_chest_pair_changed):
+        return result("window_changed")
+    if chest and chest_width is None:
+        return result("unobserved")
     if source_item is None or cursor_item is None:
         return result("unobserved")
     if take and cursor_item.stack_size:
@@ -211,7 +240,7 @@ async def _transfer_cursor(
     expected_cursor = _stack_snapshot(cursor_item)
     try:
         while remaining:
-            if inventory._cursor_window is not window:
+            if not window_is_current():
                 return result("window_changed")
             cursor_item = inventory._cursor_item
             if _stack_snapshot(cursor_item) != expected_cursor:
@@ -220,14 +249,13 @@ async def _transfer_cursor(
                 index, amount = slots, requested
             else:
                 destinations = {index: item for index in slots
-                                if (item := inventory._known_main_transfer_slot(index)) is not None}
-                writable = {index for index in destinations if inventory._can_plan_main_slot_write(index)}
+                                if (item := read_peer(index)) is not None}
                 plan = _plan_step({0: cursor_item}, destinations, item_id, remaining, limit, range(1), slots,
-                                  writable_destination=writable)
+                                  writable_destination={index for index in destinations if writable(index)})
                 if isinstance(plan, str):
                     return result(plan)
                 _, index, amount = plan
-                player_item = destinations[index]
+                peer_item = destinations[index]
             time_left = deadline - loop.time()
             if time_left <= 0:
                 raise TimeoutError("cursor transfer timed out before the next step")
@@ -246,7 +274,7 @@ async def _transfer_cursor(
 
             def record_reply(reply):
                 verdict = reply.result.name
-                current = inventory._cursor_window is window
+                current = window_is_current()
                 count = 0 if current and verdict != "SUCCESS" else confirmed
                 steps[-1] = replace(step, request_id=int(reply.client_request_id.raw_id), verdict=verdict,
                                     confirmed=count)
@@ -258,8 +286,9 @@ async def _transfer_cursor(
 
             try:
                 reply = await inventory._move_cursor_step(
-                    window, index, amount, take=take, player_item=player_item, cursor_item=cursor_item,
+                    window, index, amount, take=take, peer_item=peer_item, cursor_item=cursor_item,
                     timeout=time_left, on_submitted=record_submission, on_confirmed=confirm,
+                    window_is_current=window_is_current, containers=containers if to_chest_slot else None,
                 )
             except _InventoryMoveNotSubmitted as stopped:
                 steps.pop()

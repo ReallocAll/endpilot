@@ -370,6 +370,19 @@ class Containers:
     def _observed_window_slot_count(self, window: ContainerWindow) -> int | None:
         return self._window_slot_count if self.window is window else None
 
+    def _cursor_chest_width(self, window: ContainerWindow) -> int | None:
+        if (self.window is not window or self._window_close_requested
+                or self._window_open_block_name != "minecraft:chest" or self._ordinary_chest_replaced()
+                or self._current_window_block_name(window) != "minecraft:chest" or self._window_chest_pair_changed):
+            return None
+        width = self._window_slot_count
+        if width == 27 and self._window_chest_halves is None:
+            if self._verified_chest_halves(window.position, self._chest_facing(window.position)) is None:
+                return width
+        if width == 54 and self._paired_chest_window_is_current(window):
+            return width
+        return None
+
     def _fail_progress_waiters(
         self, error_type: type[Exception], message: str, cause: BaseException | None = None,
     ) -> None:
@@ -711,6 +724,9 @@ class Containers:
             self._set_window(window)
             block_name = self._window_open_block_name = self._observed_window_block_name(window)
             if block_name == "minecraft:chest":
+                # The UI cursor may arrive before the chest's full layout.
+                if self.inventory is not None and self.packets.protocol.number == 2225:
+                    self.inventory._set_cursor_window(window)
                 facing = self._chest_facing(window.position)
                 halves = self._verified_chest_halves(window.position, facing)
                 if halves is not None:
@@ -788,6 +804,9 @@ class Containers:
                     return
                 before = (self._slots or {}) if self._slot_observers else None
                 if self._window_slot_count != count:
+                    if (self._window_slot_count is not None and window.container_type == "CONTAINER"
+                            and self.inventory is not None and self.inventory._cursor_window is window):
+                        self.inventory._set_cursor_window(None)
                     if self._window_slot_count == 54 and self._window_chest_halves is not None:
                         self._window_chest_pair_changed = True
                     if self._window_slot_count == 27 and self._tracks_ender_chest(window):
@@ -2320,6 +2339,10 @@ class Containers:
     def _can_plan_container_slot(self, index: int) -> bool:
         endpoint = self._block_transfer_endpoint(index)
         return endpoint is not None and not self._transfer_slot_is_unconfirmed(index, endpoint)
+
+    def _known_container_cursor_slot(self, index: int):
+        item = None if self._slots is None else self._slots.get(index)
+        return item if _valid_transfer_stack(item) and self._can_plan_container_slot(index) else None
 
     def _can_plan_container_slot_write(self, index: int) -> bool:
         entity = self._entity_container

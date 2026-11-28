@@ -1373,15 +1373,39 @@ class Inventory:
             return item
         return None
 
-    async def _move_cursor_step(self, window, index, amount, *, take, player_item, cursor_item, timeout,
-                                on_submitted, on_confirmed):
+    async def _move_cursor_step(self, window, index, amount, *, take, peer_item, cursor_item, timeout,
+                                on_submitted, on_confirmed, window_is_current, containers=None):
         b = self.packets.protocol.binding
         cereal = b.ItemStackRequestCereal
-        player_endpoint, cursor_endpoint = (None, index), (id(window), 0)
-        endpoints = frozenset((player_endpoint, cursor_endpoint))
-        expected = {player_endpoint: _stack_snapshot(player_item), cursor_endpoint: _stack_snapshot(cursor_item)}
+        peer_endpoint = (None, index) if containers is None else containers._block_transfer_endpoint(index)
+        if peer_endpoint is None:
+            raise _InventoryMoveNotSubmitted("window_changed")
+        cursor_endpoint = (id(window), 0)
+        endpoints = frozenset((peer_endpoint, cursor_endpoint))
+        expected = {peer_endpoint: _stack_snapshot(peer_item), cursor_endpoint: _stack_snapshot(cursor_item)}
+        peer_domains = _PLAYER_CONTAINERS if containers is None else ("LEVEL_ENTITY_CONTAINER",)
+        known_peer = self._known_main_transfer_slot if containers is None else containers._known_container_cursor_slot
+        mark = index if containers is None else peer_endpoint
         changed = set()
         overlapped = False
+
+        def is_current():
+            return window_is_current() and (containers is None or containers._block_transfer_endpoint(index) == peer_endpoint)
+
+        def unconfirmed_peers():
+            return self._unconfirmed_transfer_slots if containers is None else self._unconfirmed_swap_slots
+
+        def observed_peer():
+            return self._slots.get(index) if containers is None else containers._slots.get(index)
+
+        def write_peer(updated):
+            unconfirmed_peers().discard(mark)
+            if containers is None:
+                self._set_slot(index, updated)
+            else:
+                before = {} if containers._slot_observers else None
+                containers._write_window_correction(index, updated, before)
+                containers._notify_slot_changes(window, before)
 
         def slot_info(container, slot, item):
             return cereal.SlotInfoData(
@@ -1389,10 +1413,10 @@ class Inventory:
                 slot=slot, net_id_variant=int(item.net_id_variant or 0),
             )
 
-        player = slot_info(_PLAYER_CONTAINERS[0], index, player_item)
+        peer = slot_info(peer_domains[0], index, peer_item)
         cursor = slot_info(_CURSOR_CONTAINER, 0, cursor_item)
         action_type = cereal.TakeActionData if take else cereal.PlaceActionData
-        source, destination = (player, cursor) if take else (cursor, player)
+        source, destination = (peer, cursor) if take else (cursor, peer)
         request_id = self._allocate_request_id()
         request = b.ItemStackRequestPacketData.RequestData(
             client_request_id=b.ItemStackRequestId(raw_id=request_id),
@@ -1401,16 +1425,16 @@ class Inventory:
         )
 
         def at_write():
-            if self._cursor_window is not window:
+            if not is_current():
                 raise _InventoryMoveNotSubmitted("window_changed")
             own = self._pending_requests[request_id]
             if (any(other is not own and other.submitted for other in self._requests_for_endpoints(endpoints))
-                    or _stack_snapshot(self._known_main_transfer_slot(index)) != expected[player_endpoint]
+                    or _stack_snapshot(known_peer(index)) != expected[peer_endpoint]
                     or _stack_snapshot(self._cursor_item) != expected[cursor_endpoint]):
                 raise _InventoryMoveNotSubmitted("unconfirmed")
             # The request may change both slots before the next authoritative report.
             self._cursor_item = None
-            self._unconfirmed_transfer_slots.add(index)
+            unconfirmed_peers().add(mark)
             on_submitted(request_id)
 
         def observe(endpoint, item):
@@ -1420,41 +1444,40 @@ class Inventory:
         def mark_overlap():
             nonlocal overlapped
             overlapped = True
-            if self._cursor_window is window:
+            if is_current():
                 self._cursor_item = None
 
         def apply(response):
-            if self._cursor_window is not window:
+            if not is_current():
                 return
             observed_cursor = self._cursor_item
             self._cursor_item = None
-            player_receipt = _exchange_receipt(response, _PLAYER_CONTAINERS, index)
+            peer_receipt = _exchange_receipt(response, peer_domains, index)
             if response.result.name != "SUCCESS":
-                # A rejection alone does not verify the cached main inventory slot.
+                # A rejection alone does not verify the cached peer slot.
                 # A full description received while pending has already cleared the mark.
-                if not overlapped and index in self._unconfirmed_transfer_slots and player_receipt is not None:
-                    corrected = _correct_observed_item(b, self._slots.get(index), player_receipt)
+                if (not overlapped and mark in unconfirmed_peers() and peer_receipt is not None
+                        and peer_endpoint not in changed):
+                    corrected = _correct_observed_item(b, observed_peer(), peer_receipt)
                     if corrected is not None:
-                        self._set_slot(index, corrected)
-                        self._unconfirmed_transfer_slots.discard(index)
+                        write_peer(corrected)
                 return
             cursor_receipt = _exchange_receipt(response, (_CURSOR_CONTAINER,), 0)
-            if overlapped or player_receipt is None or cursor_receipt is None:
+            if overlapped or peer_receipt is None or cursor_receipt is None:
                 return
-            player_delta = int(player_receipt.amount) - int(player_item.stack_size)
+            peer_delta = int(peer_receipt.amount) - int(peer_item.stack_size)
             cursor_delta = int(cursor_receipt.amount) - int(cursor_item.stack_size)
-            moved = cursor_delta if take else player_delta
-            if player_delta + cursor_delta != 0 or not 0 < moved <= amount or (take and moved != amount):
+            moved = cursor_delta if take else peer_delta
+            if peer_delta + cursor_delta != 0 or not 0 < moved <= amount or (take and moved != amount):
                 return
-            source_item = player_item if take else cursor_item
-            player_after = _response_item(b, player_item, source_item, player_receipt)
+            source_item = peer_item if take else cursor_item
+            peer_after = _response_item(b, peer_item, source_item, peer_receipt)
             cursor_after = _response_item(b, cursor_item, source_item, cursor_receipt)
-            if ((player_endpoint in changed and self._observed_stack(index) != _stack_snapshot(player_after))
+            if ((peer_endpoint in changed and _stack_snapshot(observed_peer()) != _stack_snapshot(peer_after))
                     or (cursor_endpoint in changed and _stack_snapshot(observed_cursor) != _stack_snapshot(cursor_after))):
                 return
-            self._set_slot(index, player_after)
-            self._unconfirmed_transfer_slots.discard(index)
             self._cursor_item = cursor_after
+            write_peer(peer_after)
             on_confirmed(moved, _stack_snapshot(cursor_after))
 
         return await self._request_item_stack(
