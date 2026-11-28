@@ -715,16 +715,23 @@ class BlocksTests(unittest.IsolatedAsyncioTestCase):
     async def test_replacing_unstarted_break_preserves_phased_hold(self):
         await self.check_replacement_of_unstarted_break_preserves_existing_mining(creative=False)
 
-    async def test_stop_releases_phased_hold_when_unstarted_owner_has_granted_its_turn(self):
+    async def check_stop_of_phased_hold_after_handoff(self, *, cancel_wait=False, fail=False, close=False):
         _, stream, blocks, observe = self.mining_fixture()
         x, a, b = (1, 100, 0), (2, 100, 0), (1, 100, 1)
         for target in (x, a, b):
             observe(target)
         await blocks.start_mining(x, face=4)
         finish_turn = blocks._finish_mining_turn
+        original_send = stream.send
+        released, waiting_to_release = asyncio.Event(), asyncio.Event()
+        input_lock = blocks.movement._action_lock
+        acquire_input = input_lock.acquire
+        send_error = OSError("release write failed")
         stop_after_handoff = True
         stopping = None
         tasks = []
+        events = []
+        self.addCleanup(blocks.subscribe_mining_events(events.append))
 
         def finish_and_stop():
             nonlocal stop_after_handoff, stopping
@@ -734,22 +741,60 @@ class BlocksTests(unittest.IsolatedAsyncioTestCase):
                 stopping = asyncio.eager_task_factory(asyncio.get_running_loop(), blocks.stop_mining())
                 tasks.append(stopping)
 
+        async def observe_release(packet):
+            await original_send(packet)
+            released.set()
+            if fail:
+                raise send_error
+
+        async def observe_input_wait():
+            if not stop_after_handoff:
+                waiting_to_release.set()
+            return await acquire_input()
+
+        stream.send = observe_release
         async with asyncio.timeout(3):
             try:
                 with patch.object(blocks, "_finish_mining_turn", side_effect=finish_and_stop):
-                    async with blocks.movement._action_lock:
-                        first = asyncio.create_task(blocks.mine_block(a, face=4))
-                        tasks.append(first)
-                        await asyncio.sleep(0)
-                        replacement = asyncio.create_task(blocks.mine_block(b, face=4, replace_current=True))
-                        tasks.append(replacement)
-                        with self.assertRaises(MiningAborted):
-                            await first
-                        with self.assertRaises(MiningAborted):
-                            await replacement
-                        self.assertFalse(stopping.done())
-                        self.assertEqual(len(stream.sent), 1)
-                    self.assertEqual(await stopping, stream.sent[-1].client_tick)
+                    async with input_lock:
+                        with patch.object(input_lock, "acquire", side_effect=observe_input_wait):
+                            first = asyncio.create_task(blocks.mine_block(a, face=4))
+                            tasks.append(first)
+                            await asyncio.sleep(0)
+                            replacement = asyncio.create_task(blocks.mine_block(b, face=4, replace_current=True))
+                            tasks.append(replacement)
+                            with self.assertRaises(MiningAborted):
+                                await first
+                            with self.assertRaises(MiningAborted):
+                                await replacement
+                            await waiting_to_release.wait()
+                            self.assertFalse(stopping.done())
+                            self.assertEqual(len(stream.sent), 1)
+                            self.assertEqual(events, [
+                                MiningEvent("aborted", 0, MiningTarget(x, 4), reason="stopped"),
+                            ])
+                            if close:
+                                blocks.close()
+                                with self.assertRaisesRegex(ConnectionError, "mining session is closed"):
+                                    await stopping
+                                self.assertEqual(len(stream.sent), 1)
+                                self.assertFalse(blocks._mining_lock.locked())
+                                return
+                            if cancel_wait:
+                                stopping.cancel("stop waiter cancelled")
+                                with self.assertRaisesRegex(asyncio.CancelledError, "stop waiter cancelled"):
+                                    await stopping
+                                self.assertEqual(len(stream.sent), 1)
+                    if cancel_wait:
+                        await released.wait()
+                        async with blocks._mining_lock:
+                            pass
+                    elif fail:
+                        with self.assertRaises(OSError) as failed:
+                            await stopping
+                        self.assertIs(failed.exception, send_error)
+                    else:
+                        self.assertEqual(await stopping, stream.sent[-1].client_tick)
                 self.assertEqual(len(stream.sent), 2)
                 abort, stop = stream.sent[-1].player_block_actions
                 self.assertEqual((abort.player_action_type.name, stop.player_action_type.name),
@@ -760,6 +805,18 @@ class BlocksTests(unittest.IsolatedAsyncioTestCase):
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_stop_releases_phased_hold_when_unstarted_owner_has_granted_its_turn(self):
+        await self.check_stop_of_phased_hold_after_handoff()
+
+    async def test_cancelled_stop_waiter_does_not_strand_a_phased_hold_after_handoff(self):
+        await self.check_stop_of_phased_hold_after_handoff(cancel_wait=True)
+
+    async def test_stop_after_handoff_reports_the_release_write_failure(self):
+        await self.check_stop_of_phased_hold_after_handoff(fail=True)
+
+    async def test_close_invalidates_stop_after_handoff_without_waiting_for_input(self):
+        await self.check_stop_of_phased_hold_after_handoff(close=True)
 
     async def test_replacement_waits_for_one_release_and_rejects_unusable_successors(self):
         for outcome in ("invalid", "superseded", "stopped", "failed", "cancelled", "timeout", "stale",

@@ -238,6 +238,7 @@ class _MiningOperation:
     release_previous_hold: MiningTarget | None = None
     pending_release: asyncio.Task | None = None
     successor: asyncio.Future[bool] | None = None
+    stop_release: asyncio.Task | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2203,20 +2204,44 @@ class Blocks:
             raise
         operation.successor = None
 
+    async def _settle_granted_stop(self, operation: _MiningOperation) -> None:
+        try:
+            await self._settle_mining(operation, (), False, None)
+        except Exception:
+            # Stop callers and any next replacement read the release receipt.
+            pass
+        finally:
+            operation.stop_release = None
+            self._finish_mining_turn()
+
     async def stop_mining(self) -> int | None:
         epoch = self._mining_epoch
         previous_hold = None
         operation = self._mining_operation
         if operation is not None:
             self._check_mining_epoch(operation.epoch)
-            self._cancel_mining_successor(operation)
-            if operation.attempt is None:
-                # An explicit stop also releases a hold that predates this call.
-                previous_hold = self._mining_target
-                operation.release_previous_hold = previous_hold
-                operation.release_requested = True
+            held = self._mining_target
+            successor = operation.successor
+            if (operation.attempt is None and held is not None and not self._mining_completed and successor is not None
+                    and successor.done() and operation.released.result() == (False, None, None)):
+                # Keep the granted turn while the explicitly stopped hold releases.
+                operation.successor = None
+                loop = asyncio.get_running_loop()
+                operation = self._mining_operation = _MiningOperation(
+                    epoch, loop.create_future(), loop.create_future(), accepts_stop=False,
+                    release_requested=True, release_previous_hold=held,
+                )
                 self._end_mining_attempt(reason="stopped")
-            self._interrupt_mining(operation, "stopped")
+                operation.stop_release = asyncio.create_task(self._settle_granted_stop(operation))
+            else:
+                self._cancel_mining_successor(operation)
+                if operation.attempt is None:
+                    # An explicit stop also releases a hold that predates this call.
+                    previous_hold = held
+                    operation.release_previous_hold = previous_hold
+                    operation.release_requested = True
+                    self._end_mining_attempt(reason="stopped")
+                self._interrupt_mining(operation, "stopped")
             submitted, tick, failure = await asyncio.shield(operation.released)
             if not submitted:
                 self._check_mining_epoch(operation.epoch)
