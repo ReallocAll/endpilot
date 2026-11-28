@@ -1089,7 +1089,7 @@ class EntityPlacementTests(_EntityPlacementHarness):
         x, y, z = SUPPORT
         upper = (x, y + 2, z)
         await self.deliver(
-            self.registry_packet("minecraft:sheep_spawn_egg"), self.boat_slot(1),
+            self.registry_packet("minecraft:cod_spawn_egg"), self.boat_slot(1),
             self.block(SUPPORT, STONE), self.block(upper),
             *(self.block(cell, layer=1) for cell in (SUPPORT, TARGET, upper)),
         )
@@ -1103,6 +1103,34 @@ class EntityPlacementTests(_EntityPlacementHarness):
         actor_type = "minecraft:villager_v2"
         await self.deliver(self.spawn(-91, position=position, actor_type=actor_type))
         self.assert_entity_placement_completed(await pending, EntitySpawn(-91, 91, actor_type, position))
+
+    async def test_catalog_egg_requires_a_clear_stone_top_and_the_announced_actor(self):
+        x, y, z = SUPPORT
+        upper = (x, y + 2, z)
+        east, east_head = (x + 1, y, z), (x + 1, y + 1, z)
+        await self.deliver(
+            self.registry_packet("minecraft:evoker_spawn_egg"), self.boat_slot(1),
+            self.block(SUPPORT, 3727763636), self.block(upper), self.block(east), self.block(east_head),
+            *(self.block(cell, layer=1) for cell in (SUPPORT, TARGET, upper, east, east_head)),
+        )
+        await self.assert_entity_placement_rejected()
+        await self.deliver(self.block(SUPPORT, STONE))
+        await self.assert_entity_placement_rejected(face=5)
+        await self.deliver(self.block(upper, STONE))
+        await self.assert_entity_placement_rejected()
+        await self.deliver(self.block(upper))
+        with patch.object(self.bot.protocol, "number", 2193):
+            await self.assert_entity_placement_rejected()
+
+        pending = await self.arm_entity(surface=STONE, click_height=1.)
+        position = (x + .5, y + 1., z + .5)
+        actor_type = "minecraft:evocation_illager"
+        await self.deliver(self.boat_slot(0),
+                           self.spawn(-230, position=position, actor_type="minecraft:evoker"),
+                           self.spawn(-231, position=(position[0], y + 1.125, position[2]), actor_type=actor_type))
+        self.assertFalse(pending.done())
+        await self.deliver(self.spawn(-232, position=position, actor_type=actor_type))
+        self.assert_entity_placement_completed(await pending, EntitySpawn(-232, 232, actor_type, position))
 
     async def test_pig_spawn_egg_requires_a_pig_spawn_and_the_slot_debit(self):
         x, y, z = SUPPORT

@@ -181,10 +181,10 @@ item and move within reach of the required block. Pass that block's
 coordinates to `await bot.place_entity(position, face=1, timeout=15)`. The SDK
 resolves the selected item name through the current session's registry and
 sends one click when the terrain and held item still match. Face `1` selects
-the top. Supported spawn eggs also accept horizontal faces `2` through `5`
-on stone. An unsupported face or surface fails the precondition before
-submission. The face must be an integer from `0` through `5`. Booleans,
-floats, and out-of-range values raise `ValueError`.
+the top. Cow, pig, zombie, and villager spawn eggs also accept horizontal
+faces `2` through `5` on stone. An unsupported face or surface fails the
+precondition before submission. The face must be an integer from `0` through
+`5`. Booleans, floats, and out-of-range values raise `ValueError`.
 
 | Held item | Observed block | Local click point | Matching `AddActorPacket` |
 | --- | --- | --- | --- |
@@ -199,6 +199,7 @@ floats, and out-of-range values raise `ValueError`.
 | `minecraft:pig_spawn_egg` | Spawn egg surfaces below | Face center | `minecraft:pig` |
 | `minecraft:zombie_spawn_egg` | Spawn egg surfaces below | Face center | `minecraft:zombie` |
 | `minecraft:villager_spawn_egg` | Spawn egg surfaces below | Face center | `minecraft:villager_v2` |
+| Additional spawn eggs below | Stone top with clearance | `(0.5, 1.0, 0.5)` | The corresponding vanilla actor below |
 
 The 22 watercraft use the `minecraft:` namespace and the item names in this
 table.
@@ -228,6 +229,22 @@ stone, grass blocks, dirt, and oak planks. Vanilla Survival checks exercised
 cow eggs on all four top surfaces and all four stone sides, pig eggs on an
 oak plank top and the east face of stone, zombie eggs on the east face of
 stone, and villager eggs on the south face of stone.
+
+The additional spawn eggs support face `1` on `minecraft:stone` in protocol
+2225. Use the `minecraft:` namespace and append `_spawn_egg` to the following
+names. These eggs spawn the same namespaced actor without the suffix.
+
+`armadillo`, `bogged`, `breeze`, `cat`, `cave_spider`, `chicken`,
+`copper_golem`, `creeper`, `donkey`, `endermite`, `fox`, `goat`, `hoglin`,
+`horse`, `husk`, `llama`, `mooshroom`, `mule`, `ocelot`, `panda`, `parched`,
+`piglin_brute`, `piglin`, `pillager`, `polar_bear`, `rabbit`, `sheep`,
+`silverfish`, `skeleton_horse`, `skeleton`, `sniffer`, `snow_golem`,
+`spider`, `stray`, `trader_llama`, `vindicator`, `witch`, `wolf`, `zoglin`,
+`zombie_horse`, `zombie_pigman`.
+
+The stone-top catalog also includes `minecraft:evoker_spawn_egg`, which
+spawns `minecraft:evocation_illager`, and `minecraft:zombie_villager_spawn_egg`,
+which spawns `minecraft:zombie_villager_v2`.
 
 For egg, armor stand, and end crystal placement, the SDK checks the cell adjacent to the
 clicked face and the cell above it for observed air. It also checks layer 1

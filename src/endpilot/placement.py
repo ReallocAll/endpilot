@@ -43,6 +43,52 @@ _SPAWN_EGGS = {
     "minecraft:zombie_spawn_egg": "minecraft:zombie",
     "minecraft:villager_spawn_egg": "minecraft:villager_v2",
 }
+# Verified ordinary Survival spawns from a stone top in protocol 2225.
+_STONE_TOP_SPAWN_EGGS_2225 = {
+    "minecraft:armadillo_spawn_egg": "minecraft:armadillo",
+    "minecraft:bogged_spawn_egg": "minecraft:bogged",
+    "minecraft:breeze_spawn_egg": "minecraft:breeze",
+    "minecraft:cat_spawn_egg": "minecraft:cat",
+    "minecraft:cave_spider_spawn_egg": "minecraft:cave_spider",
+    "minecraft:chicken_spawn_egg": "minecraft:chicken",
+    "minecraft:copper_golem_spawn_egg": "minecraft:copper_golem",
+    "minecraft:creeper_spawn_egg": "minecraft:creeper",
+    "minecraft:donkey_spawn_egg": "minecraft:donkey",
+    "minecraft:endermite_spawn_egg": "minecraft:endermite",
+    "minecraft:evoker_spawn_egg": "minecraft:evocation_illager",
+    "minecraft:fox_spawn_egg": "minecraft:fox",
+    "minecraft:goat_spawn_egg": "minecraft:goat",
+    "minecraft:hoglin_spawn_egg": "minecraft:hoglin",
+    "minecraft:horse_spawn_egg": "minecraft:horse",
+    "minecraft:husk_spawn_egg": "minecraft:husk",
+    "minecraft:llama_spawn_egg": "minecraft:llama",
+    "minecraft:mooshroom_spawn_egg": "minecraft:mooshroom",
+    "minecraft:mule_spawn_egg": "minecraft:mule",
+    "minecraft:ocelot_spawn_egg": "minecraft:ocelot",
+    "minecraft:panda_spawn_egg": "minecraft:panda",
+    "minecraft:parched_spawn_egg": "minecraft:parched",
+    "minecraft:piglin_brute_spawn_egg": "minecraft:piglin_brute",
+    "minecraft:piglin_spawn_egg": "minecraft:piglin",
+    "minecraft:pillager_spawn_egg": "minecraft:pillager",
+    "minecraft:polar_bear_spawn_egg": "minecraft:polar_bear",
+    "minecraft:rabbit_spawn_egg": "minecraft:rabbit",
+    "minecraft:sheep_spawn_egg": "minecraft:sheep",
+    "minecraft:silverfish_spawn_egg": "minecraft:silverfish",
+    "minecraft:skeleton_horse_spawn_egg": "minecraft:skeleton_horse",
+    "minecraft:skeleton_spawn_egg": "minecraft:skeleton",
+    "minecraft:sniffer_spawn_egg": "minecraft:sniffer",
+    "minecraft:snow_golem_spawn_egg": "minecraft:snow_golem",
+    "minecraft:spider_spawn_egg": "minecraft:spider",
+    "minecraft:stray_spawn_egg": "minecraft:stray",
+    "minecraft:trader_llama_spawn_egg": "minecraft:trader_llama",
+    "minecraft:vindicator_spawn_egg": "minecraft:vindicator",
+    "minecraft:witch_spawn_egg": "minecraft:witch",
+    "minecraft:wolf_spawn_egg": "minecraft:wolf",
+    "minecraft:zoglin_spawn_egg": "minecraft:zoglin",
+    "minecraft:zombie_horse_spawn_egg": "minecraft:zombie_horse",
+    "minecraft:zombie_pigman_spawn_egg": "minecraft:zombie_pigman",
+    "minecraft:zombie_villager_spawn_egg": "minecraft:zombie_villager_v2",
+}
 _EGG_TOP_SURFACES = ("minecraft:stone", "minecraft:grass_block", "minecraft:dirt", "minecraft:oak_planks")
 
 
@@ -539,6 +585,9 @@ async def observe_entity_placement[Result: EntityPlacementResult](
 
     item_name = registry_name(before.item_id)
     egg_actor = _SPAWN_EGGS.get(item_name)
+    egg_surfaces = _EGG_TOP_SURFACES if egg_actor is not None and face == 1 else ("minecraft:stone",)
+    if egg_actor is None and face == 1 and packets.protocol.number == 2225:
+        egg_actor = _STONE_TOP_SPAWN_EGGS_2225.get(item_name)
     legacy_oak_boat = result_type is BoatPlacementResult
     if legacy_oak_boat and item_name != "minecraft:oak_boat":
         return result("precondition_failed")
@@ -570,7 +619,7 @@ async def observe_entity_placement[Result: EntityPlacementResult](
         case _:
             if egg_actor is not None:
                 actor_type = egg_actor
-                supported_blocks = _EGG_TOP_SURFACES if face == 1 else ("minecraft:stone",)
+                supported_blocks = egg_surfaces
             elif item_name == "minecraft:armor_stand":
                 actor_type = "minecraft:armor_stand"
                 supported_blocks = ("minecraft:stone",)
