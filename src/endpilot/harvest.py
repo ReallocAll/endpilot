@@ -220,7 +220,7 @@ def _check_max_tools(max_tools):
 class HarvestTools:
     def __init__(
         self, blocks: Blocks, inventory: Inventory, containers: Containers, item_names: dict[int, str],
-        *, ordinary_mining: Callable[[], Literal["none", "haste_i"] | None] | None = None,
+        *, ordinary_mining: Callable[[], Literal["no_observed_effect", "haste_i"] | None] | None = None,
     ):
         self._blocks = blocks
         self._inventory = inventory
@@ -269,7 +269,7 @@ class HarvestTools:
             return None
         effect = self._ordinary_mining()
         if name == best.item_name == "minecraft:shears":
-            if effect != "none" or state.name != "minecraft:oak_leaves":
+            if effect != "no_observed_effect" or state.name != "minecraft:oak_leaves":
                 return None
         else:
             family = name.rpartition("_")[2]
@@ -305,7 +305,9 @@ class HarvestTools:
             if speed * multiplier < known.hardness * 30:
                 return None
         movement = blocks.movement
-        if movement is None or movement._entity_cursor_pose() is None or movement._stationary_mining_pose() is None:
+        # A pose request can be pending while the last actor data still reports standing.
+        if (movement is None or movement._pose_candidate is not None or movement._pose_intents
+                or movement._entity_cursor_pose() is None or movement._stationary_mining_pose() is None):
             return None
         motion = movement.state
         observed_feet = movement.observed_feet_position

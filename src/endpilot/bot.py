@@ -2726,7 +2726,7 @@ class Bot:
             targets, count=count, ticks=ticks, search_radius=search_radius, timeout=timeout,
         )
 
-    def _ordinary_mining_effect(self) -> Literal["none", "haste_i"] | None:
+    def _ordinary_mining_effect(self) -> Literal["no_observed_effect", "haste_i"] | None:
         state = self._player_state
         if (self.protocol.number != 2225 or self.game_mode != GameType.SURVIVAL
                 or state is None or state._closed or state._disconnected or state.is_dead
@@ -2738,7 +2738,7 @@ class Bot:
             return None
         effects = state.status_effects()
         if not effects:
-            return "none"
+            return "no_observed_effect"
         if len(effects) == 1 and (effects[0].id, effects[0].amplifier) == (3, 0) and effects[0].duration_ticks > 0:
             return "haste_i"
         return None

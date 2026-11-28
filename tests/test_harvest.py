@@ -339,6 +339,66 @@ class HarvestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.best_harvest_tool(POSITION), faster)
         self.assertEqual(self.stream.sent, [])
 
+    async def test_shears_wait_for_confirmed_standing_after_crawl_requests(self):
+        bot = await self.connect(native_writes=True)
+        self.ordinary_pose()
+        self.block(OAK_LEAVES)
+        self.inventory_slot(0, 1203, user_data=EMPTY_USER_DATA)
+        self.inventory_slot(1, 1203, user_data=enchantment_data(self.binding, 2))
+        await bot.select_hotbar(0)
+        self.stream.sent.clear()
+        current = HarvestTool(0, "minecraft:shears", 15)
+        faster = HarvestTool(1, "minecraft:shears", 15)
+        self.assertEqual(bot.best_harvest_tool(POSITION), current)
+
+        b = self.binding
+        flags = b.PlayerAuthInputPacket.InputData
+        head = (0, 101, 0)
+
+        def report_crawling(crawling):
+            entry = b.DataItemEntry(id=92, payload=b.DataItemInt64Payload(
+                value=int(crawling) << (int(b.ActorFlags.CRAWLING) % 64),
+            ))
+            self.emit(b.SetActorDataPacket(id=1, packed_items=b.SynchedActorData.CopyableDataList(data=[entry])))
+
+        self.world_block(head, STONE)
+        start_tick = await bot.set_crawling(True)
+        self.assertEqual(self.stream.sent[-1].client_tick, start_tick)
+        self.assertIn(flags.START_CRAWLING, self.stream.sent[-1].input_data)
+        self.world_block(head, HASHED_AIR_RUNTIME_ID)
+        report_crawling(False)
+        self.assertIs(bot.movement_state.crawling, False)
+        self.assertEqual(bot.best_harvest_tool(POSITION), faster)
+
+        stop_tick = await bot.set_crawling(False)
+        self.assertEqual(self.stream.sent[-1].client_tick, stop_tick)
+        self.assertIn(flags.STOP_CRAWLING, self.stream.sent[-1].input_data)
+        report_crawling(False)
+        self.assertEqual(bot.best_harvest_tool(POSITION), faster)
+        report_crawling(True)
+        self.assertEqual(bot.best_harvest_tool(POSITION), faster)
+        report_crawling(False)
+        self.assertEqual(bot.best_harvest_tool(POSITION), current)
+        self.assertEqual(await bot.equip_harvest_tool(POSITION), current)
+        self.assertEqual(len(self.stream.sent), 2)
+
+        self.world_block(head, STONE)
+        send = self.stream.send
+
+        async def remove_roof_during_send(packet):
+            self.world_block(head, HASHED_AIR_RUNTIME_ID)
+            self.assertIs(bot.movement_state.crawling, False)
+            self.assertEqual(bot.best_harvest_tool(POSITION), faster)
+            await send(packet)
+
+        with patch.object(self.stream, "send", remove_roof_during_send):
+            self.assertIsNotNone(await bot.set_crawling(True))
+        self.assertEqual(await bot.equip_harvest_tool(POSITION), faster)
+        self.assertEqual(len(self.stream.sent), 4)
+        packet = self.stream.sent[-1]
+        self.assertIsInstance(packet, b.MobEquipmentPacket)
+        self.assertEqual((packet.selected_slot, packet.item.net_id_variant), (1, 101))
+
     async def test_ordinary_equipping_resends_when_selected_stack_identity_changes(self):
         bot = await self.connect()
         self.block(DIAMOND_ORE)
