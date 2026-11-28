@@ -803,7 +803,8 @@ class Movement:
                           jump_edge: bool = True, flight: _FlightInput | None = None,
                           validate_step: Callable[
                               [tuple[float, float, float], tuple[float, float, float]], None
-                          ] | None = None):
+                          ] | None = None,
+                          walk_height: Callable[[float, float], float] | None = None):
         """Submit one predicted frame; only a later server observation proves acceptance."""
         self._require_input()
         b = self.packets.protocol.binding
@@ -898,6 +899,8 @@ class Movement:
             if finish_jump:
                 jump_tick = jump_floor = active_surface = None
                 jump_velocity = 0.0
+            if walk_height is not None:
+                next_y = walk_height(x + dx, z + dz)
             dy = next_y - y
             # The launch frame uses ground friction; airborne frames use air friction.
             friction = 0.546 if jump_floor is None or y == jump_floor else 0.91
@@ -2231,8 +2234,12 @@ class Movement:
                          or self._at_standing_height(cell[1] - 1 / 16, tolerance=0.001)))
         return self._at_standing_height(cell[1])
 
-    def _navigation_start_is_standing(self, blocks, cell: Cell, grass_path_walking=None) -> bool:
-        if not self._walking_height(blocks, cell, grass_path_walking):
+    def _navigation_start_is_standing(self, blocks, cell: Cell, grass_path_walking=None, *, carpet=False) -> bool:
+        if carpet:
+            if (blocks._carpet_walk_stance(cell) is not True or self._observed_ground is not True
+                    or not self._at_standing_height(cell[1] + 1 / 16, tolerance=.001)):
+                return False
+        elif not self._walking_height(blocks, cell, grass_path_walking):
             return False
         if self._pending_landing is None:
             return True
@@ -2388,6 +2395,9 @@ class Movement:
             return partial(self._standard_ground_motion, blocks)
         return None
 
+    def _carpet_walking(self, blocks, goal, rules):
+        return isinstance(goal, FootGoal) and not rules.allow_swimming and self._standard_ground_motion(blocks)
+
     def plan_navigation(self, blocks, goal: NavigationGoal, rules: NavigationRules) -> NavigationPlan:
         _require_goal(goal)
         if not isinstance(rules, NavigationRules):
@@ -2399,7 +2409,11 @@ class Movement:
         start = self._foot_cell(self._input_position)
         self._require_ground_input()
         grass_path_walking = self._grass_path_walking(blocks, goal, rules)
-        if not self._navigation_start_is_standing(blocks, start, grass_path_walking):
+        carpets = self._carpet_walking(blocks, goal, rules)
+        start_carpet = carpets and blocks._walking_carpet(start)
+        if start_carpet and blocks._carpet_walk_stance(start) is None:
+            return NavigationPlan(goal, rules, blocks.dimension_id, start, "unknown")
+        if not self._navigation_start_is_standing(blocks, start, grass_path_walking, carpet=start_carpet):
             return NavigationPlan(goal, rules, blocks.dimension_id, start, "unreachable")
         calibrated = self._standard_ground_motion(blocks)
         graph = _StandingGraph(blocks, start, rules, allow_vertical=not (self._sprint_key or self._sneaking),
@@ -2407,7 +2421,7 @@ class Movement:
                                allow_lower_slab_lane=calibrated,
                                allow_short_descent=calibrated and isinstance(goal, FootGoal),
                                allow_water=calibrated and rules.allow_swimming and self._water_ready(),
-                               grass_path_walking=grass_path_walking)
+                               grass_path_walking=grass_path_walking, carpet_walking=carpets)
         current_goal = self._navigation_goal(blocks, goal, visibility_budget=_VisibilityScanBudget(rules.max_expansions))
         return graph.plan(start, current_goal, limit=rules.max_expansions,
                           start_visibility_standing=self._navigation_visibility_standing)
@@ -2528,7 +2542,10 @@ class Movement:
                     return NavigationResult("unknown", 0)
                 start = self._foot_cell(self._input_position)
                 grass_path_walking = None if legacy else self._grass_path_walking(blocks, goal, rules)
-                if not self._navigation_start_is_standing(blocks, start, grass_path_walking):
+                start_carpet = not legacy and self._carpet_walking(blocks, goal, rules) and blocks._walking_carpet(start)
+                if start_carpet and blocks._carpet_walk_stance(start) is None:
+                    return NavigationResult("unknown", 0)
+                if not self._navigation_start_is_standing(blocks, start, grass_path_walking, carpet=start_carpet):
                     return NavigationResult("unreachable", 0)
                 self._pending_landing = None
                 with ExitStack() as subscriptions:
@@ -2569,7 +2586,8 @@ class Movement:
                                allow_lower_slab_lane=calibrated,
                                allow_short_descent=calibrated and isinstance(goal, FootGoal),
                                allow_water=calibrated and rules.allow_swimming and self._water_ready(),
-                               grass_path_walking=grass_path_walking)
+                               grass_path_walking=grass_path_walking,
+                               carpet_walking=not legacy and self._carpet_walking(blocks, goal, rules))
         if legacy and not any(map(graph.in_bounds, _block_face_cells(goal.position))):
             return NavigationResult("unreachable", 0)
         self._clear_manual_input()
@@ -2638,6 +2656,21 @@ class Movement:
                     and all(map(dry_cruise_stance, (anchor, first, second)))):
                 return second
             return None
+
+        def carpet_leg(source, destination):
+            return (graph.carpet_walking and source[1] == destination[1]
+                    and (blocks._walking_carpet(source) or blocks._walking_carpet(destination)))
+
+        def carpet_height(cells, x, z):
+            # The feet stay raised while any of the body footprint overlaps carpet.
+            footprint = {(a, cells[0][1], b)
+                         for a in range(math.floor(x - _PLAYER_HALF_WIDTH), math.floor(x + _PLAYER_HALF_WIDTH) + 1)
+                         for b in range(math.floor(z - _PLAYER_HALF_WIDTH), math.floor(z + _PLAYER_HALF_WIDTH) + 1)}
+            if (not self._standard_ground_motion(blocks) or self._observed_ground is not True
+                    or self._jump_floor_y is not None or not footprint.issubset(cells)
+                    or any(blocks._carpet_walk_stance(cell) is not True for cell in cells)):
+                raise _StraightWalkUnsafe
+            return cells[0][1] + 1.62 + (1 / 16 if any(map(blocks._walking_carpet, footprint)) else 0)
 
         def check_cruise_step(origin, proposal, corridor):
             # Bound one proposed frame plus all subsequent neutral coasting,
@@ -3979,7 +4012,17 @@ class Movement:
                         current = self._foot_cell(self._input_position)
                         current_y = current[1]
                         # Position-only updates cannot turn an airborne correction into a stance.
-                        if not self._walking_height(blocks, current, grass_path_walking) or not graph.in_bounds(current):
+                        if route and carpet_leg(anchor, route[0]):
+                            try:
+                                floor_y = carpet_height((anchor, route[0]), x, z)
+                            except _StraightWalkUnsafe:
+                                return abandon("unknown", "edge_unavailable")
+                            standing = abs(y - floor_y) <= .001
+                        elif graph.carpet_walking and blocks._walking_carpet(current):
+                            standing = self._at_standing_height(current_y + 1 / 16, tolerance=.001)
+                        else:
+                            standing = self._walking_height(blocks, current, grass_path_walking)
+                        if not standing or not graph.in_bounds(current):
                             return abandon("unreachable", "position_changed")
                         if self._teleport_pending is not None or resuming:
                             accepted_level = current_y
@@ -4161,6 +4204,10 @@ class Movement:
                             return outcome("budget")
                         aim = route[0] if extra is None else extra
                         cell_x, _, cell_z = aim
+                        walk_height = None
+                        if carpet_leg(anchor, route[0]):
+                            walk_height = partial(carpet_height, (anchor, route[0]))
+                        walk_args = {} if walk_height is None else {"walk_height": walk_height}
                         if use_ground_velocity:
                             # Keep the observed ground velocity through steering and braking.
                             dx, dz = cell_x + 0.5 - x, cell_z + 0.5 - z
@@ -4172,7 +4219,7 @@ class Movement:
                             rolling |= extra is not None
                             try:
                                 await send_input(
-                                    False, move_vector=directions,
+                                    False, move_vector=directions, **walk_args,
                                     validate_step=(lambda a, b: check_cruise_step(a, b, (anchor, route[0], aim)))
                                     if rolling else None,
                                 )
@@ -4188,7 +4235,10 @@ class Movement:
                                     return outcome("budget")
                                 release_input = False
                                 continue
-                            await send_input(True)
+                            try:
+                                await send_input(True, **walk_args)
+                            except _StraightWalkUnsafe:
+                                return abandon("unknown", "edge_unavailable")
                             submitted += 1
                         release_input = True
                         remaining -= 1

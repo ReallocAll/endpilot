@@ -595,7 +595,7 @@ class _StandingGraph:
                  allow_gap: bool = False, allow_stone_ledge_drop: bool = False, allow_ladder: bool = False,
                  allow_water: bool = False, allow_lower_slab_lane: bool = False,
                  allow_short_descent: bool = False,
-                 grass_path_walking: Callable[[], bool] | None = None):
+                 grass_path_walking: Callable[[], bool] | None = None, carpet_walking: bool = False):
         self.blocks = blocks
         self.origin = start
         self.rules = rules
@@ -607,8 +607,11 @@ class _StandingGraph:
         self.allow_water = allow_water
         self.allow_lower_slab_lane = allow_lower_slab_lane
         self.grass_path_walking = grass_path_walking
+        self.carpet_walking = carpet_walking
 
     def walk_stance(self, cell: Cell) -> bool | None:
+        if self.carpet_walking and self.blocks._walking_carpet(cell):
+            return self.blocks._carpet_walk_stance(cell)
         stance = self.blocks._flat_stance(cell, allow_vegetation=True)
         if stance is False and self.grass_path_walking is not None and self.grass_path_walking():
             return self.blocks._dry_grass_path_stance(cell)
@@ -635,6 +638,11 @@ class _StandingGraph:
     def edge(self, source: Cell, destination: Cell, *, check_descent_source: bool = True) -> bool | None:
         if not self.in_bounds(destination):
             return False
+        if self.carpet_walking and (self.blocks._walking_carpet(source) or self.blocks._walking_carpet(destination)):
+            if source[1] != destination[1] or abs(source[0] - destination[0]) + abs(source[2] - destination[2]) != 1:
+                return False
+            stances = (self.blocks._carpet_walk_stance(source), self.blocks._carpet_walk_stance(destination))
+            return False if False in stances else True if all(stances) else None
         if _is_water_crossing(source, destination):
             x, y, z = destination
             dx, dz = (x - source[0]) // _WATER_STRIDE, (z - source[2]) // _WATER_STRIDE

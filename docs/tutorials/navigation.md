@@ -327,6 +327,11 @@ Passable ground cover does not imply that slowing, damaging, or interactive
 blocks are treated as air.
 A one-block ascent can enter beneath a known full-cell vanilla leaf canopy
 when the launch and both landing body layers still have clear space.
+Dry blue, red, black, and moss carpets, and the supported flat or north-short
+pale moss carpet states, can carry ordinary `FootGoal` navigation on observed
+dry full grass or stone. The feet rise by 1/16 block until they clear the
+carpet. Wet, obstructed, or unobserved footing is not assumed passable. Snow
+layers are not part of this rule.
 Elevation changes require server landing evidence before continuing. A ladder
 descent waits for a grounded server correction at the ladder foot before
 stepping off. Use `reached` and the final match to choose a click, then observe

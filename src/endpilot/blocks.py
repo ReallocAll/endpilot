@@ -1650,6 +1650,40 @@ class Blocks:
             return False
         return True if all(required) else None
 
+    def _walking_carpet(self, cell: tuple[int, int, int]) -> bool:
+        block = self.observed_block(cell)
+        state = None if block is None else self._vanilla_state(block.runtime_id)
+        if state is None:
+            return False
+        if state.name in ("minecraft:blue_carpet", "minecraft:red_carpet",
+                          "minecraft:black_carpet", "minecraft:moss_carpet"):
+            return True
+        if state.name != "minecraft:pale_moss_carpet":
+            return False
+        properties = _vanilla_state_properties(state.name, block.runtime_id, hashed=self.hashed_runtime_ids)
+        return (properties["upper_block_bit"] == 0
+                and properties["pale_moss_carpet_side_north"] in ("none", "short")
+                and all(properties[f"pale_moss_carpet_side_{side}"] == "none"
+                        for side in ("east", "south", "west")))
+
+    def _carpet_walk_stance(self, cell: tuple[int, int, int]) -> bool | None:
+        """Require dry, calibrated full-block footing and two clear body layers."""
+        x, y, z = cell
+        floor = (x, y - 1, z)
+        block = self.observed_block(floor)
+        state = None if block is None else self._vanilla_state(block.runtime_id)
+        support = (False if block is not None and block.is_air is True else
+                   None if state is None else state.unit_cube and not state.unsafe_support
+                   and state.name in ("minecraft:grass_block", "minecraft:stone"))
+        required = (support, self._stance_air(self.observed_block(floor, layer=1)),
+                    self._stance_air(self.observed_block(cell, layer=1)),
+                    self._stance_clearance((x, y + 1, z)))
+        if not self._walking_carpet(cell):
+            required += (self._stance_air(self.observed_block(cell)),)
+        if False in required:
+            return False
+        return True if all(required) else None
+
     def _dry_grass_path_stance(self, position: tuple[int, int, int]) -> bool | None:
         x, y, z = position
         floor = (x, y - 1, z)
