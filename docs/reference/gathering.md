@@ -49,12 +49,23 @@ The tutorial shows how to prepare the chest and confirm the pickup.
 `endpilot.harvest.equip_harvest_tool_from_chests()` accepts an ordered
 sequence of `HarvestToolChest` entries at the player's current position.
 It checks the main inventory first. An empty sequence limits the operation
-to that inventory. The operation takes at most one tool from the supplied
-chests, within the authorized slots. A confirmed shortage in a chest opened
-by the operation allows the next attempt after the server acknowledges the
-close. A borrowed window stays with its caller and ends the search at that
-chest. Supply runs from the player's current position. Mining is a separate
-operation.
+to that inventory. A confirmed shortage in a chest opened by the operation
+allows the next attempt after the server acknowledges the close. A borrowed
+window stays with its caller and ends the search at that chest. Supply runs
+from the player's current position. Mining is a separate operation.
+
+Both chest helpers accept `max_tools`, a positive integer that defaults to
+one. A higher limit lets the first supplying chest provide spare tools within
+its authorized source and destination slots. The helper equips the best
+confirmed tool when the limit is reached, eligible stock runs out, or the
+authorized destination is known full. The remaining tools stay in inventory.
+Check `transfer.confirmed_count` and `transfer.stop_reason` for the actual
+result. An existing suitable tool takes priority and leaves the chests alone.
+
+Multi-tool supply uses one normal-operation timeout, including for the
+single-chest helper. A rejection, unconfirmed take, or stale observation ends
+the attempt with the existing receipts preserved. Interrupted calls still
+expose progress on the original exception.
 
 `HarvestToolSupply` reports the terminal `status`, ordered `attempts` as
 `HarvestToolAcquisition` snapshots, and the selected `tool` if known. The

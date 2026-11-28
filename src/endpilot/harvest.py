@@ -134,9 +134,9 @@ class _HarvestEquipUnavailable(RuntimeError):
 
 async def equip_harvest_tool_from_chest(
     bot: Bot, position: tuple[int, int, int], *, chest: tuple[int, int, int], chest_slots: range,
-    inventory_slots: range = range(36), face: int = 1, timeout: float = 15,
+    inventory_slots: range = range(36), face: int = 1, timeout: float = 15, max_tools: int = 1,
 ) -> HarvestToolAcquisition:
-    """Equip for an observed block, taking one eligible tool from a reachable chest if needed.
+    """Equip for an observed block, taking up to max_tools from a reachable chest if needed.
 
     Search the entire main inventory first. Chest slots use the active
     window's order, including the second half of a double chest. Inventory
@@ -150,16 +150,30 @@ async def equip_harvest_tool_from_chest(
     take keeps its range transfer stop reason. A confirmed take can be
     followed by equip_unavailable or window_changed.
 
+    With max_tools greater than one, the call shares a single time budget.
+    It equips the best confirmed tool when the limit is reached, the chest
+    runs out of eligible tools, or the authorized destination is known full.
+
     Timeout, cancellation, connection and cleanup errors carry
     harvest_progress, including any confirmed transfer or selection.
     """
     _check_range(chest_slots, _DOUBLE_CHEST_SIZE, "chest_slots")
     _check_range(inventory_slots, _MAIN_INVENTORY_SIZE, "inventory_slots")
+    _check_max_tools(max_tools)
     if not isfinite(timeout) or timeout < 0:
         raise ValueError("timeout must be finite and nonnegative")
     harvest = bot._harvest_tools
     if harvest is None:
         raise RuntimeError("player has not joined")
+    if max_tools > 1:
+        supply = await harvest._equip_from_chests(
+            bot, position, chests=(HarvestToolChest(chest, chest_slots, inventory_slots),),
+            face=face, timeout=timeout, max_tools=max_tools, single=True,
+        )
+        if supply.attempts:
+            attempt, = supply.attempts
+            return replace(attempt, status=supply.status)
+        return HarvestToolAcquisition(supply.status, tool=supply.tool)
     return await harvest._equip_from_chest(
         bot, position, chest=chest, chest_slots=chest_slots,
         inventory_slots=inventory_slots, face=face, timeout=timeout,
@@ -168,13 +182,15 @@ async def equip_harvest_tool_from_chest(
 
 async def equip_harvest_tool_from_chests(
     bot: Bot, position: tuple[int, int, int], *, chests: Sequence[HarvestToolChest],
-    face: int = 1, timeout: float = 15,
+    face: int = 1, timeout: float = 15, max_tools: int = 1,
 ) -> HarvestToolSupply:
     """Equip from the main inventory or the first usable chest in caller order.
 
     Supply currently reachable chests. An empty sequence tries the main
     inventory alone. Advance only after a confirmed shortage and the matching
     close of a chest opened here. Leave a borrowed window to its caller.
+    Take up to max_tools from the first chest that can supply them. A
+    confirmed take ends the chest search even when fewer tools are available.
 
     The time budget covers lock acquisition and normal operations. Settling
     already submitted window operations can take longer. An exception carries
@@ -186,12 +202,18 @@ async def equip_harvest_tool_from_chests(
     snapshot = tuple(chests)
     if any(not isinstance(chest, HarvestToolChest) for chest in snapshot):
         raise TypeError("chests must contain only HarvestToolChest entries")
+    _check_max_tools(max_tools)
     if not isfinite(timeout) or timeout < 0:
         raise ValueError("timeout must be finite and nonnegative")
     harvest = bot._harvest_tools
     if harvest is None:
         raise RuntimeError("player has not joined")
-    return await harvest._equip_from_chests(bot, position, chests=snapshot, face=face, timeout=timeout)
+    return await harvest._equip_from_chests(bot, position, chests=snapshot, face=face, timeout=timeout, max_tools=max_tools)
+
+
+def _check_max_tools(max_tools):
+    if type(max_tools) is not int or max_tools <= 0:
+        raise ValueError("max_tools must be a positive integer")
 
 
 class HarvestTools:
@@ -362,7 +384,7 @@ class HarvestTools:
         if bot._harvest_tools is not self or self._inventory._request_stream_ended:
             raise ConnectionError("harvest tool session ended")
 
-    async def _equip_from_chests(self, bot, position, *, chests, face, timeout):
+    async def _equip_from_chests(self, bot, position, *, chests, face, timeout, max_tools, single=False):
         blocks = self._blocks
         target = blocks.observed_block(position)
         epoch = blocks._mining_epoch
@@ -394,6 +416,7 @@ class HarvestTools:
                             inventory_slots=range(36) if chest is None else chest.inventory_slots,
                             face=face, timeout=max(0, deadline - loop.time()), expected_target=target,
                             expected_epoch=epoch, on_owned_window=remember_window, supply_deadline=deadline,
+                            max_tools=max_tools,
                         )
                     except (Exception, asyncio.CancelledError) as error:
                         progress = getattr(error, "harvest_progress", None)
@@ -440,7 +463,11 @@ class HarvestTools:
                             setattr(error, name, getattr(failure, name))
                     for note in getattr(failure, "__notes__", ()):
                         error.add_note(note)
-            error.harvest_supply_progress = result("interrupted")
+            if single:
+                if not hasattr(error, "harvest_progress"):
+                    error.harvest_progress = attempts[-1] if attempts else HarvestToolAcquisition("unobserved", tool=tool)
+            else:
+                error.harvest_supply_progress = result("interrupted")
             raise
 
     async def _close_supply_window(self, *, timeout, _expected_window):
@@ -460,7 +487,7 @@ class HarvestTools:
         expected_chest: BlockObservation | None = None, expected_epoch: int | None = None,
         click_pos: tuple[float, float, float] | None = None,
         on_owned_window: Callable[[ContainerWindow], None] | None = None,
-        requested_drop_id: int | None = None, supply_deadline: float | None = None,
+        requested_drop_id: int | None = None, supply_deadline: float | None = None, max_tools: int = 1,
     ) -> HarvestToolAcquisition:
         blocks, inventory, containers = self._blocks, self._inventory, self._containers
         target = blocks.observed_block(position) if expected_target is None else expected_target
@@ -484,15 +511,23 @@ class HarvestTools:
             if supply_deadline is not None and asyncio.get_running_loop().time() >= supply_deadline:
                 raise TimeoutError("harvest tool supply timed out before submission")
 
-        def require_shortage(*, submitting=None):
+        def require_shortage(*, submitting=None, received=None, equipping=False):
             check_supply_deadline()
             slots = current_inventory()
             if slots is None:
                 raise _InventoryMoveNotSubmitted("unobserved")
-            if self._best_in_inventory(rule, slots) is not None:
+            others = slots
+            if received:
+                for slot, stack in received.items():
+                    if (_stack_snapshot(slots.get(slot)) != stack
+                            or _stack_snapshot(inventory.item_or_empty(slot)) != stack):
+                        raise _InventoryMoveNotSubmitted("equip_unavailable")
+                others = {slot: item for slot, item in slots.items() if slot not in received}
+            if self._best_in_inventory(rule, others) is not None:
                 raise _InventoryMoveNotSubmitted("inventory_available")
-            if not self._inventory_is_observed(slots, submitting=submitting):
+            if not equipping and not self._inventory_is_observed(slots, submitting=submitting):
                 raise _InventoryMoveNotSubmitted("unobserved")
+            return slots
 
         def is_target_window(current):
             return (current is not None and current.position == chest and current.container_type == "CONTAINER"
@@ -504,7 +539,7 @@ class HarvestTools:
             if on_owned_window is not None:
                 on_owned_window(current)
 
-        async def equip_inventory(choice, slots, *, confirmed=False):
+        async def equip_inventory(choice, slots, *, confirmed=False, received=None, extra_check=None):
             nonlocal tool
 
             def require_equip_window():
@@ -522,6 +557,8 @@ class HarvestTools:
                 require_equip_window()
                 if current_inventory() is None:
                     raise _InventoryMoveNotSubmitted("unobserved")
+                if extra_check is not None:
+                    extra_check()
 
             try:
                 if choice.slot is not None:
@@ -529,7 +566,7 @@ class HarvestTools:
                 tool = await self._equip_tool(choice, slots, timeout=timeout, confirmed=confirmed,
                                               before_slot_use=before_slot_use,
                                               before_write=before_write if supply_deadline is not None else None,
-                                              close_window=close_window)
+                                              close_window=close_window, received=received)
             except _InventoryMoveNotSubmitted as stopped:
                 return str(stopped)
             except _HarvestEquipUnavailable:
@@ -538,6 +575,27 @@ class HarvestTools:
             if window is not None and containers.window is not window:
                 return "window_changed"
             return "equip_unavailable" if tool is None else "equipped"
+
+        async def take_one(choice, contents, require_source, *, received=None, time_left):
+            chosen = _stack_snapshot(contents[choice.slot])
+            moved = None
+
+            def before_take(request_id):
+                require_shortage(submitting=request_id, received=received)
+                require_source()
+                if _stack_snapshot((containers.slots or {}).get(choice.slot)) != chosen:
+                    raise _InventoryMoveNotSubmitted("unobserved")
+
+            def confirm(slot, stack):
+                nonlocal moved
+                moved = slot, stack
+
+            reply = await _transfer_range(
+                bot, direction="take", item=choice.item_name, count=1,
+                source_slots=range(choice.slot, choice.slot + 1), destination_slots=inventory_slots,
+                match=lambda stack: stack == chosen, timeout=time_left, before_write=before_take, on_confirmed=confirm,
+            )
+            return reply, moved
 
         async def take_and_equip():
             nonlocal window, transfer
@@ -590,30 +648,14 @@ class HarvestTools:
                     or containers._observed_window_block_name(window) != "minecraft:chest"):
                 return "unobserved"
             _check_range(chest_slots, width, "chest_slots")
+            if max_tools > 1:
+                return await take_multiple(layout, require_same_chest)
             if not self._known_item_slots(chest_items, chest_slots):
                 return "unobserved"
             choice = self._best_in_slots(rule, {slot: chest_items[slot] for slot in chest_slots})
             if choice is None:
                 return "tool_unavailable"
-            chosen = _stack_snapshot(chest_items[choice.slot])
-            received = None
-
-            def before_take(request_id):
-                require_shortage(submitting=request_id)
-                require_same_chest()
-                contents = containers.slots or {}
-                if _stack_snapshot(contents.get(choice.slot)) != chosen:
-                    raise _InventoryMoveNotSubmitted("unobserved")
-
-            def confirm(slot, stack):
-                nonlocal received
-                received = slot, stack
-
-            transfer = await _transfer_range(
-                bot, direction="take", item=choice.item_name, count=1,
-                source_slots=range(choice.slot, choice.slot + 1), destination_slots=inventory_slots,
-                match=lambda stack: stack == chosen, timeout=timeout, before_write=before_take, on_confirmed=confirm,
-            )
+            transfer, received = await take_one(choice, chest_items, require_same_chest, time_left=timeout)
             if transfer.stop_reason == "inventory_available":
                 transfer = None
                 raise _InventoryMoveNotSubmitted("inventory_available")
@@ -630,6 +672,78 @@ class HarvestTools:
             if _stack_snapshot(slots.get(slot)) != stack:
                 return "equip_unavailable"
             return await equip_inventory(replace(choice, slot=slot), slots, confirmed=True)
+
+        async def take_multiple(layout, require_same_chest):
+            nonlocal transfer
+            steps = []
+            received = {}
+            loop = asyncio.get_running_loop()
+
+            def require_source():
+                if containers.window is not window or containers._layout_token is not layout:
+                    raise _InventoryMoveNotSubmitted("window_changed")
+                require_same_chest()
+
+            def require_equipment():
+                require_source()
+                return require_shortage(received=received, equipping=True)
+
+            def record(reason):
+                nonlocal transfer
+                transfer = RangeTransferResult(max_tools, tuple(steps), reason)
+
+            try:
+                for _ in range(max_tools):
+                    require_source()
+                    require_shortage(received=received)
+                    contents = containers.slots or {}
+                    if not self._known_item_slots(contents, chest_slots):
+                        raise _InventoryMoveNotSubmitted("unobserved")
+                    choice = self._best_in_slots(rule, {slot: contents[slot] for slot in chest_slots})
+                    if choice is None:
+                        if not steps:
+                            return "tool_unavailable"
+                        record("source_exhausted")
+                        break
+
+                    reply, moved = await take_one(
+                        choice, contents, require_source, received=received, time_left=max(0, supply_deadline - loop.time()),
+                    )
+                    steps.extend(reply.steps)
+                    record(reply.stop_reason)
+                    require_source()
+                    if moved is None:
+                        if received and reply.stop_reason == "destination_full":
+                            break
+                        return ("unobserved" if reply.stop_reason in ("unconfirmed", "source_exhausted")
+                                else reply.stop_reason)
+                    slot, stack = moved
+                    received[slot] = stack
+                    # Keep partial progress even if the next write has not started.
+                    record("unconfirmed")
+                else:
+                    record("complete")
+
+                slots = require_equipment()
+                choice = self._best_in_slots(rule, {slot: slots[slot] for slot in received})
+                status = await equip_inventory(choice, slots, confirmed=True, received=received, extra_check=require_equipment)
+                if status in ("inventory_available", "equip_unavailable", "window_changed", "unobserved"):
+                    record(status)
+                return status
+            except _InventoryMoveNotSubmitted as stopped:
+                if steps:
+                    record(str(stopped))
+                return str(stopped)
+            except (Exception, asyncio.CancelledError) as error:
+                pending = getattr(error, "transfer_progress", None)
+                if pending is not None:
+                    steps.extend(pending.steps)
+                    record(pending.stop_reason)
+                elif steps and transfer.stop_reason == "unconfirmed" and isinstance(error, asyncio.CancelledError):
+                    record("cancelled")
+                if transfer is not None:
+                    error.transfer_progress = transfer
+                raise
 
         async def acquire():
             slots = current_inventory()
@@ -650,7 +764,7 @@ class HarvestTools:
             try:
                 return await take_and_equip()
             except _InventoryMoveNotSubmitted as stopped:
-                if str(stopped) != "inventory_available":
+                if str(stopped) != "inventory_available" or max_tools > 1:
                     return str(stopped)
                 if window is not None and containers.window is not window:
                     return "window_changed"
@@ -731,7 +845,7 @@ class HarvestTools:
         self, tool: HarvestTool, slots: dict[int, object], *, timeout: float, confirmed: bool = False,
         before_slot_use: Callable[..., None] | None = None,
         before_write: Callable[[], None] | None = None,
-        close_window=None,
+        close_window=None, received: dict[int, HeldItemStack] | None = None,
     ) -> HarvestTool | None:
         inventory = self._inventory
         source = tool.slot
@@ -761,7 +875,7 @@ class HarvestTools:
 
         held = await self._transfer(
             source, destination, slots, hotbar_slot=hotbar_slot, timeout=timeout, confirmed=confirmed,
-            before_slot_use=before_slot_use, before_write=before_write, close_window=close_window,
+            before_slot_use=before_slot_use, before_write=before_write, close_window=close_window, received=received,
         )
         return await self._select(tool, hotbar_slot, held, before_slot_use=before_slot_use, before_write=before_write)
 
@@ -801,7 +915,7 @@ class HarvestTools:
     async def _transfer(
         self, source: int, destination: int, slots: dict[int, object], *, hotbar_slot: int, timeout: float,
         confirmed: bool, before_slot_use: Callable[..., None] | None, before_write: Callable[[], None] | None,
-        close_window=None,
+        close_window=None, received: dict[int, HeldItemStack] | None = None,
     ):
         inventory = self._inventory
         containers = self._containers
@@ -812,6 +926,7 @@ class HarvestTools:
         check_receipt = confirmed or before_write is not None
         expected_stack = _stack_snapshot(expected) if check_receipt else None
         held = None
+        source_after = None
         expected_slots = ({slot: _stack_snapshot(slots[slot]) for slot in (source, destination)}
                           if before_write is not None else {})
 
@@ -821,9 +936,11 @@ class HarvestTools:
                 self._require_slot_at_write(slot, snapshot)
 
         def capture_held_stack() -> None:
-            nonlocal held
+            nonlocal held, source_after
             # Use the network ID from this response before later packets or window closure.
             held = inventory.slots.get(hotbar_slot)
+            if received is not None:
+                source_after = inventory._observed_stack(source)
 
         def remember_window(window: ContainerWindow) -> None:
             nonlocal owned_window
@@ -883,6 +1000,25 @@ class HarvestTools:
                     raise _HarvestEquipUnavailable(
                         f"harvest tool transfer did not confirm inventory slot {hotbar_slot}",
                     )
+            if received is not None:
+                # Update the acquired slots only after both sides of the hotbar
+                # move or swap were described by its matching verdict.
+                correction = _receipt_slot(response, _PLAYER_CONTAINERS, source)
+                previous = expected_slots[destination]
+                if previous.item_id:
+                    matched = (correction is not None and correction.amount == previous.count
+                               and source_after == _receipt_stack(previous, correction))
+                else:
+                    net_id = None if correction is None else correction.item_stack_net_id
+                    matched = (correction is not None and correction.amount == 0
+                               and (net_id is None or net_id.raw_id == 0)
+                               and source_after is not None and not source_after.item_id and not source_after.count)
+                if not matched:
+                    raise _HarvestEquipUnavailable(f"harvest tool transfer did not confirm inventory slot {source}")
+                del received[source]
+                if destination in received:
+                    received[source] = source_after
+                received[destination] = _stack_snapshot(held)
             return held
         except BaseException as error:
             failure = error

@@ -354,3 +354,11 @@ confirmed shortage, the next chest is considered once an operation-owned
 window has closed with server confirmation. A borrowed chest stays open
 and ends this call. Supply stops after an equipped tool or any uncertain
 result. Start collection separately after checking `result.status`.
+
+Pass `max_tools=2` to either helper to request one equipped tool and an
+optional spare. Authorize sufficient destination slots to receive both.
+The helpers take up to that number from the first chest that supplies a
+tool. If its stock falls short, examine `transfer.confirmed_count` and
+`transfer.stop_reason` on the acquisition. In the ordered helper, that
+acquisition is in `result.attempts`. A suitable tool already in the main
+inventory ends supply before opening a chest.

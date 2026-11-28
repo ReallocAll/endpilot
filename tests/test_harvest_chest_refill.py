@@ -131,16 +131,19 @@ class HarvestChestRefillTests(unittest.IsolatedAsyncioTestCase):
     def equipment(self):
         return [packet for packet in self.stream.sent if isinstance(packet, self.b.MobEquipmentPacket)]
 
-    async def acquire(self, *, allowed=range(4, 7), destinations=range(14, 16), timeout=1):
+    async def acquire(self, *, allowed=range(4, 7), destinations=range(14, 16), timeout=1, max_tools=1):
         return await equip_harvest_tool_from_chest(
-            self.bot, TARGET, chest=CHEST, chest_slots=allowed, inventory_slots=destinations, face=2, timeout=timeout,
+            self.bot, TARGET, chest=CHEST, chest_slots=allowed, inventory_slots=destinations,
+            face=2, timeout=timeout, max_tools=max_tools,
         )
 
-    async def supply(self, *, chests=None, timeout=1):
+    async def supply(self, *, chests=None, timeout=1, max_tools=1):
         if chests is None:
             chests = (HarvestToolChest(CHEST, range(4, 5), range(3, 4)),
                       HarvestToolChest(SECOND_CHEST, range(6, 7), range(3, 4)))
-        return await equip_harvest_tool_from_chests(self.bot, TARGET, chests=chests, face=2, timeout=timeout)
+        return await equip_harvest_tool_from_chests(
+            self.bot, TARGET, chests=chests, face=2, timeout=timeout, max_tools=max_tools,
+        )
 
     def supply_server(self, packet):
         if isinstance(packet, self.b.InventoryTransactionPacket):
@@ -155,6 +158,190 @@ class HarvestChestRefillTests(unittest.IsolatedAsyncioTestCase):
     def chest_clicks(self):
         return [packet.variant_transaction.pos for packet in self.stream.sent
                 if isinstance(packet, self.b.InventoryTransactionPacket)]
+
+    def backups(self, destinations=range(3, 5)):
+        return (HarvestToolChest(CHEST, range(4, 6), destinations),
+                HarvestToolChest(SECOND_CHEST, range(6, 7), destinations))
+
+    def backups_server(self, packet, *, outcome="success", number=2):
+        b = self.b
+        if isinstance(packet, b.InventoryTransactionPacket):
+            pos = packet.variant_transaction.pos
+            stocks = {4: self.stack(IRON, 14), 8: self.stack(IRON, 18, efficiency=5)}
+            if number == 2:
+                stocks[5] = self.stack(IRON, 15, efficiency=2)
+            self.open_storage(position=(pos.x, pos.y, pos.z), stacks=stocks)
+        elif isinstance(packet, b.ItemStackRequestPacket):
+            request, = packet.requests
+            action, = request.actions
+            source, destination = int(action.source.slot), int(action.destination.slot)
+            if isinstance(action, b.ItemStackRequestCereal.TakeActionData):
+                if len(self.actions()) == 2:
+                    if outcome == "reject":
+                        self.reply(request, verdict="ERROR")
+                        return
+                    if outcome == "reopen":
+                        self.open_storage(stacks={4: self.stack(PAPER, 42)})
+                    if outcome == "pending":
+                        return
+                self.reply(request, (STORAGE, source, 0, None), (PLAYER, destination, 1, 90 + source))
+            else:
+                self.reply(request, (PLAYER, source, 0, None), (PLAYER, destination, 1, 250))
+        elif isinstance(packet, b.ContainerClosePacket):
+            self.emit(packet)
+
+    async def test_multiple_supply_ranks_both_receipts_and_later_calls_use_inventory(self):
+        self.after_write = self.backups_server
+        result = await self.supply(chests=self.backups(), max_tools=2)
+        attempt, = result.attempts
+        self.assertEqual((result.status, result.tool.slot, attempt.transfer.stop_reason), ("equipped", 3, "complete"))
+        self.assertEqual(attempt.transfer.requested, attempt.transfer.confirmed_count)
+        self.assertEqual([(row.source_slot, row.destination_slot, row.confirmed) for row in attempt.transfer.steps],
+                         [(5, 3, 1), (4, 4, 1)])
+        self.assertEqual((self.bot.inventory_slots[3].net_id_variant, self.bot.inventory_slots[4].net_id_variant), (95, 94))
+        equipped, = self.equipment()
+        self.assertEqual(equipped.item.net_id_variant, 95)
+        self.assertEqual(len(self.chest_clicks()), 1)
+
+        self.stream.sent.clear()
+        repeated = await self.supply(chests=self.backups(), max_tools=200)
+        self.assertEqual(repeated, HarvestToolSupply("equipped", tool=result.tool))
+        self.assertEqual(self.stream.sent, self.equipment())
+
+    async def test_multiple_supply_equips_confirmed_tool_after_known_source_or_destination_exhaustion(self):
+        for stock, destination, reason in ((1, range(3, 5), "source_exhausted"),
+                                           (2, range(3, 4), "destination_full")):
+            with self.subTest(reason=reason):
+                self.contents(0, 36, {0: self.stack(GOLD, 10)})
+                self.stream.sent.clear()
+                self.after_write = lambda packet: self.backups_server(packet, number=stock)
+                result = await self.supply(chests=self.backups(destination), max_tools=10**100)
+                attempt, = result.attempts
+                self.assertEqual((result.status, attempt.transfer.stop_reason, attempt.transfer.confirmed_count),
+                                 ("equipped", reason, 1))
+                self.assertEqual(len(self.actions()), 1)
+                self.assertEqual(len(self.chest_clicks()), 1)
+                self.assertEqual(len(self.equipment()), 1)
+
+    async def test_multiple_supply_second_rejection_or_replacement_keeps_first_without_equipping(self):
+        for outcome, status in (("reject", "rejected"), ("reopen", "window_changed")):
+            with self.subTest(outcome=outcome):
+                self.contents(0, 36, {0: self.stack(GOLD, 10)})
+                self.stream.sent.clear()
+                self.after_write = lambda packet: self.backups_server(packet, outcome=outcome)
+                result = await self.supply(chests=self.backups(), max_tools=2)
+                attempt, = result.attempts
+                first, second = attempt.transfer.steps
+                self.assertEqual((result.status, first.source_slot, first.confirmed), (status, 5, 1))
+                self.assertEqual(second.source_slot, 4)
+                self.assertEqual((second.confirmed, second.verdict), (0, "ERROR") if outcome == "reject" else (1, "SUCCESS"))
+                self.assertEqual(attempt.transfer.confirmed_count, 1 if outcome == "reject" else 2)
+                self.assertIsNone(result.tool)
+                self.assertEqual(self.equipment(), [])
+                self.assertEqual(len(self.chest_clicks()), 1)
+                if outcome == "reopen":
+                    self.assertEqual(self.bot.container_slots[4].net_id_variant, 42)
+                    self.assertIsNot(self.bot.open_window, attempt.window)
+
+    async def test_multiple_supply_stops_if_inventory_gains_tool_or_replaces_confirmed_stack_before_second_write(self):
+        for slot, stack, status in ((6, self.stack(IRON, 26), "inventory_available"),
+                                     (3, self.stack(PAPER, 23), "equip_unavailable")):
+            with self.subTest(status=status):
+                self.contents(0, 36, {0: self.stack(GOLD, 10)})
+                self.stream.sent.clear()
+                self.after_write = self.backups_server
+
+                def replace_slot(packet):
+                    if isinstance(packet, self.b.ItemStackRequestPacket) and len(self.actions()) == 1:
+                        self.slot(0, slot, stack)
+
+                self.before_write = replace_slot
+                result = await self.supply(chests=self.backups(), max_tools=2)
+                attempt, = result.attempts
+                self.assertEqual((result.status, attempt.transfer.stop_reason, attempt.transfer.confirmed_count),
+                                 (status, status, 1))
+                self.assertEqual(len(self.actions()), 1)
+                self.assertEqual(len(self.chest_clicks()), 1)
+                self.assertEqual(self.equipment(), [])
+
+    async def test_multiple_supply_cancellation_keeps_pending_second_and_matching_first(self):
+        pending = asyncio.Event()
+
+        def server(packet):
+            self.backups_server(packet, outcome="pending")
+            if isinstance(packet, self.b.ItemStackRequestPacket) and len(self.actions()) == 2:
+                pending.set()
+
+        self.after_write = server
+        task = asyncio.create_task(self.supply(chests=self.backups(), max_tools=2))
+        await asyncio.wait_for(pending.wait(), 1)
+        task.cancel("stop after second take")
+        with self.assertRaisesRegex(asyncio.CancelledError, "stop after second take") as caught:
+            await task
+        error = caught.exception
+        attempt, = error.harvest_supply_progress.attempts
+        self.assertIs(attempt, error.harvest_progress)
+        self.assertIs(attempt.transfer, error.transfer_progress)
+        first, second = attempt.transfer.steps
+        self.assertEqual((first.confirmed, first.verdict, second.confirmed, second.request_id), (1, "SUCCESS", None, -3))
+        self.assertEqual(len(self.chest_clicks()), 1)
+        self.assertEqual(self.equipment(), [])
+        self.assertIsNone(self.bot.open_window)
+
+    async def test_multiple_single_chest_timeout_keeps_pending_second(self):
+        self.after_write = lambda packet: self.backups_server(packet, outcome="pending")
+        with self.assertRaises(TimeoutError) as caught:
+            await self.acquire(max_tools=2, timeout=0.08)
+        error = caught.exception
+        self.assertIs(error.harvest_progress.transfer, error.transfer_progress)
+        first, second = error.transfer_progress.steps
+        self.assertEqual((first.confirmed, second.confirmed, second.request_id), (1, None, -3))
+        self.assertEqual(self.equipment(), [])
+        self.assertIsNone(self.bot.open_window)
+
+    async def test_multiple_single_chest_uses_total_budget_and_reuses_hotbar_equipment_path(self):
+        async with self.bot._harvest_tools._equip_lock:
+            with self.assertRaises(TimeoutError) as caught:
+                await self.acquire(max_tools=2, timeout=0.01)
+        self.assertIsNone(caught.exception.harvest_progress.transfer)
+        self.assertEqual(self.stream.sent, [])
+
+        self.after_write = self.backups_server
+        result = await self.acquire(allowed=range(4, 6), destinations=range(14, 16), max_tools=2)
+        self.assertEqual((result.status, result.transfer.confirmed_count, result.tool.slot), ("equipped", 2, 1))
+        self.assertEqual([(row.source_slot, row.destination_slot) for row in result.transfer.steps], [(5, 14), (4, 15)])
+        self.assertEqual(self.bot.inventory_slots[1].net_id_variant, 250)
+        self.assertEqual(self.bot.inventory_slots[15].net_id_variant, 94)
+
+    async def test_multiple_supply_keeps_acquired_spare_when_hotbar_swap_moves_it(self):
+        b = self.b
+        self.contents(0, 36, {slot: self.stack(GOLD, 20 + slot) for slot in range(9)})
+
+        def server(packet):
+            if isinstance(packet, b.ItemStackRequestPacket):
+                request, = packet.requests
+                action, = request.actions
+                if isinstance(action, b.ItemStackRequestCereal.SwapActionData):
+                    self.assertEqual((action.source.slot, action.destination.slot), (9, 0))
+                    self.reply(request, (PLAYER, 9, 1, 251), (PLAYER, 0, 1, 250))
+                    return
+            self.backups_server(packet)
+            if isinstance(packet, b.ItemStackRequestPacket) and len(self.actions()) == 1:
+                self.slot(0, 0, self.stack())
+
+        self.after_write = server
+        result = await self.acquire(allowed=range(4, 6), destinations=range(0, 16), max_tools=2)
+        self.assertEqual((result.status, result.transfer.confirmed_count, result.tool.slot), ("equipped", 2, 0))
+        self.assertEqual([(row.source_slot, row.destination_slot) for row in result.transfer.steps], [(5, 9), (4, 0)])
+        self.assertEqual(self.bot.inventory_slots[0].net_id_variant, 250)
+        self.assertEqual(self.bot.inventory_slots[9].net_id_variant, 251)
+
+    async def test_multiple_supply_validates_strictly_positive_integer_before_network(self):
+        for size in (False, True, 0, -1, 1.5, "2"):
+            for operation in (self.acquire, self.supply):
+                with self.subTest(size=size, operation=operation), self.assertRaisesRegex(ValueError, "positive integer"):
+                    await operation(max_tools=size)
+        self.assertEqual(self.stream.sent, [])
 
     async def test_ordered_supply_waits_for_close_and_takes_only_authorized_tool(self):
         first_close = asyncio.Event()
