@@ -73,6 +73,7 @@ from .player_state import (
 )
 from .qa import PacketTimeline
 from .qa_terrain import _TerrainObserver
+from .range_transfer import RangeTransferResult, _transfer_cursor
 from .recipes import Recipe, RecipeDeltaPlan, Recipes
 from .recoverable_error import RecoverableError
 from .resource_packs import PackDecisionHandler, ResourcePackIndex
@@ -2265,6 +2266,16 @@ class Bot:
         return await self._inventory.move_item(
             source_slot, destination_slot, amount, timeout=timeout
         )
+
+    async def take_inventory_to_cursor(self, source_slot: int, *, timeout: float = 15) -> RangeTransferResult:
+        """Take one whole observed main inventory stack onto the current workbench cursor."""
+        return await _transfer_cursor(self, source_slot, take=True, timeout=timeout)
+
+    async def return_cursor_to_inventory(
+        self, destination_slots: range, *, timeout: float = 15,
+    ) -> RangeTransferResult:
+        """Return the observed workbench cursor stack to compatible or empty slots in the range."""
+        return await _transfer_cursor(self, destination_slots, take=False, timeout=timeout)
 
     async def swap_inventory_items(
         self, source_slot: int, destination_slot: int, *, timeout: float = 15

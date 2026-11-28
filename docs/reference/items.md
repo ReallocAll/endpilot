@@ -69,6 +69,29 @@ error reports the snapshot under
 `error.attributes.transfer_progress` in `observe_script`. Use `stop_script`
 to terminate the worker and drain its actions on the resident connection.
 
+## Return workbench cursor items to the main inventory
+
+With a protocol 2225 crafting table window open, call
+`await bot.take_inventory_to_cursor(12)` to pick up the entire observed stack
+in main inventory slot 12. The current window must have reported an empty
+cursor, and the source needs a known stack network ID.
+
+Call `await bot.return_cursor_to_inventory(range(13, 15))` to place the cursor
+stack in main inventory slots 13 and 14. The call fills compatible stacks
+first, then uses observed empty slots in the range. It stops when authorized
+space runs out. Each call returns a `RangeTransferResult` with its own confirmed
+count and step records. Check `stop_reason` and the confirmed count before
+continuing. A timeout or cancellation carries `error.transfer_progress`. A step
+with a request ID and no verdict may still complete in the same window.
+
+After rejection or an incomplete receipt, wait for a fresh full cursor report
+in the current window before retrying. The main inventory slot involved in a
+rejected step also needs a fresh description or a matching correction. Closing
+or replacing the window, changing dimensions, or ending the connection invalidates
+cursor state for writes.
+`bot.last_cursor_observation` retains the latest historical report during the
+connection and can still show a previously confirmed quantity.
+
 ## Move horse equipment
 
 Stand near a tamed horse while holding sneak with an empty hand. Open it

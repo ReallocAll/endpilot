@@ -146,6 +146,114 @@ def _receipt_stack(stack: HeldItemStack, slot) -> HeldItemStack:
     return replace(stack, count=int(slot.amount), net_id=stack.net_id if net_id is None else int(net_id.raw_id))
 
 
+async def _transfer_cursor(bot: Bot, slots: int | range, *, take: bool, timeout: float) -> RangeTransferResult:
+    if not isfinite(timeout) or timeout < 0:
+        raise ValueError("timeout must be finite and nonnegative")
+    if take:
+        if type(slots) is not int or not 0 <= slots < _PLAYER_SIZE:
+            raise ValueError("source_slot must be a main inventory slot within 0..35")
+    else:
+        _check_range(slots, _PLAYER_SIZE, "destination_slots")
+
+    inventory, window = bot._inventory, bot.open_window
+    if (inventory is None or window is None or window.container_type != "WORKBENCH"
+            or window.position is None or window.entity_unique_id != -1 or bot.protocol.number != 2225):
+        raise RuntimeError("open a protocol 2225 workbench before transferring cursor items")
+
+    steps = []
+    player_item = inventory._cursor_inventory_slot(slots) if take else None
+    cursor_item = inventory._cursor_item
+    source_item = player_item if take else cursor_item
+    requested = 0 if source_item is None else int(source_item.stack_size)
+
+    def result(reason):
+        return RangeTransferResult(requested, tuple(steps), reason)
+
+    if inventory._cursor_window is not window:
+        return result("window_changed")
+    if inventory._requests_for_endpoints(((id(window), 0),)):
+        return result("unconfirmed")
+    if source_item is None or cursor_item is None:
+        return result("unobserved")
+    if take and cursor_item.stack_size:
+        return result("cursor_occupied")
+    if not requested:
+        return result("source_exhausted" if take else "complete")
+
+    item_id = int(source_item.id)
+    registry = bot.item_registry
+    limit = None if registry is None else STACK_LIMITS.get(registry.name_for_id(item_id))
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    remaining = requested
+    expected_cursor = _stack_snapshot(cursor_item)
+    try:
+        while remaining:
+            if inventory._cursor_window is not window:
+                return result("window_changed")
+            cursor_item = inventory._cursor_item
+            if _stack_snapshot(cursor_item) != expected_cursor:
+                return result("unconfirmed")
+            if take:
+                index, amount = slots, requested
+            else:
+                destinations = {index: item for index in slots
+                                if (item := inventory._cursor_inventory_slot(index)) is not None}
+                plan = _plan_step({0: cursor_item}, destinations, item_id, remaining, limit, range(1), slots)
+                if isinstance(plan, str):
+                    return result(plan)
+                _, index, amount = plan
+                player_item = destinations[index]
+            time_left = deadline - loop.time()
+            if time_left <= 0:
+                raise TimeoutError("cursor transfer timed out before the next step")
+
+            origin, target = (index, 0) if take else (0, index)
+            step = RangeTransferStep(origin, target, amount, None, None, None)
+            steps.append(step)
+            confirmed = None
+
+            def record_submission(request_id):
+                steps[-1] = replace(step, request_id=request_id)
+
+            def confirm(moved, cursor_after):
+                nonlocal confirmed, expected_cursor
+                confirmed, expected_cursor = moved, cursor_after
+
+            def record_reply(reply):
+                verdict = reply.result.name
+                current = inventory._cursor_window is window
+                count = 0 if current and verdict != "SUCCESS" else confirmed
+                steps[-1] = replace(step, request_id=int(reply.client_request_id.raw_id), verdict=verdict,
+                                    confirmed=count)
+                if not current:
+                    return "window_changed"
+                if verdict != "SUCCESS":
+                    return "rejected"
+                return "unconfirmed" if confirmed is None else None
+
+            try:
+                reply = await inventory._move_cursor_step(
+                    window, index, amount, take=take, player_item=player_item, cursor_item=cursor_item,
+                    timeout=time_left, on_submitted=record_submission, on_confirmed=confirm,
+                )
+            except _InventoryMoveNotSubmitted as stopped:
+                steps.pop()
+                return result(str(stopped))
+            except (TimeoutError, asyncio.CancelledError) as error:
+                if (reply := getattr(error, "_item_stack_response", None)) is not None:
+                    record_reply(reply)
+                raise
+
+            if (stop := record_reply(reply)) is not None:
+                return result(stop)
+            remaining -= confirmed
+        return result("complete")
+    except (Exception, asyncio.CancelledError) as error:
+        error.transfer_progress = result("cancelled" if isinstance(error, asyncio.CancelledError) else "unconfirmed")
+        raise
+
+
 async def transfer_range(
     bot: Bot,
     *,

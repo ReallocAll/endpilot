@@ -64,6 +64,7 @@ def _stack_snapshot(item) -> HeldItemStack | None:
 
 _MAIN_INVENTORY_SIZE = 36
 _PLAYER_CONTAINERS = ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", "INVENTORY_CONTAINER", "HOTBAR_CONTAINER")
+_CURSOR_CONTAINER = "CURSOR_CONTAINER"
 _ARMOR_SLOT_NAMES = ("head", "chest", "legs", "feet")
 _DAMAGE_ARMOR_SLOTS = tuple(("ARMOR_CONTAINER", slot) for slot in range(len(_ARMOR_SLOT_NAMES)))
 _DAMAGE_OFFHAND_SLOT = ("OFFHAND_CONTAINER", 0)
@@ -136,6 +137,7 @@ class _PendingStackRequest:
     submitted: bool = False
     automatic_unequip: bool = False
     exact_offhand_take: bool = False
+    cursor_exchange: bool = False
 
     def retain_uncertain_personal_grid(self) -> bool:
         # Only the write hook establishes a possible submission for these endpoints.
@@ -180,6 +182,30 @@ def _correct_observed_item(binding, item, response_slot):
     return _response_item(binding, item, item, response_slot)
 
 
+def _valid_cursor_transfer_stack(item) -> bool:
+    if item is None:
+        return False
+    net_id = int(item.net_id_variant or 0)
+    if not item.id:
+        return item.stack_size == net_id == 0
+    return 0 < item.stack_size <= 255 and net_id > 0
+
+
+def _cursor_exchange_receipt(response, names, index):
+    matches = [(group, slot) for group in response.containers or ()
+               if group.full_container_name.name.name in names
+               for slot in group.slots if slot.slot == index or slot.requested_slot == index]
+    if len(matches) != 1:
+        return None
+    group, slot = matches[0]
+    if group.full_container_name.dynamic_id is not None or slot.slot != index or slot.requested_slot != index:
+        return None
+    net_id = 0 if slot.item_stack_net_id is None else int(slot.item_stack_net_id.raw_id)
+    if (slot.amount > 0 and net_id > 0) or (slot.amount == 0 and net_id == 0):
+        return slot
+    return None
+
+
 class Inventory:
     def __init__(self, packets, player_id: int):
         self.packets = packets
@@ -191,6 +217,8 @@ class Inventory:
         self._armor_slots = {}
         self._offhand_slot = None  # None means the server has not described this slot.
         self._last_cursor_observation: CursorObservation | None = None
+        self._cursor_window: object | None = None
+        self._cursor_item = None
         self._damage_descriptors = {}
         self._next_request_id = -1
         self._selected_slot = 0
@@ -264,7 +292,14 @@ class Inventory:
             event.set()
         self._changed.set()
 
+    def _set_cursor_window(self, window: object | None) -> None:
+        self._cursor_window = window
+        self._cursor_item = None
+
     def _observe_cursor_item(self, source: Literal["inventory_content", "inventory_slot"], item) -> None:
+        if self._cursor_window is not None:
+            self._cursor_item = item if _valid_cursor_transfer_stack(item) else None
+            self._observe_transfer_slot((id(self._cursor_window), 0), self._cursor_item)
         if self._request_stream_ended or item is None:
             return
         count = int(item.stack_size)
@@ -310,6 +345,11 @@ class Inventory:
                     self._pending_requests.pop(request_id)
                     continue
                 try:
+                    if pending.cursor_exchange and any(
+                        other is not response and int(other.client_request_id.raw_id) == request_id
+                        for other in responses
+                    ):
+                        raise ValueError("duplicate verdict for a cursor transfer request")
                     self._mark_range_overlap({
                         (None, int(slot.slot))
                         for container in response.containers or ()
@@ -318,7 +358,7 @@ class Inventory:
                     }, except_request=pending)
                     before = self._apply_inventory_verdict(pending, response)
                 except Exception as error:
-                    self._fail_request(pending.reply, error)
+                    self._fail_stack_request(pending, error)
                 else:
                     pending.reply.set_result(response)
                     # Apply all slot corrections for this verdict before exposing its change.
@@ -333,8 +373,7 @@ class Inventory:
             inventory_id = int(packet.inventory_id)
             if inventory_id == int(b.ContainerID.PLAYER_ONLY_UI):
                 slots = packet.slots
-                if slots:
-                    self._observe_cursor_item("inventory_content", slots[0])
+                self._observe_cursor_item("inventory_content", slots[0] if slots else None)
                 return
             if inventory_id == int(b.ContainerID.ARMOR):
                 previous = self._armor_slots
@@ -575,18 +614,24 @@ class Inventory:
         # The caller may have stopped waiting. Its next read can still raise this error.
         reply.exception()
 
+    def _fail_stack_request(self, pending, error):
+        if pending.cursor_exchange and pending.submitted:
+            pending.on_unconfirmed()
+        self._fail_request(pending.reply, error)
+
     def _fail_pending_requests(self, error_type, message, cause, *, retain_grid_ownership=False):
         for request_id, pending in tuple(self._pending_requests.items()):
             if not pending.reply.done():
                 error = error_type(message)
                 error.__cause__ = cause
-                self._fail_request(pending.reply, error)
+                self._fail_stack_request(pending, error)
             if not (retain_grid_ownership and pending.retain_uncertain_personal_grid()):
                 self._pending_requests.pop(request_id)
 
     def _end_requests(self, cause=None):
         self._request_stream_ended = True
         self._last_cursor_observation = None
+        self._set_cursor_window(None)
         self._slot_observers.clear()
         self._fail_pending_requests(ConnectionError, "connection ended before an item-stack verdict", cause)
         for waiter in self._held_item_waiters:
@@ -644,7 +689,8 @@ class Inventory:
     async def _request_item_stack(self, request, apply, *, timeout, queued=False, before_send=None,
                                   after_send=None, _endpoints=None, _range_step=False,
                                   _wait_for=(), _on_unconfirmed=None, _on_slot_observed=None,
-                                  _at_write=None, _automatic_unequip=False, _exact_offhand_take=False):
+                                  _at_write=None, _automatic_unequip=False, _exact_offhand_take=False,
+                                  _cursor_exchange=False):
         """Own pending replies for inventory, containers, trading, recipes, enchanting and creative actions.
 
         The operation owns its slot/window checks and supplies synchronous hooks.
@@ -670,13 +716,16 @@ class Inventory:
         pending = _PendingStackRequest(
             reply, apply, endpoints, _range_step, _on_unconfirmed, _on_slot_observed,
             checked_at_write=_at_write is not None, automatic_unequip=_automatic_unequip,
-            exact_offhand_take=_exact_offhand_take,
+            exact_offhand_take=_exact_offhand_take, cursor_exchange=_cursor_exchange,
         )
         self._pending_requests[request_id] = pending
         if queued:
             self._qa_requests[request_id] = reply
 
         def submit():
+            if any(other is not pending and other.submitted and other.cursor_exchange
+                   for other in self._requests_for_endpoints(endpoints)):
+                raise _InventoryMoveNotSubmitted("unconfirmed")
             if _at_write is not None:
                 if reply.done():
                     raise RuntimeError("item-stack request ended before submission")
@@ -706,7 +755,7 @@ class Inventory:
                     if not pending.retain_uncertain_personal_grid():
                         self._pending_requests.pop(request_id)
                     if not reply.done():
-                        self._fail_request(reply, error)
+                        self._fail_stack_request(pending, error)
 
         task = asyncio.create_task(send())
         self._request_sends.add(task)
@@ -1271,6 +1320,103 @@ class Inventory:
             before_send=None if checked_take else before_send, _at_write=before_send if checked_take else None,
             _on_slot_observed=observe if automatic else None,
             _automatic_unequip=automatic, _exact_offhand_take=exact_take,
+        )
+
+    def _cursor_inventory_slot(self, index):
+        item = self._slots.get(index)
+        if (index not in self._unconfirmed_transfer_slots and index not in self._count_observation_gaps
+                and _valid_cursor_transfer_stack(item)
+                and _stack_snapshot(item) == _stack_snapshot(self.item_or_empty(index))):
+            return item
+        return None
+
+    async def _move_cursor_step(self, window, index, amount, *, take, player_item, cursor_item, timeout,
+                                on_submitted, on_confirmed):
+        b = self.packets.protocol.binding
+        cereal = b.ItemStackRequestCereal
+        player_endpoint, cursor_endpoint = (None, index), (id(window), 0)
+        endpoints = frozenset((player_endpoint, cursor_endpoint))
+        expected = {player_endpoint: _stack_snapshot(player_item), cursor_endpoint: _stack_snapshot(cursor_item)}
+        changed = set()
+        overlapped = False
+
+        def slot_info(container, slot, item):
+            return cereal.SlotInfoData(
+                full_container_name=b.FullContainerName(name=b.ContainerEnumName[container]),
+                slot=slot, net_id_variant=int(item.net_id_variant or 0),
+            )
+
+        player = slot_info(_PLAYER_CONTAINERS[0], index, player_item)
+        cursor = slot_info(_CURSOR_CONTAINER, 0, cursor_item)
+        action_type = cereal.TakeActionData if take else cereal.PlaceActionData
+        source, destination = (player, cursor) if take else (cursor, player)
+        request_id = self._allocate_request_id()
+        request = b.ItemStackRequestPacketData.RequestData(
+            client_request_id=b.ItemStackRequestId(raw_id=request_id),
+            actions=[action_type(amount=amount, source=source, destination=destination)],
+            strings_to_filter=[], strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
+        )
+
+        def at_write():
+            if self._cursor_window is not window:
+                raise _InventoryMoveNotSubmitted("window_changed")
+            own = self._pending_requests[request_id]
+            if (any(other is not own and other.submitted for other in self._requests_for_endpoints(endpoints))
+                    or _stack_snapshot(self._cursor_inventory_slot(index)) != expected[player_endpoint]
+                    or _stack_snapshot(self._cursor_item) != expected[cursor_endpoint]):
+                raise _InventoryMoveNotSubmitted("unconfirmed")
+            # The request may change both slots before the next authoritative report.
+            self._cursor_item = None
+            self._unconfirmed_transfer_slots.add(index)
+            on_submitted(request_id)
+
+        def observe(endpoint, item):
+            if _stack_snapshot(item) != expected[endpoint]:
+                changed.add(endpoint)
+
+        def mark_overlap():
+            nonlocal overlapped
+            overlapped = True
+            if self._cursor_window is window:
+                self._cursor_item = None
+
+        def apply(response):
+            if self._cursor_window is not window:
+                return
+            observed_cursor = self._cursor_item
+            self._cursor_item = None
+            player_receipt = _cursor_exchange_receipt(response, _PLAYER_CONTAINERS, index)
+            if response.result.name != "SUCCESS":
+                # A rejection alone does not verify the cached main inventory slot.
+                # A full description received while pending has already cleared the mark.
+                if not overlapped and index in self._unconfirmed_transfer_slots and player_receipt is not None:
+                    corrected = _correct_observed_item(b, self._slots.get(index), player_receipt)
+                    if corrected is not None:
+                        self._set_slot(index, corrected)
+                        self._unconfirmed_transfer_slots.discard(index)
+                return
+            cursor_receipt = _cursor_exchange_receipt(response, (_CURSOR_CONTAINER,), 0)
+            if overlapped or player_receipt is None or cursor_receipt is None:
+                return
+            player_delta = int(player_receipt.amount) - int(player_item.stack_size)
+            cursor_delta = int(cursor_receipt.amount) - int(cursor_item.stack_size)
+            moved = cursor_delta if take else player_delta
+            if player_delta + cursor_delta != 0 or not 0 < moved <= amount or (take and moved != amount):
+                return
+            source_item = player_item if take else cursor_item
+            player_after = _response_item(b, player_item, source_item, player_receipt)
+            cursor_after = _response_item(b, cursor_item, source_item, cursor_receipt)
+            if ((player_endpoint in changed and self._observed_stack(index) != _stack_snapshot(player_after))
+                    or (cursor_endpoint in changed and _stack_snapshot(observed_cursor) != _stack_snapshot(cursor_after))):
+                return
+            self._set_slot(index, player_after)
+            self._unconfirmed_transfer_slots.discard(index)
+            self._cursor_item = cursor_after
+            on_confirmed(moved, _stack_snapshot(cursor_after))
+
+        return await self._request_item_stack(
+            request, apply, timeout=timeout, _endpoints=endpoints, _range_step=True, _cursor_exchange=True,
+            _on_unconfirmed=mark_overlap, _on_slot_observed=observe, _at_write=at_write,
         )
 
     async def move_item(

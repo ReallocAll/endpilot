@@ -255,6 +255,11 @@ class Containers:
         for stop in tuple(self._transfer_block_watches):
             stop()
         self.window = window
+        if self.inventory is not None:
+            workbench = (window is not None and window.container_type == "WORKBENCH"
+                         and window.position is not None and window.entity_unique_id == -1
+                         and self.packets.protocol.number == 2225)
+            self.inventory._set_cursor_window(window if workbench else None)
         self._slot_observers.clear()
         self._furnace_progress_observers.clear()
         self._layout_token = object()
@@ -1379,6 +1384,8 @@ class Containers:
                 raise ConnectionError("container session ended before its close was requested")
             if self.window is not window:
                 raise _WindowChangedBeforeClose("container window changed before its close was requested")
+            if self.inventory is not None and self.inventory._cursor_window is window:
+                self.inventory._set_cursor_window(None)
 
         pending = asyncio.create_task(self.wait_for_close(
             timeout=timeout, _expected_window=window,
