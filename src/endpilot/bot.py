@@ -2314,15 +2314,23 @@ class Bot:
             source_slot, destination_slot, amount, timeout=timeout
         )
 
-    async def take_inventory_to_cursor(self, source_slot: int, *, timeout: float = 15) -> RangeTransferResult:
-        """Take one whole observed main inventory stack onto the current workbench cursor."""
-        return await _transfer_cursor(self, source_slot, take=True, timeout=timeout)
+    async def take_inventory_to_cursor(
+        self, source_slot: int, *, half: bool = False, timeout: float = 15,
+    ) -> RangeTransferResult:
+        """Take the whole observed main inventory stack, or round up half onto the workbench cursor."""
+        if type(half) is not bool:
+            raise ValueError("half must be a boolean")
+        return await _transfer_cursor(self, source_slot, mode="take_half" if half else "take", timeout=timeout)
+
+    async def place_one_from_cursor(self, destination_slot: int, *, timeout: float = 15) -> RangeTransferResult:
+        """Place one observed workbench cursor item into a compatible or empty main inventory slot."""
+        return await _transfer_cursor(self, destination_slot, mode="place_one", timeout=timeout)
 
     async def return_cursor_to_inventory(
         self, destination_slots: range, *, timeout: float = 15,
     ) -> RangeTransferResult:
         """Return the observed workbench cursor stack to compatible or empty slots in the range."""
-        return await _transfer_cursor(self, destination_slots, take=False, timeout=timeout)
+        return await _transfer_cursor(self, destination_slots, mode="return", timeout=timeout)
 
     async def swap_inventory_items(
         self, source_slot: int, destination_slot: int, *, timeout: float = 15

@@ -108,6 +108,79 @@ class CursorInventoryTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch.object(self.bot.packets, "send", pause))
         return entered, release
 
+    async def test_half_take_rounds_up_the_observed_source_quantity(self):
+        await self.seed()
+        for index, (before, taken) in enumerate(((5, 3), (6, 3), (1, 1))):
+            with self.subTest(before=before):
+                await self.deliver(self.slot(12, self.apple(before, 1)), self.cursor(self.apple()))
+                taking = self.start(self.bot.take_inventory_to_cursor(12, half=True))
+                request = await self.request(index)
+                self.assert_request(request, "Take", (_MAIN, 12, 1), (_CURSOR, 0, 0), taken)
+                after = before - taken
+                await self.verdict(request, (_MAIN, 12, after, 1 if after else 0), (_CURSOR, 0, taken, 5))
+                result = await taking
+                self.assertEqual((result.requested, result.confirmed_count, result.stop_reason),
+                                 (taken, taken, "complete"))
+                self.assertEqual(self.read_counts(12), (after,))
+                self.assertEqual(self.bot.last_cursor_observation,
+                                 CursorObservation("item_stack_response", taken, 5, None))
+
+    async def test_place_one_targets_the_requested_empty_or_compatible_slot(self):
+        await self.seed()
+        await self.deliver(self.cursor(self.apple(3, 5)))
+        for index, (slot, old_id, after, new_id) in enumerate(((14, 0, 1, 6), (13, 2, 64, 2))):
+            with self.subTest(slot=slot):
+                placing = self.start(self.bot.place_one_from_cursor(slot))
+                request = await self.request(index)
+                self.assert_request(request, "Place", (_CURSOR, 0, 5), (_MAIN, slot, old_id), 1)
+                await self.verdict(request, (_CURSOR, 0, 2 - index, 5), (_MAIN, slot, after, new_id))
+                result = await placing
+                self.assertEqual((result.requested, result.confirmed_count, result.stop_reason), (1, 1, "complete"))
+                step, = result.steps
+                self.assertEqual((step.source_slot, step.destination_slot, step.confirmed), (0, slot, 1))
+        self.assertEqual(self.read_counts(12, 13, 14, 15), (5, 64, 1, 0))
+        self.assertEqual(self.bot.last_cursor_observation, CursorObservation("item_stack_response", 1, 5, None))
+
+    async def test_split_and_exact_place_fail_without_writing(self):
+        await self.seed()
+        result = await self.bot.take_inventory_to_cursor(14, half=True)
+        self.assertEqual((result.requested, result.stop_reason, result.steps), (0, "source_exhausted", ()))
+        result = await self.bot.place_one_from_cursor(14)
+        self.assertEqual((result.requested, result.stop_reason, result.steps), (1, "source_exhausted", ()))
+
+        await self.deliver(
+            self.cursor(self.apple(3, 5)), self.slot(13, self.apple(64, 2)),
+            self.slot(14, self.apple(1, 6, aux=1)), self.slot(15, self.apple(1)),
+        )
+        self.assertEqual((await self.bot.take_inventory_to_cursor(12, half=True)).stop_reason, "cursor_occupied")
+        for slot, reason in ((13, "destination_full"), (14, "destination_full"), (15, "unobserved")):
+            with self.subTest(slot=slot):
+                result = await self.bot.place_one_from_cursor(slot)
+                self.assertEqual((result.requested, result.stop_reason, result.steps), (1, reason, ()))
+        with self.assertRaisesRegex(ValueError, "destination_slot"):
+            await self.bot.place_one_from_cursor(36)
+        with self.assertRaisesRegex(ValueError, "half"):
+            await self.bot.take_inventory_to_cursor(12, half=1)
+        self.assertEqual(self.requests, [])
+
+    async def test_cancelled_exact_place_keeps_its_request_and_accepts_late_receipt(self):
+        await self.seed()
+        await self.deliver(self.cursor(self.apple(2, 5)))
+        placing = self.start(self.bot.place_one_from_cursor(14))
+        request = await self.request(0)
+        placing.cancel()
+        with self.assertRaises(asyncio.CancelledError) as caught:
+            await placing
+        progress = caught.exception.transfer_progress
+        self.assertEqual((progress.requested, progress.confirmed_count, progress.stop_reason), (1, 0, "cancelled"))
+        step, = progress.steps
+        self.assertEqual((step.request_id, step.confirmed), (request.client_request_id.raw_id, None))
+        self.assertEqual((await self.bot.place_one_from_cursor(15)).stop_reason, "unconfirmed")
+        self.assertEqual(len(self.requests), 1)
+        await self.verdict(request, (_CURSOR, 0, 1, 5), (_MAIN, 14, 1, 6))
+        self.assertEqual(self.read_counts(14, 15), (1, 0))
+        self.assertEqual(self.bot.last_cursor_observation, CursorObservation("item_stack_response", 1, 5, None))
+
     async def test_whole_stack_then_merge_and_empty_track_each_verdict(self):
         await self.seed()
         await self.take()

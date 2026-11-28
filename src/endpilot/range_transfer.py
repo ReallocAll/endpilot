@@ -156,12 +156,19 @@ def _receipt_stack(stack: HeldItemStack, slot) -> HeldItemStack:
     return replace(stack, count=int(slot.amount), net_id=stack.net_id if net_id is None else int(net_id.raw_id))
 
 
-async def _transfer_cursor(bot: Bot, slots: int | range, *, take: bool, timeout: float) -> RangeTransferResult:
+async def _transfer_cursor(
+    bot: Bot, slots: int | range, *, mode: Literal["take", "take_half", "place_one", "return"], timeout: float,
+) -> RangeTransferResult:
     if not isfinite(timeout) or timeout < 0:
         raise ValueError("timeout must be finite and nonnegative")
-    if take:
+    take = mode in ("take", "take_half")
+    place_one = mode == "place_one"
+    if take or place_one:
         if type(slots) is not int or not 0 <= slots < _PLAYER_SIZE:
-            raise ValueError("source_slot must be a main inventory slot within 0..35")
+            name = "source_slot" if take else "destination_slot"
+            raise ValueError(f"{name} must be a main inventory slot within 0..35")
+        if place_one:
+            slots = range(slots, slots + 1)
     else:
         _check_range(slots, _PLAYER_SIZE, "destination_slots")
 
@@ -174,7 +181,12 @@ async def _transfer_cursor(bot: Bot, slots: int | range, *, take: bool, timeout:
     player_item = inventory._known_main_transfer_slot(slots) if take else None
     cursor_item = inventory._cursor_item
     source_item = player_item if take else cursor_item
-    requested = 0 if source_item is None else int(source_item.stack_size)
+    source_count = 0 if source_item is None else int(source_item.stack_size)
+    requested = source_count
+    if mode == "take_half":
+        requested = (source_count + 1) // 2
+    elif place_one:
+        requested = 1
 
     def result(reason):
         return RangeTransferResult(requested, tuple(steps), reason)
@@ -187,8 +199,8 @@ async def _transfer_cursor(bot: Bot, slots: int | range, *, take: bool, timeout:
         return result("unobserved")
     if take and cursor_item.stack_size:
         return result("cursor_occupied")
-    if not requested:
-        return result("source_exhausted" if take else "complete")
+    if not source_count:
+        return result("source_exhausted" if take or place_one else "complete")
 
     item_id = int(source_item.id)
     registry = bot.item_registry

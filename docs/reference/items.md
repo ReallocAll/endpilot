@@ -95,6 +95,13 @@ With a protocol 2225 crafting table window open, call
 in main inventory slot 12. The current window must have reported an empty
 cursor, and the source needs a known stack network ID.
 
+Pass `half=True` to take half the observed stack, rounded up. For example,
+`await bot.take_inventory_to_cursor(12, half=True)` takes 3 items from a stack
+of 5. Use `await bot.place_one_from_cursor(14)` to place one item from the
+cursor into that main inventory slot. It accepts an observed empty slot or a
+compatible stack with room. A full or incompatible slot reports
+`destination_full`, and an observed empty source reports `source_exhausted`.
+
 Call `await bot.return_cursor_to_inventory(range(13, 15))` to place the cursor
 stack in main inventory slots 13 and 14. The call fills compatible stacks
 first, then uses observed empty slots in the range. It stops when authorized
