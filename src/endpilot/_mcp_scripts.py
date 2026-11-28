@@ -49,6 +49,7 @@ _RANGE_TRANSFERS = {
     "transfer_container_range": transfer_container_range,
     "transfer_inventory_range": transfer_inventory_range,
 }
+_CURSOR_TRANSFERS = ("take_inventory_to_cursor", "place_one_from_cursor", "return_cursor_to_inventory")
 _COLLECTION_STORAGE_CALLS = frozenset({"collect_targets", "collect_by_count", "collect_vein_by_count"})
 
 # The bridge owns this allowlist independently of the worker. Listed methods
@@ -61,7 +62,7 @@ _MEMBERS = {
             world_difficulty world_hardcore world_spawn player_id spawn_chunk_radius
             requested_chunk_radius accepted_chunk_radius published_chunk_bounds position movement_state
             rotation is_swimming dimension_bounds is_sleeping sleeping_bed player_respawn_point
-            held_item inventory_slots armor_slots offhand_item open_window container_slots
+            held_item inventory_slots armor_slots offhand_item last_cursor_observation open_window container_slots
             furnace_progress brewing_progress mining_target health hunger experience_level vitals abilities
             status_effects is_dead observed_entities observed_drops vehicle vehicle_links commands_enabled trade_offers
         """,
@@ -110,7 +111,7 @@ _MEMBERS = {
         """,
     }.items()
     for name in names.split()
-} | dict.fromkeys(_RANGE_TRANSFERS, "async")
+} | dict.fromkeys((*_RANGE_TRANSFERS, *_CURSOR_TRANSFERS), "async")
 
 _RECORDS = {
     "beds": "BedObservation PlayerRespawnPoint",
@@ -127,7 +128,7 @@ _RECORDS = {
                 "EntityMovement EntityLifecycleEvent EntityCursorResult EntitySpawn ItemPickup "
                 "PlayerEquipmentSnapshot VehicleLink VehicleLinkChange",
     "harvest": "HarvestTool HarvestToolAcquisition HarvestToolChest",
-    "inventory": "HeldItemStack HeldItemSnapshot InventorySlotChange",
+    "inventory": "CursorObservation HeldItemStack HeldItemSnapshot InventorySlotChange",
     "item_use": "ItemConsumption",
     "movement": "BlockApproach FlightResult MovementState",
     "navigation": "NavigationPlan NavigationResult BlockFaceMatch BlockInteractionMatch BlockPlacementMatch",

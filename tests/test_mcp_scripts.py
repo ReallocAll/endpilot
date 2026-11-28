@@ -1148,6 +1148,92 @@ async def main(bot, count):
                                                           "confirmed_count": 0}},
                 })
 
+    async def test_workbench_cursor_actions_and_historical_report(self):
+        b = self.bot.protocol.binding
+        apple = 883
+        slots = [b.SerializedNetworkItemStackDescriptor() for _ in range(36)]
+        slots[12] = b.SerializedNetworkItemStackDescriptor(id=apple, stack_size=5, net_id_variant=3)
+        self.bot._session._replace_item_registry(b.ItemRegistryPacket(items=[
+            b.ItemData(id=apple, name="minecraft:apple"),
+        ]))
+        cursor_item = b.SerializedNetworkItemStackDescriptor(id=apple, stack_size=2, net_id_variant=8)
+        for packet in (
+            b.ContainerOpenPacket(container_id=2, type=b.ContainerType.WORKBENCH,
+                                  pos=b.BlockPos(x=1, y=100, z=2), entity_unique_id=-1),
+            b.InventoryContentPacket(inventory_id=b.ContainerID.INVENTORY, slots=slots),
+            b.InventoryContentPacket(inventory_id=b.ContainerID.PLAYER_ONLY_UI, slots=[cursor_item]),
+        ):
+            await test_scheduled_input.ScheduledInputTests().observe(self.bot, self.wire, packet)
+
+        sent = asyncio.Queue()
+        self.addCleanup(self.bot.packets.subscribe_sent(
+            lambda packet_id: sent.put_nowait(None) if packet_id == b.ItemStackRequestPacket.ID else None,
+        ))
+        run = await self.start("""
+import asyncio
+
+async def main(bot):
+    history = bot.last_cursor_observation
+    assert (history.source, history.count, history.stack_net_id) == ('inventory_content', 2, 8)
+    assert (history.observed_item.item_id, history.observed_item.net_id) == (883, 8)
+    assert (await bot.take_inventory_to_cursor(12, half=True)).stop_reason == 'cursor_occupied'
+    for method, args, kwargs in (
+        (bot.take_inventory_to_cursor, (12,), {'half': 1}),
+        (bot.place_one_from_cursor, (True,), {}),
+        (bot.return_cursor_to_inventory, (range(12, 14, 2),), {}),
+    ):
+        try:
+            await method(*args, **kwargs)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('invalid cursor arguments accepted')
+    print('ready', flush=True)
+    while bot.last_cursor_observation.count != 0:
+        await asyncio.sleep(.01)
+    take = await bot.take_inventory_to_cursor(12, half=True)
+    placed = await bot.place_one_from_cursor(14)
+    returned = await bot.return_cursor_to_inventory(range(12, 13))
+    assert [row.confirmed_count for row in (take, placed, returned)] == [3, 1, 2]
+    assert all(row.stop_reason == 'complete' for row in (take, placed, returned))
+    assert history.count == 2 and bot.last_cursor_observation.count == 0
+    assert bot.last_cursor_observation.source == 'item_stack_response'
+    assert bot.last_cursor_observation.observed_item is None
+    return [bot.inventory_slots[index].count for index in (12, 14)]
+""")
+        await self.wait_for(run, lambda status: "ready\n" in self.text(status))
+        self.assertTrue(sent.empty())
+        self.wire.push(b.InventoryContentPacket(inventory_id=b.ContainerID.PLAYER_ONLY_UI, slots=[slots[0]]))
+        for kind, source, target, amount, player_slot, player_count, player_net_id, cursor_count in (
+            ("TakeActionData", 12, 0, 3, 12, 2, 3, 3),
+            ("PlaceActionData", 0, 14, 1, 14, 1, 5, 2),
+            ("PlaceActionData", 0, 12, 2, 12, 4, 3, 0),
+        ):
+            await self.wait_for(run, lambda _: not sent.empty())
+            sent.get_nowait()
+            packet = next(packet for packet in reversed(self.wire.sent) if isinstance(packet, b.ItemStackRequestPacket))
+            request, = packet.requests
+            action, = request.actions
+            self.assertEqual((type(action).__name__, action.source.slot, action.destination.slot, action.amount),
+                             (kind, source, target, amount))
+            containers = []
+            for name, slot, count, net_id in (
+                ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", player_slot, player_count, player_net_id),
+                ("CURSOR_CONTAINER", 0, cursor_count, 4 if cursor_count else 0),
+            ):
+                containers.append(b.ItemStackResponseContainerInfo(
+                    full_container_name=b.FullContainerName(name=b.ContainerEnumName[name]),
+                    slots=[b.ItemStackResponseSlotInfo(slot=slot, requested_slot=slot, amount=count,
+                                                       item_stack_net_id=b.ItemStackNetId(raw_id=net_id))],
+                ))
+            response = b.ItemStackResponseInfo(client_request_id=request.client_request_id,
+                                               result=b.ItemStackNetResult.SUCCESS, containers=containers)
+            self.wire.push(b.ItemStackResponsePacket(responses=[response]))
+        final = await self.completed(run)
+        self.assertEqual(final["state"], "succeeded", final)
+        self.assertEqual(final["result"], [4, 1])
+        self.assertTrue(sent.empty())
+
     async def test_stalled_pipe_does_not_block_stop_and_reports_overflow(self):
         offered = []
         released = []
