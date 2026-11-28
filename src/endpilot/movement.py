@@ -2637,11 +2637,14 @@ class Movement:
             floor = (x, y - 1, z)
             block = blocks.observed_block(floor)
             state = None if block is None else blocks._vanilla_state(block.runtime_id)
+            feet = blocks.observed_block(cell)
+            cover = None if feet is None else blocks._vanilla_state(feet.runtime_id)
             # These full-height surfaces use the calibrated ordinary ground friction.
             return (state is not None and state.name in ("minecraft:grass_block", "minecraft:stone")
                     and state.unit_cube and not state.unsafe_support
                     and blocks._stance_air(blocks.observed_block(floor, layer=1)) is True
-                    and blocks._flat_stance(cell) is True)
+                    and blocks._flat_stance(cell, allow_vegetation=(
+                        cover is not None and cover.name == "minecraft:fern")) is True)
 
         def cruise_target(anchor, route):
             if (not isinstance(original_goal, FootGoal) or not use_ground_velocity or not calibrated

@@ -568,7 +568,7 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(frame.pos.y, 101.62 - 1 / 16, places=4)
         self.assertFalse(self.jump_input())
 
-    async def test_dry_straight_walk_passes_centres_but_stops_before_a_new_obstacle(self):
+    async def test_dry_straight_walk_passes_through_fern_but_stops_before_a_new_obstacle(self):
         self.blocks._player_game_type = "SURVIVAL"
         self.movement._gap_jump_allowed = lambda: True
         for x in range(-1, 9):
@@ -577,6 +577,7 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                     solid = y == 99 or z != 0 or x in (-1, 8)
                     self.set_block((x, y, z), self.STONE if solid else self.AIR)
                     self.set_block((x, y, z), self.AIR, layer=1)
+        self.set_block((3, 100, 0), 0xBBAB0B0A)  # Fern
         blocked = (5, 100, 0)
         goal = FootGoal((7, 100, 0))
         rules = NavigationRules(search_radius=7, vertical_radius=0)
