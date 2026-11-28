@@ -330,6 +330,95 @@ class CommandCatalogTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.bot.complete_command(f"/scoreboard players set {target_token} ep_"), ())
         self.assertEqual(self.wire.sent, sent)
 
+    async def test_scoreboard_completes_quoted_roster_targets_and_advertised_objectives(self):
+        b = self.b
+        packet = b.AvailableCommandsPacket
+        players, set_action, reset_action, fixed_objectives, aliases = (0x00300000 + index for index in range(5))
+        target, objectives, count = 0x0010000A, 0x04100000, 0x00100001
+
+        def advertisement(*overloads):
+            return packet(
+                enum_values=("players", "set", "add", "reset", "ep_fixed", "scores"),
+                enums=[
+                    packet.EnumData(name=name, values=indexes)
+                    for name, indexes in (
+                        ("Category", (0,)), ("Actions", (1, 2)), ("Reset", (3,)),
+                        ("Fixed", (4,)), ("Aliases", (5,)),
+                    )
+                ],
+                soft_enums=[packet.SoftEnumData(name="ScoreboardObjectives", values=("ep_alpha",))],
+                commands=[
+                    packet.CommandData(name="scoreboard", alias_enum=aliases & 0xFFFFF, overloads=overloads),
+                    packet.CommandData(name="other", alias_enum=-1, overloads=[
+                        self.overload(players, set_action, target, objectives, count),
+                    ]),
+                ],
+            )
+
+        await self.join(advertisement(
+            self.overload(players, set_action, target, objectives, count),
+            self.overload(players, reset_action, target, fixed_objectives, optional_from=3),
+            self.overload(players, reset_action, target, objectives, optional_from=3),
+        ))
+
+        def query(text, starts_at, tokens):
+            with self.subTest(text=text):
+                before = list(self.wire.sent)
+                self.assertEqual(self.bot.complete_command_with_span(text),
+                                 CommandCompletion(text.index(starts_at), len(text), tokens))
+                self.assertEqual(self.bot.complete_command(text), tokens)
+                self.assertEqual(self.wire.sent, before)
+
+        query('/scoreboard players set "Dm P', '"', ())
+        await self.deliver(b.PlayerListPacket(entries=[
+            b.PlayerListPacket.AddEntry(action=b.PlayerListPacketType.ADD, uuid=UUID(int=1), name="Dm Peer"),
+            b.PlayerListPacket.AddEntry(action=b.PlayerListPacketType.ADD, uuid=UUID(int=2), name="Dm Pal"),
+        ]))
+
+        partial = ' \t/scoreboard  players set\t"Dm '
+        query(partial, '"', ('"Dm Peer"', '"Dm Pal"'))
+        completion = self.bot.complete_command_with_span(partial)
+        self.assertEqual(partial[:completion.start] + completion.tokens[0] + partial[completion.end:],
+                         ' \t/scoreboard  players set\t"Dm Peer"')
+        query('/scores players reset "Dm Pe', '"', ('"Dm Peer"',))
+        query('/scores players set "Dm Peer" ep_', 'ep_', ("ep_alpha",))
+        reset_query = '/scoreboard players reset "Dm Peer" ep_'
+        set_query = '/scoreboard players set "Dm Peer" ep_'
+        query(reset_query, 'ep_', ("ep_fixed", "ep_alpha"))
+        for operation, value, expected in (
+            (b.SoftEnumUpdateType.ADD, "ep_beta", ("ep_alpha", "ep_beta")),
+            (b.SoftEnumUpdateType.REMOVE, "ep_alpha", ("ep_beta",)),
+        ):
+            await self.deliver(b.UpdateSoftEnumPacket(
+                enum_name="ScoreboardObjectives", type=operation, values=(value,),
+            ))
+            query(set_query, 'ep_', expected)
+            query(reset_query, 'ep_', ("ep_fixed", *expected))
+
+        for text in (
+            '/scoreboard players set "Dm Peer"', '/scoreboard players set "Dm Peer"ep_',
+            '/scoreboard players set "Dm Peer" ep_beta ', '/scoreboard players set "Dm Peer" ep_ extra',
+            '/scoreboard players set "Dm Peer " ep_', '/scoreboard players set "dm peer" ep_',
+            '/scoreboard players set "Unknown Peer" ep_', '/scoreboard players set "@a" ep_',
+            '/scoreboard players add "Dm Pe', '/scoreboard players add "Dm Peer" ep_',
+            '/scoreboard players unknown "Dm Pe', '/other players set "Dm Pe',
+            '/scoreboard players set Dm',
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.bot.complete_command(text), ())
+
+        await self.deliver(b.PlayerListPacket(entries=[
+            b.PlayerListPacket.RemoveEntry(action=b.PlayerListPacketType.REMOVE, uuid=UUID(int=1)),
+        ]))
+        query(partial, '"', ('"Dm Pal"',))
+        query(set_query, 'ep_', ())
+        await self.deliver(advertisement(
+            self.overload(players, set_action, target, objectives, count, chaining=True),
+            self.overload(players, reset_action, target, objectives, optional_from=2),
+        ))
+        self.assertEqual(self.bot.complete_command(partial), ())
+        self.assertEqual(self.bot.complete_command('/scores players reset "Dm Pa'), ())
+
     async def test_literal_target_keeps_overlapping_enum_overloads_independent(self):
         packet = self.b.AvailableCommandsPacket
         choose, named_target, fixed_choice, hidden_choice = (0x00300000 + i for i in range(4))

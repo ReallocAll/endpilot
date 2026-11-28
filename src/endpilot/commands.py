@@ -65,6 +65,7 @@ class _CommandAdvertisement:
     overloads: dict[str, tuple[_CompletionPrefix, ...]]
     soft_enums: list[tuple[str, tuple[str, ...]]]
     player_target_commands: set[str]
+    scoreboard_player_overloads: dict[str, list[_CompletionPrefix]]
 
     def enum_values(self, ref: _EnumRef) -> tuple[str, ...]:
         return self.soft_enums[ref][1] if isinstance(ref, int) else ref
@@ -73,6 +74,40 @@ class _CommandAdvertisement:
         if ref is None:
             return all(character.isalnum() or character == "_" for character in argument)
         return argument in self.enum_values(ref)
+
+    def complete_quoted_scoreboard_target(
+        self, name: str, text: str, player_names: Iterable[str],
+    ) -> CommandCompletion | None:
+        overloads = self.scoreboard_player_overloads.get(name)
+        if not overloads:
+            return None
+        parts = text.split(maxsplit=3)
+        if len(parts) != 4:
+            return None
+        _, category, action, target = parts
+        if category != "players" or action not in ("set", "reset") or not target.startswith('"'):
+            return None
+        matched = [overload for overload in overloads
+                   if self.matches_argument(overload[0], category) and self.matches_argument(overload[1], action)]
+        if not matched:
+            return None
+
+        literal, closing_quote, remainder = target[1:].partition('"')
+        end = len(text)
+        if not closing_quote:
+            return CommandCompletion(end - len(target), end, tuple(dict.fromkeys(_player_tokens(literal, player_names))))
+        if not remainder or not remainder[0].isspace():
+            return None
+        prefix = remainder.lstrip()
+        if any(character.isspace() for character in prefix):
+            return None
+        values = ()
+        if _LITERAL_PLAYER_NAME.fullmatch(literal) and literal in player_names:
+            values = tuple(dict.fromkeys(
+                value for overload in matched if len(overload) > 3 and (ref := overload[3]) is not None
+                for value in self.enum_values(ref) if value.startswith(prefix)
+            ))
+        return CommandCompletion(end - len(prefix), end, values)
 
     def update_soft_enum(self, packet, update_type) -> None:
         name, operation = packet.enum_name, packet.type
@@ -121,6 +156,7 @@ def _command_advertisement(packet) -> _CommandAdvertisement:
     commands = []
     overloads = {}
     player_target_commands = set()
+    scoreboard_player_overloads = {}
     for record in packet.commands:
         alias_enum = record.alias_enum
         aliases = hard_enums[alias_enum] if 0 <= alias_enum < len(hard_enums) else ()
@@ -138,12 +174,19 @@ def _command_advertisement(packet) -> _CommandAdvertisement:
             and (prefix := _completion_prefix(overload.params, hard_enums, len(soft_enums)))
         )
         if prefixes:
+            scoreboard_targets = tuple(
+                prefix for prefix in prefixes
+                if record.name == "scoreboard" and len(prefix) >= 3 and prefix[2] is None
+                and all(ref is not None for ref in prefix[:2])
+            )
             for name in dict.fromkeys((record.name, *aliases)):
                 if name:
                     overloads.setdefault(name, []).extend(prefixes)
+                    if scoreboard_targets:
+                        scoreboard_player_overloads.setdefault(name, []).extend(scoreboard_targets)
     return _CommandAdvertisement(
         CommandCatalog(tuple(commands)), {name: tuple(items) for name, items in overloads.items()}, soft_enums,
-        player_target_commands,
+        player_target_commands, scoreboard_player_overloads,
     )
 
 
@@ -295,6 +338,8 @@ class Commands:
             prefix = ""
         command, *arguments = tokens
         name = command.removeprefix("/")
+        if (quoted := advertisement.complete_quoted_scoreboard_target(name, text, player_names)) is not None:
+            return quoted
         start = end - len(prefix)
         position = len(arguments)
         matches = []

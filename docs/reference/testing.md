@@ -58,10 +58,10 @@ the text with an optional leading slash. Completion matches the current
 token by case-sensitive prefix.
 
 The result is a tuple of advertised command names or aliases for the first
-token. For arguments, completion covers unquoted, whitespace-separated values
-from positional hard or soft enums, including optional enum parameters. Earlier
-positions must match their advertised parameter in the same overload. Trailing
-whitespace starts a new token outside an open player target quote.
+token. For arguments, completion covers values from positional hard or soft
+enums, including optional enum parameters. Earlier positions must match their
+advertised parameter in the same overload. Trailing whitespace starts a new
+token outside an open player target quote.
 
 When the catalog advertises the standard `/tell` target, the first argument
 also completes ordinary names from the current server player list. The same
@@ -71,12 +71,22 @@ Names with internal spaces return one double-quoted token. An open double
 quote lets the prefix include spaces, as in `/tell "Dm P`. Player suggestions
 end when the target is closed or the input moves to the message.
 
+When the catalog advertises the player target for `/scoreboard players set`
+or `reset`, an open double quote completes names from the current player list.
+For example, `/scoreboard players set "Dm P` can return `"Dm Peer"`. After a
+closed quoted name that matches an online player and a separating space,
+completion uses the objective enum advertised for that overload. Soft enum
+updates become visible in subsequent queries. Objective completion also supports
+unquoted, single-word player names.
+
 `bot.complete_command_with_span(text)` returns an immutable
 `endpilot.commands.CommandCompletion` with `start`, `end`, and `tokens`.
 Use `text[:result.start] + token + text[result.end:]` to apply a candidate.
 The indices are Python string indices and preserve any leading slash on a
 command name. For `/tell Dm` and `/tell "Dm P`, the spans are `[6, 8)` and
 `[6, 11)`, and both can return the token `"Dm Peer"`.
+For `/scoreboard players set "Dm P`, the span is `[24, 29)`. For
+`/scoreboard players set "Dm Peer" ep_`, the span covers only `ep_`.
 
 Both methods return `None` when the catalog is unavailable. An empty tuple
 of tokens means the catalog is known and there are no supported matches.
