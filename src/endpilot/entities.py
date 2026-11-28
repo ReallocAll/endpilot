@@ -888,21 +888,16 @@ class Entities:
         self._require_remote_player_target(runtime_id)
         return await self._wait_for_entity_event(self._sleep_observers, runtime_id, timeout)
 
-    def _require_name_tag_target(self, runtime_id: int | None) -> None:
-        self._require_live()
-        if runtime_id is not None and (runtime_id == self._own_runtime_id or runtime_id not in self._by_runtime):
-            raise LookupError("remote entity is not currently observed")
-
     def subscribe_entity_name_tag_changes(
         self, callback: Callable[[EntityState], None], *, runtime_id: int | None = None,
     ) -> Callable[[], None]:
-        self._require_name_tag_target(runtime_id)
+        self._require_confirmed_remote_entity(runtime_id)
         return self.packets._subscribe(self._name_tag_observers, _EntityObserver(runtime_id, callback))
 
     async def wait_for_entity_name_tag_change(
         self, *, runtime_id: int | None = None, timeout: float | None = 15,
     ) -> EntityState:
-        self._require_name_tag_target(runtime_id)
+        self._require_confirmed_remote_entity(runtime_id)
         return await self._wait_for_entity_event(self._name_tag_observers, runtime_id, timeout)
 
     def subscribe_attached_fireworks(self, callback: Callable[[EntityState], None]) -> Callable[[], None]:
@@ -1034,25 +1029,25 @@ class Entities:
         self._require_remote_event_target(runtime_id)
         return await self._wait_for_entity_event(self._effect_observers, runtime_id, timeout)
 
-    def _visible_effect_target(self, runtime_id: int) -> bool:
+    def _is_confirmed_remote_entity(self, runtime_id: int) -> bool:
         return (runtime_id != self._own_runtime_id and runtime_id in self._actor_instances
                 and (runtime_id not in self._player_uuid_by_runtime or runtime_id in self._player_views))
 
-    def _require_visible_effect_target(self, runtime_id: int | None) -> None:
+    def _require_confirmed_remote_entity(self, runtime_id: int | None) -> None:
         self._require_live()
-        if runtime_id is not None and not self._visible_effect_target(runtime_id):
+        if runtime_id is not None and not self._is_confirmed_remote_entity(runtime_id):
             raise LookupError("remote entity is not currently observed")
 
     def subscribe_entity_visible_effect_changes(
         self, callback: Callable[[EntityVisibleEffectUpdate], None], *, runtime_id: int | None = None,
     ) -> Callable[[], None]:
-        self._require_visible_effect_target(runtime_id)
+        self._require_confirmed_remote_entity(runtime_id)
         return self.packets._subscribe(self._visible_effect_observers, _EntityObserver(runtime_id, callback))
 
     async def wait_for_entity_visible_effect_change(
         self, *, runtime_id: int | None = None, timeout: float | None = 15,
     ) -> EntityVisibleEffectUpdate:
-        self._require_visible_effect_target(runtime_id)
+        self._require_confirmed_remote_entity(runtime_id)
         return await self._wait_for_entity_event(self._visible_effect_observers, runtime_id, timeout)
 
     async def _wait_for_entity_event[Event](
@@ -1963,8 +1958,9 @@ class Entities:
                 shield_observers = tuple(self._shield_block_observers)
                 shield_block = ShieldBlockEvent(runtime_id, self._animation_entity_id(runtime_id), int(packet.tick))
             state = self._by_runtime.get(runtime_id)
+            confirmed_remote_entity = self._is_confirmed_remote_entity(runtime_id)
             name_tag_observers = ()
-            if state is not None and runtime_id != self._own_runtime_id:
+            if state is not None and confirmed_remote_entity:
                 name_tag = _actor_name_tag(metadata, b)
                 if name_tag is not None and name_tag != state.name_tag:
                     state = self._by_runtime[runtime_id] = replace(state, name_tag=name_tag)
@@ -1982,7 +1978,7 @@ class Entities:
                     state = replace(state, trade_tier=tier, trade_experience=experience)
                     self._by_runtime[runtime_id] = state
             visible_observers = ()
-            if state is not None and self._visible_effect_target(runtime_id):
+            if state is not None and confirmed_remote_entity:
                 visible_effects = _visible_effects_value(metadata, b)
                 if visible_effects is not None and visible_effects != state.visible_effects_value:
                     state = replace(state, visible_effects_value=visible_effects)

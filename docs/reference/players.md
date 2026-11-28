@@ -450,7 +450,10 @@ packets.
 Omit `runtime_id` to observe every visible remote entity. A runtime filter
 binds to the current actor instance. An untracked runtime ID or the local
 player raises `LookupError`, as does a filtered wait whose target leaves view
-or is replaced. The subscription returns an idempotent unsubscribe function.
+or is replaced. A conflicting player list identity clears the label, ends
+filtered subscriptions and waits, and blocks further name-tag reports for
+that player until the entity's identity is confirmed. The subscription
+returns an idempotent unsubscribe function.
 A dimension change ends filtered subscriptions and raises `RuntimeError` in
 pending waits. Unfiltered subscriptions continue across dimensions. A
 deadline raises `TimeoutError`. Use `timeout=None` to wait without a deadline.

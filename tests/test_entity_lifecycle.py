@@ -143,6 +143,74 @@ class EntityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((changed.name, changed.name_tag), ("Peer", "New custom name"))
         self.assertEqual(self.bot.observed_players[0].name, "Roster name")
 
+    async def test_name_tag_ignores_a_player_spawn_that_conflicts_with_the_existing_roster(self):
+        uuid = UUID(int=8)
+        player = self.player(uuid, 8, 108)
+        player.unpack = self.name_metadata("Conflicting spawn")
+        await self.join(self.roster_add(uuid, 109), player, self.actor(220, 9, actor_type="minecraft:cow"))
+        peer, cow = self.bot.observed_entities
+        self.assertEqual((peer.entity_id, peer.name, peer.name_tag), (109, "Peer", None))
+        self.assertEqual((cow.runtime_id, cow.name_tag), (9, None))
+
+        with self.assertRaisesRegex(LookupError, "remote entity is not currently observed"):
+            self.bot.subscribe_entity_name_tag_changes(lambda _: None, runtime_id=8)
+        with self.assertRaisesRegex(LookupError, "remote entity is not currently observed"):
+            await self.bot.wait_for_entity_name_tag_change(runtime_id=8, timeout=1)
+        broad, cows = [], []
+        self.bot.subscribe_entity_name_tag_changes(broad.append)
+        self.bot.subscribe_entity_name_tag_changes(cows.append, runtime_id=9)
+        await self.deliver(self.name_update(8, "Conflicting update"), self.name_update(9, "Cow"))
+        peer, cow = self.bot.observed_entities
+        self.assertEqual((peer.entity_id, peer.name, peer.name_tag), (109, "Peer", None))
+        self.assertEqual(cow.name_tag, "Cow")
+        self.assertEqual(broad, [cow])
+        self.assertEqual(cows, [cow])
+
+    async def test_name_tag_stops_when_a_late_roster_entry_conflicts_with_the_player_spawn(self):
+        uuid = UUID(int=8)
+        player = self.player(uuid, 8, 108)
+        player.unpack = self.name_metadata("Original")
+        await self.join(self.roster_add(uuid, 108), player, self.actor(220, 9, actor_type="minecraft:cow"))
+        broad, scoped = [], []
+        self.bot.subscribe_entity_name_tag_changes(broad.append)
+        self.bot.subscribe_entity_name_tag_changes(scoped.append, runtime_id=8)
+        change = asyncio.create_task(self.bot.wait_for_entity_name_tag_change(runtime_id=8, timeout=1))
+        await asyncio.sleep(0)
+        await self.deliver(self.name_update(8, "Original"))
+        self.assertFalse(change.done())
+        self.assertEqual((broad, scoped), ([], []))
+        await self.deliver(self.name_update(8, "Verified"))
+        verified = await change
+        self.assertEqual(broad, [verified])
+        self.assertEqual(scoped, [verified])
+        self.assertEqual((verified.entity_id, verified.name, verified.name_tag), (108, "Peer", "Verified"))
+
+        pending = asyncio.create_task(self.bot.wait_for_entity_name_tag_change(runtime_id=8, timeout=1))
+        await asyncio.sleep(0)
+        await self.deliver(self.roster_add(uuid, 109), self.name_update(8, "Late unconfirmed name"),
+                           self.name_update(9, "Cow"))
+        with self.assertRaisesRegex(LookupError, "entity is no longer observed"):
+            await pending
+        peer, cow = self.bot.observed_entities
+        self.assertEqual((peer.entity_id, peer.name, peer.name_tag), (109, "Peer", None))
+        self.assertEqual(cow.name_tag, "Cow")
+        self.assertEqual(broad, [verified, cow])
+        self.assertEqual(scoped, [verified])
+        with self.assertRaisesRegex(LookupError, "remote entity is not currently observed"):
+            self.bot.subscribe_entity_name_tag_changes(scoped.append, runtime_id=8)
+
+        restored = self.player(uuid, 8, 109)
+        restored.unpack = self.name_metadata("Confirmed again")
+        await self.deliver(restored)
+        resumed = []
+        self.bot.subscribe_entity_name_tag_changes(resumed.append, runtime_id=8)
+        await self.deliver(self.name_update(8, "Restored change"))
+        current = next(actor for actor in self.bot.observed_entities if actor.runtime_id == 8)
+        self.assertEqual((current.entity_id, current.name, current.name_tag), (109, "Peer", "Restored change"))
+        self.assertEqual(broad, [verified, cow, current])
+        self.assertEqual(scoped, [verified])
+        self.assertEqual(resumed, [current])
+
     async def test_name_tag_subscriptions_follow_visibility_and_instance_lifetime(self):
         b = self.b
         old = self.actor()
