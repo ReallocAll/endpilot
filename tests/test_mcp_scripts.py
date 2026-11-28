@@ -499,6 +499,7 @@ async def main(bot):
         self.assertEqual(notices, ["unsubscribed"])
 
     async def test_world_feedback_waits_and_notifications_copy_wire_fields(self):
+        await self.update_block((-3, 220, 17), 2359)  # Sequential vanilla note block runtime ID.
         run = await self.start("""
 import asyncio
 
@@ -512,21 +513,23 @@ def particle(event):
 
 def block(event):
     assert not hasattr(event, 'packet')
-    return [event.kind, event.position, event.note_pitch, event.instrument_id, event.data, event.instrument_sound]
+    return [event.kind, event.position, event.note_pitch, event.note_tuning, event.instrument_id,
+            event.data, event.instrument_sound, event.b0, event.b1]
 
 async def main(bot):
     delivered = asyncio.Event()
     notifications = []
     def report(project, event):
         notifications.append(project(event))
-        if len(notifications) == 3:
+        if len(notifications) == 4:
             delivered.set()
 
     stop_sound = bot.subscribe_sound(lambda event: report(sound, event), name='fixture.pop', kind='play')
     stop_particle = bot.subscribe_particle(lambda event: report(particle, event), name='fixture.flame')
     stop_block = bot.subscribe_block_events(lambda event: report(block, event), kind='note')
+    stop_tuning = bot.subscribe_block_events(lambda event: report(block, event), kind='note_tuning')
     waits = asyncio.gather(bot.wait_for_sound('fixture.pop', kind='play'), bot.wait_for_particle('fixture.flame'),
-                           bot.wait_for_block_event(kind='note'))
+                           bot.wait_for_block_event(kind='note'), bot.wait_for_block_event(kind='note_tuning'))
     await asyncio.sleep(0)
     bot.get_tick()   # Wait for admission of preceding requests before triggering the fixture.
     print('feedback ready')
@@ -535,7 +538,9 @@ async def main(bot):
     stop_sound()
     stop_particle()
     stop_block()
-    return {'waits': [sound(results[0]), particle(results[1]), block(results[2])], 'notifications': notifications}
+    stop_tuning()
+    return {'waits': [sound(results[0]), particle(results[1]), block(results[2]), block(results[3])],
+            'notifications': notifications}
 """)
         await self.wait_for(run, lambda status: "feedback ready" in self.text(status))
         b = self.bot.protocol.binding
@@ -546,12 +551,14 @@ async def main(bot):
                                                     effect_name="fixture.flame", molang_variables='{"a":1}'))
         # Vanilla 2225 skeleton head above a note block after its second click.
         note = RawPacket(123, bytes.fromhex("046e6f7465000040c000005c43000088419254000000ffffffffffffffff00"))
-        self.wire.incoming.put_nowait(write_batch((note,)))
+        tuning = RawPacket(26, bytes.fromhex("05b803222a04"))
+        self.wire.incoming.put_nowait(write_batch((note, tuning)))
         status = await self.completed(run)
         self.assertEqual(status["state"], "succeeded", status)
         expected = [["fixture.pop", [1, 100, 2], 0.75, 1.25, 3],
                     ["fixture.flame", [1, 100, 2], 2, 91, '{"a":1}'],
-                    ["note", [-3, 220, 17], 9, 21, 5385, "note.skeleton"]]
+                    ["note", [-3, 220, 17], 9, None, 21, 5385, "note.skeleton", None, None],
+                    ["note_tuning", [-3, 220, 17], None, 2, 21, None, "note.skeleton", 21, 2]]
         self.assertEqual(status["result"], {"waits": expected, "notifications": expected})
 
     async def test_stop_drains_host_action_before_original_bot_is_released(self):

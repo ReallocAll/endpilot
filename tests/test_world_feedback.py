@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import FrozenInstanceError
 import unittest
 import weakref
 from types import SimpleNamespace
@@ -143,6 +144,47 @@ class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
         self.incoming.put_nowait(write_batch((RawPacket(b.BlockEventPacket.ID, b""), self.bot.protocol.encode(event))))
         observed = await pending
         self.assertEqual((observed.position, observed.packet), ((0, 0, 0), event))
+
+    async def test_note_tuning_is_opt_in_and_requires_a_current_note_block(self):
+        b = self.b
+        cell = (-3, 220, 17)
+        pos = b.BlockPos(x=cell[0], y=cell[1], z=cell[2])
+        note = b.LevelSoundEventPacket(pos=b.Vec3(x=cell[0], y=cell[1], z=cell[2]), sound_event="note", data=5385)
+
+        def event(tuning, instrument=21):
+            return b.BlockEventPacket(pos=pos, b0=instrument, b1=tuning)
+
+        initial, later = event(1), event(2)
+        minimum, maximum = event(0, 0), event(24, 26)
+        packets = [initial, later, event(-1), event(25), minimum, maximum, initial, later]
+        generic, sounds, tuning, explicit_blocks = [], [], [], []
+        self.bot.subscribe_block_events(generic.append)
+        self.bot.subscribe_block_events(sounds.append, kind="note")
+        self.bot.subscribe_block_events(tuning.append, position=cell, kind="note_tuning")
+        self.bot.subscribe_block_events(explicit_blocks.append, kind="block")
+        async with asyncio.TaskGroup() as group:
+            tuned = group.create_task(self.bot.wait_for_block_event(cell, kind="note_tuning", timeout=1))
+            legacy = group.create_task(self.bot.wait_for_block_event(cell, timeout=1))
+            drained = group.create_task(self.bot.packets.wait_for_packet(b.SetTimePacket.ID, timeout=1))
+            await asyncio.sleep(0)
+            self.push(initial, note, b.UpdateBlockPacket(pos=pos, runtime_id=0x80310E21, layer=0), later,
+                      b.UpdateBlockPacket(pos=pos, runtime_id=166024317, layer=0), packets[2], packets[3],
+                      minimum, maximum, initial, note, b.UpdateBlockPacket(pos=pos, runtime_id=0x80310E21, layer=0),
+                      later, b.SetTimePacket(time=42))
+
+        self.assertEqual([event.packet for event in generic], [initial, note, *packets[1:-1], note, later])
+        self.assertEqual([event.packet for event in explicit_blocks], packets)
+        self.assertEqual(legacy.result().kind, "block")
+        self.assertIsNone(legacy.result().note_tuning)
+        self.assertEqual([(event.note_tuning, event.instrument_id) for event in tuning], [(0, 0), (24, 26), (1, 21)])
+        self.assertEqual([event.packet for event in tuning], [minimum, maximum, initial])
+        self.assertEqual(tuned.result(), tuning[0])
+        self.assertIsNone(tuning[1].instrument_sound)
+        self.assertEqual(tuning[2].instrument_sound, "note.skeleton")
+        self.assertTrue(all(event.note_pitch is None for event in tuning))
+        self.assertEqual([(event.note_pitch, event.note_tuning) for event in sounds], [(9, None), (9, None)])
+        with self.assertRaises(FrozenInstanceError):
+            tuning[0].note_tuning = 5
 
     async def test_subscriptions_deliver_every_matching_packet_in_dispatch_order(self):
         b = self.b

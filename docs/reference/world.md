@@ -445,8 +445,18 @@ In protocol 2225, note events expose the numeric `instrument_id` and packed
 sound `note_pitch`. The sound pitch of a mob-head note can differ from the
 block's tuning. `instrument_sound` resolves a known ID to a vanilla Bedrock
 sound identifier such as `note.bd`. It is `None` for unknown IDs, missing or
-negative note data, and other block events. The level sound packet carries
-the generic sound event `note`.
+negative note sound data. The level sound packet carries the generic sound
+event `note`.
+
+For protocol 2225, pass `kind="note_tuning"` to `wait_for_block_event` or
+`subscribe_block_events` to read the tuning index. The event is available
+when the latest main-layer block observation at the packet position is
+`minecraft:noteblock` and the packet's `b1` is in `0..24`.
+`event.note_tuning` is that index, and `event.instrument_id` comes from
+`b0` of the same packet. `event.note_pitch` is `None` on tuning events.
+These fields are also available to MCP script waits and callbacks.
+The default stream and `kind="block"` continue to deliver generic feedback
+for those packets. Use `kind="note"` for sound pitch.
 
 Use `vanilla_note_instruments(protocol=2225)` from `endpilot` to look up these
 identifiers without a connection. The mapping is read-only and unsupported

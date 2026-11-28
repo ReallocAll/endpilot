@@ -117,7 +117,10 @@ class ParticleEvent:
 
 @dataclass(frozen=True, slots=True)
 class BlockEvent:
-    """Block feedback from one packet, with a kind derived when established."""
+    """Block feedback from one packet, with a kind derived when established.
+
+    ``note_tuning`` is the block's tuning index on explicit note tuning events.
+    """
 
     kind: str
     dimension_id: int
@@ -126,6 +129,7 @@ class BlockEvent:
     chest_partner: _Cell | None = None
     piston_face: int | None = None
     piston_attached_blocks: tuple[_Cell, ...] | None = None
+    note_tuning: int | None = None
 
     def _note_data(self) -> int | None:
         if self.kind != "note":
@@ -145,6 +149,8 @@ class BlockEvent:
     @property
     def instrument_id(self) -> int | None:
         """Return the numeric Bedrock instrument from a note event."""
+        if self.kind == "note_tuning":
+            return getattr(self.packet, "b0", None)
         data = self._note_data()
         return None if data is None else data >> 8
 
@@ -331,10 +337,22 @@ class WorldFeedback:
             return BlockEvent("block_particle", dimension, _xyz(packet.pos), packet)
         return None
 
+    def _note_tuning(self, packet, dimension: int) -> BlockEvent | None:
+        if not 0 <= packet.b1 <= 24:
+            return None
+        position = _xyz(packet.pos)
+        state = self._block_state(position)
+        if state is not None and state.name == "minecraft:noteblock":
+            return BlockEvent("note_tuning", dimension, position, packet, note_tuning=packet.b1)
+        return None
+
     def _block_event_source(self, kind: str | None):
         if kind == "block_particle":
             packet_ids = (self.binding.LevelEventPacket.ID,) if self._is_2225 else ()
             return packet_ids, self._block_particle
+        if kind == "note_tuning":
+            packet_ids = (self.binding.BlockEventPacket.ID,) if self._is_2225 else ()
+            return packet_ids, self._note_tuning
         return self._block_ids, self._block
 
     async def wait_for_block_event(self, position: _Position | None, kind: str | None, timeout: float) -> BlockEvent:
