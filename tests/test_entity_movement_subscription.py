@@ -2,6 +2,7 @@
 
 import asyncio
 from dataclasses import FrozenInstanceError, replace
+from math import isnan
 import unittest
 from unittest.mock import patch
 from uuid import UUID
@@ -82,26 +83,29 @@ class EntityMovementSubscriptionTests(unittest.IsolatedAsyncioTestCase):
             b.MovePlayerPacket(player_id=9, pos=player_position, y_head_rot=-45.5, on_ground=False),
         )
 
-        absolute = EntityState(108, 8, "minecraft:cow", (5, 70, 10))
-        merged = replace(absolute, position=(0, 70, -2.25))
-        last_actor = replace(absolute, position=(0, 63.5, -2.25))
-        player = EntityState(0, 9, "minecraft:player", (7.25, 80, 11), name="Peer")
-        moved_player = replace(player, position=(7.25, 81.625, 11))
-        rotated = EntityMovementUpdate(entity=merged, pitch=0, yaw=None, head_yaw=45, on_ground=True)
+        absolute = EntityState(108, 8, "minecraft:cow", (5, 70, 10), pitch=281.25, yaw=90, head_yaw=358.59375)
+        merged = replace(absolute, position=(0, 70, -2.25), yaw=270)
+        turned = replace(merged, pitch=0, head_yaw=45)
+        last_actor = replace(turned, position=(0, 63.5, -2.25))
+        reset_actor = replace(last_actor, yaw=0, head_yaw=0)
+        player = EntityState(0, 9, "minecraft:player", (7.25, 80, 11), name="Peer", pitch=0, yaw=0, head_yaw=0)
+        moved_player = replace(player, position=(7.25, 81.625, 11), pitch=-12.25, yaw=271.5, head_yaw=137.75)
+        turned_player = replace(moved_player, pitch=0, yaw=0, head_yaw=-45.5)
+        rotated = EntityMovementUpdate(entity=turned, pitch=0, yaw=None, head_yaw=45, on_ground=True)
         expected = [
             EntityMovementUpdate(entity=absolute, pitch=281.25, yaw=90, head_yaw=358.59375, on_ground=True),
             EntityMovementUpdate(entity=merged, pitch=None, yaw=270, head_yaw=None, on_ground=False),
             rotated,
             rotated,
             EntityMovementUpdate(entity=last_actor, pitch=None, yaw=None, head_yaw=None, on_ground=False),
-            EntityMovementUpdate(entity=last_actor, pitch=0, yaw=0, head_yaw=0, on_ground=False),
+            EntityMovementUpdate(entity=reset_actor, pitch=0, yaw=0, head_yaw=0, on_ground=False),
             EntityMovementUpdate(entity=moved_player, pitch=-12.25, yaw=271.5, head_yaw=137.75, on_ground=True),
-            EntityMovementUpdate(entity=moved_player, pitch=0, yaw=0, head_yaw=-45.5, on_ground=False),
+            EntityMovementUpdate(entity=turned_player, pitch=0, yaw=0, head_yaw=-45.5, on_ground=False),
         ]
         self.assertEqual(seen, expected)
         self.assertEqual(cached, [
-            (absolute, player), (merged, player), (merged, player), (merged, player),
-            (last_actor, player), (last_actor, player), (last_actor, moved_player), (last_actor, moved_player),
+            (absolute, player), (merged, player), (turned, player), (turned, player),
+            (last_actor, player), (reset_actor, player), (reset_actor, moved_player), (reset_actor, turned_player),
         ])
         self.assertEqual(lifecycle, [])
         for update, wanted in zip(seen, expected):
@@ -110,6 +114,58 @@ class EntityMovementSubscriptionTests(unittest.IsolatedAsyncioTestCase):
             seen[0].yaw = 0
         with self.assertRaises(FrozenInstanceError):
             seen[0].entity.position = (0, 0, 0)
+
+    async def test_query_tracks_finite_axes_and_keeps_history_through_reuse_and_disconnect(self):
+        b = self.b
+        invalid = float("nan")
+        await self.join(
+            b.AddActorPacket(entity_id=108, runtime_id=8, actor_type="minecraft:cow",
+                             rot=b.Vec2(x=-3.5, y=400), y_head_rotation=106, y_body_rotation=200),
+            b.AddPlayerPacket(uuid=UUID(int=9), runtime_id=9, name="Peer",
+                              rot=b.Vec2(x=invalid, y=-93.5), y_head_rot=250.25),
+            b.AddPaintingPacket(entity_id=110, runtime_id=10, dir=2, motif="Kebab"),
+        )
+        sent_before = list(self.wire.sent)
+        actor, player, painting = self.bot.observed_entities
+
+        def angles(actor):
+            return actor.pitch, actor.yaw, actor.head_yaw
+
+        self.assertEqual(angles(actor), (-3.5, 400, 106))
+        self.assertEqual(angles(player), (None, -93.5, 250.25))
+        self.assertEqual(angles(painting), (None, None, None))
+        seen, lifecycle = [], []
+        self.bot.subscribe_entity_movement(seen.append)
+        self.bot.subscribe_entity_lifecycle(lifecycle.append)
+        await self.deliver(self.delta(10, rot_y_head=64), b.MovePlayerPacket(
+            player_id=9, rot=b.Vec2(x=-24.25, y=float("inf")), y_head_rot=invalid,
+        ))
+        _, current_player, current_painting = self.bot.observed_entities
+        self.assertEqual(angles(current_player), (-24.25, -93.5, 250.25))
+        self.assertEqual(angles(current_painting), (None, None, 90))
+        self.assertEqual((angles(seen[0]), seen[0].entity.position), ((None, None, 90), painting.position))
+        self.assertEqual(seen[1].pitch, -24.25)
+        self.assertEqual(seen[1].yaw, float("inf"))
+        self.assertTrue(isnan(seen[1].head_yaw))
+        self.assertEqual(lifecycle, [])
+
+        replacement = b.AddItemActorPacket(id=108, runtime_id=8)
+        await self.deliver(b.RemoveActorPacket(entity_id=108), self.delta(rot_x=64), replacement)
+        current = next(state for state in self.bot.observed_entities if state.runtime_id == 8)
+        self.assertEqual((current.actor_type, angles(current)), ("minecraft:item", (None, None, None)))
+        self.assertEqual(tuple(angles(state) for state in (actor, player, painting)),
+                         ((-3.5, 400, 106), (None, -93.5, 250.25), (None, None, None)))
+        with self.assertRaises(FrozenInstanceError):
+            actor.yaw = 0
+        before_end = self.bot.observed_entities
+        await self.deliver(b.DisconnectPacket(), self.delta(rot_y=64))
+        self.assertEqual(self.bot.observed_entities, before_end)
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(self.wire.sent, sent_before)
+        await self.bot.close()
+        await self.join(replacement)
+        fresh, = self.bot.observed_entities
+        self.assertEqual(angles(fresh), (None, None, None))
 
     async def test_reentrant_subscription_changes_apply_to_the_next_packet(self):
         await self.join(self.actor())

@@ -108,6 +108,9 @@ class EntityState:
 
     ``trade_tier`` and ``trade_experience`` hold the latest valid metadata for
     this visible villager instance. Each is ``None`` until observed.
+
+    ``pitch``, ``yaw``, and ``head_yaw`` hold the last observed angle in
+    degrees on each axis. Each is ``None`` until observed for this instance.
     """
 
     entity_id: int
@@ -134,6 +137,9 @@ class EntityState:
     sitting: bool | None = None
     trade_tier: int | None = None
     trade_experience: int | None = None
+    pitch: float | None = None
+    yaw: float | None = None
+    head_yaw: float | None = None
 
     @property
     def visible_effect_ids(self) -> tuple[int, ...] | None:
@@ -535,6 +541,17 @@ def _adult_cursor_pose(body: _CursorBody, actor_type: str, binding) -> bool:
 def _actor_angle(value: int) -> float:
     # Packed actor angles are unsigned fractions of a turn.
     return (int(value) & 255) * 360 / 256
+
+
+def _last_angle(reported: float | None, previous: float | None = None) -> float | None:
+    return reported if reported is not None and math.isfinite(reported) else previous
+
+
+def _float_angles(packet, head_field: str) -> tuple[float | None, float | None, float | None]:
+    rotation = getattr(packet, "rot", None)
+    return tuple(None if angle is None else float(angle) for angle in (
+        getattr(rotation, "x", None), getattr(rotation, "y", None), getattr(packet, head_field, None),
+    ))
 
 
 def _player_rotation(packet) -> _PlayerRotation | None:
@@ -1669,9 +1686,10 @@ class Entities:
             self._forget_entity_observers(self._sleep_observers, runtime_id)
             self._forget_entity_observers(self._shield_block_observers, runtime_id)
             self._shield_block_asserted.discard(runtime_id)
-            if not new_instance and (state.attributes or state.status_effects or state.visible_effects_value is not None):
+            if not new_instance:
                 # A conflicting roster identity must not inherit the previous actor's reports.
-                state = replace(state, attributes=(), status_effects=(), visible_effects_value=None)
+                state = replace(state, attributes=(), status_effects=(), visible_effects_value=None,
+                                pitch=None, yaw=None, head_yaw=None)
         if lifecycle_events is not None and new_instance:
             outgoing = self._by_runtime.get(runtime_id)
             if outgoing is not None:
@@ -1865,10 +1883,14 @@ class Entities:
             riding_block = getattr(player, "passenger_of_block_data", None) is not None
             if not riding_block and not _unsupported_view_pose(words, b):
                 feet = position, self._unresolved_ride_epoch
+            pitch, yaw, head_yaw = map(_last_angle, _float_angles(player, "y_head_rot")) if identity_matches else (
+                None, None, None,
+            )
             self._record(EntityState(
                 listed_id, runtime_id, _PLAYER, position, name=str(player.name), gliding=gliding, sneaking=sneaking,
                 sleeping=sleeping,
                 visible_effects_value=_visible_effects_value(metadata, b) if identity_matches else None,
+                pitch=pitch, yaw=yaw, head_yaw=head_yaw,
             ), player_uuid=player_uuid, player_feet=feet,
                 unlisted_entity_id=entity_id if entity_id and not listed_id else None,
                 identity_matches=identity_matches, lifecycle_events=lifecycle_events)
@@ -2029,6 +2051,7 @@ class Entities:
                 attributes[name] = EntityAttribute(
                     name, float(attribute.min_value), float(attribute.current_value), float(attribute.max_value),
                 )
+            pitch, yaw, head_yaw = map(_last_angle, _float_angles(actor, "y_head_rotation"))
             state = EntityState(
                 int(actor.entity_id), runtime_id, actor.actor_type,
                 (float(actor.pos.x), float(actor.pos.y), float(actor.pos.z)),
@@ -2043,6 +2066,7 @@ class Entities:
                 sitting=_wolf_sitting(actor.data.data, b) if actor.actor_type == _WOLF else None,
                 trade_tier=trade_tier,
                 trade_experience=trade_experience,
+                pitch=pitch, yaw=yaw, head_yaw=head_yaw,
             )
             if (not startup and self._attached_firework_observers and self._own_entity_id
                     and runtime_id != self._own_runtime_id and state.firework_attached_entity_id == self._own_entity_id):
@@ -2158,7 +2182,9 @@ class Entities:
             state = self._by_runtime.get(runtime_id)
             if state is not None and state.actor_type == "minecraft:player":
                 x, y, z = position = (float(move.pos.x), float(move.pos.y), float(move.pos.z))
-                state = replace(state, position=position)
+                pitch, yaw, head_yaw = angles = _float_angles(move, "y_head_rot")
+                state = replace(state, position=position, pitch=_last_angle(pitch, state.pitch),
+                                yaw=_last_angle(yaw, state.yaw), head_yaw=_last_angle(head_yaw, state.head_yaw))
                 self._by_runtime[runtime_id] = state
                 view = self._player_views.get(runtime_id)
                 unsupported = view is not None and (view.riding_block or _unsupported_view_pose(view.flags, b))
@@ -2176,7 +2202,7 @@ class Entities:
                     self._player_views[runtime_id] = replace(
                         view, rotation=rotation, ordinary_move=ordinary_move,
                     )
-                self._observe_movement(state, move, packet_id)
+                self._observe_movement(state, angles, bool(move.on_ground))
         elif packet_id == b.TakeItemActorPacket.ID:
             packet = self.packets.protocol.decode(raw)
             runtime_id, collector = int(packet.item_id), int(packet.actor_id)
@@ -2232,16 +2258,20 @@ class Entities:
                                                    and state.entity_id not in self._rides)
                     elif all(value is not None for value in axes):
                         instance.feet_known = state.entity_id not in self._rides
+            pitch, yaw, head_yaw = angles = tuple(
+                None if angle is None else _actor_angle(angle)
+                for angle in (getattr(move, "rot_x", None), getattr(move, "rot_y", None), getattr(move, "rot_y_head", None))
+            )
             rotation = state.boat_rotation
             if rotation is not None:
-                rotation = tuple(
-                    old if value is None else _actor_angle(value)
-                    for old, value in zip(rotation, (move.rot_x, move.rot_y))
-                )
-            state = replace(state, position=position, boat_rotation=rotation)
+                rotation = _last_angle(pitch, rotation[0]), _last_angle(yaw, rotation[1])
+            state = replace(state, position=position, boat_rotation=rotation, pitch=_last_angle(pitch, state.pitch),
+                            yaw=_last_angle(yaw, state.yaw), head_yaw=_last_angle(head_yaw, state.head_yaw))
             self._by_runtime[runtime_id] = state
             self._player_feet_by_runtime.pop(runtime_id, None)
-            self._observe_movement(state, move, packet_id)
+            on_ground = (bool(getattr(move, "header", 0) & 1) if packet_id == b.MoveActorAbsolutePacket.ID
+                         else bool(getattr(move, "is_on_ground", False)))
+            self._observe_movement(state, angles, on_ground)
 
         # Other packet observers may already have changed the subscriptions.
         if lifecycle_events and not self._closed:
@@ -2581,7 +2611,9 @@ class Entities:
             if not waiters and self._movement_waiters.get(runtime_id) is waiters:
                 del self._movement_waiters[runtime_id]
 
-    def _observe_movement(self, state: EntityState, move, packet_id: int) -> None:
+    def _observe_movement(
+        self, state: EntityState, angles: tuple[float | None, float | None, float | None], on_ground: bool,
+    ) -> None:
         # Predicates can change subscriptions while matching this packet.
         observers = ()
         if self._movement_observers and state.runtime_id != self._own_runtime_id:
@@ -2590,18 +2622,7 @@ class Entities:
         if not observers or self._closed:
             return
 
-        b = self.packets.protocol.binding
-        if packet_id == b.MovePlayerPacket.ID:
-            rotation = move.rot
-            pitch, yaw, head_yaw = float(rotation.x), float(rotation.y), float(move.y_head_rot)
-            on_ground = bool(move.on_ground)
-        else:
-            pitch, yaw, head_yaw = (
-                None if angle is None else _actor_angle(angle)
-                for angle in (move.rot_x, move.rot_y, move.rot_y_head)
-            )
-            on_ground = bool(move.header & 1) if packet_id == b.MoveActorAbsolutePacket.ID else bool(move.is_on_ground)
-        event = EntityMovementUpdate(state, pitch, yaw, head_yaw, on_ground)
+        event = EntityMovementUpdate(state, *angles, on_ground)
         self._notify_entity_observers(observers, event, state.runtime_id, "entity movement observer failed")
 
     def _match_movement_waiters(self, state: EntityState) -> None:

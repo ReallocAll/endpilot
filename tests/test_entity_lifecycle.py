@@ -276,7 +276,7 @@ class EntityLifecycleTests(unittest.IsolatedAsyncioTestCase):
             ("entered", "spawn_packet", "minecraft:painting"),
         ])
         actor, remote, drop, artwork = [event.entity for event, _ in seen]
-        self.assertEqual(actor, EntityState(108, 8, "minecraft:zombie", (1.5, 100, 2.5)))
+        self.assertEqual(actor, EntityState(108, 8, "minecraft:zombie", (1.5, 100, 2.5), pitch=0, yaw=0, head_yaw=0))
         self.assertEqual((remote.entity_id, remote.runtime_id, remote.name, remote.position),
                          (0x1122334455667788, 1, "FixtureActor", (8.5, 220, 8.5)))
         self.assertEqual(drop, EntityState(109, 9, "minecraft:item", (2, 3, 4), "minecraft:diamond", 2, 5))
@@ -310,9 +310,9 @@ class EntityLifecycleTests(unittest.IsolatedAsyncioTestCase):
             player,
             self.actor(entity_id=208),
         )
-        entered = EntityState(108, 8, "minecraft:player", (0, 0, 0), name="Peer")
+        entered = EntityState(108, 8, "minecraft:player", (0, 0, 0), name="Peer", pitch=0, yaw=0, head_yaw=0)
         moved = replace(entered, position=(2, 72, 5))
-        replacement = EntityState(208, 8, "minecraft:zombie", (1.5, 100, 2.5))
+        replacement = EntityState(208, 8, "minecraft:zombie", (1.5, 100, 2.5), pitch=0, yaw=0, head_yaw=0)
         self.assertEqual(seen, [
             (EntityLifecycleEvent(kind="entered", entity=entered, reason="spawn_packet"), (entered,)),
             (EntityLifecycleEvent(kind="left", entity=moved, reason="remove_actor"), ()),
@@ -339,7 +339,8 @@ class EntityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         drop = EntityState(109, 9, "minecraft:item", (2, 3, 4), "#5", 2, 5)
         self.assertEqual(seen, [
             EntityLifecycleEvent(kind="entered", entity=drop, reason="spawn_packet"),
-            EntityLifecycleEvent(kind="left", entity=replace(drop, position=(5, 6, 7)), reason="pickup"),
+            EntityLifecycleEvent(kind="left", entity=replace(drop, position=(5, 6, 7), pitch=0, yaw=0, head_yaw=0),
+                                 reason="pickup"),
         ])
         self.assertEqual(self.bot.observed_entities, ())
 
@@ -384,12 +385,12 @@ class EntityLifecycleTests(unittest.IsolatedAsyncioTestCase):
             lambda event: seen.append((event, self.bot.observed_entities)),
         )
         await self.deliver(self.roster_add(uuid, 108), self.player(uuid, 8, 108), self.actor(17, 7))
-        remote = EntityState(108, 8, "minecraft:player", (0, 0, 0), name="Peer")
+        remote = EntityState(108, 8, "minecraft:player", (0, 0, 0), name="Peer", pitch=0, yaw=0, head_yaw=0)
         entered = EntityLifecycleEvent(kind="entered", entity=remote, reason="spawn_packet")
         self.assertEqual(seen, [(entered, (remote,))])
 
         await self.deliver(self.roster_add(uuid, 17))
-        projected = replace(remote, entity_id=17)
+        projected = replace(remote, entity_id=17, pitch=None, yaw=None, head_yaw=None)
         self.assertEqual([state for state in self.bot.observed_entities if state.runtime_id == 8], [projected])
         self.assertEqual(seen, [(entered, (remote,))])
 
@@ -417,7 +418,7 @@ class EntityLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.bot.subscribe_vehicle_links(register_on_link_cleanup)
         await self.deliver(b.ChangeDimensionPacket(dimension_id=1), self.actor(208))
-        reentered = EntityState(208, 8, "minecraft:zombie", (1.5, 100, 2.5))
+        reentered = EntityState(208, 8, "minecraft:zombie", (1.5, 100, 2.5), pitch=0, yaw=0, head_yaw=0)
         next_event = EntityLifecycleEvent(kind="entered", entity=reentered, reason="spawn_packet")
         self.assertEqual(seen[:-1], [
             (EntityLifecycleEvent(kind="left", entity=state, reason="dimension_changed"), ())

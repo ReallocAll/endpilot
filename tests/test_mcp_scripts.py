@@ -348,7 +348,8 @@ async def main(bot):
     async def test_world_time_and_entity_properties_are_projected_as_snapshots(self):
         clocks = (WorldClock(1, "minecraft:overworld", 120_001, False),)
         world_time = WorldTime(daylight_ticks=48_123, clocks=clocks)
-        entities = (EntityState(1, 2, "minecraft:sheep", (0, 0, 0), visible_effects_value=18 | (6 << 7)),
+        entities = (EntityState(1, 2, "minecraft:sheep", (0, 0, 0), visible_effects_value=18 | (6 << 7),
+                                pitch=-12.25, yaw=0.0, head_yaw=137.75),
                     EntityState(3, 4, "minecraft:sheep", (1, 0, 0), visible_effects_value=0),
                     EntityState(5, 6, "minecraft:villager_v2", (2, 0, 0), trade_tier=1, trade_experience=10),
                     EntityState(7, 8, "minecraft:villager_v2", (3, 0, 0), trade_tier=0))
@@ -362,12 +363,14 @@ async def main(bot):
     entities = bot.observed_entities
     return [time.daytime, time.day, time.observed_moon_phase,
             [entity.visible_effect_ids for entity in entities],
-            [[entity.trade_tier, entity.trade_experience] for entity in entities]]
+            [[entity.trade_tier, entity.trade_experience] for entity in entities],
+            [[entity.pitch, entity.yaw, entity.head_yaw] for entity in entities]]
 """)
             report = await self.completed(run)
         self.assertEqual(report["state"], "succeeded", report)
         self.assertEqual(report["result"], [
             123, 2, 5, [[9, 3], [], None, None], [[None, None], [None, None], [1, 10], [0, None]],
+            [[-12.25, 0.0, 137.75], [None, None, None], [None, None, None], [None, None, None]],
         ])
 
     async def test_ability_speeds_are_projected_in_read_and_wait_snapshots(self):

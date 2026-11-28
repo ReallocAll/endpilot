@@ -275,6 +275,13 @@ joined connection ends.
 
 ## Observe remote entity movement
 
+Each `EntityState` in `bot.observed_entities` holds the latest reported
+`pitch`, `yaw`, and `head_yaw` in degrees for that actor instance. Each angle
+is `None` until a spawn or movement packet supplies it. Omitted and non-finite
+values leave the previous observation for that axis in place. Look-only
+movement can update the angles while the position holds. The query sends no
+packets, and previously returned snapshots are immutable.
+
 `bot.subscribe_entity_movement(callback)` delivers one immutable
 `EntityMovementUpdate` per received `MovePlayer`, `MoveActorAbsolute`, or
 `MoveActorDelta` applied to a visible remote entity, including look-only and
@@ -283,8 +290,8 @@ or actors outside the cache produce no updates.
 
 The `entity` snapshot reflects the cache after applying the packet. Its
 `position` uses the cache's packet coordinate reference, with omitted delta
-axes carried forward from the previous snapshot. `pitch`, `yaw`, and
-`head_yaw` hold the angles reported in that packet in degrees. Player angles
+axes carried forward from the previous snapshot. The update's `pitch`, `yaw`,
+and `head_yaw` hold the angles reported in that packet in degrees. Player angles
 retain their reported values, even when head and body yaw differ. Actor angles
 use units of `360 / 256` degrees, and a delta packet's omitted angles are
 `None`. `on_ground` is the packet's ground flag.
