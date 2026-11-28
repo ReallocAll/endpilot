@@ -1667,10 +1667,9 @@ class Blocks:
         if state.name != "minecraft:pale_moss_carpet":
             return False
         properties = _vanilla_state_properties(state.name, block.runtime_id, hashed=self.hashed_runtime_ids)
-        return (properties["upper_block_bit"] == 0
-                and properties["pale_moss_carpet_side_north"] in ("none", "short")
-                and all(properties[f"pale_moss_carpet_side_{side}"] == "none"
-                        for side in ("east", "south", "west")))
+        sides = tuple(properties[f"pale_moss_carpet_side_{side}"]
+                      for side in ("north", "east", "south", "west"))
+        return properties["upper_block_bit"] == 0 and "tall" not in sides and sides.count("short") <= 1
 
     def _carpet_walk_stance(self, cell: tuple[int, int, int]) -> bool | None:
         """Require dry, calibrated full-block footing and two clear body layers."""

@@ -423,6 +423,18 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.stream.sent, [])
                 self.set_block(cell, ids[restore], layer=layer)
 
+    def test_plans_onto_pale_moss_carpet_with_one_short_side_in_each_direction(self):
+        self.blocks._player_game_type = "SURVIVAL"
+        self.movement._gap_jump_allowed = lambda: True
+        self.prepare_vegetation_corridor(hashed=True)
+        self.set_position(0.5, 0.5, on_ground=True)
+        goal = FootGoal((1, 100, 0))
+        for state in (0x06C8B089, 0xD1E737D5, 0x1C79A2F5, 0xCEDCCB61):
+            with self.subTest(state=state):
+                self.set_block(goal.position, state)
+                self.assertEqual(self.bot.plan_navigation(goal).status, "found")
+        self.assertEqual(self.stream.sent, [])
+
     async def test_flat_navigation_plans_and_walks_through_passable_vegetation(self):
         path = ((0, 100, 0), (1, 100, 0), (2, 100, 0))
         goal = FootGoal(path[-1])
