@@ -108,6 +108,13 @@ the server. The `kind` filter matches both plain text and text objects for the
 selected title kind. `times` events carry `fade_in_ticks`, `stay_ticks`, and
 `fade_out_ticks`. Text and timing fields that do not apply are `None`.
 
+Call `event.resolve_text(locale="fr_FR", resource_pack_index=index)` to
+resolve the event's text. Keep `index = bot.resource_pack_index` from the
+session that received the event. Plain text is returned verbatim, including
+an empty string. Text objects use the requested locale and the supplied
+index. A missing translation, unsupported node, or non-text event returns
+`None`. Resolution preserves `text` and `filtered_text` and sends no packets.
+
 Run `python examples/observe_title.py URL --protocol 2225 --kind subtitle`
 against a compatible offline server, then send `title Knight subtitle Example`
 from the server console after the example prints `title_watcher_ready`.

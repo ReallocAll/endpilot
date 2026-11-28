@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from bedrock_protocol import DecodeError
 
-from endpilot import Bot, RecoverableError, TextPacketType, TitleEvent
+from endpilot import Bot, RecoverableError, ResourcePackIndex, TextPacketType, TitleEvent
 from endpilot.compression import PacketConnection
 from endpilot.login import JoinSession
 from endpilot.protocol import RawPacket, write_batch
@@ -90,7 +90,8 @@ class TitleTests(unittest.IsolatedAsyncioTestCase):
             self.packet(type=self.title_type.RESET),
         )
 
-        self.assertEqual(await asyncio.gather(*waits), [
+        events = await asyncio.gather(*waits)
+        self.assertEqual(events, [
             TitleEvent("subtitle", text="§aSide"),
             TitleEvent("title", text="Top"),
             TitleEvent("subtitle", text="§aSide"),
@@ -99,12 +100,14 @@ class TitleTests(unittest.IsolatedAsyncioTestCase):
             TitleEvent("clear"),
             TitleEvent("reset"),
         ])
+        self.assertEqual([event.resolve_text(locale="en_US", resource_pack_index=None) for event in events],
+                         ["§aSide", "Top", "§aSide", "", None, None, None])
 
     async def test_preserves_each_text_object_and_filtered_text(self):
         waits = [asyncio.create_task(self.bot.wait_for_title(kind=kind, timeout=1))
                  for kind in ("title", "subtitle", "actionbar")]
         await asyncio.sleep(0)
-        title = '{"rawtext":[{"translate":"title.test"}]}'
+        title = '{"rawtext":[{"translate":"title.test","with":["Alice","snow"]}]}'
         subtitle = '{"rawtext":[{"text":"subtitle"}]}'
         actionbar = '{"rawtext":[{"text":"status"}]}'
         filtered = '{"rawtext":[{"text":"filtered"}]}'
@@ -114,11 +117,28 @@ class TitleTests(unittest.IsolatedAsyncioTestCase):
             self.packet(type=self.title_type.ACTIONBAR_TEXT_OBJECT, title_text=actionbar),
         )
 
-        self.assertEqual(await asyncio.gather(*waits), [
+        events = await asyncio.gather(*waits)
+        self.assertEqual(events, [
             TitleEvent("title", text=title, filtered_text=filtered, text_object=True),
             TitleEvent("subtitle", text=subtitle, text_object=True),
             TitleEvent("actionbar", text=actionbar, text_object=True),
         ])
+        index = ResourcePackIndex((), {"texts/fr_FR.lang": "title.test=%s reçoit %s\n".encode()})
+        self.assertEqual(events[0].resolve_text(locale="fr_FR", resource_pack_index=index), "Alice reçoit snow")
+        self.assertIsNone(events[0].resolve_text(locale="en_US", resource_pack_index=index))
+        self.assertIsNone(events[0].resolve_text(locale="fr_FR", resource_pack_index=None))
+        self.assertEqual((events[0].text, events[0].filtered_text), (title, filtered))
+        self.assertEqual([event.resolve_text(locale="en_US", resource_pack_index=None) for event in events[1:]],
+                         ["subtitle", "status"])
+
+    def test_unresolved_title_objects_require_the_entire_text(self):
+        index = ResourcePackIndex((), {"texts/en_US.lang": b"title.known=known\n"})
+        for raw in ('{"rawtext":[{"text":"prefix"},{"translate":"title.missing"}]}',
+                    '{"rawtext":[{"text":"prefix"},{"selector":"@s"}]}',
+                    '{"rawtext":'):
+            with self.subTest(raw=raw):
+                event = TitleEvent("actionbar", text=raw, text_object=True)
+                self.assertIsNone(event.resolve_text(locale="en_US", resource_pack_index=index))
 
     async def test_timeout_ignores_other_kinds_and_past_packets(self):
         pending = asyncio.create_task(self.bot.wait_for_title(kind="title", timeout=0.05))

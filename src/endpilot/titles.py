@@ -8,9 +8,11 @@ from typing import TYPE_CHECKING, Literal
 
 from bedrock_protocol import DecodeError, SetTitlePacket
 
+from .chat import _resolve_rawtext
 from .compression import PacketConnection
 from .protocol import RawPacket
 from .recoverable_error import RecoverableError
+from .resource_packs import ResourcePackIndex
 
 if TYPE_CHECKING:
     from .login import _SessionEndState
@@ -46,6 +48,14 @@ class TitleEvent:
     fade_in_ticks: int | None = None
     stay_ticks: int | None = None
     fade_out_ticks: int | None = None
+
+    def resolve_text(self, *, locale: str, resource_pack_index: ResourcePackIndex | None) -> str | None:
+        """Resolve title text with the effective resource-pack index from the receiving session."""
+        if self.kind not in ("title", "subtitle", "actionbar") or self.text is None:
+            return None
+        if self.text_object:
+            return _resolve_rawtext(self.text, locale, resource_pack_index)
+        return self.text
 
 
 def _title_event(packet: SetTitlePacket) -> TitleEvent | None:
