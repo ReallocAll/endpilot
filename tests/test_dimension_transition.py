@@ -16,11 +16,12 @@ class DimensionTransitionTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(self.clock.patch_scheduler())
         self.addAsyncCleanup(self.bot.close)
 
-    async def join(self, *early, timeline=None):
+    async def join(self, *early, timeline=None, dimension=0):
         b = self.b
         self.wire = Wire(self.bot.protocol)
         self.wire.push(b.NetworkSettingsPacket(compression_algorithm=b.PacketCompressionAlgorithm.NONE))
-        self.push(b.StartGamePacket(runtime_id=7, entity_id=4, block_network_ids_are_hashes=True),
+        self.push(b.StartGamePacket(runtime_id=7, entity_id=4, block_network_ids_are_hashes=True,
+                                   settings=b.LevelSettings(spawn_settings=b.SpawnSettings(dimension=dimension))),
                   *early, b.PlayStatusPacket(status=b.PlayStatus.PLAYER_SPAWN))
         with patch("endpilot.transport.nethernet.connect", return_value=self.wire):
             await self.bot.join_nethernet("http://127.0.0.1:19132", timeline=timeline)
@@ -28,9 +29,13 @@ class DimensionTransitionTests(unittest.IsolatedAsyncioTestCase):
     def push(self, *packets):
         self.wire.incoming.put_nowait(write_batch(self.bot.protocol.encode(packet) for packet in packets))
 
-    def change(self, dimension, screen_id, *, y=70):
+    def change(self, dimension, screen_id, *, y=70, respawn=False):
         return self.b.ChangeDimensionPacket(dimension_id=dimension, pos=self.b.Vec3(x=10, y=y, z=8),
-                                            loading_screen_id=screen_id)
+                                            loading_screen_id=screen_id, respawn=respawn)
+
+    def credits(self, player_id=7, *, finished=False):
+        state = self.b.ShowCreditsPacket.CreditsState
+        return self.b.ShowCreditsPacket(player_id=player_id, credits_state=state.FINISHED if finished else state.START)
 
     def ack(self, runtime_id=7):
         return self.b.PlayerActionPacket(runtime_id=runtime_id, action=self.b.PlayerActionType.CHANGE_DIMENSION_ACK,
@@ -201,3 +206,92 @@ class DimensionTransitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.screens(), [("START_LOADING_SCREEN", None), ("END_LOADING_SCREEN", None)])
         with self.assertRaises(TimeoutError):
             await self.bot.wait_for_dimension_change(timeout=0)
+
+    async def test_end_credits_finish_once_and_wait_for_the_real_return_exchange(self):
+        b = self.b
+        await self.join()
+        before = len(self.wire.sent)
+        await self.observe(self.credits())
+        self.assertEqual(len(self.wire.sent), before)
+        await self.observe(self.change(2, 0))
+        during_entry = len(self.wire.sent)
+        await self.observe(self.credits())
+        self.assertEqual(len(self.wire.sent), during_entry)
+        await self.observe(self.ack())
+        await self.observe(self.moved(24, reset_position=2))
+
+        future = asyncio.create_task(self.bot.wait_for_dimension_change(timeout=1))
+        await asyncio.sleep(0)
+        before = len(self.wire.sent)
+        await self.observe(self.credits())
+        await self.observe(self.credits())
+        self.assertEqual(self.wire.sent[before:], [self.credits(finished=True)])
+        self.assertIsNone(self.bot.active_dimension_change)
+        self.assertFalse(future.done())
+        self.assertEqual(self.bot.dimension_bounds.dimension_id, 2)
+        self.assertEqual(self.bot.position, (24, 72, 8))
+
+        await self.observe(b.RespawnPacket(state=b.PlayerRespawnState.SEARCHING_FOR_SPAWN, runtime_id=0))
+        await self.observe(self.change(0, 1, respawn=True))
+        await self.observe(self.credits())
+        await self.observe(self.ack(17))
+        self.assertFalse(future.done())
+        await self.observe(self.ack())
+        self.assertEqual(await future, DimensionTransition(0, (10, 70, 8), True, 1))
+        await self.observe(b.RespawnPacket(pos=b.Vec3(x=8, y=71.62, z=8), state=b.PlayerRespawnState.READY_TO_SPAWN,
+                                           runtime_id=0))
+        await self.observe(self.moved(8, reset_position=2))
+        await self.observe(self.credits())
+        sent = self.wire.sent[before:]
+        self.assertEqual([type(packet) for packet in sent], [
+            b.ShowCreditsPacket, b.ServerboundLoadingScreenPacket,
+            b.ServerboundLoadingScreenPacket, b.PlayerActionPacket,
+        ])
+        self.assertEqual(sent[0], self.credits(finished=True))
+        self.assertEqual(self.screens()[-2:], [("START_LOADING_SCREEN", 1), ("END_LOADING_SCREEN", 1)])
+        self.assertEqual(sent[-1], self.ack())
+
+    async def test_end_entry_rearms_credits_without_rearming_a_same_dimension_update(self):
+        await self.join(dimension=2)
+        await self.observe(self.credits())
+        await self.observe(self.change(2, None))
+        await self.observe(self.ack())
+        await self.observe(self.credits())
+        self.assertEqual([p for p in self.wire.sent if isinstance(p, self.b.ShowCreditsPacket)],
+                         [self.credits(finished=True)])
+        await self.observe(self.change(0, None))
+        await self.observe(self.ack())
+        await self.observe(self.change(2, None))
+        await self.observe(self.ack())
+        await self.observe(self.credits())
+        self.assertEqual([p for p in self.wire.sent if isinstance(p, self.b.ShowCreditsPacket)],
+                         [self.credits(finished=True)] * 2)
+
+    async def test_end_credits_ignore_pre_spawn_foreign_finished_and_closed_session_packets(self):
+        await self.join(self.credits(), dimension=2)
+        self.assertFalse(any(isinstance(p, self.b.ShowCreditsPacket) for p in self.wire.sent))
+        before = len(self.wire.sent)
+        await self.observe(self.credits(17))
+        await self.observe(self.credits(finished=True))
+        self.assertEqual(len(self.wire.sent), before)
+        await self.observe(self.credits())
+        self.assertEqual(self.wire.sent[before:], [self.credits(finished=True)])
+        session, original = self.bot._session, self.wire
+        await self.observe(self.b.DisconnectPacket())
+        await self.bot.close()
+        before = len(original.sent)
+        await session._receive_dimension_packet(self.bot.protocol.encode(self.credits()))
+        self.assertEqual(len(original.sent), before)
+        await self.join(dimension=2)
+        await self.observe(self.credits())
+        self.assertEqual([p for p in self.wire.sent if isinstance(p, self.b.ShowCreditsPacket)],
+                         [self.credits(finished=True)])
+
+    async def test_legacy_protocol_keeps_credits_unanswered(self):
+        self.bot = Bot("LegacyDimensionTraveler", protocol=2193)
+        self.addAsyncCleanup(self.bot.close)
+        self.b = self.bot.protocol.binding
+        await self.join(dimension=2)
+        before = len(self.wire.sent)
+        await self.observe(self.credits())
+        self.assertEqual(len(self.wire.sent), before)

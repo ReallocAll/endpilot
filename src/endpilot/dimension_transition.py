@@ -4,6 +4,9 @@ import asyncio
 from dataclasses import dataclass
 
 
+_END_DIMENSION = 2
+
+
 @dataclass(frozen=True, slots=True)
 class DimensionTransition:
     dimension_id: int
@@ -18,11 +21,15 @@ class _DimensionTransitions:
         self._binding = binding = packets.protocol.binding
         self.packet_ids = (binding.ChangeDimensionPacket.ID, binding.PlayerActionPacket.ID,
                            binding.DisconnectPacket.ID)
+        self._credits_packet_id = binding.ShowCreditsPacket.ID if packets.protocol.number == 2225 else None
+        if self._credits_packet_id is not None:
+            self.packet_ids += (self._credits_packet_id,)
+        self._finished_end_credits = False
         self.active: DimensionTransition | None = None
         self._closed = False
         self._waiters: set[asyncio.Future[DimensionTransition]] = set()
 
-    async def receive(self, raw, player_id):
+    async def receive(self, raw, player_id, *, dimension_id, online):
         if self._closed:
             return
         b = self._binding
@@ -35,8 +42,18 @@ class _DimensionTransitions:
                 int(packet.dimension_id), (float(pos.x), float(pos.y), float(pos.z)),
                 bool(packet.respawn), packet.loading_screen_id,
             )
+            if transition.dimension_id == _END_DIMENSION and dimension_id != _END_DIMENSION:
+                self._finished_end_credits = False
             self.active = transition
             await self._send_screen(b.ServerboundLoadingScreenPacketType.START_LOADING_SCREEN, transition)
+        elif (raw.packet_id == self._credits_packet_id and online and dimension_id == _END_DIMENSION
+              and self.active is None and not self._finished_end_credits):
+            packet = self._packets.protocol.decode(raw)
+            if packet.player_id == player_id and packet.credits_state == b.ShowCreditsPacket.CreditsState.START:
+                self._finished_end_credits = True
+                await self._packets.send(b.ShowCreditsPacket(
+                    player_id=player_id, credits_state=b.ShowCreditsPacket.CreditsState.FINISHED,
+                ))
         elif self.active is not None and raw.packet_id == b.PlayerActionPacket.ID:
             packet = self._packets.protocol.decode(raw)
             if packet.runtime_id != player_id or packet.action != b.PlayerActionType.CHANGE_DIMENSION_ACK:

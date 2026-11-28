@@ -332,6 +332,10 @@ for ordinary transfers and a fresh position update for death returns.
 Scheduled input pauses during the exchange. Explicit input submission raises
 `RuntimeError` if the exchange is still active when the action would send a frame.
 
+On protocol 2225, a headless player in the End automatically finishes its
+server-issued credits once per return. The usual dimension and position
+observations still follow the server's return exchange.
+
 ## Read the current dimension's Y range
 
 `bot.dimension_bounds` returns an immutable `DimensionBounds` snapshot with

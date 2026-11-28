@@ -231,7 +231,14 @@ class JoinSession:
 
     async def _receive_dimension_packet(self, raw):
         if self.player_id is not None and raw.packet_id in self._dimensions.packet_ids:
-            await self._dimensions.receive(raw, self.player_id)
+            await self._dimensions.receive(
+                raw, self.player_id, dimension_id=self.dimension_id,
+                online=self.spawned and self._end_state.result is None,
+            )
+            if raw.packet_id == self.packets.protocol.binding.ChangeDimensionPacket.ID:
+                transition = self._dimensions.active
+                if transition is not None:
+                    self.dimension_id = transition.dimension_id
 
     @classmethod
     async def _connect_address(
@@ -598,7 +605,6 @@ class JoinSession:
                 # Entities may be sent before PlayStatus spawn on reconnect.
                 self.entity_packets.append(raw)
                 if raw.packet_id == binding.ChangeDimensionPacket.ID and self.player_id is not None:
-                    self.dimension_id = self._dimensions.active.dimension_id
                     self.movement_packets.append(raw)
                     startup_dimension_change = True
                     self.bed_packets.append(raw)
