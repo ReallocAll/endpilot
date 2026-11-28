@@ -139,17 +139,22 @@ def air_metadata(packet, binding):
     }
 
 
-def swimming_metadata(packet, binding) -> bool | None:
-    """Read the swimming bit from the low actor flags, when present."""
+def _low_actor_flag(packet, binding, flag) -> bool | None:
     for entry in packet.packed_items.data:
         if entry.id == 0 and isinstance(entry.payload, binding.DataItemInt64Payload):
-            return bool(entry.payload.value & (1 << int(binding.ActorFlags.SWIMMING)))
+            return bool(entry.payload.value & (1 << int(flag)))
     return None
+
+
+def swimming_metadata(packet, binding) -> bool | None:
+    """Read the swimming bit from the low actor flags, when present."""
+    return _low_actor_flag(packet, binding, binding.ActorFlags.SWIMMING)
 
 
 class PlayerState:
     def __init__(self, packets, runtime_id: int, *, unique_id: int | None = None,
-                 auto_respawn: bool = False, initial_packets=(), replay_game_mode=None):
+                 auto_respawn: bool = False, initial_packets=(), replay_game_mode=None,
+                 glide_boost_tick: Callable[[], int | None] | None = None):
         self.packets = packets
         self.runtime_id = int(runtime_id)
         self.unique_id = unique_id
@@ -172,6 +177,8 @@ class PlayerState:
         self.experience_progress: float | None = None
         self._experience_observers: dict[object, Callable[[PlayerVitals], None]] = {}
         self._effects: dict[int, PlayerEffect] = {}
+        self._glide_boost_tick = None
+        self._glide_boost_timing: tuple[int, int] | None = None
         self._auto_respawn = False
         self._cycle: _RespawnCycle | None = None
         self._on_spawn: Callable[[Literal["initial", "respawn"]], None] | None = None
@@ -185,6 +192,7 @@ class PlayerState:
                 self._observe_game_mode(replay_game_mode(packet))
             else:
                 self._on_packet(packet)
+        self._glide_boost_tick = glide_boost_tick
         self._auto_respawn = auto_respawn
         self._unsubscribe = packets.subscribe_raw(self._on_packet)
         if self._auto_respawn and self._cycle is not None and self._cycle.ready is None:
@@ -319,29 +327,35 @@ class PlayerState:
         b = self.packets.protocol.binding
         if raw.packet_id == b.DisconnectPacket.ID:
             self._disconnected = True
+            self._glide_boost_timing = None
             for task in self._respawn_tasks:
                 task.cancel()
         elif raw.packet_id == b.ChangeDimensionPacket.ID:
             self._collision_size = (None, None)
+            self._glide_boost_timing = None
         elif raw.packet_id == b.ActorEventPacket.ID and self._on_spawn is not None:
             packet = self.packets.protocol.decode(raw)
             if packet.runtime_id == self.runtime_id:
                 if packet.event_id == b.ActorEvent.DEATH:
                     self._awaiting_spawn_alive = True
+                    self._glide_boost_timing = None
                 elif packet.event_id == b.ActorEvent.SPAWN_ALIVE and self._awaiting_spawn_alive:
                     self._awaiting_spawn_alive = False
+                    self._glide_boost_timing = None
                     self._on_spawn("respawn")
         elif raw.packet_id == b.RespawnPacket.ID:
             packet = self._local_respawn(raw)
             if packet is None:
                 return
             if packet.state == b.PlayerRespawnState.SEARCHING_FOR_SPAWN:
+                self._glide_boost_timing = None
                 if self._cycle is None or self._cycle.ready is not None:
                     self._collision_size = (None, None)
                     self._cycle = _RespawnCycle()
                     if self._auto_respawn:
                         asyncio.get_running_loop().call_soon(self._auto_request, self._cycle)
             elif packet.state == b.PlayerRespawnState.READY_TO_SPAWN:
+                self._glide_boost_timing = None
                 if self._cycle is not None and self._cycle.ready is None:
                     self._cycle.ready = raw
         elif raw.packet_id == b.SetHealthPacket.ID:
@@ -386,6 +400,17 @@ class PlayerState:
                 self.air_supply = air.get(b.ActorDataIDs.AIR_SUPPLY, self.air_supply)
                 self.air_supply_max = air.get(b.ActorDataIDs.AIR_SUPPLY_MAX, self.air_supply_max)
                 self._observe_collision_size(packet)
+                if (self._glide_boost_timing is not None
+                        and _low_actor_flag(packet, b, b.ActorFlags.GLIDING) is False):
+                    _, received_tick = self._glide_boost_timing
+                    self._glide_boost_timing = (0, received_tick)
+        elif self._glide_boost_tick is not None and raw.packet_id == b.MovementEffectPacket.ID:
+            if self._awaiting_spawn_alive or (self._cycle is not None and self._cycle.ready is None):
+                return
+            tick = self._glide_boost_tick()
+            if tick is not None and (boost := self._glide_boost_event(raw)) is not None:
+                duration = boost.duration_ticks
+                self._glide_boost_timing = (duration, tick) if duration >= 0 else None
         elif raw.packet_id == b.MobEffectPacket.ID:
             packet = self.packets.protocol.decode(raw)
             if packet.runtime_id == self.runtime_id:
@@ -515,20 +540,34 @@ class PlayerState:
         assert snapshot is not None
         return snapshot
 
-    async def wait_for_glide_boost(self, timeout: float | None = 15) -> GlideBoostEvent:
+    @property
+    def estimated_glide_boost_ticks_remaining(self) -> int | None:
+        if self._glide_boost_timing is None or self._glide_boost_tick is None:
+            return None
+        tick = self._glide_boost_tick()
+        if tick is None:
+            return None
+        duration, received_tick = self._glide_boost_timing
+        return max(0, duration - (tick - received_tick))
+
+    def _glide_boost_event(self, raw) -> GlideBoostEvent | None:
         protocol = self.packets.protocol
-        binding = protocol.binding
+        packet = protocol.decode(raw)
+        if (int(packet.runtime_id) == self.runtime_id
+                and packet.effect_type == protocol.binding.MovementEffectType.GLIDE_BOOST):
+            return GlideBoostEvent(self.runtime_id, int(packet.effect_duration), int(packet.tick))
+        return None
+
+    async def wait_for_glide_boost(self, timeout: float | None = 15) -> GlideBoostEvent:
         event = None
 
         def own_boost(raw):
             nonlocal event
-            packet = protocol.decode(raw)
-            if int(packet.runtime_id) != self.runtime_id or packet.effect_type != binding.MovementEffectType.GLIDE_BOOST:
-                return False
-            event = GlideBoostEvent(self.runtime_id, int(packet.effect_duration), int(packet.tick))
-            return True
+            event = self._glide_boost_event(raw)
+            return event is not None
 
-        await self._wait(binding.MovementEffectPacket.ID, timeout, own_boost, require_live_after_match=False)
+        await self._wait(self.packets.protocol.binding.MovementEffectPacket.ID, timeout, own_boost,
+                         require_live_after_match=False)
         assert event is not None
         return event
 
@@ -635,6 +674,7 @@ class PlayerState:
     def close(self) -> None:
         if not self._closed:
             self._closed = True
+            self._glide_boost_timing = None
             self._on_spawn = None
             self._end_experience_observation()
             self._unsubscribe()

@@ -568,10 +568,17 @@ class Bot:
             creative._apply(packet)
             return creative.game_mode
 
+        def glide_boost_tick() -> int | None:
+            if (session._dimensions.active is not None or session._end_state.result is not None
+                    or session.packets._reader_end_result()[0]):
+                return None
+            return session.clock.tick
+
         player_state = self._player_state = PlayerState(
             session.packets, session.player_id, unique_id=session.player_unique_id,
             auto_respawn=self._auto_respawn, initial_packets=session.player_state_packets,
             replay_game_mode=replay_game_mode,
+            glide_boost_tick=glide_boost_tick if session.spawned and session.packets.protocol.number == 2225 else None,
         )
         for raw in session.movement_packets:
             self._movement._on_packet(raw, startup=True)
@@ -3215,6 +3222,12 @@ class Bot:
         if self._player_state is None:
             raise RuntimeError("player has not joined")
         return await self._player_state.wait_for_abilities(timeout)
+
+    @property
+    def estimated_glide_boost_ticks_remaining(self) -> int | None:
+        """Estimate the latest local glide boost in executed client ticks (protocol 2225)."""
+        state = self._player_state
+        return None if state is None else state.estimated_glide_boost_ticks_remaining
 
     async def wait_for_glide_boost(self, *, timeout: float | None = 15) -> GlideBoostEvent:
         """Wait for the next glide boost reported by the server for this player."""

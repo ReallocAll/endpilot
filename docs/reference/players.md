@@ -524,6 +524,20 @@ Use `await bot.wait_for_glide_boost()` to observe the server's separate
 boost effect for this player. Rocket sightings and boost reports are
 independent observations.
 
+`bot.estimated_glide_boost_ticks_remaining` is a read-only estimate for the
+local player on protocol 2225. It subtracts the logical client ticks executed
+since receipt from the latest reported boost duration. A new report replaces
+the previous one. The estimate stays at `0` when the countdown runs out or a
+server update confirms the player stopped gliding. Starting another glide
+requires a fresh boost report for a new countdown.
+
+The value is `None` until a usable report arrives in the current world cycle
+and resets on dimension change, respawn, or disconnect. Reading it sends no
+packets. The estimate measures local elapsed ticks and cannot identify the
+server tick when the firework stops affecting motion. `wait_for_glide_boost`
+still waits for a future report and includes the server's last handled input
+tick in its event.
+
 ## Find a nearby or targeted entity
 
 `EntityState.position` keeps the latest packet's coordinate reference.
