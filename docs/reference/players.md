@@ -153,10 +153,14 @@ unsupported protocol raises `ValueError`. The lookup is available offline
 and sends no packets.
 
 The catalog covers measured default forms on BDS 1.26.66.1, including adult
-standing animals and ordinary monster spawns. The measured adult farmer and
-librarian use the `minecraft:villager_v2` key. A live entity's age, posture,
-variant or scale can give it a different box. Use live observations when an
-action depends on the current shape.
+standing animals and ordinary land, airborne, and aquatic spawns. The measured
+adult farmer and librarian use the `minecraft:villager_v2` key. A live entity's
+age, posture, variant or scale can give it a different box. Use live observations
+when an action depends on the current shape.
+
+The measured minecarts were placed on level straight rails. Watercraft were
+placed on source water. All tested boat and raft items use the `minecraft:boat`
+or `minecraft:chest_boat` actor key for these dimensions.
 
 ## Observe the server player list
 

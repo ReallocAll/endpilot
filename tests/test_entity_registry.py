@@ -37,6 +37,23 @@ class VanillaEntityDimensionsTests(unittest.TestCase):
         self.assertEqual((pig.width, pig.height), (.9, .9))
         self.assertEqual(vanilla_entity_dimensions()["minecraft:pig"], VanillaEntityDimensions(.9, .9))
 
+    def test_vehicle_dimensions_use_exact_actor_names(self):
+        dimensions = vanilla_entity_dimensions()
+        for name in ("boat", "chest_boat"):
+            self.assertEqual(dimensions[f"minecraft:{name}"], VanillaEntityDimensions(1.4, .455))
+        for name in ("minecart", "chest_minecart", "hopper_minecart"):
+            self.assertEqual(dimensions[f"minecraft:{name}"], VanillaEntityDimensions(.98, .7))
+        for name in ("oak_boat", "bamboo_raft", "bamboo_chest_raft", "tnt_minecart"):
+            self.assertIsNone(dimensions.get(f"minecraft:{name}"))
+
+    def test_measured_spawn_dimensions_and_unknown_forms(self):
+        dimensions = vanilla_entity_dimensions()
+        for name, expected in (("armor_stand", (0.5, 1.975)), ("cod", (0.6, 0.3)), ("ghast", (4.02, 4.0)),
+                               ("zombie_villager_v2", (0.6, 1.9))):
+            self.assertEqual(dimensions[f"minecraft:{name}"], VanillaEntityDimensions(*expected))
+        for name in ("zombie_villager", "fox", "strider", "wither_skeleton", "creaking"):
+            self.assertIsNone(dimensions.get(f"minecraft:{name}"))
+
     def test_other_protocols_and_nonintegers_are_rejected(self):
         for protocol in (2168, 2224, 2226, "2225", 2225.0, True, None):
             with self.subTest(protocol=protocol), self.assertRaisesRegex(ValueError, "unsupported vanilla entity dimensions"):
