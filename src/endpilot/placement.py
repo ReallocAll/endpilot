@@ -117,6 +117,21 @@ def _is_water_source(state: BlockStateObservation | None) -> bool:
     return type(depth) is int and depth == 0
 
 
+def _is_minecart_rail(state: BlockStateObservation) -> bool:
+    direction = state.properties.get("rail_direction")
+    if type(direction) is not int:
+        return False
+    if state.name == "minecraft:rail":
+        return 0 <= direction <= 9
+    if (state.name not in ("minecraft:golden_rail", "minecraft:activator_rail", "minecraft:detector_rail")
+        or not 0 <= direction <= 5):
+        return False
+    power = state.properties.get("rail_data_bit")
+    if type(power) is not int:
+        return False
+    return power == 0 or (power == 1 and state.name != "minecraft:detector_rail")
+
+
 async def _wait_for_placement[Result](
     submit: Coroutine[None, None, _PlacementReason | None],
     finished: asyncio.Future[_PlacementReason],
@@ -533,8 +548,7 @@ async def observe_entity_placement[Result: EntityPlacementResult](
                 variant = hull_variant
             click_pos = spawn_offset = (0.5, 0.875, 0.5)
         case "minecraft:minecart" | "minecraft:chest_minecart" | "minecraft:hopper_minecart":
-            direction = clicked.properties.get("rail_direction")
-            if clicked.name != "minecraft:rail" or type(direction) is not int or not 0 <= direction <= 5:
+            if not _is_minecart_rail(clicked):
                 return result("precondition_failed")
             actor_type = item_name
             click_pos = (0.5, 0.125, 0.5)

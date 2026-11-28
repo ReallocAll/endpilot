@@ -2320,7 +2320,7 @@ class Bot:
     ) -> EntityPlacementResult:
         """Place a supported held item with one click on observed terrain in Survival.
 
-        Plain, chest, and hopper minecarts use flat straight or ascending ordinary rails.
+        Plain, chest, and hopper minecarts use ordinary, powered, activator, or inactive detector rails.
         Report a matching new spawn and a one-item decrease in the selected slot
         when each observation arrives after submission.
         """

@@ -2,19 +2,23 @@ import asyncio
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
+
+from bedrock_protocol import nbt
 
 from endpilot import (
     BoatPlacementResult, Bot, EntityPlacementResult, ItemRegistrySnapshot, PlacementInventoryChange, PlacementResult,
     WaterBucketFillResult,
 )
-from endpilot.blocks import Blocks, HASHED_AIR_RUNTIME_ID
+from endpilot.block_data import lookup_vanilla_block_state
+from endpilot.blocks import BlockStateObservation, Blocks, HASHED_AIR_RUNTIME_ID
 from endpilot.compression import PacketConnection
 from endpilot.containers import Containers
 from endpilot.entities import Entities, EntitySpawn
 from endpilot.inventory import Inventory
 from endpilot.login import JoinSession
 from endpilot.protocol import write_batch
+from test_block_state_lookup import state as vanilla_state_tag
 from test_scheduled_input import Wire
 
 
@@ -859,6 +863,12 @@ class BoatPlacementTests(_EntityPlacementHarness):
 
 
 class EntityPlacementTests(_EntityPlacementHarness):
+    def rail_runtime_id(self, name, direction, power=None):
+        properties = {"rail_direction": nbt.IntTag(direction)}
+        if power is not None:
+            properties["rail_data_bit"] = nbt.ByteTag(power)
+        return lookup_vanilla_block_state(vanilla_state_tag(f"minecraft:{name}", properties))[1]
+
     async def arm_entity(self, *, surface, click_height):
         pending = await self.arm_click(self.bot.place_entity(SUPPORT, timeout=0.6))
         packet, = self.wire.sent
@@ -933,40 +943,83 @@ class EntityPlacementTests(_EntityPlacementHarness):
         await self.deliver(self.spawn(-61, position=position, actor_type=actor_type))
         self.assert_entity_placement_completed(await pending, EntitySpawn(-61, 61, actor_type, position))
 
-    async def test_each_minecart_on_ascending_rails_completes_from_the_initial_center_spawn(self):
+    async def test_each_minecart_on_supported_rail_states_completes_from_the_initial_center_spawn(self):
         x, y, z = SUPPORT
         center = (x + 0.5, y + 0.5, z + 0.5)
-        entity_id = -100
-        for direction, runtime_id in ((2, 2683460236), (3, 2621985413), (4, 2806409882), (5, 2744935059)):
+        states = [("rail", direction, None) for direction in range(10)]
+        states.extend((name, direction, power) for name in ("golden_rail", "activator_rail")
+                      for direction in range(6) for power in (0, 1))
+        states.extend(("detector_rail", direction, 0) for direction in range(6))
+        entity_id = -99
+        for name, direction, power in states:
+            runtime_id = self.rail_runtime_id(name, direction, power)
             for actor_type in ("minecraft:minecart", "minecraft:chest_minecart", "minecraft:hopper_minecart"):
-                with self.subTest(direction=direction, actor_type=actor_type):
+                entity_id -= 1
+                with self.subTest(name=name, direction=direction, power=power, actor_type=actor_type):
                     self.completions.clear()
                     self.wire.sent.clear()
                     await self.deliver(self.registry_packet(actor_type), self.boat_slot(1), self.block(SUPPORT, runtime_id))
-                    self.assertEqual(self.bot.observed_block_state(SUPPORT).properties["rail_direction"], direction)
+                    surface = self.bot.observed_block_state(SUPPORT)
+                    self.assertEqual(surface.name, f"minecraft:{name}")
+                    self.assertEqual(surface.properties["rail_direction"], direction)
+                    self.assertEqual(surface.properties.get("rail_data_bit"), power)
                     pending = await self.arm_entity(surface=runtime_id, click_height=0.125)
                     await self.deliver(self.spawn(entity_id, position=center, actor_type=actor_type))
                     self.assertFalse(pending.done())
+                    if name == "detector_rail" and power == 0:
+                        await self.deliver(self.block(SUPPORT, self.rail_runtime_id(name, direction, 1)))
+                        self.assertFalse(pending.done())
                     await self.deliver(self.boat_slot(0))
                     expected = EntitySpawn(entity_id, -entity_id, actor_type, center)
                     self.assert_entity_placement_completed(await pending, expected)
-                    entity_id -= 1
 
-    async def test_minecart_rejects_curves_other_rails_and_unknown_states(self):
+    async def test_minecart_rejects_unknown_or_invalid_rail_states(self):
         await self.deliver(self.registry_packet("minecraft:minecart"), self.boat_slot(1))
-        for runtime_id, name, direction in (
-            (2929359528, "rail", 6), (791742332, "golden_rail", 0),
-            (2297846613, "detector_rail", 0), (2602891109, "activator_rail", 0), (123456789, None, None),
-        ):
-            with self.subTest(runtime_id=runtime_id):
-                await self.deliver(self.block(SUPPORT, runtime_id))
-                observed = self.bot.observed_block_state(SUPPORT)
-                if name is None:
-                    self.assertIsNone(observed)
-                else:
-                    self.assertEqual((observed.name, observed.properties["rail_direction"]),
-                                     (f"minecraft:{name}", direction))
+        await self.deliver(self.block(SUPPORT, 123456789))
+        self.assertIsNone(self.bot.observed_block_state(SUPPORT))
+        await self.assert_entity_placement_rejected()
+        for direction in range(6):
+            with self.subTest(active_detector_direction=direction):
+                await self.deliver(self.block(SUPPORT, self.rail_runtime_id("detector_rail", direction, 1)))
                 await self.assert_entity_placement_rejected()
+        for name, properties in (
+            ("minecraft:powered_rail", {"rail_direction": 1, "rail_data_bit": 0}),
+            ("example:rail", {"rail_direction": 1}),
+            ("minecraft:rail", {}),
+            ("minecraft:rail", {"rail_direction": True}),
+            ("minecraft:rail", {"rail_direction": "1"}),
+            ("minecraft:rail", {"rail_direction": -1}),
+            ("minecraft:rail", {"rail_direction": 10}),
+            ("minecraft:golden_rail", {"rail_direction": 6, "rail_data_bit": 1}),
+            ("minecraft:activator_rail", {"rail_direction": 0, "rail_data_bit": 2}),
+            ("minecraft:detector_rail", {"rail_direction": 0, "rail_data_bit": False}),
+            ("minecraft:detector_rail", {"rail_direction": 0, "rail_data_bit": "0"}),
+            ("minecraft:golden_rail", {"rail_direction": 1}),
+        ):
+            with self.subTest(name=name, properties=properties):
+                observed = BlockStateObservation(SUPPORT, 123456789, 0, name, properties)
+                with patch.object(self.blocks, "observed_block_state", return_value=observed):
+                    await self.assert_entity_placement_rejected()
+
+    async def test_minecart_rechecks_the_rail_and_selected_stack_before_sending(self):
+        rail = self.rail_runtime_id("golden_rail", 0, 0)
+        await self.deliver(self.registry_packet("minecraft:minecart"))
+        corrections = (
+            self.block(SUPPORT, self.rail_runtime_id("golden_rail", 0, 1)),
+            self.block(SUPPORT, self.rail_runtime_id("golden_rail", 1, 0)),
+            self.block(SUPPORT, self.rail_runtime_id("activator_rail", 0, 0)),
+            self.boat_slot(2),
+        )
+        for correction in corrections:
+            with self.subTest(correction=correction):
+                await self.deliver(self.boat_slot(1), self.block(SUPPORT, rail))
+
+                async def sync(*, timeout):
+                    await self.deliver(correction)
+
+                self.movement.wait_for_position_sync.side_effect = sync
+                await self.assert_entity_placement_rejected()
+                self.assert_observers_restored()
 
     async def test_hopper_minecart_on_east_west_rail_requires_a_new_matching_center_spawn(self):
         east_west_rail = 2499035767

@@ -159,9 +159,9 @@ sends one top-face click when the terrain and held item still match.
 | --- | --- | --- | --- |
 | Plain watercraft below | Source water | `(0.5, 0.875, 0.5)` | `minecraft:boat` with the hull's integer `VARIANT` |
 | Chest watercraft below | Source water | `(0.5, 0.875, 0.5)` | `minecraft:chest_boat` with the hull's integer `VARIANT` |
-| `minecraft:minecart` | Flat straight or ascending ordinary rail | `(0.5, 0.125, 0.5)` | `minecraft:minecart` |
-| `minecraft:chest_minecart` | Flat straight or ascending ordinary rail | `(0.5, 0.125, 0.5)` | `minecraft:chest_minecart` |
-| `minecraft:hopper_minecart` | Flat straight or ascending ordinary rail | `(0.5, 0.125, 0.5)` | `minecraft:hopper_minecart` |
+| `minecraft:minecart` | Ordinary, powered, activator, or inactive detector rail | `(0.5, 0.125, 0.5)` | `minecraft:minecart` |
+| `minecraft:chest_minecart` | Ordinary, powered, activator, or inactive detector rail | `(0.5, 0.125, 0.5)` | `minecraft:chest_minecart` |
+| `minecraft:hopper_minecart` | Ordinary, powered, activator, or inactive detector rail | `(0.5, 0.125, 0.5)` | `minecraft:hopper_minecart` |
 | `minecraft:armor_stand` | Stone with clearance | `(0.5, 1.0, 0.5)` | `minecraft:armor_stand` |
 | `minecraft:end_crystal` | Obsidian or bedrock with clearance | `(0.5, 1.0, 0.5)` | `minecraft:ender_crystal` |
 | `minecraft:cow_spawn_egg` | Stone with clearance | `(0.5, 1.0, 0.5)` | `minecraft:cow` |
@@ -185,16 +185,19 @@ table.
 | `pale_oak_boat` | `pale_oak_chest_boat` | 9 |
 | `poplar_boat` | `poplar_chest_boat` | 10 |
 
-Source water is vanilla `minecraft:water` with `liquid_depth=0`. The rail is
-vanilla `minecraft:rail` with `rail_direction` of `0` (flat north–south),
-`1` (flat east–west), or `2` through `5` (ascending east, west, north, and
-south, respectively). Land placements require
+Source water is vanilla `minecraft:water` with `liquid_depth=0`. Ordinary
+`minecraft:rail` uses `rail_direction` of `0` through `9`, including flat,
+ascending, and curved shapes. Powered (`minecraft:golden_rail`), activator,
+and detector rails use `rail_direction` of `0` through `5`. Powered and
+activator rails accept `rail_data_bit` of `0` or `1`. A detector rail requires
+`rail_data_bit=0` before sending and can activate after a minecart spawns.
+Land placements require
 observed air in the two main-layer cells above their support and in layer 1
 of all three cells. The initial `AddActorPacket` matches the world click
 coordinates for boats and land placements, or the rail block center, offset
 `(0.5, 0.5, 0.5)`, for minecarts. Coordinates are compared at the wire's
 float32 precision, with a tolerance of `0.001` block per axis for minecarts.
-A minecart's position can change after it spawns on a slope.
+A minecart's position can change after it spawns.
 
 `EntityPlacementResult` records the original dimension, clicked block,
 selected slot, and local submission state. `submitted` is `False` before
