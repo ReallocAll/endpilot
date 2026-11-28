@@ -9,7 +9,7 @@ import json
 from operator import index
 from typing import Literal
 
-from .inventory import _PLAYER_CONTAINERS, _correct_observed_item, _response_item, _stack_snapshot
+from .inventory import _PLAYER_CONTAINERS, _CraftingGridEndpoint, _correct_observed_item, _response_item, _stack_snapshot
 
 
 _RECIPE_KINDS = (
@@ -110,6 +110,48 @@ class Recipes:
         else:
             self._grid_slots[slot] = item
             self._unconfirmed_grid_slots.discard(slot)
+
+    def _grid_slot(self, window, slot):
+        if self._sync_grid_window() is window:
+            return self._grid_slots.get(slot)
+        return None
+
+    def _grid_state(self, slot):
+        return _stack_snapshot(self._grid_slots.get(slot)), self._grid_versions.get(slot, 0)
+
+    def _grid_state_is_current(self, window, slot, expected):
+        return self._sync_grid_window() is window and self._grid_state(slot) == expected
+
+    def _require_grid_state(self, window, expected):
+        if self._sync_grid_window() is not window:
+            raise RuntimeError("the crafting window changed before submission")
+        if any(self._grid_state(slot) != state for slot, state in expected.items()):
+            raise RuntimeError("crafting inputs changed before submission")
+
+    def _require_no_grid_destroy(self, endpoints):
+        if any(pending.submitted and any(
+            isinstance(endpoint, _CraftingGridEndpoint) and endpoint.destroy
+            for endpoint in pending.endpoints
+        ) for pending in self.inventory._requests_for_endpoints(endpoints)):
+            raise RuntimeError("a crafting input has a pending creative destroy request")
+
+    def _apply_grid_destroy(self, window, slot, expected, reply):
+        if not self._grid_state_is_current(window, slot, expected):
+            return
+        corrections = [row for group in reply.containers or ()
+                       if group.full_container_name.name.name == "CRAFTING_INPUT_CONTAINER"
+                       and group.full_container_name.dynamic_id is None
+                       for row in group.slots if slot in (row.slot, row.requested_slot)]
+        if len(corrections) == 1 and corrections[0].slot == corrections[0].requested_slot == slot:
+            row = corrections[0]
+            if row.amount or row.item_stack_net_id is None or not row.item_stack_net_id.raw_id:
+                corrected = _correct_observed_item(self.packets.protocol.binding, self._grid_slots[slot], row)
+                if corrected is not None:
+                    self._set_grid_slot(slot, corrected)
+                    return
+        if reply.result.name == "SUCCESS":
+            self._set_grid_slot(slot, None)
+            self._unconfirmed_grid_slots.add(slot)
 
     def _on_packet(self, raw) -> None:
         b = self.packets.protocol.binding
@@ -632,11 +674,15 @@ class Recipes:
             actions=[action],
             strings_to_filter=[], strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
         )
+        personal = window.container_type == "INVENTORY"
+        grid_endpoint = _CraftingGridEndpoint(id(window), grid_slot, personal=personal)
+        player_endpoint = (None, player_slot)
+        expected_grid = {grid_slot: self._grid_state(grid_slot)}
 
         def apply(reply):
-            def correct(current, original, slot):
-                if current is not original:
-                    return _correct_observed_item(b, current, slot)
+            grid_is_current = self._grid_state_is_current(window, grid_slot, expected_grid[grid_slot])
+
+            def correct(current, slot):
                 previous = current or inventory.item_or_empty(-1)
                 fallback = source if reply.result.name == "SUCCESS" else previous
                 if int(slot.amount) > 0 and int(previous.id) == int(fallback.id) == 0:
@@ -649,11 +695,12 @@ class Recipes:
                     index = int(slot.slot)
                     if name in ("HOTBAR_CONTAINER", "INVENTORY_CONTAINER", player_label) and index == player_slot:
                         current = inventory.slots.get(index)
-                        inventory._set_slot(index, correct(current, original_player, slot))
-                    elif (name == grid_label and index == grid_slot
-                          and self.containers.window is window):
+                        item = (correct(current, slot) if current is original_player
+                                else _correct_observed_item(b, current, slot))
+                        inventory._set_slot(index, item)
+                    elif name == grid_label and index == grid_slot and grid_is_current:
                         current = self._grid_slots.get(index)
-                        self._set_grid_slot(index, correct(current, original_grid, slot))
+                        self._set_grid_slot(index, correct(current, slot))
 
         def check_return_window():
             if self.containers.window is not window:
@@ -662,22 +709,28 @@ class Recipes:
         public_return = not into_grid and not queued
         expected = (_stack_snapshot(original_grid), _stack_snapshot(original_player)) if public_return else None
 
-        def check_return_write():
-            nonlocal original_grid, original_player
+        def at_write():
+            nonlocal original_player
+            if personal:
+                self._require_grid_state(window, expected_grid)
+                self._require_no_grid_destroy((grid_endpoint,))
+            if not public_return:
+                return
             check_return_window()
             grid_item = self._grid_slots.get(grid_slot)
             player_item = inventory.slots.get(player_slot)
             if (_stack_snapshot(grid_item), _stack_snapshot(player_item)) != expected:
                 raise RuntimeError("crafting transfer slots changed before returning ingredients")
             owner = inventory._pending_requests[request_id]
-            if any(pending is not owner for pending in inventory._requests_for_endpoints({(None, player_slot)})):
+            if any(pending is not owner for pending in inventory._requests_for_endpoints((player_endpoint,))):
                 raise RuntimeError("the player slot has a pending item-stack request")
-            original_grid, original_player = grid_item, player_item
+            original_player = player_item
 
         return await inventory._request_item_stack(
             request, apply, timeout=timeout, queued=queued,
-            before_send=check_return_window if not into_grid and queued else None,
-            _at_write=check_return_write if public_return else None,
+            before_send=check_return_window if not personal and not into_grid and queued else None,
+            _at_write=at_write if personal or public_return else None,
+            _endpoints=frozenset((player_endpoint, grid_endpoint)),
         )
 
     async def craft_grid(self, recipe_id: str | int, destination_slot: int, *,
@@ -793,17 +846,15 @@ class Recipes:
         )
 
         def apply(reply):
+            current_inputs = {slot for slot, expected in expected_grid.items()
+                              if self._grid_state_is_current(window, slot, expected)}
             for container in reply.containers or ():
                 name = container.full_container_name.name.name
                 for slot in container.slots:
                     index = int(slot.slot)
-                    if (name == "CRAFTING_INPUT_CONTAINER" and index in grid
-                            and self.containers.window is window):
-                        current = self._grid_slots.get(index)
+                    if name == "CRAFTING_INPUT_CONTAINER" and index in current_inputs:
                         source = grid[index]
-                        updated = (_response_item(b, source, source, slot) if current is source
-                                   else _correct_observed_item(b, current, slot))
-                        self._set_grid_slot(index, updated)
+                        self._set_grid_slot(index, _response_item(b, source, source, slot))
                     elif name in _PLAYER_CONTAINERS and index in output_descriptors:
                         current = inventory.slots.get(index)
                         destination = destinations[index]
@@ -815,13 +866,25 @@ class Recipes:
                             updated = _response_item(b, destination, fallback, slot)
                         inventory._set_slot(index, updated)
 
-        if not multiple:
-            return await inventory._request_item_stack(request, apply, timeout=timeout, queued=_queued)
+        personal = window.container_type == "INVENTORY"
+        grid_endpoints = {_CraftingGridEndpoint(id(window), slot, personal=personal) for slot in grid}
+        player_endpoints = {(None, slot) for slot in destination_slots}
+        expected_grid = {slot: self._grid_state(slot) for slot in grid}
 
-        expected_grid = {slot: _stack_snapshot(item) for slot, item in grid.items()}
+        def check_personal_grid_write():
+            self._require_grid_state(window, expected_grid)
+            self._require_no_grid_destroy(grid_endpoints)
+
+        if not multiple:
+            return await inventory._request_item_stack(
+                request, apply, timeout=timeout, queued=_queued,
+                _endpoints=frozenset(player_endpoints | grid_endpoints),
+                _at_write=check_personal_grid_write if personal else None,
+            )
+
         expected_destinations = {slot: _stack_snapshot(item) for slot, item in observed_destinations.items()}
         # A second multi-result request cannot use this grid until the first receives its verdict.
-        endpoints = frozenset({(None, slot) for slot in destination_slots} | {(id(window), -1)})
+        protected_endpoints = player_endpoints | {(id(window), -1)}
         submitted_grid_versions = {}
         changed_destinations = set()
 
@@ -834,9 +897,12 @@ class Recipes:
                 raise RuntimeError("the crafting window changed before submission")
             if self.get(recipe_id) != recipe:
                 raise RuntimeError("the crafting recipe changed before submission")
+            current_grid = {slot: _stack_snapshot(item) for slot, item in observed_grid().items()}
             if (not self._unconfirmed_grid_slots.isdisjoint(grid_slots)
-                    or {slot: _stack_snapshot(item) for slot, item in observed_grid().items()} != expected_grid):
+                    or current_grid != {slot: snapshot for slot, (snapshot, _) in expected_grid.items()}):
                 raise RuntimeError("crafting inputs changed before submission")
+            if personal:
+                check_personal_grid_write()
             carried = inventory.slots
             current_destinations = {slot: carried.get(slot) for slot in destination_slots}
             if ({slot: _stack_snapshot(item) for slot, item in current_destinations.items()} != expected_destinations
@@ -844,7 +910,7 @@ class Recipes:
                            for slot in destination_slots)):
                 raise RuntimeError("crafting destinations are no longer confirmed empty")
             owner = inventory._pending_requests[request_id]
-            if any(pending is not owner for pending in inventory._requests_for_endpoints(endpoints)):
+            if any(pending is not owner for pending in inventory._requests_for_endpoints(protected_endpoints)):
                 raise RuntimeError("the crafting window or a result destination has a pending item-stack request")
             submitted_grid_versions.update((slot, self._grid_versions.get(slot, 0)) for slot in grid)
             unsubscribe = inventory.subscribe_inventory_changes(observe_destination)
@@ -895,8 +961,10 @@ class Recipes:
                     inventory._count_observation_gaps.add(index)
                     inventory._set_slot(index, None)
 
-        return await inventory._request_item_stack(request, apply_multiple, timeout=timeout, queued=_queued,
-                                                   _endpoints=endpoints, _at_write=at_write)
+        return await inventory._request_item_stack(
+            request, apply_multiple, timeout=timeout, queued=_queued,
+            _endpoints=frozenset(protected_endpoints | grid_endpoints), _at_write=at_write,
+        )
 
     def close(self) -> None:
         self._unsubscribe()

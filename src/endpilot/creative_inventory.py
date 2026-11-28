@@ -8,7 +8,7 @@ from typing import Literal
 from bedrock_protocol import GameType
 
 from .compression import PacketConnection
-from .inventory import _ARMOR_SLOT_NAMES, _correct_observed_item, _response_item, _stack_snapshot
+from .inventory import _ARMOR_SLOT_NAMES, _CraftingGridEndpoint, _correct_observed_item, _response_item, _stack_snapshot
 from .item_user_data import read_item_user_data
 
 
@@ -54,7 +54,7 @@ class CreativeCatalog:
 @dataclass(frozen=True, slots=True)
 class CreativeRequestProgress:
     slot: int
-    action: Literal["take", "destroy"]
+    action: Literal["take", "destroy", "destroy_grid"]
     request_id: int
     submitted: bool | None
     verdict: object | None = None
@@ -98,6 +98,17 @@ class CreativeArmorClearResult(CreativeClearResult):
 
 
 @dataclass(frozen=True, slots=True)
+class CreativeCraftingGridClearResult(CreativeArmorClearResult):
+    crafting_grid: tuple[CreativeClearSlot, ...]
+
+    @property
+    def complete(self) -> bool:
+        return super(CreativeCraftingGridClearResult, self).complete and all(
+            slot.status in ("already_empty", "cleared") for slot in self.crafting_grid
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class CreativeOperationProgress:
     """Confirmed verdicts and submission state when a composite action raises."""
 
@@ -109,6 +120,18 @@ class _Progress:
     def __init__(self):
         self.requests: list[CreativeRequestProgress] = []
         self.interrupted = False
+
+    def start(self, slot, action, request_id):
+        step = len(self.requests)
+        self.requests.append(CreativeRequestProgress(slot, action, request_id, False))
+
+        def update(submitted, verdict=None):
+            previous = self.requests[step]
+            self.requests[step] = replace(
+                previous, submitted=submitted, verdict=previous.verdict if verdict is None else verdict,
+            )
+
+        return update
 
     def attach(self, error, clear_result=None):
         self.interrupted = True
@@ -357,25 +380,35 @@ class CreativeInventory:
             for outcome in results.values()
         ))
 
-    async def clear_inventory(self, slots, *, timeout, include_armor=False):
+    async def clear_inventory(self, slots, *, timeout, include_armor=False, crafting=None):
         window = self._window()
         slots = tuple(range(36) if slots is None else slots)
         for slot in slots:
             self._check_slot(slot)
         results = {slot: CreativeClearSlot(slot, "pending") for slot in slots}
         armor = [CreativeArmorClearSlot(slot, "pending") for slot in _ARMOR_SLOT_NAMES] if include_armor else []
+        grid = {slot: CreativeClearSlot(slot, "pending") for slot in range(28, 32)} if crafting is not None else {}
         progress = _Progress()
         main_finished = False
 
         def result():
             main = self._clear_result(results)
-            if not include_armor:
+            if not include_armor and crafting is None:
                 return main
-            return CreativeArmorClearResult(main.slots, tuple(
+            armor_result = tuple(
                 replace(outcome, status="unconfirmed")
                 if outcome.status in ("cleared", "already_empty") and not self._armor_empty(index)
                 else outcome
                 for index, outcome in enumerate(armor)
+            )
+            if crafting is None:
+                return CreativeArmorClearResult(main.slots, armor_result)
+            return CreativeCraftingGridClearResult(main.slots, armor_result, tuple(
+                replace(outcome, status="unconfirmed")
+                if outcome.status in ("cleared", "already_empty")
+                and not self._grid_empty(crafting._grid_slot(window, slot))
+                else outcome
+                for slot, outcome in grid.items()
             ))
 
         try:
@@ -402,6 +435,27 @@ class CreativeInventory:
                         await self._clear_armor_slot(index, _stack_snapshot(observed), window, progress, armor)
                         if armor[index].status != "cleared":
                             break
+                for slot in grid:
+                    self._require_window(window)
+                    item = crafting._grid_slot(window, slot)
+                    if self._grid_empty(item):
+                        grid[slot] = CreativeClearSlot(slot, "already_empty")
+                    elif (item is None or not item.id or not 1 <= item.stack_size <= 255
+                          or not item.net_id_variant or item.net_id_variant < 0):
+                        grid[slot] = CreativeClearSlot(slot, "unknown")
+                    else:
+                        step = len(progress.requests)
+                        try:
+                            await self._destroy_grid(crafting, window, slot, item, progress)
+                        finally:
+                            verdict = progress.requests[step].verdict if len(progress.requests) > step else None
+                            status = "unconfirmed"
+                            if verdict is not None:
+                                if verdict.result.name != "SUCCESS":
+                                    status = "rejected"
+                                elif self._grid_empty(crafting._grid_slot(window, slot)):
+                                    status = "cleared"
+                            grid[slot] = CreativeClearSlot(slot, status, verdict)
         except (Exception, asyncio.CancelledError) as error:
             if not main_finished:
                 for request in progress.requests:
@@ -410,6 +464,42 @@ class CreativeInventory:
             progress.attach(error, result())
             raise
         return result()
+
+    @staticmethod
+    def _grid_empty(item):
+        return item is not None and not item.id and not item.stack_size and not item.net_id_variant
+
+    async def _destroy_grid(self, crafting, window, slot, item, progress):
+        inventory = self._inventory
+        expected = {slot: crafting._grid_state(slot)}
+        b = self._binding
+        request_id = inventory._allocate_request_id()
+        action = b.ItemStackRequestCereal.DestroyActionData(
+            amount=int(item.stack_size),
+            source=self._slot_info("CRAFTING_INPUT_CONTAINER", slot, int(item.net_id_variant)),
+        )
+        request = b.ItemStackRequestPacketData.RequestData(
+            client_request_id=b.ItemStackRequestId(raw_id=request_id), actions=[action],
+            strings_to_filter=[], strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
+        )
+        endpoints = frozenset((_CraftingGridEndpoint(id(window), slot, personal=True, destroy=True),))
+        update_progress = progress.start(slot, "destroy_grid", request_id)
+
+        def at_write():
+            self._require_window(window)
+            crafting._require_grid_state(window, expected)
+            if any(pending.submitted for pending in inventory._requests_for_endpoints(endpoints)):
+                raise RuntimeError("a crafting input has a pending item-stack request")
+            update_progress(None)
+
+        def apply(reply):
+            update_progress(True, reply)
+            crafting._apply_grid_destroy(window, slot, expected[slot], reply)
+
+        return await inventory._request_item_stack(
+            request, apply, timeout=None, _endpoints=endpoints, _at_write=at_write,
+            after_send=lambda: update_progress(True),
+        )
 
     def _armor_empty(self, index):
         item = self._inventory.armor_slots.get(index)
@@ -549,20 +639,13 @@ class CreativeInventory:
             client_request_id=b.ItemStackRequestId(raw_id=request_id), actions=actions,
             strings_to_filter=[], strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
         )
-        if progress is not None:
-            step = len(progress.requests)
-            progress.requests.append(CreativeRequestProgress(
-                index, "destroy" if entry is None else "take", request_id, False,
-            ))
+        track = None if progress is None else progress.start(index, "destroy" if entry is None else "take", request_id)
         original_snapshot = _stack_snapshot(original) if at_write is not None else None
         changed = False
 
         def update_progress(submitted, verdict=None):
-            if progress is not None:
-                previous = progress.requests[step]
-                progress.requests[step] = replace(
-                    previous, submitted=submitted, verdict=previous.verdict if verdict is None else verdict,
-                )
+            if track is not None:
+                track(submitted, verdict)
 
         def before_send():
             if progress is not None and progress.interrupted:

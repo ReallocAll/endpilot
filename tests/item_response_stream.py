@@ -10,7 +10,9 @@ def feed_item_replies(inventory, *, timeout=15):
     send, fixture_reply = packets.send, packets.wait_for_packet
     response_id = packets.protocol.binding.ItemStackResponsePacket.ID
 
-    async def send_and_deliver(packet):
+    async def send_and_deliver(packet, *, _before_send=None):
+        if _before_send is not None:
+            _before_send()
         await send(packet)
         request_id = int(packet.requests[0].client_request_id.raw_id)
         delivered = False

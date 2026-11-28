@@ -283,12 +283,26 @@ requests and leaves the remaining outcomes `"pending"`. If no empty staging
 slot is confirmed for an observed piece, the operation raises `RuntimeError`.
 `result.complete` also requires all four armor slots to be observed empty.
 
+Pass `include_crafting_grid=True` to clear the personal 2×2 crafting grid
+after the selected main inventory and armor slots. For example,
+`await bot.clear_creative_inventory([], include_crafting_grid=True)` selects
+only the grid. Its `CreativeCraftingGridClearResult.crafting_grid` contains
+four outcomes in native slot order (28–31). `result.slots` still reports
+the main inventory selection, and `result.armor` is empty when armor clearing
+was omitted. Each known nonempty grid stack is destroyed in place. Unknown
+and already empty grid slots require no request. `result.complete` also
+requires each selected grid slot to be observed empty. If a planned grid
+destroy reaches the write with a changed slot or a request already in flight
+for that slot, it raises `RuntimeError` before sending.
+
 Timeout, disconnect and other interruptions of a started fill or bulk clear
 preserve the original exception. Read `error.creative_progress.requests` for
 the slot, action, request ID, submission and any confirmed verdict of each
 prepared request. `submitted` is `True` after a transport send or server
 verdict, `False` before any transport attempt, or `None` when a transport
-attempt began without confirmation. A step absent from the list was never
+attempt began without confirmation. Grid destroy requests use the
+`"destroy_grid"` action to distinguish them from main inventory slots with
+the same number. A step absent from the list was never
 prepared. An interrupted bulk clear also includes `creative_progress.clear_result`
 with partial slot results and pending slots. Use these results and reconcile
 the current inventory before retrying an interrupted operation.

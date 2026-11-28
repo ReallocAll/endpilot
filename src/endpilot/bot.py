@@ -1785,17 +1785,21 @@ class Bot:
         return await self._require_creative_inventory().clear(slot, timeout=timeout)
 
     async def clear_creative_inventory(
-        self, slots: Iterable[int] | None = None, *, include_armor: bool = False, timeout: float = 15,
+        self, slots: Iterable[int] | None = None, *, include_armor: bool = False,
+        include_crafting_grid: bool = False, timeout: float = 15,
     ) -> CreativeClearResult:
         """Clear selected observed slots, defaulting to all main inventory slots.
 
         The result reports each selected slot in order. With include_armor,
         four additional results report armor clearing after the main inventory.
+        With include_crafting_grid, four results report the personal crafting
+        grid (slots 28–31) after the main inventory and any selected armor.
         If interrupted, the original exception's creative_progress carries the
         partial result.
         """
         return await self._require_creative_inventory().clear_inventory(
             slots, include_armor=include_armor, timeout=timeout,
+            crafting=self._recipes if include_crafting_grid else None,
         )
 
     @property

@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from itertools import count
 from typing import Literal
 
@@ -90,8 +90,17 @@ class _BlockTransferEndpoint:
         return allow_possible and not self.possible_halves.isdisjoint(other.possible_halves)
 
 
+@dataclass(frozen=True, slots=True)
+class _CraftingGridEndpoint:
+    # The request closures retain the window instance until its verdict.
+    window_id: int
+    slot: int
+    personal: bool = field(default=False, compare=False)
+    destroy: bool = field(default=False, compare=False)
+
+
 # Tuple endpoints use None for main inventory, ARMOR_CONTAINER for armor, and the actor instance for entity slots.
-_TransferEndpoint = tuple[object, int] | _BlockTransferEndpoint
+_TransferEndpoint = tuple[object, int] | _BlockTransferEndpoint | _CraftingGridEndpoint
 
 
 def _transfer_endpoints_match(first: _TransferEndpoint, second: _TransferEndpoint, *, allow_possible=False) -> bool:
@@ -112,6 +121,16 @@ class _PendingStackRequest:
     submitted: bool = False
     automatic_unequip: bool = False
     exact_offhand_take: bool = False
+
+    def retain_uncertain_personal_grid(self) -> bool:
+        # Only the write hook establishes a possible submission for these endpoints.
+        if not (self.checked_at_write and self.submitted):
+            return False
+        self.endpoints = frozenset(
+            endpoint for endpoint in self.endpoints
+            if isinstance(endpoint, _CraftingGridEndpoint) and endpoint.personal
+        )
+        return bool(self.endpoints)
 
 
 class _InventoryMoveNotSubmitted(RuntimeError):
@@ -260,13 +279,19 @@ class Inventory:
                 responses = self.packets.protocol.decode(raw).responses
             except Exception as error:
                 # Without decoded IDs any pending verdict may belong to this packet.
-                self._fail_pending_requests(ValueError, "could not decode item-stack response", error)
+                self._fail_pending_requests(
+                    ValueError, "could not decode item-stack response", error, retain_grid_ownership=True,
+                )
                 return
             for response in responses:
                 self._observe_cursor_response(response, b)
                 request_id = int(response.client_request_id.raw_id)
                 pending = self._pending_requests.get(request_id)
                 if pending is None or (pending.checked_at_write and not pending.submitted):
+                    continue
+                if pending.reply.done():
+                    # An ambiguous send or decode error can leave only the grid reservation.
+                    self._pending_requests.pop(request_id)
                     continue
                 try:
                     self._mark_range_overlap({
@@ -525,12 +550,14 @@ class Inventory:
         # The caller may have stopped waiting. Its next read can still raise this error.
         reply.exception()
 
-    def _fail_pending_requests(self, error_type, message, cause):
-        for pending in self._pending_requests.values():
-            error = error_type(message)
-            error.__cause__ = cause
-            self._fail_request(pending.reply, error)
-        self._pending_requests.clear()
+    def _fail_pending_requests(self, error_type, message, cause, *, retain_grid_ownership=False):
+        for request_id, pending in tuple(self._pending_requests.items()):
+            if not pending.reply.done():
+                error = error_type(message)
+                error.__cause__ = cause
+                self._fail_request(pending.reply, error)
+            if not (retain_grid_ownership and pending.retain_uncertain_personal_grid()):
+                self._pending_requests.pop(request_id)
 
     def _end_requests(self, cause=None):
         self._request_stream_ended = True
@@ -650,8 +677,11 @@ class Inventory:
                 if after_send is not None:
                     after_send()
             except Exception as error:
-                if self._pending_requests.pop(request_id, None) is not None:
-                    self._fail_request(reply, error)
+                if self._pending_requests.get(request_id) is pending:
+                    if not pending.retain_uncertain_personal_grid():
+                        self._pending_requests.pop(request_id)
+                    if not reply.done():
+                        self._fail_request(reply, error)
 
         task = asyncio.create_task(send())
         self._request_sends.add(task)

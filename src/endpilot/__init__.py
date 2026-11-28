@@ -21,7 +21,8 @@ from .commands import CommandCatalog, CommandCatalogEntry
 from .containers import BrewingProgress, ContainerSlotChange, FurnaceProgress
 from .creative_inventory import (
     CreativeArmorClearResult, CreativeArmorClearSlot, CreativeCatalog, CreativeClearResult, CreativeClearSlot,
-    CreativeEntry, CreativeGroup, CreativeItemDescriptor, CreativeOperationProgress, CreativeRequestProgress,
+    CreativeCraftingGridClearResult, CreativeEntry, CreativeGroup, CreativeItemDescriptor, CreativeOperationProgress,
+    CreativeRequestProgress,
 )
 from .dimension_transition import DimensionTransition
 from .enchanting import EnchantOption, Enchantment
@@ -110,6 +111,7 @@ __all__ = [
     "CreativeCatalog",
     "CreativeClearResult",
     "CreativeClearSlot",
+    "CreativeCraftingGridClearResult",
     "CreativeEntry",
     "CreativeGroup",
     "CreativeItemDescriptor",
