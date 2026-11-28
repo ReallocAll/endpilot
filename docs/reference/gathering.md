@@ -20,10 +20,13 @@ returns the observed `BlockUpdate`.
 
 The ordinary tool ranking can retain a confirmed held pickaxe or shovel in
 dry, grounded survival with Haste I when it and the best eligible tool both
-cross the known vanilla block's first-tick threshold. If any required
+cross the known vanilla block's first-tick threshold. For oak leaves under
+the same standing conditions with no active effect observed, the ranking can
+also retain confirmed held shears when both shears cross that threshold.
+White wool continues to use the normal speed ranking. If a required
 observation is unavailable, the normal speed ranking applies. Equipping an
-ordinary selection that already matches the full confirmed hand stack sends
-no equipment packet.
+ordinary selection that already matches the full confirmed hand stack sends no
+equipment packet.
 
 Pass `requested_drop_id` to `bot.best_harvest_tool(position)` or
 `await bot.equip_harvest_tool(position)` to choose for an observed block and a

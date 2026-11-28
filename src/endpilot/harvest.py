@@ -7,7 +7,7 @@ from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from math import dist, floor, isfinite
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from .block_data import MiningRule, VanillaBlockState
 from .block_catalog import vanilla_blocks
@@ -220,13 +220,13 @@ def _check_max_tools(max_tools):
 class HarvestTools:
     def __init__(
         self, blocks: Blocks, inventory: Inventory, containers: Containers, item_names: dict[int, str],
-        *, ordinary_haste: Callable[[], bool] | None = None,
+        *, ordinary_mining: Callable[[], Literal["none", "haste_i"] | None] | None = None,
     ):
         self._blocks = blocks
         self._inventory = inventory
         self._containers = containers
         self._item_names = item_names
-        self._ordinary_haste = ordinary_haste
+        self._ordinary_mining = ordinary_mining
         self._equip_lock = asyncio.Lock()
 
     def best(
@@ -258,23 +258,30 @@ class HarvestTools:
     def _first_tick_held_tool(self, target, rule, slots, best) -> HarvestTool | None:
         blocks, inventory = self._blocks, self._inventory
         slot = inventory.selected_slot
-        if (slot == best.slot or blocks._custom_blocks or self._ordinary_haste is None
-                or not self._ordinary_haste()):
+        if slot == best.slot or blocks._custom_blocks or self._ordinary_mining is None:
             return None
         current = slots.get(slot)
         if not inventory._has_confirmed_selection(slot, current):
             return None
         name = self._item_names.get(int(current.id), "")
-        family = name.rpartition("_")[2]
-        if family not in ("pickaxe", "shovel") or not best.item_name.endswith("_" + family):
-            return None
         state = blocks._vanilla_state(target.runtime_id)
-        known = None if state is None else vanilla_blocks().get(state.name)
+        if state is None:
+            return None
+        effect = self._ordinary_mining()
+        if name == best.item_name == "minecraft:shears":
+            if effect != "none" or state.name != "minecraft:oak_leaves":
+                return None
+        else:
+            family = name.rpartition("_")[2]
+            if effect != "haste_i" or family not in ("pickaxe", "shovel") or not best.item_name.endswith("_" + family):
+                return None
+        known = vanilla_blocks().get(state.name)
         if known is None or not isfinite(known.hardness) or known.hardness <= 0:
             return None
         efficiency_id = int(inventory.packets.protocol.binding.Enchant.Type.EFFICIENCY)
         # Both eligible tools must cross the first-tick threshold in ordinary
-        # dry survival. Haste I's 1.44 factor is from the 2225 stock comparison.
+        # dry survival. The Haste I factor is from the 2225 stock comparison.
+        multiplier = 1.44 if effect == "haste_i" else 1.0
         for item, item_name in ((current, name), (slots[best.slot], best.item_name)):
             props = known.tool_properties(item_name)
             if (props is None or props.qualifies_for_drops is not True
@@ -295,7 +302,7 @@ class HarvestTools:
             ))):
                 return None
             speed = props.speed_multiplier + _efficiency_bonus(data, efficiency_id)
-            if speed * 1.44 < known.hardness * 30:
+            if speed * multiplier < known.hardness * 30:
                 return None
         movement = blocks.movement
         if movement is None or movement._entity_cursor_pose() is None or movement._stationary_mining_pose() is None:

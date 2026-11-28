@@ -507,7 +507,7 @@ class Bot:
         session.form_packets.clear()
         self._harvest_tools = HarvestTools(
             self._blocks, self._inventory, self._containers, session.item_names,
-            ordinary_haste=self._ordinary_haste_mining,
+            ordinary_mining=self._ordinary_mining_effect,
         )
         self._signs = Signs(session.packets, self._blocks, self._movement, self._inventory, session.player_id)
         pack_index = session.resource_pack_index
@@ -2726,19 +2726,22 @@ class Bot:
             targets, count=count, ticks=ticks, search_radius=search_radius, timeout=timeout,
         )
 
-    def _ordinary_haste_mining(self) -> bool:
+    def _ordinary_mining_effect(self) -> Literal["none", "haste_i"] | None:
         state = self._player_state
         if (self.protocol.number != 2225 or self.game_mode != GameType.SURVIVAL
                 or state is None or state._closed or state._disconnected or state.is_dead
                 or state.abilities.flying is not False or state.flight_target(require_permission=False)[0] is not False):
-            return False
+            return None
         width, height = state._collision_size
         if (width is None or height is None or not isclose(width, 0.6, abs_tol=.001)
                 or not isclose(height, 1.8, abs_tol=.001)):
-            return False
+            return None
         effects = state.status_effects()
-        return (len(effects) == 1 and (effects[0].id, effects[0].amplifier) == (3, 0)
-                and effects[0].duration_ticks > 0)
+        if not effects:
+            return "none"
+        if len(effects) == 1 and (effects[0].id, effects[0].amplifier) == (3, 0) and effects[0].duration_ticks > 0:
+            return "haste_i"
+        return None
 
     def best_harvest_tool(
         self, position: tuple[int, int, int], *, require_harvest: bool = True, requested_drop_id: int | None = None,

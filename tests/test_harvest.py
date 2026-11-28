@@ -26,6 +26,7 @@ OAK_LOG = 0xF253CAD8
 NETHER_WART_BLOCK = 0x22A97687
 HAY_BLOCK = 0x5A4A90AB
 WHITE_WOOL = 0x9096F28E
+OAK_LEAVES = 0x3EE83EB2
 WEB = 0x38FA6D0A
 RAW_IRON_ITEM, IRON_ORE_ITEM, DEEPSLATE_IRON_ORE_ITEM = 1300, 1301, 1302
 DIAMOND_ITEM, DIAMOND_ORE_ITEM, DEEPSLATE_DIAMOND_ORE_ITEM = 1303, 1304, 1305
@@ -284,6 +285,58 @@ class HarvestTests(unittest.IsolatedAsyncioTestCase):
         self.stream.sent.clear()
         self.effect()
         self.assertEqual(bot.best_harvest_tool(POSITION), HarvestTool(1, "minecraft:golden_pickaxe", 12))
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_plain_shears_stay_held_for_oak_leaves_and_change_for_wool(self):
+        bot = await self.connect()
+        self.ordinary_pose()
+        self.inventory_slot(0, 1203, user_data=EMPTY_USER_DATA)
+        efficient = enchantment_data(self.binding, 2)
+        self.inventory_slot(1, 1203, user_data=efficient)
+        await bot.select_hotbar(0)
+        self.stream.sent.clear()
+
+        self.block(OAK_LEAVES)
+        current = HarvestTool(0, "minecraft:shears", 15)
+        self.assertEqual(bot.best_harvest_tool(POSITION), current)
+        self.assertEqual(await bot.equip_harvest_tool(POSITION), current)
+        self.assertEqual(self.stream.sent, [])
+
+        self.block(WHITE_WOOL)
+        faster = HarvestTool(1, "minecraft:shears", 5)
+        self.assertEqual(bot.best_harvest_tool(POSITION), faster)
+        self.assertEqual(self.stream.sent, [])
+        self.assertEqual(await bot.equip_harvest_tool(POSITION), faster)
+        packet, = self.stream.sent
+        self.assertEqual((packet.selected_slot, packet.item.net_id_variant, packet.item.user_data_buffer),
+                         (1, 101, efficient))
+
+    async def test_shears_use_ordinary_ranking_with_effects_or_unverified_stance_or_hand(self):
+        bot = await self.connect()
+        self.ordinary_pose()
+        self.block(OAK_LEAVES)
+        self.inventory_slot(0, 1203, user_data=EMPTY_USER_DATA)
+        self.inventory_slot(1, 1203, user_data=enchantment_data(self.binding, 2))
+        await bot.select_hotbar(0)
+        self.stream.sent.clear()
+        current = HarvestTool(0, "minecraft:shears", 15)
+        faster = HarvestTool(1, "minecraft:shears", 15)
+        self.assertEqual(bot.best_harvest_tool(POSITION), current)
+
+        for effect in (3, 4):
+            with self.subTest(effect=effect):
+                self.effect(effect_id=effect)
+                self.assertEqual(bot.best_harvest_tool(POSITION), faster)
+                self.effect(effect_id=effect, remove=True)
+        self.ordinary_pose(on_ground=False)
+        self.assertEqual(bot.best_harvest_tool(POSITION), faster)
+        self.ordinary_pose()
+        self.world_block((0, 101, 0), WATER, layer=1)
+        self.assertEqual(bot.best_harvest_tool(POSITION), faster)
+        self.world_block((0, 101, 0), HASHED_AIR_RUNTIME_ID, layer=1)
+        self.assertEqual(bot.best_harvest_tool(POSITION), current)
+        self.inventory_slot(0, 1203, user_data=EMPTY_USER_DATA, net_id=200)
+        self.assertEqual(bot.best_harvest_tool(POSITION), faster)
         self.assertEqual(self.stream.sent, [])
 
     async def test_ordinary_equipping_resends_when_selected_stack_identity_changes(self):
