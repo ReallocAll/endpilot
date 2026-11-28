@@ -2507,8 +2507,11 @@ class Bot:
         """Place a supported held item with one click on observed terrain in Survival.
 
         Plain, chest, and hopper minecarts use ordinary, powered, activator, or inactive detector rails.
-        Supported spawn eggs use the top of stone, grass blocks, dirt, or oak
-        planks, or a horizontal face of stone with observed clearance.
+        Cow, pig, zombie, and villager eggs use stone, grass block, dirt, or
+        oak plank tops, or horizontal stone faces with observed clearance.
+        Additional protocol 2225 spawn eggs use stone tops only. Tests used
+        open space around the target. Allow room around wider mobs beyond
+        the two air cells checked directly above the stone.
         Report a matching new spawn and a one-item decrease in the selected slot
         when each observation arrives after submission.
         """

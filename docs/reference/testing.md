@@ -231,8 +231,10 @@ oak plank top and the east face of stone, zombie eggs on the east face of
 stone, and villager eggs on the south face of stone.
 
 The additional spawn eggs support face `1` on `minecraft:stone` in protocol
-2225. Use the `minecraft:` namespace and append `_spawn_egg` to the following
-names. These eggs spawn the same namespaced actor without the suffix.
+2225. Vanilla checks used open space around the target. Allow room around
+wider mobs beyond the two air cells checked directly above the stone. Use the
+`minecraft:` namespace and append `_spawn_egg` to the following names. These
+eggs spawn the same namespaced actor without the suffix.
 
 `armadillo`, `bogged`, `breeze`, `cat`, `cave_spider`, `chicken`,
 `copper_golem`, `creeper`, `donkey`, `endermite`, `fox`, `goat`, `hoglin`,
