@@ -1078,6 +1078,7 @@ class Containers:
 
     async def open_inventory_screen(
         self, *, timeout: float = 15, _on_observed: Callable[[ContainerWindow], None] | None = None,
+        _before_send: Callable[[], None] | None = None,
     ) -> ContainerWindow:
         """Open the player inventory UI and await BDS's ContainerOpen response."""
         caller_owned = _on_observed is None
@@ -1118,12 +1119,21 @@ class Containers:
         ))
         try:
             await asyncio.sleep(0)
-            submitted = True
-            await self.packets.send(b.InteractPacket(
+            packet = b.InteractPacket(
                 action=b.InteractPacket.Action.OPEN_INVENTORY,
                 target_id=self.inventory.player_id,
                 pos=None,
-            ))
+            )
+            if _before_send is None:
+                submitted = True
+                await self.packets.send(packet)
+            else:
+                def before_write():
+                    nonlocal submitted
+                    _before_send()
+                    submitted = True
+
+                await self.packets.send(packet, _before_send=before_write)
             reply = pending if caller_owned else asyncio.shield(pending)
             raw = await reply
             if raw.packet_id == b.DisconnectPacket.ID:

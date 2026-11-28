@@ -16,6 +16,28 @@ starting the break if no face can be confirmed. Omit `face` to use the
 default top face (`1`), or pass the face explicitly. A completed action
 returns the observed `BlockUpdate`.
 
+## Choose a tool for a specific drop
+
+Pass `requested_drop_id` to `bot.best_harvest_tool(position)` or
+`await bot.equip_harvest_tool(position)` to choose for an observed block and a
+specific drop. Look up the item network ID with the current session's
+`bot.item_registry.id_for_name()`. Passing `None` uses the ordinary ranking.
+An explicit drop ID requires `require_harvest=True`.
+
+For iron and diamond ores, including their deepslate variants, request the
+matching ore item to select a pickaxe with Silk Touch I. Request
+`minecraft:raw_iron` or `minecraft:diamond` to select an eligible pickaxe
+without Silk Touch. For `minecraft:web`, request `minecraft:string` to select
+a sword or `minecraft:web` to select shears.
+
+The query sends no packets. An unobserved block, an unsupported combination,
+or a lack of matching tools returns `None`. When the equip call cannot find a
+suitable tool at the start, it sends no packets. During an explicit drop
+request, the equip call checks the observed block and inventory again before
+opening, transferring, or selecting. A stale observation skips the affected
+write and returns `None`. Any confirmed transfer stays applied if selection
+later becomes invalid. The equip call closes any inventory screen it opened.
+
 ## Equip a harvest tool from a chest
 
 `endpilot.harvest.equip_harvest_tool_from_chest()` first searches the main

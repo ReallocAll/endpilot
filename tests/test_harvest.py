@@ -4,21 +4,29 @@ import unittest
 from unittest.mock import patch
 
 from endpilot import Bot
+from endpilot.compression import PacketConnection
 from endpilot.harvest import HarvestTool
 from endpilot.login import JoinSession
 
 from test_blocks import PacketStream
+from test_scheduled_input import Wire
 
 
 POSITION = (4, 99, -9)
 DIAMOND_ORE = 0x54A1D0FD
+DEEPSLATE_DIAMOND_ORE = 0x3057FA73
 IRON_ORE = 0x79275ADE
+DEEPSLATE_IRON_ORE = 0x3E6F3450
 DIRT = 0x824EEF86
 OAK_LOG = 0xF253CAD8
 NETHER_WART_BLOCK = 0x22A97687
 HAY_BLOCK = 0x5A4A90AB
 WHITE_WOOL = 0x9096F28E
 WEB = 0x38FA6D0A
+RAW_IRON_ITEM, IRON_ORE_ITEM, DEEPSLATE_IRON_ORE_ITEM = 1300, 1301, 1302
+DIAMOND_ITEM, DIAMOND_ORE_ITEM, DEEPSLATE_DIAMOND_ORE_ITEM = 1303, 1304, 1305
+STRING_ITEM, WEB_ITEM = 1306, 1307
+EMPTY_USER_DATA = bytes(10)  # No NBT and two empty restriction lists.
 
 
 def enchantment_data(binding, level, *, enchantment=None):
@@ -28,10 +36,15 @@ def enchantment_data(binding, level, *, enchantment=None):
 
 
 class HarvestTests(unittest.IsolatedAsyncioTestCase):
-    async def connect(self, *, protocol=2225, hashed=True, custom=False):
+    async def connect(self, *, protocol=2225, hashed=True, custom=False, native_writes=False):
         bot = Bot("HarvestTest", protocol=protocol)
         self.stream = PacketStream(bot.protocol)
         self.binding = bot.protocol.binding
+        if native_writes:
+            wire = Wire(bot.protocol)
+            settings = self.binding.NetworkSettingsPacket(compression_algorithm=self.binding.PacketCompressionAlgorithm.NONE)
+            self.stream.sent = wire.sent
+            self.stream.send = PacketConnection(wire, bot.protocol, settings).send
         session = JoinSession(self.stream, bot.identity, "127.0.0.1")
         session.player_id = session.player_unique_id = 1
         session.block_network_ids_are_hashes = hashed
@@ -51,6 +64,14 @@ class HarvestTests(unittest.IsolatedAsyncioTestCase):
             1210: "minecraft:diamond_hoe",
             1211: "minecraft:iron_sword",
             1212: "minecraft:copper_pickaxe",
+            RAW_IRON_ITEM: "minecraft:raw_iron",
+            IRON_ORE_ITEM: "minecraft:iron_ore",
+            DEEPSLATE_IRON_ORE_ITEM: "minecraft:deepslate_iron_ore",
+            DIAMOND_ITEM: "minecraft:diamond",
+            DIAMOND_ORE_ITEM: "minecraft:diamond_ore",
+            DEEPSLATE_DIAMOND_ORE_ITEM: "minecraft:deepslate_diamond_ore",
+            STRING_ITEM: "minecraft:string",
+            WEB_ITEM: "minecraft:web",
             299: "test:iron_pickaxe",
         }
         self.stream.close = self.close_stream
@@ -72,11 +93,11 @@ class HarvestTests(unittest.IsolatedAsyncioTestCase):
             update_flags=0, layer=0,
         ))
 
-    def inventory_slot(self, slot, item_id, count=1, *, user_data=b""):
+    def inventory_slot(self, slot, item_id, count=1, *, user_data=b"", net_id=None):
         b = self.binding
         item = b.SerializedNetworkItemStackDescriptor(
             id=item_id, stack_size=count if item_id else 0, aux_value=0,
-            net_id_variant=slot + 100 if item_id else None, block_runtime_id=0,
+            net_id_variant=(slot + 100 if net_id is None else net_id) if item_id else None, block_runtime_id=0,
             user_data_buffer=user_data,
         )
         self.emit(b.InventorySlotPacket(inventory_id=b.ContainerID.INVENTORY, slot=slot,
@@ -149,6 +170,165 @@ class HarvestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.best_harvest_tool(POSITION), HarvestTool(12, "minecraft:iron_pickaxe", 6))
         self.block(0x80310E21)  # Stone admits the faster gold tool.
         self.assertEqual(bot.best_harvest_tool(POSITION), HarvestTool(0, "minecraft:golden_pickaxe", 12))
+
+    async def test_requested_ore_drop_constrains_both_tool_query_and_equip(self):
+        bot = await self.connect()
+        b = self.binding
+        silk_data = enchantment_data(b, 1, enchantment=b.Enchant.Type.SILK_TOUCH)
+        self.inventory_slot(1, 1205, user_data=EMPTY_USER_DATA)
+        self.inventory_slot(2, 1205, user_data=silk_data)
+        for runtime_id, ordinary_drop, ore_item in (
+            (IRON_ORE, RAW_IRON_ITEM, IRON_ORE_ITEM),
+            (DEEPSLATE_IRON_ORE, RAW_IRON_ITEM, DEEPSLATE_IRON_ORE_ITEM),
+            (DIAMOND_ORE, DIAMOND_ITEM, DIAMOND_ORE_ITEM),
+            (DEEPSLATE_DIAMOND_ORE, DIAMOND_ITEM, DEEPSLATE_DIAMOND_ORE_ITEM),
+        ):
+            self.block(runtime_id)
+            for drop_id, slot, metadata in ((ordinary_drop, 1, EMPTY_USER_DATA), (ore_item, 2, silk_data)):
+                with self.subTest(block=runtime_id, drop_id=drop_id):
+                    expected = HarvestTool(slot, "minecraft:diamond_pickaxe", 8)
+                    self.assertEqual(bot.best_harvest_tool(POSITION, requested_drop_id=drop_id), expected)
+                    self.assertEqual(self.stream.sent, [])
+                    self.assertEqual(await bot.equip_harvest_tool(POSITION, requested_drop_id=drop_id), expected)
+                    packet, = self.stream.sent
+                    self.assertIsInstance(packet, b.MobEquipmentPacket)
+                    self.assertEqual((packet.selected_slot, packet.item.user_data_buffer), (slot, metadata))
+                    self.stream.sent.clear()
+
+    async def test_requested_web_drop_chooses_a_sword_or_shears(self):
+        bot = await self.connect()
+        self.block(WEB)
+        self.inventory_slot(1, 1211)
+        self.inventory_slot(2, 1203, user_data=enchantment_data(self.binding, 2))
+        for drop_id, slot, name, item_id in (
+            (STRING_ITEM, 1, "minecraft:iron_sword", 1211),
+            (WEB_ITEM, 2, "minecraft:shears", 1203),
+        ):
+            with self.subTest(drop_id=drop_id):
+                choice = bot.best_harvest_tool(POSITION, requested_drop_id=drop_id)
+                self.assertEqual((choice.slot, choice.item_name), (slot, name))
+                self.assertEqual(self.stream.sent, [])
+                self.assertEqual(await bot.equip_harvest_tool(POSITION, requested_drop_id=drop_id), choice)
+                packet, = self.stream.sent
+                self.assertIsInstance(packet, self.binding.MobEquipmentPacket)
+                self.assertEqual((packet.selected_slot, packet.item.id), (slot, item_id))
+                self.stream.sent.clear()
+
+    async def test_requested_drop_rejects_unknown_inputs_and_ineligible_tools_without_sending(self):
+        bot = await self.connect()
+        self.inventory_slot(1, 1201, user_data=EMPTY_USER_DATA)
+        for runtime_id, drop_id in (
+            (None, RAW_IRON_ITEM), (0xDEADBEEF, RAW_IRON_ITEM), (DIRT, RAW_IRON_ITEM),
+            (IRON_ORE, 9000), (IRON_ORE, DIAMOND_ITEM), (IRON_ORE, IRON_ORE_ITEM),
+        ):
+            with self.subTest(block=runtime_id, drop_id=drop_id):
+                if runtime_id is not None:
+                    self.block(runtime_id)
+                self.assertIsNone(bot.best_harvest_tool(POSITION, requested_drop_id=drop_id))
+                self.assertIsNone(await bot.equip_harvest_tool(POSITION, requested_drop_id=drop_id))
+                self.assertEqual(self.stream.sent, [])
+        self.inventory_slot(1, 1201)
+        self.assertIsNone(bot.best_harvest_tool(POSITION, requested_drop_id=RAW_IRON_ITEM))
+        self.assertIsNone(await bot.equip_harvest_tool(POSITION, requested_drop_id=RAW_IRON_ITEM))
+        self.assertEqual(bot.best_harvest_tool(POSITION, requested_drop_id=None),
+                         HarvestTool(1, "minecraft:iron_pickaxe", 6))
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_requested_drop_conflicts_with_breaking_without_a_drop(self):
+        bot = await self.connect()
+        with self.assertRaisesRegex(ValueError, "requires require_harvest=True"):
+            bot.best_harvest_tool(POSITION, requested_drop_id=RAW_IRON_ITEM, require_harvest=False)
+        with self.assertRaisesRegex(ValueError, "requires require_harvest=True"):
+            await bot.equip_harvest_tool(POSITION, requested_drop_id=RAW_IRON_ITEM, require_harvest=False)
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_requested_drop_rechecks_target_across_inventory_open(self):
+        for before_write in (True, False):
+            with self.subTest(before_open_write=before_write):
+                bot = await self.connect(native_writes=True)
+                b = self.binding
+                self.block(IRON_ORE)
+                self.inventory_slot(2, 0)
+                self.inventory_slot(12, 1201, user_data=EMPTY_USER_DATA)
+                original_send = self.stream.send
+
+                async def send(packet, *, _before_send=None):
+                    if before_write and isinstance(packet, b.InteractPacket):
+                        self.block(DIRT)
+                    await original_send(packet, _before_send=_before_send)
+                    if not before_write and isinstance(packet, b.InteractPacket):
+                        self.block(DIRT)
+
+                self.stream.send = send
+                self.reply_to_transfers(bot, "SUCCESS")
+                self.assertIsNone(await bot.equip_harvest_tool(POSITION, requested_drop_id=RAW_IRON_ITEM))
+                self.assertIsNone(bot.best_harvest_tool(POSITION, requested_drop_id=RAW_IRON_ITEM))
+                expected = [] if before_write else [b.InteractPacket, b.ContainerClosePacket]
+                self.assertEqual([type(packet) for packet in self.stream.sent], expected)
+                self.assertEqual((bot.inventory_slots[12].id, bot.inventory_slots[2].id), (1201, 0))
+                self.assertIsNone(bot.open_window)
+
+    async def test_requested_drop_rechecks_source_nbt_at_transfer_write(self):
+        for hotbar_item in (0, 1211):
+            with self.subTest(hotbar_item=hotbar_item):
+                bot = await self.connect(native_writes=True)
+                b = self.binding
+                self.block(IRON_ORE)
+                self.inventory_slot(2, hotbar_item)
+                self.inventory_slot(12, 1201, user_data=EMPTY_USER_DATA)
+                silk_data = enchantment_data(b, 1, enchantment=b.Enchant.Type.SILK_TOUCH)
+                self.reply_to_transfers(bot, "SUCCESS")
+                original_send = self.stream.send
+
+                async def send(packet, *, _before_send=None):
+                    if isinstance(packet, b.ItemStackRequestPacket):
+                        self.inventory_slot(12, 1201, user_data=silk_data)
+                    await original_send(packet, _before_send=_before_send)
+
+                self.stream.send = send
+                self.assertIsNone(await bot.equip_harvest_tool(POSITION, requested_drop_id=RAW_IRON_ITEM))
+                self.assertEqual([type(packet) for packet in self.stream.sent], [b.InteractPacket, b.ContainerClosePacket])
+                tool = bot.inventory_slots[12]
+                self.assertEqual((tool.id, tool.net_id_variant, tool.user_data_buffer), (1201, 112, silk_data))
+                self.assertEqual(bot.inventory_slots[2].id, hotbar_item)
+                self.assertIsNone(bot.open_window)
+
+    async def test_requested_drop_keeps_confirmed_transfer_when_selection_becomes_stale(self):
+        for stale in (False, True):
+            with self.subTest(stale_selection=stale):
+                bot = await self.connect(native_writes=True)
+                b = self.binding
+                self.block(IRON_ORE)
+                self.inventory_slot(2, 0)
+                self.inventory_slot(12, 1201, user_data=EMPTY_USER_DATA)
+                silk_data = enchantment_data(b, 1, enchantment=b.Enchant.Type.SILK_TOUCH)
+                self.reply_to_transfers(bot, "SUCCESS")
+                original_send = self.stream.send
+
+                async def send(packet, *, _before_send=None):
+                    if isinstance(packet, b.MobEquipmentPacket):
+                        confirmed = bot.inventory_slots[2]
+                        self.assertEqual((confirmed.net_id_variant, confirmed.user_data_buffer), (502, EMPTY_USER_DATA))
+                        if stale:
+                            self.inventory_slot(2, 1201, user_data=silk_data, net_id=502)
+                    await original_send(packet, _before_send=_before_send)
+
+                self.stream.send = send
+                result = await bot.equip_harvest_tool(POSITION, requested_drop_id=RAW_IRON_ITEM)
+                expected = [b.InteractPacket, b.ItemStackRequestPacket, b.ContainerClosePacket]
+                if stale:
+                    self.assertIsNone(result)
+                    self.assertEqual(bot.held_item.slot, 0)
+                else:
+                    expected.append(b.MobEquipmentPacket)
+                    self.assertEqual(result, HarvestTool(2, "minecraft:iron_pickaxe", 6))
+                    self.assertEqual(bot.held_item.slot, 2)
+                self.assertEqual([type(packet) for packet in self.stream.sent], expected)
+                self.assertEqual(bot.inventory_slots[12].id, 0)
+                tool = bot.inventory_slots[2]
+                self.assertEqual((tool.id, tool.net_id_variant), (1201, 502))
+                self.assertEqual(tool.user_data_buffer, silk_data if stale else EMPTY_USER_DATA)
+                self.assertIsNone(bot.open_window)
 
     async def test_clear_tool_compares_progress_with_and_without_a_drop(self):
         bot = await self.connect()

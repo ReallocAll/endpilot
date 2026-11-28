@@ -734,11 +734,17 @@ class Inventory:
         if 0 <= slot < 9:
             self._apply_selection(slot, next(self._selection_order), "server", equipment=equipment)
 
-    async def _send_selection(self, packet, slot: int, *, equipment: HeldItemStack | None = None) -> None:
+    async def _send_selection(
+        self, packet, slot: int, *, equipment: HeldItemStack | None = None,
+        _before_send: Callable[[], None] | None = None,
+    ) -> None:
         # Reserve order before handing the packet to the transport. Only
         # successful sends and received corrections can advance the selection.
         order = next(self._selection_order)
-        await self.packets.send(packet)
+        if _before_send is None:
+            await self.packets.send(packet)
+        else:
+            await self.packets.send(packet, _before_send=_before_send)
         self._apply_selection(slot, order, "local", equipment=equipment)
 
     def item_or_empty(self, slot: int):
@@ -790,7 +796,7 @@ class Inventory:
             should_select_slot=True,
         ), slot)
 
-    async def announce_equipment(self, slot: int, item) -> None:
+    async def announce_equipment(self, slot: int, item, *, _before_send: Callable[[], None] | None = None) -> None:
         """Carry the server-observed item descriptor for a use transaction."""
         b = self.packets.protocol.binding
         await self._send_selection(b.MobEquipmentPacket(
@@ -799,7 +805,7 @@ class Inventory:
             slot=slot,
             selected_slot=slot,
             container_id=b.ContainerID.INVENTORY,
-        ), slot, equipment=_stack_snapshot(item))
+        ), slot, equipment=_stack_snapshot(item), _before_send=_before_send)
 
 
 
@@ -1212,6 +1218,7 @@ class Inventory:
         self, source_slot: int, destination_slot: int, amount: int = 1, *, timeout: float = 15, _queued: bool = False,
         _on_confirmed=None, _expected_slots: tuple[HeldItemStack, HeldItemStack] | None = None,
         _window_is_current: Callable[[], bool] | None = None, _on_unconfirmed: Callable[[], None] | None = None,
+        _at_write: Callable[[], None] | None = None,
     ):
         """Place part or all of an observed stack in another player inventory slot.
 
@@ -1291,7 +1298,7 @@ class Inventory:
             if _on_confirmed is not None and response.result.name == "SUCCESS":
                 _on_confirmed()
 
-        return await self._request_item_stack(request, apply, timeout=timeout, queued=_queued)
+        return await self._request_item_stack(request, apply, timeout=timeout, queued=_queued, _at_write=_at_write)
 
     async def _move_range_step(self, request, source, destination, amount, *, timeout, expected, endpoints,
                                window_is_current, on_unconfirmed):
@@ -1367,7 +1374,7 @@ class Inventory:
 
     async def swap_items(
         self, source_slot: int, destination_slot: int, *, timeout: float = 15, _queued: bool = False,
-        _on_confirmed=None,
+        _on_confirmed=None, _at_write: Callable[[], None] | None = None,
     ):
         """Swap two inventory slots; reconcile only the matching BDS response slots.
 
@@ -1439,7 +1446,7 @@ class Inventory:
             if _on_confirmed is not None and success:
                 _on_confirmed()
 
-        return await self._request_item_stack(request, apply, timeout=timeout, queued=_queued)
+        return await self._request_item_stack(request, apply, timeout=timeout, queued=_queued, _at_write=_at_write)
 
     async def drop_item(self, slot: int, amount: int = 1, *, timeout: float = 15, _queued: bool = False):
         """Drop part of an observed inventory stack; return the matching BDS verdict.

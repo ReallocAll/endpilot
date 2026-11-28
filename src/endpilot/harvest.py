@@ -12,7 +12,7 @@ from .block_data import MiningRule, VanillaBlockState
 from .blocks import BlockObservation, Blocks, _ORDINARY_MINING_REACH
 from .containers import Containers, ContainerWindow, _same_slot
 from .inventory import (
-    Inventory, _InventoryMoveNotSubmitted, _MAIN_INVENTORY_SIZE, _PLAYER_CONTAINERS, _stack_snapshot,
+    HeldItemStack, Inventory, _InventoryMoveNotSubmitted, _MAIN_INVENTORY_SIZE, _PLAYER_CONTAINERS, _stack_snapshot,
 )
 from .item_user_data import read_item_user_data
 from .range_transfer import (
@@ -166,21 +166,34 @@ class HarvestTools:
         self._item_names = item_names
         self._equip_lock = asyncio.Lock()
 
-    def best(self, position: tuple[int, int, int], *, require_harvest: bool = True) -> HarvestTool | None:
-        return self._best(position, self._inventory.slots, require_harvest=require_harvest)
+    def best(
+        self, position: tuple[int, int, int], *, require_harvest: bool = True, requested_drop_id: int | None = None,
+    ) -> HarvestTool | None:
+        return self._best(
+            position, self._inventory.slots, require_harvest=require_harvest,
+            requested_drop_id=requested_drop_id, strict_drop=True,
+        )
 
     def _best(
         self, position: tuple[int, int, int], slots: dict[int, object], *, requested_drop_id: int | None = None,
-        require_harvest: bool = True,
+        require_harvest: bool = True, strict_drop: bool = False,
     ) -> HarvestTool | None:
-        rule = self._mining_rule(self._blocks.observed_block(position), requested_drop_id=requested_drop_id)
+        rule = self._mining_rule(
+            self._blocks.observed_block(position), requested_drop_id=requested_drop_id, strict_drop=strict_drop,
+        )
         return None if rule is None else self._best_in_inventory(rule, slots, require_harvest=require_harvest)
 
     def _mining_rule(
         self, block: BlockObservation | None, *, requested_drop_id: int | None = None,
+        strict_drop: bool = False,
     ) -> MiningRule | None:
         state = None if block is None else self._blocks._vanilla_state(block.runtime_id)
-        return None if state is None else self._requested_drop_rule(state, requested_drop_id) or state.mining_rule
+        if state is None:
+            return None
+        requested_rule = self._requested_drop_rule(state, requested_drop_id)
+        if strict_drop and requested_drop_id is not None:
+            return requested_rule
+        return requested_rule or state.mining_rule
 
     def _requested_drop_rule(
         self, state: VanillaBlockState | None, requested_drop_id: int | None,
@@ -523,31 +536,58 @@ class HarvestTools:
 
     async def equip(
         self, position: tuple[int, int, int], *, timeout: float, requested_drop_id: int | None = None,
-        require_harvest: bool = True,
+        require_harvest: bool = True, strict_drop: bool = False,
     ) -> HarvestTool | None:
         async with self._equip_lock:
             return await self._equip(
                 position, timeout=timeout, requested_drop_id=requested_drop_id, require_harvest=require_harvest,
+                strict_drop=strict_drop,
             )
 
     async def _equip(
         self, position: tuple[int, int, int], *, timeout: float, requested_drop_id: int | None = None,
-        require_harvest: bool = True,
+        require_harvest: bool = True, strict_drop: bool = False,
     ) -> HarvestTool | None:
-        slots = self._inventory.slots
-        tool = self._best(position, slots, requested_drop_id=requested_drop_id, require_harvest=require_harvest)
+        blocks, inventory = self._blocks, self._inventory
+        target = blocks.observed_block(position)
+        rule = self._mining_rule(target, requested_drop_id=requested_drop_id, strict_drop=strict_drop)
+        if rule is None:
+            return None
+        slots = inventory.slots
+        tool = self._best_in_inventory(rule, slots, require_harvest=require_harvest)
         if tool is None:
             return None
-        return await self._equip_tool(tool, slots, timeout=timeout)
+        if not strict_drop or requested_drop_id is None:
+            return await self._equip_tool(tool, slots, timeout=timeout)
+
+        if tool.slot is None:
+            return None
+        epoch = blocks._mining_epoch
+        item_id = int(slots[tool.slot].id)
+
+        def before_write():
+            if (blocks._mining_epoch != epoch or blocks.observed_block(position) != target
+                    or self._mining_rule(target, requested_drop_id=requested_drop_id, strict_drop=True) != rule
+                    or self._item_names.get(item_id) != tool.item_name):
+                raise _InventoryMoveNotSubmitted("harvest target or drop tool changed")
+
+        try:
+            equipped = await self._equip_tool(tool, slots, timeout=timeout, before_write=before_write)
+        except _InventoryMoveNotSubmitted:
+            return None
+        return (equipped if equipped is not None and self._has_equipped_drop_tool(target, equipped, requested_drop_id)
+                else None)
 
     async def _equip_tool(
         self, tool: HarvestTool, slots: dict[int, object], *, timeout: float, confirmed: bool = False,
         before_slot_use: Callable[..., None] | None = None,
+        before_write: Callable[[], None] | None = None,
     ) -> HarvestTool | None:
         inventory = self._inventory
         source = tool.slot
         if source is not None and source < 9:
-            return await self._select(tool, source, slots[source], before_slot_use=before_slot_use)
+            return await self._select(tool, source, slots[source], before_slot_use=before_slot_use,
+                                      before_write=before_write)
 
         selected = inventory.selected_slot
         hotbar = sorted((slot for slot in range(9) if slot in slots),
@@ -571,18 +611,36 @@ class HarvestTools:
 
         held = await self._transfer(
             source, destination, slots, hotbar_slot=hotbar_slot, timeout=timeout, confirmed=confirmed,
-            before_slot_use=before_slot_use,
+            before_slot_use=before_slot_use, before_write=before_write,
         )
-        return await self._select(tool, hotbar_slot, held, before_slot_use=before_slot_use)
+        return await self._select(tool, hotbar_slot, held, before_slot_use=before_slot_use, before_write=before_write)
 
     def _matches_slot(self, slot: int, item) -> bool:
         inventory = self._inventory
         return (_same_slot(item, inventory.slots.get(slot))
                 and _same_slot(item, inventory.item_or_empty(slot)))
 
-    async def _select(self, tool: HarvestTool, slot: int, item, *, before_slot_use=None) -> HarvestTool:
+    def _require_slot_at_write(self, slot: int, expected: HeldItemStack | None) -> None:
+        inventory = self._inventory
+        if (inventory._observed_stack(slot) != expected
+                or _stack_snapshot(inventory.item_or_empty(slot)) != expected):
+            raise _InventoryMoveNotSubmitted(f"harvest inventory slot {slot} changed")
+
+    async def _select(self, tool: HarvestTool, slot: int, item, *, before_slot_use=None, before_write=None) -> HarvestTool:
         if before_slot_use is not None:
             before_slot_use(slot)
+        if before_write is not None:
+            expected = _stack_snapshot(item)
+
+            def require_selection():
+                before_write()
+                self._require_slot_at_write(slot, expected)
+
+            require_selection()
+            await self._inventory.announce_equipment(slot, item, _before_send=require_selection)
+            require_selection()
+            return replace(tool, slot=slot)
+
         if not self._matches_slot(slot, item):
             raise _HarvestEquipUnavailable(f"inventory slot {slot} changed before selecting the harvest tool")
         await self._inventory.select_hotbar(slot)
@@ -592,14 +650,22 @@ class HarvestTools:
 
     async def _transfer(
         self, source: int, destination: int, slots: dict[int, object], *, hotbar_slot: int, timeout: float,
-        confirmed: bool, before_slot_use: Callable[..., None] | None,
+        confirmed: bool, before_slot_use: Callable[..., None] | None, before_write: Callable[[], None] | None,
     ):
         inventory = self._inventory
         containers = self._containers
         owned_window = None
         expected = None if source == hotbar_slot else slots[source]
-        expected_stack = _stack_snapshot(expected) if confirmed else None
+        check_receipt = confirmed or before_write is not None
+        expected_stack = _stack_snapshot(expected) if check_receipt else None
         held = None
+        expected_slots = ({slot: _stack_snapshot(slots[slot]) for slot in (source, destination)}
+                          if before_write is not None else {})
+
+        def require_current_slots() -> None:
+            before_write()
+            for slot, snapshot in expected_slots.items():
+                self._require_slot_at_write(slot, snapshot)
 
         def capture_held_stack() -> None:
             nonlocal held
@@ -612,31 +678,47 @@ class HarvestTools:
 
         failure = None
         try:
-            if containers.window is None:
+            window = containers.window
+            if window is None:
                 # BDS validates player stack requests against an active window.
-                opened = await containers.open_inventory_screen(timeout=timeout, _on_observed=remember_window)
-                if containers.window is not opened:
+                open_guard = {"_before_send": require_current_slots} if before_write is not None else {}
+                window = await containers.open_inventory_screen(timeout=timeout, _on_observed=remember_window,
+                                                                 **open_guard)
+                if containers.window is not window:
+                    if before_write is not None:
+                        raise _InventoryMoveNotSubmitted("harvest inventory window changed")
                     raise _HarvestEquipUnavailable("player inventory window did not open")
             if before_slot_use is not None:
                 before_slot_use(source, destination)
-            for slot in (source, destination):
-                if not self._matches_slot(slot, slots[slot]):
-                    raise _HarvestEquipUnavailable(f"inventory slot {slot} changed before harvest tool transfer")
+
+            def require_transfer() -> None:
+                require_current_slots()
+                if containers.window is not window:
+                    raise _InventoryMoveNotSubmitted("harvest inventory window changed")
+
+            if before_write is not None:
+                require_transfer()
+            else:
+                for slot in (source, destination):
+                    if not self._matches_slot(slot, slots[slot]):
+                        raise _HarvestEquipUnavailable(f"inventory slot {slot} changed before harvest tool transfer")
+
+            transfer_guard = {"_at_write": require_transfer} if before_write is not None else {}
             if int(slots[destination].id) == 0:
                 response = await inventory.move_item(
                     source, destination, int(slots[source].stack_size), timeout=timeout,
-                    _on_confirmed=capture_held_stack,
+                    _on_confirmed=capture_held_stack, **transfer_guard,
                 )
             else:
                 response = await inventory.swap_items(
-                    source, destination, timeout=timeout, _on_confirmed=capture_held_stack,
+                    source, destination, timeout=timeout, _on_confirmed=capture_held_stack, **transfer_guard,
                 )
             if response.result.name != "SUCCESS":
                 raise _HarvestEquipUnavailable(f"harvest tool transfer rejected: {response.result.name}")
             if (held is None or int(held.id) != (0 if expected is None else int(expected.id))
                     or (expected is not None and held.user_data_buffer != expected.user_data_buffer)):
                 raise _HarvestEquipUnavailable(f"harvest tool transfer did not confirm inventory slot {hotbar_slot}")
-            if confirmed:
+            if check_receipt:
                 correction = _receipt_slot(response, _PLAYER_CONTAINERS, hotbar_slot)
                 if (correction is None or correction.amount != expected_stack.count
                         or _stack_snapshot(held) != _receipt_stack(expected_stack, correction)):
@@ -652,6 +734,6 @@ class HarvestTools:
                 try:
                     await containers.close_window(timeout=timeout, _expected_window=owned_window)
                 except Exception as error:
-                    if failure is None:
+                    if failure is None or (before_write is not None and isinstance(failure, _InventoryMoveNotSubmitted)):
                         raise
                     failure.add_note(f"player inventory close failed: {error!r}")
