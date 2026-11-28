@@ -10,7 +10,7 @@ from math import isfinite
 from typing import TYPE_CHECKING, Literal
 
 from ._stack_limits_2225 import STACK_LIMITS
-from .containers import _PLAYER_CONTAINERS, _same_slot
+from .containers import _PLAYER_CONTAINERS, _same_slot, _shared_storage_domain
 from .inventory import HeldItemStack, _InventoryMoveNotSubmitted, _stack_snapshot
 
 if TYPE_CHECKING:
@@ -465,7 +465,7 @@ async def transfer_inventory_range(
     """
     return await _transfer_within(
         bot, item=item, count=count, source_slots=source_slots, destination_slots=destination_slots,
-        match=match, timeout=timeout, in_chest=False,
+        match=match, timeout=timeout, in_container=False,
     )
 
 
@@ -479,20 +479,20 @@ async def transfer_container_range(
     match: Callable[[HeldItemStack], bool] | None = None,
     timeout: float = 15,
 ) -> RangeTransferResult:
-    """Move a registered item between disjoint ranges in an open single chest.
+    """Move a registered item between disjoint ranges in an open storage window.
 
-    Use an observed 27-slot ordinary chest. Fill compatible stacks before
-    empty slots, and count only moves confirmed by both server corrections.
-    The optional synchronous match and transfer_progress follow
-    transfer_inventory_range.
+    Use an observed 27-slot ordinary chest, trapped chest, barrel or shulker
+    box. Fill compatible stacks before empty slots and count only moves
+    confirmed by matching corrections to both slots. The optional
+    synchronous match and transfer_progress follow transfer_inventory_range.
     """
     return await _transfer_within(
         bot, item=item, count=count, source_slots=source_slots, destination_slots=destination_slots,
-        match=match, timeout=timeout, in_chest=True,
+        match=match, timeout=timeout, in_container=True,
     )
 
 
-async def _transfer_within(bot, *, item, count, source_slots, destination_slots, match, timeout, in_chest):
+async def _transfer_within(bot, *, item, count, source_slots, destination_slots, match, timeout, in_container):
     if not isinstance(item, str) or not item:
         raise ValueError("item must be a nonempty registered name")
     if type(count) is not int or count < 0:
@@ -501,12 +501,12 @@ async def _transfer_within(bot, *, item, count, source_slots, destination_slots,
         raise ValueError("timeout must be finite and nonnegative")
     if match is not None and not callable(match):
         raise TypeError("match must be callable")
-    slot_limit = _SINGLE_CONTAINER_SIZE if in_chest else _PLAYER_SIZE
+    slot_limit = _SINGLE_CONTAINER_SIZE if in_container else _PLAYER_SIZE
     _check_range(source_slots, slot_limit, "source_slots")
     _check_range(destination_slots, slot_limit, "destination_slots")
     if (source_slots and destination_slots and source_slots.start < destination_slots.stop
             and destination_slots.start < source_slots.stop):
-        if in_chest:
+        if in_container:
             raise ValueError("container transfer ranges must not overlap")
         raise ValueError("inventory transfer ranges must not overlap")
     if not count:
@@ -531,42 +531,48 @@ async def _transfer_within(bot, *, item, count, source_slots, destination_slots,
     try:
         inventory, containers = bot._inventory, bot._containers
         window = bot.open_window
-        kind = "CONTAINER" if in_chest else "INVENTORY"
+        kind = "CONTAINER" if in_container else "INVENTORY"
         if inventory is None or containers is None or window is None or window.container_type != kind:
-            target = "an ordinary single chest" if in_chest else "the player inventory"
+            target = "a block storage window" if in_container else "the player inventory"
             raise RuntimeError(f"open {target} before transferring items")
-        if in_chest:
+        name = domain = None
+        if in_container:
             if window.position is None or window.entity_unique_id != -1:
-                raise RuntimeError("open an ordinary single chest before transferring items")
+                raise RuntimeError("open a block storage window before transferring items")
             name = containers._observed_window_block_name(window)
             current_name = containers._current_window_block_name(window)
             slot_count = containers._observed_window_slot_count(window)
             if name is None or slot_count is None or current_name is None:
                 return result("unobserved")
-            if name != "minecraft:chest" or slot_count != _SINGLE_CONTAINER_SIZE:
-                raise RuntimeError("the active window must match an ordinary single chest with 27 slots")
-            if current_name != name:
+            domain = _shared_storage_domain(name)
+            if (domain is None or slot_count != _SINGLE_CONTAINER_SIZE
+                    or (name != "minecraft:chest" and bot.protocol.number != 2225)):
+                raise RuntimeError("the active window must match a supported storage block with 27 slots")
+            if current_name != name or containers._shared_storage_replaced:
                 return result("window_changed")
+            if name != "minecraft:chest" and containers._shared_storage_replaced is None:
+                return result("unobserved")
         layout = containers._layout_token
 
         target_replaced = False
 
-        def observe_target(name):
+        def observe_target(current_name):
             nonlocal target_replaced
-            if name is not None and name != "minecraft:chest":
+            if current_name is not None and current_name != name:
                 target_replaced = True
 
         def window_is_current():
             return (bot._inventory is inventory and bot._containers is containers
                     and containers.window is window and containers._layout_token is layout
                     and not target_replaced
-                    and (not in_chest or containers._current_window_block_name(window) == "minecraft:chest"))
+                    and (not in_container or (not containers._shared_storage_replaced
+                                              and containers._current_window_block_name(window) == name)))
 
         registry = bot.item_registry
         item_id = None if registry is None else registry.id_for_name(item)
         if not item_id:
             return result("unobserved")
-        if in_chest:
+        if in_container:
             stop_watching = containers._watch_transfer_block(window.position, observe_target)
         limit = STACK_LIMITS.get(item) if bot.protocol.number == 2225 else None
         loop = asyncio.get_running_loop()
@@ -575,12 +581,12 @@ async def _transfer_within(bot, *, item, count, source_slots, destination_slots,
         while remaining:
             if not window_is_current():
                 return result("window_changed")
-            if in_chest:
+            if in_container:
                 slots = containers.slots
 
                 def observed(indices):
                     return {index: stack for index, stack in _known_slots(slots, indices).items()
-                            if containers._can_plan_chest_slot(index)}
+                            if containers._can_plan_container_slot(index)}
             else:
                 slots = inventory.slots
                 predicted = inventory.client_slots()
@@ -592,7 +598,7 @@ async def _transfer_within(bot, *, item, count, source_slots, destination_slots,
 
             source, destination = observed(source_slots), observed(destination_slots)
             plan = _plan_step(source, destination, item_id, remaining, limit, source_slots, destination_slots,
-                              match=match, window_is_current=window_is_current if in_chest else None)
+                              match=match, window_is_current=window_is_current if in_container else None)
             if isinstance(plan, str):
                 return result(plan)
             origin, target, amount = plan
@@ -603,23 +609,23 @@ async def _transfer_within(bot, *, item, count, source_slots, destination_slots,
             step = RangeTransferStep(origin, target, amount, None, None, None)
             steps.append(step)
             overlapped = False
-            chest_confirmed = None
+            container_confirmed = None
 
-            def confirm_chest(moved):
-                nonlocal chest_confirmed
-                chest_confirmed = moved
+            def confirm_container(moved):
+                nonlocal container_confirmed
+                container_confirmed = moved
 
             def record_reply(reply):
                 observed = replace(step, request_id=int(reply.client_request_id.raw_id), verdict=reply.result.name,
-                                   confirmed=chest_confirmed)
+                                   confirmed=container_confirmed)
                 steps[-1] = observed
                 if not window_is_current():
                     return "window_changed"
                 if observed.verdict != "SUCCESS":
                     steps[-1] = replace(observed, confirmed=0)
                     return "rejected"
-                if in_chest:
-                    return "unconfirmed" if chest_confirmed is None else None
+                if in_container:
+                    return "unconfirmed" if container_confirmed is None else None
                 if overlapped:
                     return "unconfirmed"
 
@@ -635,11 +641,11 @@ async def _transfer_within(bot, *, item, count, source_slots, destination_slots,
 
             try:
                 expected = source[origin], destination[target]
-                if in_chest:
-                    reply = await containers._move_within_chest(
-                        window, origin, target, amount, timeout=time_left, expected=expected,
+                if in_container:
+                    reply = await containers._move_within_container(
+                        window, origin, target, amount, domain=domain, timeout=time_left, expected=expected,
                         window_is_current=window_is_current, on_submitted=retain_watch_until,
-                        on_confirmed=confirm_chest,
+                        on_confirmed=confirm_container,
                     )
                 else:
                     reply = await inventory.move_item(

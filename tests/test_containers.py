@@ -1830,6 +1830,7 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
     async def test_exact_block_transfer_unregisters_watch_on_close_timeout_or_cancellation(self):
         for stop in ("close", "timeout", "cancel"):
             with self.subTest(stop=stop):
+                closed_observers = self.transfer_observers()
                 await self.deliver(self.block("minecraft:undyed_shulker_box"), self.opened(-1),
                                    self.storage_content(27, (26, 5, 31)))
                 observers = self.transfer_observers()
@@ -1841,7 +1842,7 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(self.transfer_observers(), tuple(count + 1 for count in observers))
                     if stop == "close":
                         await self.deliver(self.closed())
-                        self.assertEqual(self.transfer_observers(), observers)
+                        self.assertEqual(self.transfer_observers(), closed_observers)
                         released.set()
                         with self.assertRaisesRegex(RuntimeError, "endpoint changed"):
                             await taking
@@ -1852,8 +1853,10 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
                         taking.cancel()
                         with self.assertRaises(asyncio.CancelledError):
                             await taking
-                self.assertEqual(self.transfer_observers(), observers)
+                self.assertEqual(self.transfer_observers(), closed_observers if stop == "close" else observers)
                 self.assertEqual(self.wire.sent, sent_before)
+                await self.deliver(self.closed())
+                self.assertEqual(self.transfer_observers(), closed_observers)
 
     async def test_late_shulker_reply_cannot_change_a_reused_window(self):
         b = self.b

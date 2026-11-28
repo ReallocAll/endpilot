@@ -148,6 +148,16 @@ _SHULKER_BOXES = frozenset(
 )
 
 
+def _shared_storage_domain(block_name: str | None) -> str | None:
+    if block_name in ("minecraft:chest", "minecraft:trapped_chest"):
+        return "LEVEL_ENTITY_CONTAINER"
+    if block_name == "minecraft:barrel":
+        return "BARREL_CONTAINER"
+    if block_name in _SHULKER_BOXES:
+        return "SHULKER_BOX_CONTAINER"
+    return None
+
+
 def _same_stack(before, current):
     if before is current:
         return True
@@ -182,6 +192,7 @@ class Containers:
         self._dimension = None if blocks is None else blocks.dimension_id
         self._layout_token = object()
         self._window_block_name: str | None = None
+        self._shared_storage_replaced: bool | None = None
         self._window_slot_count: int | None = None
         self._transfer_block_watches: set[Callable[[], None]] = set()
         self._slots: dict[int, object] | None = None
@@ -230,6 +241,7 @@ class Containers:
         self._furnace_progress_observers.clear()
         self._layout_token = object()
         self._window_block_name = None
+        self._shared_storage_replaced = None
         self._window_slot_count = None
         self._entity_container = None
         self._slots = None
@@ -376,6 +388,14 @@ class Containers:
         else:
             self._slots[index] = updated
         self._slots_updated.set()
+
+    def _mark_late_single_container_overlap(self, anchor, index, *, except_request):
+        # A late extra correction still identifies the old physical slot.
+        # The replacement window has its own observations of that slot.
+        endpoint = replace(anchor, slot=index, local_slot=index)
+        for pending in self.inventory._requests_for_endpoints((endpoint,), allow_possible=False):
+            if pending is not except_request and pending.submitted and pending.on_unconfirmed is not None:
+                pending.on_unconfirmed()
 
     def _notify_slot_changes(self, window, before, *, complete=False) -> None:
         if before is None or self.window is not window or not self._slot_observers or (not complete and not before):
@@ -545,7 +565,16 @@ class Containers:
         elif raw.packet_id == b.ContainerOpenPacket.ID:
             window = self._decode_open(raw)
             self._set_window(window)
-            self._observed_window_block_name(window)
+            block_name = self._observed_window_block_name(window)
+            if (block_name != "minecraft:chest" and _shared_storage_domain(block_name) is not None
+                    and self.packets.protocol.number == 2225):
+                self._shared_storage_replaced = False
+
+                def observe_target(current_name):
+                    if current_name is not None and current_name != block_name:
+                        self._shared_storage_replaced = True
+
+                self._watch_transfer_block(window.position, observe_target)
             if self._entities is not None:
                 actor = self._entities._get_by_unique_id(window.entity_unique_id)
                 entity = _observed_entity_container(self._entities, actor)
@@ -1499,6 +1528,8 @@ class Containers:
         brewing = window.container_type == "BREWING_STAND"
         player_endpoint = (None, player_slot)
         block_endpoint = self._block_transfer_endpoint(chest_slot)
+        shared_anchor = (block_endpoint if observed_slot_count == 27
+                         and _shared_storage_domain(self._window_block_name) == container_name else None)
         chest_endpoint = block_endpoint if entity_container is None else (entity_container.instance, chest_slot)
         endpoints = {player_endpoint}
         if chest_endpoint is not None:
@@ -1796,6 +1827,12 @@ class Containers:
                             index, correct(current, original_chest, index == chest_slot, slot), before,
                             additional_to=additional_to,
                         )
+                    elif (success and matches_window and shared_anchor is not None and index != chest_slot
+                          and 0 <= index < observed_slot_count and slot.requested_slot == index
+                          and container.full_container_name.dynamic_id is None):
+                        self._mark_late_single_container_overlap(
+                            shared_anchor, index, except_request=self.inventory._pending_requests[request_id],
+                        )
                     elif name in _PLAYER_CONTAINERS:
                         if preserve_player_slot:
                             continue
@@ -1910,25 +1947,27 @@ class Containers:
             if stop_watching is not None:
                 stop_watching()
 
-    def _can_plan_chest_slot(self, index: int) -> bool:
+    def _can_plan_container_slot(self, index: int) -> bool:
         endpoint = self._block_transfer_endpoint(index)
         return (index not in self._unconfirmed_transfer_slots and endpoint is not None
                 and not any(old.matches(endpoint, allow_possible=True) for old in self._unconfirmed_block_slots))
 
-    async def _move_within_chest(self, window, source, destination, amount, *, timeout, expected,
-                                 window_is_current, on_submitted, on_confirmed):
+    async def _move_within_container(self, window, source, destination, amount, *, domain, timeout, expected,
+                                     window_is_current, on_submitted, on_confirmed):
         indices = source, destination
         originals = dict(zip(indices, expected, strict=True))
-        endpoints = frozenset(self._block_transfer_endpoint(index) for index in indices)
+        anchor = self._block_transfer_endpoint(source)
+        endpoints = frozenset((anchor, self._block_transfer_endpoint(destination)))
         if None in endpoints:
             raise _InventoryMoveNotSubmitted("window_changed")
+        slot_count = self._window_slot_count
         inventory = self.inventory
         if inventory._requests_for_endpoints(endpoints):
             raise _InventoryMoveNotSubmitted("unconfirmed")
 
         b = self.packets.protocol.binding
         cereal = b.ItemStackRequestCereal
-        address = b.FullContainerName(name=b.ContainerEnumName.LEVEL_ENTITY_CONTAINER, dynamic_id=None)
+        address = b.FullContainerName(name=b.ContainerEnumName[domain], dynamic_id=None)
         request_id = inventory._allocate_request_id()
         origin, target = (
             cereal.SlotInfoData(full_container_name=address, slot=index,
@@ -1951,7 +1990,7 @@ class Containers:
             if any(pending is not own for pending in inventory._requests_for_endpoints(endpoints)):
                 raise _InventoryMoveNotSubmitted("unconfirmed")
             # A replaced descriptor is a newer observation even when its values repeat.
-            if any(not self._can_plan_chest_slot(index) or self._slots.get(index) is not originals[index]
+            if any(not self._can_plan_container_slot(index) or self._slots.get(index) is not originals[index]
                    for index in indices):
                 raise _InventoryMoveNotSubmitted("unobserved")
             on_submitted(own.reply)
@@ -1970,17 +2009,22 @@ class Containers:
                 observations[index] = item
 
         def apply(response):
-            if not window_is_current() or response.result.name != "SUCCESS":
+            if response.result.name != "SUCCESS":
                 return
             receipts = {}
             for group in response.containers or ():
                 container = group.full_container_name
                 if container.name == address.name and container.dynamic_id is None:
                     for slot in group.slots:
-                        if 0 <= slot.slot < self._window_slot_count:
+                        if 0 <= slot.slot < slot_count:
                             receipts.setdefault(slot.slot, []).append(slot)
             corrections = {index: entries[0] for index, entries in receipts.items()
                            if len(entries) == 1 and entries[0].requested_slot == index}
+            own = inventory._pending_requests[request_id]
+            if not window_is_current():
+                for index in corrections.keys() - originals.keys():
+                    self._mark_late_single_container_overlap(anchor, index, except_request=own)
+                return
             current = {index: self._slots.get(index) for index in indices}
             before = {} if self._slot_observers else None
 
@@ -2013,7 +2057,6 @@ class Containers:
 
             # Unrelated corrections can resolve a known stack, but do not
             # establish that another pending request moved it.
-            own = inventory._pending_requests[request_id]
             for index, slot in corrections.items():
                 if index in originals:
                     continue

@@ -450,21 +450,163 @@ class RangeTransferTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((outcome.stop_reason, outcome.confirmed_count), ("unconfirmed", 0))
         self.assertEqual([self.bot.container_slots[i].stack_size for i in (2, 21)], [0, 4])
 
-    async def test_same_chest_requires_observed_single_chest_and_disjoint_ranges(self):
+    async def test_old_window_additional_correction_conflicts_only_with_the_same_physical_slot(self):
+        pending = self.hold_requests()
+        other_position = (POSITION[0] + 3, POSITION[1], POSITION[2])
+        for name, domain, new_position, old_take in (
+            ("minecraft:chest", CHEST, POSITION, False),
+            ("minecraft:chest", CHEST, POSITION, True),
+            ("minecraft:barrel", BARREL, POSITION, False),
+            ("minecraft:barrel", BARREL, other_position, False),
+        ):
+            with self.subTest(name=name, new_position=new_position, old_take=old_take):
+                def seed(position, offset):
+                    self.observe_block(name, position)
+                    slots = [self.stack() for _ in range(22)]
+                    for index, amount, net_id in ((3, 62, 51), (4, 50, 52), (20, 5, 53), (21, 8, 54)):
+                        slots[index] = self.stack(PAPER, amount, net_id + offset)
+                    self.open_chest(*slots, position=position)
+
+                seed(POSITION, 0)
+                self.player_slot(9, self.stack())
+                if old_take:
+                    old = self.start(self.bot.take_from_container(20, 9, 2))
+                else:
+                    old = self.start(self.within_chest(2, source=range(20, 21), destination=range(3, 4)))
+                request = await asyncio.wait_for(pending.get(), 1)
+                old_window = self.bot.open_window
+                self.emit(self.b.ContainerClosePacket(container_id=2, container_type=self.b.ContainerType.CONTAINER))
+                seed(new_position, 20)
+                self.assertEqual(self.bot.open_window.container_id, old_window.container_id)
+                newer = self.start(self.within_chest(2, source=range(21, 22), destination=range(4, 5)))
+                newer_request = await asyncio.wait_for(pending.get(), 1)
+                counterpart = (PLAYER, 9, 2, 55) if old_take else (domain, 3, 64, 51)
+                self.reply(request, [(domain, 20, 3, 53), counterpart, (domain, 21, 4, 54)])
+                old_result = await old
+                if old_take:
+                    self.assertEqual(old_result.result.name, "SUCCESS")
+                else:
+                    self.assertEqual((old_result.stop_reason, old_result.confirmed_count), ("window_changed", 0))
+                self.assertEqual([self.bot.container_slots[i].stack_size for i in (3, 4, 20, 21)], [62, 50, 5, 8])
+
+                self.reply(newer_request, [(domain, 21, 6, 74), (domain, 4, 52, 72)])
+                result = await newer
+                if new_position == POSITION:
+                    self.assertEqual((result.stop_reason, result.confirmed_count), ("unconfirmed", 0))
+                    self.assertEqual([self.bot.container_slots[i].stack_size for i in (4, 21)], [50, 8])
+                else:
+                    self.assertEqual((result.stop_reason, result.confirmed_count), ("complete", 2))
+                    self.assertEqual([self.bot.container_slots[i].stack_size for i in (4, 21)], [52, 6])
+
+    async def test_same_container_requires_observed_shared_27_slots_and_disjoint_ranges(self):
         self.open_chest(width=None)
         self.assertEqual((await self.within_chest(1)).stop_reason, "unobserved")
         self.open_chest(width=54)
         with self.assertRaisesRegex(RuntimeError, "27 slots"):
             await self.within_chest(1)
-        self.observe_block("minecraft:barrel")
+        self.observe_block("minecraft:ender_chest")
         self.open_chest()
-        with self.assertRaisesRegex(RuntimeError, "ordinary single chest"):
+        with self.assertRaisesRegex(RuntimeError, "27 slots"):
+            await self.within_chest(1)
+        self.open_chest(entity_unique_id=0)
+        with self.assertRaisesRegex(RuntimeError, "block storage window"):
             await self.within_chest(1)
         with self.assertRaisesRegex(ValueError, "must not overlap"):
             await self.within_chest(source=range(2, 5))
         with self.assertRaisesRegex(ValueError, "0..27"):
             await self.within_chest(destination=range(2, 28))
         self.assertEqual(self.outgoing(), [])
+
+    async def test_shared_storage_reports_progress_after_merge_empty_and_rejection(self):
+        self.observe_block("minecraft:barrel")
+        self.seed_chest_move()
+        pending = self.hold_requests()
+        moving = self.start(self.within_chest())
+        first = await asyncio.wait_for(pending.get(), 1)
+        self.assertEqual(self.action(first), (20, 3, 2, 52, 51))
+        self.reply(first, [(BARREL, 20, 3, 52), (BARREL, 3, 64, 51)])
+        second = await asyncio.wait_for(pending.get(), 1)
+        self.assertEqual(self.action(second), (20, 2, 3, 52, 0))
+        self.reply(second, [(BARREL, 20, 0, None), (BARREL, 2, 3, 54)])
+        third = await asyncio.wait_for(pending.get(), 1)
+        self.assertEqual(self.action(third), (21, 2, 1, 53, 54))
+        self.reply(third, verdict="ERROR")
+        result = await moving
+        self.assertEqual((result.stop_reason, result.confirmed_count), ("rejected", 5))
+        self.assertEqual([step.confirmed for step in result.steps], [2, 3, 0])
+        self.assertEqual([self.action_addresses(request) for request in self.outgoing()], [(BARREL, BARREL)] * 3)
+        self.assertEqual([self.bot.container_slots[i].stack_size for i in (2, 3, 20, 21)], [3, 64, 0, 8])
+
+    async def test_shared_storage_rejects_unknown_opening_block_and_round_trip_replacements(self):
+        unknown = (POSITION[0] + 3, POSITION[1], POSITION[2])
+        self.open_chest(position=unknown)
+        self.observe_block("minecraft:barrel", unknown)
+        self.assertEqual((await self.within_chest(1)).stop_reason, "unobserved")
+        for name, replacement in (("minecraft:barrel", "minecraft:air"),
+                                  ("minecraft:trapped_chest", "minecraft:air"),
+                                  ("minecraft:red_shulker_box", "minecraft:blue_shulker_box")):
+            with self.subTest(name=name):
+                self.observe_block(name)
+                self.seed_chest_move()
+                self.observe_block(replacement)
+                self.observe_block(name)
+                result = await self.within_chest(2, source=range(20, 21), destination=range(3, 4))
+                self.assertEqual((result.stop_reason, result.steps), ("window_changed", ()))
+        self.assertEqual(self.outgoing(), [])
+
+    async def test_shulker_color_round_trip_during_write_invalidates_the_pending_step(self):
+        self.observe_block("minecraft:red_shulker_box")
+        self.seed_chest_move()
+        send = self.stream.send
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def pause(packet, **kwargs):
+            entered.set()
+            await release.wait()
+            await send(packet, **kwargs)
+
+        self.stream.send = pause
+        task = self.start(self.within_chest(2, source=range(20, 21), destination=range(3, 4)))
+        await asyncio.wait_for(entered.wait(), 1)
+        self.observe_block("minecraft:blue_shulker_box")
+        self.observe_block("minecraft:red_shulker_box")
+        release.set()
+        self.assertEqual(await task, RangeTransferResult(2, (), "window_changed"))
+        self.assertEqual(self.outgoing(), [])
+
+    async def test_shulker_keeps_progress_and_watches_replacement_during_later_receipt(self):
+        pending = self.hold_requests()
+        domain = "SHULKER_BOX_CONTAINER"
+        for end in ("live", "cancelled", "timeout"):
+            with self.subTest(end=end):
+                self.observe_block("minecraft:red_shulker_box")
+                self.seed_chest_move()
+                moving = self.start(self.within_chest(timeout=0.15 if end == "timeout" else 1))
+                first = await asyncio.wait_for(pending.get(), 1)
+                self.reply(first, [(domain, 20, 3, 52), (domain, 3, 64, 51)])
+                second = await asyncio.wait_for(pending.get(), 1)
+                self.assertEqual(self.action(second), (20, 2, 3, 52, 0))
+                if end == "cancelled":
+                    moving.cancel()
+                if end == "live":
+                    progress = None
+                else:
+                    with self.assertRaises(asyncio.CancelledError if end == "cancelled" else TimeoutError) as error:
+                        await moving
+                    progress = error.exception.transfer_progress
+                    self.assertEqual(progress.steps[-1].verdict, None)
+                self.assertEqual(len(self.bot._containers._transfer_block_watches), 2)
+                self.observe_block("minecraft:blue_shulker_box")
+                self.observe_block("minecraft:red_shulker_box")
+                self.reply(second, [(domain, 20, 0, None), (domain, 2, 3, 54)])
+                if end == "live":
+                    progress = await moving
+                    self.assertEqual(progress.stop_reason, "window_changed")
+                await asyncio.sleep(0)
+                self.assertEqual(len(self.bot._containers._transfer_block_watches), 1)
+                self.assertEqual([step.confirmed for step in progress.steps], [2, None])
+                self.assertEqual([self.bot.container_slots[i].stack_size for i in (2, 3, 20, 21)], [0, 64, 3, 8])
+        self.assertEqual(len(self.outgoing()), 6)
 
     async def test_transfers_across_multiple_sources_merge_before_empty_in_both_directions(self):
         original_send = self.stream.send

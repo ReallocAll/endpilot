@@ -1,11 +1,13 @@
 # Inventory and items
 
-## Move items within a chest
+## Move items within a storage window
 
-Call `transfer_container_range()` with two non-overlapping ranges in the
-active ordinary 27-slot chest. Use `await bot.wait_for_container_slots()`
-after opening the chest to observe its slots. Check `confirmed_count`
-and `stop_reason` before continuing, especially after a partial move.
+Call `transfer_container_range()` with two non-overlapping ranges in an
+active 27-slot ordinary chest, trapped chest, barrel, or vanilla shulker box.
+Use `await bot.wait_for_container_slots()` after opening the window. The
+helper fills compatible stacks before using observed empty slots and can
+move items across multiple stacks. Check `confirmed_count` and
+`stop_reason` before continuing, especially after a partial move.
 [Choose ranges and interpret partial results](../tutorials/containers.md#choose-ranges-and-interpret-partial-results)
 
 ## Move a horse saddle
