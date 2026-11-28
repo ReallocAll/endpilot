@@ -15,6 +15,14 @@ from endpilot.login import JoinSession
 from endpilot.protocol import Protocol, RawPacket, read_batch, write_batch
 
 
+# Stock 2225 reply to /list with sendCommandFeedback disabled.
+_SILENT_LIST_OUTPUT = RawPacket(79, bytes.fromhex(
+    "06706c61796572e7412d4b3ab36e540acbbc33829e0ba40000000000000000000673696c656e74010000000215636f6d6d"
+    "616e64732e706c61796572732e6c6973740102013201341b636f6d6d616e64732e706c61796572732e6c6973742e6e616d"
+    "657301011e436861744c6973745769746e6573732c20436861744c6973744163746f7200"
+))
+
+
 class ChatTests(unittest.IsolatedAsyncioTestCase):
     async def test_typed_chat_send_and_filtered_server_observation(self):
         protocol = Protocol(2193)
@@ -96,6 +104,24 @@ class PublicChatPatternTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(cleanup)
         await asyncio.sleep(0)
         return task
+
+    def command_request(self, batch):
+        payload = zlib.decompress(batch[1:], wbits=-15) if batch[0] == 0 else batch[1:]
+        raw, = read_batch(payload)
+        request = self.protocol.decode(raw)
+        self.assertIsInstance(request, self.protocol.binding.CommandRequestPacket)
+        return request
+
+    def silent_output(self, origin_uuid):
+        b = self.protocol.binding
+        recorded = self.protocol.decode(_SILENT_LIST_OUTPUT)
+        self.assertEqual(recorded.output.type, b.CommandOutputType.SILENT)
+        return self.protocol.encode(b.CommandOutputPacket(
+            origin_data=b.CommandOriginData(type=recorded.origin_data.type, uuid=origin_uuid,
+                                            request_id=recorded.origin_data.request_id,
+                                            player_id=recorded.origin_data.player_id),
+            output=recorded.output,
+        ))
 
     async def test_group_advances_in_wire_order_and_ordinary_chat_can_observe_same_packet(self):
         group = self.bot.add_chat_pattern("order", (r"^start (?P<number>\d+)", r"finish (red|blue)$"))
@@ -586,7 +612,7 @@ class PublicChatPatternTests(unittest.IsolatedAsyncioTestCase):
         keys = ("commands.players.list", "commands.players.list.names")
         messages = [b.CommandOutputMessage(message_id=key, successful=True, params=params)
                     for key, params in zip(keys, (["2", "4"], ["Other, Player"]))]
-        previous = UUID(int=9)
+        unrelated = UUID(int=9)
 
         def response(origin_uuid, origin_type, output_type, rows):
             return b.CommandOutputPacket(
@@ -601,26 +627,148 @@ class PublicChatPatternTests(unittest.IsolatedAsyncioTestCase):
                           (all_output, [])))
 
         async def respond(batch):
-            nonlocal previous
-            raw, = read_batch(zlib.decompress(batch[1:], wbits=-15) if batch[0] == 0 else batch[1:])
-            request = self.protocol.decode(raw)
-            self.assertIsInstance(request, b.CommandRequestPacket)
+            request = self.command_request(batch)
             self.assertEqual(request.command, "/list")
             origin = request.origin.uuid
-            self.assertNotEqual(origin, previous)
+            self.assertEqual((origin.version, UUID(hex=request.origin.request_id).version), (8, 4))
             mode, rows = next(responses)
-            replies = [response(previous, player, all_output, messages), response(origin, false_type, all_output, messages),
+            replies = [response(unrelated, player, all_output, messages), response(origin, false_type, all_output, messages),
                        response(origin, player, mode, rows), response(origin, player, mode, rows)]
             self.incoming.put_nowait(b"\xff" + write_batch(self.protocol.encode(reply) for reply in replies))
-            previous = origin
 
         self.transport.send.side_effect = respond
         for _ in range(4):
             await self.bot.execute_command_output("/list", timeout=2)
 
-        self.assertEqual(history, [ChatMessage(None, None, "command", keys[0], ("2", "4")),
-                                   ChatMessage(None, None, "command", keys[1], ("Other, Player",))] * 3)
+        self.assertEqual(history, [ChatMessage(None, None, "command", keys[0], ("2", "4"), successful=True),
+                                   ChatMessage(None, None, "command", keys[1], ("Other, Player",),
+                                               successful=True)] * 6)
         self.assertEqual(texts, [])
+
+    async def test_submitted_output_survives_cancel_and_timeout_in_chat_history(self):
+        b = self.protocol.binding
+        recorded = self.protocol.decode(_SILENT_LIST_OUTPUT)
+        self.assertEqual(recorded.output.type, b.CommandOutputType.SILENT)
+        for timeout in (None, 0.2):
+            with self.subTest(timeout=timeout):
+                history = []
+                stop = self.bot.subscribe_chat(history.append)
+                sent = asyncio.Event()
+                def observe_send(packet_id):
+                    if packet_id == b.CommandRequestPacket.ID:
+                        sent.set()
+
+                stop_sent = self.bot.packets.subscribe_sent(observe_send)
+                waiting = await self.arm(self.bot.execute_command_output("list", timeout=timeout or 2))
+                await asyncio.wait_for(sent.wait(), 1)
+                stop_sent()
+                origin = self.command_request(self.transport.send.await_args.args[0]).origin.uuid
+                reply = self.silent_output(origin)
+                if timeout is None:
+                    waiting.cancel()
+                with self.assertRaises(asyncio.CancelledError if timeout is None else TimeoutError):
+                    await waiting
+                barrier = self.protocol.encode(b.TextPacket(body=self.player_chat("late barrier")))
+                self.incoming.put_nowait(b"\xff" + write_batch((reply, barrier)))
+                await asyncio.sleep(0)
+                self.assertEqual(history, [ChatMessage(None, None, "command", row.message_id, tuple(row.params),
+                                                       successful=True) for row in recorded.output.messages]
+                                 + [ChatMessage("Player", "late barrier")])
+                stop()
+
+    async def test_unsubmitted_and_previous_session_output_stays_out_of_chat(self):
+        b = self.protocol.binding
+        origin = self.bot._commands._command_origin_uuid(1)
+        reply = self.silent_output(origin)
+        old_history = []
+        self.bot.subscribe_chat(old_history.append)
+        sent = asyncio.Event()
+
+        def observe_send(packet_id):
+            if packet_id == b.CommandRequestPacket.ID:
+                sent.set()
+
+        self.bot.packets.subscribe_sent(observe_send)
+        async with self.bot._commands._lock:
+            unsubmitted = await self.arm(self.bot.execute_command_output("/list", timeout=2))
+            unsubmitted.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await unsubmitted
+        self.assertFalse(sent.is_set())
+        self.incoming.put_nowait(b"\xff" + write_batch((reply,)))
+        await asyncio.sleep(0)
+        self.assertEqual(old_history, [])
+
+        submitted = await self.arm(self.bot.execute_command_output("/list", timeout=2))
+        await asyncio.wait_for(sent.wait(), 1)
+        self.assertEqual(self.command_request(self.transport.send.await_args.args[0]).origin.uuid, origin)
+        submitted.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await submitted
+        await self.bot.close()
+        await self.join()
+        current_history = []
+        self.bot.subscribe_chat(current_history.append)
+        self.assertNotEqual(self.bot._commands._command_origin_uuid(1), origin)
+        barrier = self.protocol.encode(self.protocol.binding.TextPacket(body=self.player_chat("new session")))
+        self.incoming.put_nowait(b"\xff" + write_batch((reply, barrier)))
+        await asyncio.sleep(0)
+        self.assertEqual((old_history, current_history), ([], [ChatMessage("Player", "new session")]))
+
+    async def test_command_delivered_to_transport_before_cancellation_keeps_late_reply(self):
+        b = self.protocol.binding
+        recorded = self.protocol.decode(_SILENT_LIST_OUTPUT)
+        history = []
+        self.bot.subscribe_chat(history.append)
+        at_peer = asyncio.Event()
+        delivered = []
+
+        async def deliver_request_then_wait(batch):
+            delivered.append(self.command_request(batch).origin.uuid)
+            at_peer.set()
+            await asyncio.Future()  # The peer has the request before this send returns.
+
+        self.transport.send.side_effect = deliver_request_then_wait
+        waiting = await self.arm(self.bot.execute_command_output("list", timeout=2))
+        await asyncio.wait_for(at_peer.wait(), 1)
+        waiting.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await waiting
+        origin, = delivered
+        reply = self.silent_output(origin)
+        barrier = self.protocol.encode(b.TextPacket(body=self.player_chat("late after transport entry")))
+        self.incoming.put_nowait(b"\xff" + write_batch((reply, barrier)))
+        await asyncio.sleep(0)
+        self.assertEqual(history, [ChatMessage(None, None, "command", row.message_id, tuple(row.params), successful=True)
+                                   for row in recorded.output.messages]
+                         + [ChatMessage("Player", "late after transport entry")])
+
+    async def test_typed_waiter_rejects_an_exact_uuid_before_the_write_boundary(self):
+        history = []
+        self.bot.subscribe_chat(history.append)
+        packets = self.bot.packets
+        entry, proceed, sent = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        original_send = packets.send
+
+        async def gate(packet, *, _before_send):
+            entry.set()
+            await proceed.wait()
+            await original_send(packet, _before_send=_before_send)
+            sent.set()
+
+        reply = self.silent_output(self.bot._commands._command_origin_uuid(1))
+        with patch.object(packets, "send", side_effect=gate):
+            waiting = await self.arm(self.bot.execute_command_output("/list", timeout=2))
+            await asyncio.wait_for(entry.wait(), 1)
+            self.incoming.put_nowait(b"\xff" + write_batch((reply,)))
+            await asyncio.sleep(0)
+            self.assertFalse(waiting.done())
+            self.assertEqual(history, [])
+            proceed.set()
+            await asyncio.wait_for(sent.wait(), 1)
+            self.incoming.put_nowait(b"\xff" + write_batch((reply,)))
+            self.assertEqual(self.protocol.encode(await waiting), reply)
+        self.assertEqual(len(history), 2)
 
     async def test_identity_command_history_preserves_formatted_literal_and_failed_records(self):
         await self.bot.close()
@@ -636,7 +784,7 @@ class PublicChatPatternTests(unittest.IsolatedAsyncioTestCase):
         header, footer = "§2%commands.help.header", "§2%commands.help.footer"
         literal = "/help <page: int>\n/list"
         rows = [(header, True, ["1", "2"]), (literal, True, []), (footer, True, []),
-                ("§2%commands.unavailable", True, []), ("commands.generic.disabled", False, [])]
+                ("§2%commands.unavailable", False, []), ("commands.generic.disabled", False, [])]
         messages = [b.CommandOutputMessage(message_id=key, successful=success, params=params)
                     for key, success, params in rows]
         own = self.bot.identity.uuid
@@ -652,11 +800,12 @@ class PublicChatPatternTests(unittest.IsolatedAsyncioTestCase):
                    output(own, b.CommandOriginType.DEDICATED_SERVER), output(own, b.CommandOriginType.PLAYER)]
         self.incoming.put_nowait(b"\xff" + write_batch(self.protocol.encode(packet) for packet in packets))
         await asyncio.sleep(0)
-        self.assertEqual(history, [ChatMessage(None, "§2Page 1/2", "command", header, ("1", "2")),
-                                   ChatMessage(None, literal, "command", params=(), raw_message=literal),
-                                   ChatMessage(None, "§2Finish", "command", footer, ()),
-                                   ChatMessage(None, None, "command", "§2%commands.unavailable", ()),
-                                   ChatMessage(None, "§cCommands disabled", "command", "commands.generic.disabled", ())])
+        self.assertEqual(history, [ChatMessage(None, "§2Page 1/2", "command", header, ("1", "2"), successful=True),
+                                   ChatMessage(None, literal, "command", params=(), raw_message=literal, successful=True),
+                                   ChatMessage(None, "§2Finish", "command", footer, (), successful=True),
+                                   ChatMessage(None, None, "command", "§2%commands.unavailable", (), successful=False),
+                                   ChatMessage(None, "§cCommands disabled", "command", "commands.generic.disabled", (),
+                                               successful=False)])
 
     async def test_callback_exceptions_do_not_interrupt_other_callbacks_or_waiters(self):
         pattern = self.bot.add_chat_pattern("signal", "^signal")

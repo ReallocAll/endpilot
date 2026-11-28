@@ -5,9 +5,10 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from math import isfinite
 import re
+import secrets
 import uuid
 
-from bedrock_protocol import CommandBlockMode, TextPacketType, nbt
+from bedrock_protocol import CommandBlockMode, DecodeError, TextPacketType, nbt
 
 from .blocks import Blocks, BlockEntityUpdate, BlockStateObservation
 from .protocol import RawPacket
@@ -15,6 +16,8 @@ from .protocol import RawPacket
 
 _DISCONNECT_ERROR = "server disconnected while waiting for command feedback"
 _OUTPUT_TIMEOUT_ERROR = "command output timed out"
+_COMMAND_ORIGIN_SEQUENCE_MASK = (1 << 62) - 1
+_COMMAND_ORIGIN_VARIANT = 2 << 62
 _EDIT_DISCONNECT_ERROR = "connection ended during command block edit"
 _EDIT_DIMENSION_ERROR = "dimension changed during command block edit"
 _COMMAND_BLOCK_TYPES = {
@@ -213,6 +216,9 @@ class Commands:
         self.player_uuid = player_uuid
         self.player_unique_id = player_unique_id
         self._on_chat_output = _on_chat_output
+        # The high half identifies this connection and carries the UUIDv8 version bits.
+        self._command_origin_prefix = (secrets.randbits(64) & ~(0xF << 12)) | (8 << 12)
+        self._submitted_command_sequence = 0
         self._lock = asyncio.Lock()
         self._command_block_lock = asyncio.Lock()
         self._server_disconnected = False
@@ -327,6 +333,30 @@ class Commands:
             self.close()
         elif raw.packet_id == binding.ChangeDimensionPacket.ID:
             self._end_command_block_edits(RuntimeError, _EDIT_DIMENSION_ERROR)
+        elif (self._on_chat_output is not None and protocol.number == 2225
+              and raw.packet_id == binding.CommandOutputPacket.ID):
+            try:
+                response = protocol.decode(raw)
+            except DecodeError:
+                return  # A raw command waiter handles its own decode errors.
+            origin = response.origin_data
+            if origin.type != binding.CommandOriginType.PLAYER:
+                return
+            if origin.uuid != self.player_uuid and not self._owns_command_origin(origin.uuid):
+                return
+            self._on_chat_output(response)
+
+    def _command_origin_uuid(self, sequence: int) -> uuid.UUID:
+        return uuid.UUID(int=(self._command_origin_prefix << 64) | _COMMAND_ORIGIN_VARIANT | sequence)
+
+    def _owns_command_origin(self, origin: uuid.UUID) -> bool:
+        value = origin.int
+        sequence = value & _COMMAND_ORIGIN_SEQUENCE_MASK
+        return (
+            value >> 64 == self._command_origin_prefix
+            and ((value >> 62) & 3) == 2
+            and 0 < sequence <= self._submitted_command_sequence
+        )
 
     def _request(self, command: str, *, origin_uuid: uuid.UUID | None = None):
         b = self.packets.protocol.binding
@@ -361,7 +391,9 @@ class Commands:
             body = packet.body
             return isinstance(body, text.MessageOnly) and body.type == TextPacketType.TEXT_OBJECT
 
-        return await self._request_feedback(self._request(command), text.ID, matches, timeout=timeout)
+        packet = self._request(command)
+        async with self._lock:
+            return await self._request_feedback(packet, text.ID, matches, timeout=timeout)
 
     async def execute_output(self, command: str, *, timeout: float = 15):
         if not isfinite(timeout):
@@ -373,25 +405,34 @@ class Commands:
         binding = self.packets.protocol.binding
         if not command.startswith("/"):
             command = f"/{command}"
-        origin_uuid = uuid.uuid4()
-        packet = self._request(command, origin_uuid=origin_uuid)
+        async with asyncio.timeout_at(deadline), self._lock:
+            sequence = self._submitted_command_sequence + 1
+            if sequence > _COMMAND_ORIGIN_SEQUENCE_MASK:
+                raise OverflowError("command origin UUID sequence exhausted")
+            origin_uuid = self._command_origin_uuid(sequence)
+            packet = self._request(command, origin_uuid=origin_uuid)
 
-        def matches(response):
-            # BDS echoes this UUID and can clear the request ID and player ID.
-            origin = response.origin_data
-            return origin.type == binding.CommandOriginType.PLAYER and origin.uuid == origin_uuid
+            def matches(response):
+                # BDS echoes this UUID and can clear the request ID and player ID.
+                origin = response.origin_data
+                return (self._submitted_command_sequence == sequence
+                        and origin.type == binding.CommandOriginType.PLAYER and origin.uuid == origin_uuid)
 
-        async with asyncio.timeout_at(deadline):
+            def submit():
+                if self._closed:
+                    raise ConnectionError(_DISCONNECT_ERROR)
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError(_OUTPUT_TIMEOUT_ERROR)
+                self._submitted_command_sequence = sequence
+
             return await self._request_feedback(
-                packet, binding.CommandOutputPacket.ID, matches, timeout=None, deadline=deadline,
-                on_response=self._on_chat_output if origin_uuid != self.player_uuid else None,
+                packet, binding.CommandOutputPacket.ID, matches, timeout=None, before_send=submit,
             )
 
-    async def _request_feedback(self, packet, packet_id, matches, *, timeout, deadline=None, on_response=None):
+    async def _request_feedback(self, packet, packet_id, matches, *, timeout, before_send=None):
         protocol = self.packets.protocol
         disconnect = protocol.binding.DisconnectPacket.ID
         feedback = None
-        send_started = False
 
         def observe(raw):
             nonlocal feedback
@@ -400,50 +441,39 @@ class Commands:
             response = protocol.decode(raw)
             if matches(response):
                 feedback = response
-                if send_started and on_response is not None:
-                    on_response(response)
                 return True
             return False
 
-        def check_deadline_and_context():
-            nonlocal send_started
-            if self._closed:
-                raise ConnectionError(_DISCONNECT_ERROR)
-            if asyncio.get_running_loop().time() >= deadline:
-                raise TimeoutError(_OUTPUT_TIMEOUT_ERROR)
-            send_started = True
-
-        async with self._lock:
+        if self._server_disconnected:
+            raise ConnectionError(_DISCONNECT_ERROR)
+        # Arm before send: a quick server response must not be lost.
+        waiting = asyncio.create_task(self.packets.wait_for_packet(
+            (packet_id, disconnect), match=observe, timeout=timeout,
+        ))
+        tasks = [waiting]
+        try:
+            await asyncio.sleep(0)
             if self._server_disconnected:
                 raise ConnectionError(_DISCONNECT_ERROR)
-            # Arm before send: a quick server response must not be lost.
-            waiting = asyncio.create_task(self.packets.wait_for_packet(
-                (packet_id, disconnect), match=observe, timeout=timeout,
-            ))
-            tasks = [waiting]
-            try:
-                await asyncio.sleep(0)
-                if self._server_disconnected:
-                    raise ConnectionError(_DISCONNECT_ERROR)
-                if deadline is None:
-                    await self.packets.send(packet)
-                else:
-                    sending = asyncio.create_task(self.packets.send(packet, _before_send=check_deadline_and_context))
-                    tasks.append(sending)
-                    # A disconnect or reader error can arrive while the send is blocked.
-                    done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                    if waiting not in done and not self.packets._reader_end_result()[0]:
-                        sending.result()
-                response = await waiting
-                if response.packet_id == disconnect:
-                    raise ConnectionError(_DISCONNECT_ERROR)
-                if deadline is not None:
-                    await sending
-                return feedback
-            finally:
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+            if before_send is None:
+                await self.packets.send(packet)
+            else:
+                sending = asyncio.create_task(self.packets.send(packet, _before_send=before_send))
+                tasks.append(sending)
+                # A disconnect or reader error can arrive while the send is blocked.
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                if waiting not in done and not self.packets._reader_end_result()[0]:
+                    sending.result()
+            response = await waiting
+            if response.packet_id == disconnect:
+                raise ConnectionError(_DISCONNECT_ERROR)
+            if before_send is not None:
+                await sending
+            return feedback
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def set_command_block(
         self, blocks: Blocks, position: tuple[int, int, int], command: str, *,

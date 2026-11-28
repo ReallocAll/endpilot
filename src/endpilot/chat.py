@@ -64,6 +64,7 @@ class ChatMessage:
     translation_key: str | None = None
     params: tuple[str, ...] | None = None
     raw_message: str | None = None
+    successful: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -486,14 +487,13 @@ class _RegisteredPattern[T]:
 class Chat:
     def __init__(
         self, packets, name: str, *, resource_pack_index: ResourcePackIndex | None = None,
-        translations: TextTranslations | None = None, player_uuid: UUID | None = None, _xuid: str = "",
+        translations: TextTranslations | None = None, _xuid: str = "",
     ):
         self.packets = packets
         self.name = name
         self._xuid = _xuid
         self._resource_pack_index = resource_pack_index
         self._translations = translations
-        self._player_uuid = player_uuid
         self._text = packets.protocol.binding.packets[9]
         self._pattern_ids = count(1)
         self._patterns: dict[int, _RegisteredPattern[ChatMessage]] = {}
@@ -829,7 +829,8 @@ class Chat:
                 message = None
             if message is not None and not item.successful:
                 message = "§c" + message
-            self._notify(self._message_observers, ChatMessage(None, message, "command", key, params, raw_message))
+            self._notify(self._message_observers, ChatMessage(None, message, "command", key, params,
+                                                              raw_message, successful=item.successful))
 
     @staticmethod
     def _matches_text(
@@ -853,13 +854,6 @@ class Chat:
         binding = protocol.binding
         if raw.packet_id == binding.DisconnectPacket.ID:
             self._end_subscriptions()
-            return
-        if (self._message_observers and self._player_uuid is not None and protocol.number == 2225
-                and raw.packet_id == binding.CommandOutputPacket.ID):
-            packet = protocol.decode(raw)
-            origin = packet.origin_data
-            if origin.type == binding.CommandOriginType.PLAYER and origin.uuid == self._player_uuid:
-                self._on_command_output(packet)
             return
         if raw.packet_id != self._text.ID:
             return

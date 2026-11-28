@@ -48,10 +48,14 @@ Use `subscribe_text()` for the original wire fields, including text objects.
 On protocol 2225, a player command response addressed to this session can
 contribute one chat entry per message in its received order. An empty message
 list contributes zero entries. The typed `execute_command_output()` method
-also returns the original response. The `/list` count and player names are
-two separate entries. Localized output keeps the original key and parameters.
+also returns the original response. A submitted command can still produce chat
+entries after its caller cancels or times out. This uses the current connection's
+command UUIDs for correlation. The `/list` count and player names are two
+separate entries. Localized output keeps the original key and parameters.
 For example, `/help` preserves the green formatting of the page header and
-footer. An unsuccessful command record uses the red `§c` formatting prefix.
+footer. Native command output carries `successful` even when a translation is
+unavailable. Unsuccessful rendered output uses the red `§c` formatting prefix.
+Events without a native result flag have `successful=None`.
 
 ## Match display text
 

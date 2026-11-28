@@ -19,6 +19,18 @@ from endpilot.placement import PlacementInventoryChange, PlacementResult
 from test_placement import PLACED_ID, SUPPORT, TARGET, _PlacementHarness
 
 
+# Stock 1.26.65.1, /list with sendCommandFeedback=false and the UUIDv8 SDK origin.
+_SILENT_REQUEST = (
+    "052f6c69737406706c617965726a89a525e882d23801000000000000802066613332323538396263303334373133"
+    "6263316165366330613539313439313107000000ffffffff00066c6174657374"
+)
+_SILENT_RESPONSE = (
+    "06706c617965726a89a525e882d23801000000000000800000000000000000000673696c656e74010000000215"
+    "636f6d6d616e64732e706c61796572732e6c6973740102013101341b636f6d6d616e64732e706c61796572732e"
+    "6c6973742e6e616d657301010a5265616c6c6f63416c6c00"
+)
+
+
 class FakeBot:
     def __init__(self, name, *, chat_languages=None):
         self.player_id = 17
@@ -792,6 +804,7 @@ class MCPStdioTests(unittest.IsolatedAsyncioTestCase):
         peer = """
 import asyncio
 import runpy
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import UUID
@@ -801,18 +814,9 @@ from endpilot.protocol import Protocol, RawPacket, read_batch, write_batch
 
 protocol = Protocol(2225)
 b = protocol.binding
-# Request and SILENT reply from the stock run with sendCommandFeedback=false.
-request = RawPacket(b.CommandRequestPacket.ID, bytes.fromhex(
-    '052f6c69737406706c61796572e7412d4b3ab36e540acbbc33829e0ba420613736303965653531353331346230'
-    '306164386336303136613863326238623812000000ffffffff00066c6174657374'
-))
-silent = RawPacket(b.CommandOutputPacket.ID, bytes.fromhex(
-    '06706c61796572e7412d4b3ab36e540acbbc33829e0ba40000000000000000000673696c656e74010000000215'
-    '636f6d6d616e64732e706c61796572732e6c6973740102013201341b636f6d6d616e64732e706c61796572732e'
-    '6c6973742e6e616d657301011e436861744c6973745769746e6573732c20436861744c6973744163746f7200'
-))
+request = RawPacket(b.CommandRequestPacket.ID, bytes.fromhex(sys.argv.pop(1)))
+silent = RawPacket(b.CommandOutputPacket.ID, bytes.fromhex(sys.argv.pop(1)))
 origin = protocol.decode(request).origin
-nonces = iter((origin.uuid, UUID(hex=origin.request_id)))
 # A compound /tellraw TEXT_OBJECT_WHISPER from the stock resource-pack test.
 compound = RawPacket(b.TextPacket.ID, bytes.fromhex(
     '0000099b017b2272617774657874223a5b7b2274657874223a22455054582d73657175656e7469616c7c227d2c'
@@ -852,9 +856,9 @@ class Transport:
 async def dial(url, **kwargs):
     return Transport()
 
-with patch('endpilot.transport.nethernet.connect', dial), patch.object(commands, 'uuid', SimpleNamespace(
-    uuid4=lambda: next(nonces),
-)):
+with (patch('endpilot.transport.nethernet.connect', dial),
+      patch.object(commands, 'secrets', SimpleNamespace(randbits=lambda _: origin.uuid.int >> 64)),
+      patch.object(commands, 'uuid', SimpleNamespace(UUID=UUID, uuid4=lambda: UUID(hex=origin.request_id)))):
     runpy.run_module('endpilot.mcp_server', run_name='__main__')
 """
         worker = """
@@ -864,7 +868,7 @@ async def main(bot):
     rows = []
     barrier = asyncio.Event()
     def record(event):
-        rows.append([event.message, event.kind, event.translation_key, event.params, event.raw_message])
+        rows.append([event.message, event.kind, event.translation_key, event.params, event.raw_message, event.successful])
         if event.message == 'barrier':
             barrier.set()
     unsubscribe = bot.subscribe_chat(record)
@@ -885,10 +889,10 @@ async def main(bot):
                 '{"rawtext":[{"text":"EPTX-sequential|"},{"translate":"endpilot.packtext.sequence",'
                 '"with":{"rawtext":[{"text":"Alice"},{"text":"snow"}]}},{"text":"|end"}]}\n'
             )
-            players = "ChatListWitness, ChatListActor"
-            for configured, message in ((False, None), (True, "目前有 2/4 个玩家在线：")):
+            players = "ReallocAll"
+            for configured, message in ((False, None), (True, "目前有 1/4 个玩家在线：")):
                 with self.subTest(configured=configured):
-                    args = ["-B", "-c", peer]
+                    args = ["-B", "-c", peer, _SILENT_REQUEST, _SILENT_RESPONSE]
                     if configured:
                         args.extend(("--chat-language", "zh_CN", str(language)))
                     params = StdioServerParameters(command=sys.executable, args=args,
@@ -910,13 +914,226 @@ async def main(bot):
                                 await asyncio.sleep(0.01)
                         self.assertEqual(report["state"], "succeeded", report)
                         self.assertEqual(report["result"], [
-                            [message, "command", "commands.players.list", ["2", "4"], None],
-                            [players if configured else None, "command", "commands.players.list.names", [players], None],
+                            [message, "command", "commands.players.list", ["1", "4"], None, True],
+                            [players if configured else None, "command", "commands.players.list.names", [players],
+                             None, True],
                             ["EPTX-sequential|Alice 获得 snow|end" if configured else None,
-                             "whisper", None, None, raw_message],
-                            ["barrier", "chat", None, None, None],
+                             "whisper", None, None, raw_message, None],
+                            ["barrier", "chat", None, None, None, None],
                         ])
                         self.assertEqual(await call("shutdown"), {"shutdown": True})
+
+    async def test_resident_chat_observes_late_command_replies_across_worker_lifetimes(self):
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+
+        source = Path(endpilot.__file__).resolve().parents[1]
+        peer = """
+import asyncio
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from endpilot import commands
+from endpilot.mcp_server import create_server
+from endpilot.protocol import Protocol, RawPacket, read_batch, write_batch
+
+protocol = Protocol(2225)
+b = protocol.binding
+silent = RawPacket(b.CommandOutputPacket.ID, bytes.fromhex(sys.argv[1]))
+captured = protocol.decode(silent)
+prefix = captured.origin_data.uuid.int >> 64
+prefixes = iter((prefix, prefix ^ 1))
+connections = []
+requests = asyncio.Queue()
+submitted = []
+
+class Transport:
+    def __init__(self, player_id):
+        self.incoming = asyncio.Queue()
+        self.deliver(b.NetworkSettingsPacket(compression_algorithm=b.PacketCompressionAlgorithm.NONE))
+        self.deliver(b.StartGamePacket(runtime_id=player_id, entity_id=player_id),
+                     b.PlayStatusPacket(status=b.PlayStatus.PLAYER_SPAWN))
+
+    def deliver(self, *packets):
+        self.incoming.put_nowait(write_batch(packet if isinstance(packet, RawPacket) else protocol.encode(packet)
+                                            for packet in packets))
+
+    async def send(self, batch):
+        for raw in read_batch(batch):
+            if raw.packet_id == b.CommandRequestPacket.ID:
+                requests.put_nowait(protocol.decode(raw))
+
+    async def recv(self):
+        return await self.incoming.get()
+
+    async def close(self):
+        pass
+
+async def dial(url, **kwargs):
+    connection = Transport(41 + len(connections))
+    connections.append(connection)
+    return connection
+
+def marker(label):
+    return b.TextPacket(body=b.TextPacket.AuthorAndMessage(type=b.TextPacketType.CHAT,
+                                                           author='Fixture', message=label))
+
+def response(request, output):
+    return b.CommandOutputPacket(origin_data=b.CommandOriginData(type=b.CommandOriginType.PLAYER,
+                                                                 uuid=request.origin.uuid), output=output)
+
+def register(server, player):
+    @server.tool()
+    async def next_request() -> dict:
+        request = await asyncio.wait_for(requests.get(), 5)
+        submitted.append(request)
+        return {'command': request.command, 'uuid': str(request.origin.uuid), 'version': request.origin.uuid.version}
+
+    @server.tool()
+    async def cancel_marker() -> None:
+        connections[-1].deliver(marker('cancel requester'))
+
+    @server.tool()
+    async def release_reply(index: int) -> None:
+        request = submitted[index]
+        connection = connections[-1]
+        if index == 0:
+            assert request.origin.uuid == captured.origin_data.uuid
+            connection.deliver(silent)
+        elif index == 1:
+            failure = b.CommandOutputMessage(message_id='commands.fixture.missing_translation', successful=False,
+                                             params=['untranslated'])
+            connection.deliver(response(request, b.CommandOutput(type=b.CommandOutputType.ALL_OUTPUT,
+                                                                 success_count=0, messages=[failure])), marker('done'))
+        else:
+            assert len(connections) == 2 and request.origin.uuid.int >> 64 != prefix
+            fresh = b.CommandOutputMessage(message_id='commands.players.list.names', successful=True,
+                                           params=['NewResident'])
+            connection.deliver(silent, response(request, b.CommandOutput(type=b.CommandOutputType.SILENT,
+                                                                         success_count=1, messages=[fresh])), marker('done'))
+
+language = b'commands.players.list=There are %1$d/%2$d players online:\\ncommands.players.list.names=%s\\n'
+with (patch('endpilot.transport.nethernet.connect', dial),
+      patch.object(commands, 'secrets', SimpleNamespace(randbits=lambda _: next(prefixes)))):
+    create_server(register, chat_languages={'en_US': language}).run(transport='stdio')
+"""
+        subscriber = """
+import asyncio
+
+async def main(bot):
+    done = asyncio.Event()
+    rows = []
+    def record(event):
+        if event.kind == 'command':
+            rows.append([event.translation_key, event.params, event.message, event.successful])
+        elif event.message == 'done':
+            done.set()
+    unsubscribe = bot.subscribe_chat(record)
+    try:
+        print('subscribed')
+        await done.wait()
+        return [bot.player_id, rows]
+    finally:
+        unsubscribe()
+"""
+        cancellable = """
+import asyncio
+
+async def main(bot):
+    cancel = asyncio.Event()
+    def record(event):
+        if event.message == 'cancel requester':
+            cancel.set()
+    unsubscribe = bot.subscribe_chat(record)
+    try:
+        request = asyncio.create_task(bot.execute_command_output('/list', timeout=15))
+        await cancel.wait()
+        request.cancel('requester cancelled')
+        try:
+            await request
+        except asyncio.CancelledError as error:
+            return str(error)
+        raise AssertionError('command wait was not cancelled')
+    finally:
+        unsubscribe()
+"""
+        await_command = """
+async def main(bot, command):
+    reply = await bot.execute_command_output(command, timeout=15)
+    return reply.origin_data.uuid
+"""
+        params = StdioServerParameters(command=sys.executable, args=["-B", "-c", peer, _SILENT_RESPONSE],
+                                       env={"PYTHONPATH": str(source)})
+        async with stdio_client(params) as (incoming, outgoing), ClientSession(
+            incoming, outgoing, read_timeout_seconds=10,
+        ) as session:
+            await session.initialize()
+
+            async def call(tool, **arguments):
+                result = await session.call_tool(tool, arguments)
+                self.assertFalse(result.is_error, result)
+                if result.structured_content is not None:
+                    return result.structured_content
+                if result.content:
+                    return json.loads(result.content[0].text)
+
+            async def start(script, *args):
+                return (await call("run_script", source=script, args=list(args)))["run_id"]
+
+            async def observe(run_id, predicate=lambda _: False):
+                async with asyncio.timeout(10):
+                    while True:
+                        report = await call("observe_script", run_id=run_id)
+                        if predicate(report) or report["state"] != "running":
+                            return report
+                        await asyncio.sleep(0.01)
+
+            async def watch():
+                run = await start(subscriber)
+                ready = await observe(run, lambda report: any("subscribed" in chunk["text"] for chunk in report["output"]))
+                self.assertEqual(ready["state"], "running", ready)
+                return run
+
+            await call("connect", url="http://127.0.0.1")
+            listener = await watch()
+            requester = await start(cancellable)
+            cancelled_origin = await call("next_request")
+            self.assertEqual((cancelled_origin["command"], cancelled_origin["version"]), ("/list", 8))
+            await call("cancel_marker")
+            cancelled = await observe(requester)
+            self.assertEqual((cancelled["state"], cancelled["result"]), ("succeeded", "requester cancelled"))
+            await call("release_reply", index=0)
+
+            requester = await start(await_command, "/ep_unknown")
+            stopping_origin = await call("next_request")
+            self.assertEqual((stopping_origin["command"], stopping_origin["version"]), ("/ep_unknown", 8))
+            self.assertEqual((await call("stop_script", run_id=requester))["state"], "stopped")
+            await call("release_reply", index=1)
+            original = await observe(listener)
+            expected = [["commands.players.list", ["1", "4"], "There are 1/4 players online:", True],
+                        ["commands.players.list.names", ["ReallocAll"], "ReallocAll", True]]
+            self.assertEqual(original["state"], "succeeded", original)
+            self.assertEqual(original["result"], [41, [*expected,
+                ["commands.fixture.missing_translation", ["untranslated"], None, False],
+            ]])
+            self.assertEqual((await call("session_status"))["player_id"], 41)
+
+            self.assertEqual((await call("reconnect"))["player_id"], 42)
+            listener = await watch()
+            requester = await start(await_command, "/list")
+            fresh = await call("next_request")
+            self.assertEqual(fresh["version"], 8)
+            self.assertNotEqual(fresh["uuid"], cancelled_origin["uuid"])
+            await call("release_reply", index=2)
+            current = await observe(listener)
+            self.assertEqual(current["state"], "succeeded", current)
+            self.assertEqual(current["result"], [42, [
+                ["commands.players.list.names", ["NewResident"], "NewResident", True],
+            ]])
+            matched = await observe(requester)
+            self.assertEqual((matched["state"], matched["result"]), ("succeeded", fresh["uuid"]))
+            self.assertEqual(await call("disconnect"), {"disconnected": True})
 
     async def test_cancelled_disconnect_closes_transport_before_reconnect(self):
         from mcp import ClientSession, StdioServerParameters
