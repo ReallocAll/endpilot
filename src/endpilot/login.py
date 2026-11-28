@@ -16,7 +16,9 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 from ._join_address import _JoinAddress
-from .authentication import DEFAULT_LOCALE, _OnlineIdentity, _validate_locale
+from .authentication import (
+    DEFAULT_LOCALE, SubmittedClientSettings, _OnlineIdentity, _read_submitted_client_settings, _validate_locale,
+)
 from .beds import invalidates_bed_respawn
 from .biome_data import BiomeDefinition, _read_biome_definitions
 from .block_data import matches_vanilla_palette
@@ -184,6 +186,7 @@ class JoinSession:
         self.player_game_type: str | None = None
         self._enchantment_seed_at_join: int | None = None
         self.reported_server_version: str | None = None
+        self.submitted_client_settings = SubmittedClientSettings()
         self.dimension_id = 0
         self.chunk_radius = None
         self.requested_chunk_radius: int | None = None
@@ -454,6 +457,9 @@ class JoinSession:
         # Bind later skin submissions to the UUID serialized in this login.
         self.player_uuid = self.identity.uuid
         await self.packets.send(login)
+        self.submitted_client_settings = _read_submitted_client_settings(
+            login.connection_request, getattr(binding, "GraphicsMode", None),
+        )
 
         while not self.spawned:
             raw = await self.packets.recv_raw()

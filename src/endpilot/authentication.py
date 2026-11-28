@@ -50,6 +50,15 @@ class BedrockCredentials:
 BedrockCredentialProvider = Callable[[str], Awaitable[BedrockCredentials]]
 
 
+@dataclass(frozen=True, slots=True)
+class SubmittedClientSettings:
+    """Client declarations successfully submitted on one Bedrock session."""
+
+    locale: str | None = None
+    graphics_mode: str | None = None
+    filter_profanity: bool | None = None
+
+
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
@@ -236,6 +245,37 @@ def _read_jwt(token: str, algorithms: tuple[str, ...], label: str) -> tuple[dict
     if not valid_signature:
         raise ValueError(f"{label} has an invalid signature encoding")
     return header, claims, signature, f"{head}.{body}".encode("ascii")
+
+
+def _read_submitted_client_settings(request: bytes, graphics_modes) -> SubmittedClientSettings:
+    # Skip the authentication segment without decoding it.
+    try:
+        auth_size, = struct.unpack_from("<i", request)
+        if auth_size < 0:
+            return SubmittedClientSettings()
+        client_length_offset = 4 + auth_size
+        client_size, = struct.unpack_from("<i", request, client_length_offset)
+        client_offset = client_length_offset + 4
+        if client_size <= 0 or client_offset + client_size != len(request):
+            return SubmittedClientSettings()
+        _, claims, _, _ = _read_jwt(request[client_offset:].decode("ascii"), ("ES384", "RS256"), "client claims")
+    except (struct.error, ValueError):
+        return SubmittedClientSettings()
+
+    locale = claims.get("LanguageCode")
+    try:
+        _validate_locale(locale)
+    except ValueError:
+        locale = None
+    graphics_mode = None
+    mode = claims.get("GraphicsMode")
+    if type(mode) is int and graphics_modes is not None:
+        try:
+            graphics_mode = graphics_modes(mode).name
+        except ValueError:
+            pass
+    filter_profanity = claims.get("FilterProfanity")
+    return SubmittedClientSettings(locale, graphics_mode, filter_profanity if type(filter_profanity) is bool else None)
 
 
 def _read_public_key(value: object, label: str) -> ec.EllipticCurvePublicKey:

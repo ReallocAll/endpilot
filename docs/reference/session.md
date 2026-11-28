@@ -47,6 +47,23 @@ A `True` result describes the SDK implementation. The server's login
 requirements and the game mode, window and observed inputs needed for an
 anvil preview are still determined during play. [Anvil preview](items.md#preview-anvil-costs)
 
+## Read submitted client settings
+
+`bot.submitted_client_settings` returns an immutable `SubmittedClientSettings`
+for the active joined session. The initial values come from the client claims
+in the login request that was sent. `locale` is a Bedrock language code,
+`graphics_mode` is an enum name such as `"SIMPLE"`, and `filter_profanity` is
+a boolean. A missing or unreadable declaration yields `None` for the affected
+field. The property itself is `None` outside an active joined session.
+
+After `await bot.update_client_options(graphics_mode="FANCY", filter_profanity=False)`
+returns successfully, the current snapshot includes the submitted values.
+Omitted arguments preserve their current values, and a previously obtained
+snapshot stays unchanged. Concurrent calls apply in successful completion
+order. This is a record of submissions through the SDK login and settings
+methods. Server-accepted settings and render behavior require their own
+observations.
+
 ## Accept server resource packs
 
 Either join method accepts an `on_resource_packs` callback. For a nonempty

@@ -17,7 +17,8 @@ from bedrock_protocol.v712 import CommandOutputPacket
 from ._join_address import _parse_join_address
 from .anvil import AnvilPreview
 from .authentication import (
-    BedrockCredentialProvider, DEFAULT_LOCALE, OfflineIdentity, _OnlineIdentity, acquire_online_identity,
+    BedrockCredentialProvider, DEFAULT_LOCALE, OfflineIdentity, SubmittedClientSettings, _OnlineIdentity,
+    acquire_online_identity,
 )
 from .beds import BedObservation, Beds, PlayerRespawnPoint, _BedEvent
 from .biome_data import BiomeDefinition
@@ -321,6 +322,15 @@ class Bot:
         if session is None or state is None or state.result is not None:
             return None
         return session.reported_server_version
+
+    @property
+    def submitted_client_settings(self) -> SubmittedClientSettings | None:
+        """Return an immutable snapshot of the active session's client declarations."""
+        session = self._session
+        state = self._get_session_end_state()
+        if session is None or state is None or state.result is not None:
+            return None
+        return session.submitted_client_settings
 
     @property
     def resource_pack_index(self) -> ResourcePackIndex | None:
@@ -942,6 +952,7 @@ class Bot:
     ) -> None:
         """Report the supplied client options to BDS. None omits a field."""
         packets = self.packets
+        session = self._session
         b = packets.protocol.binding
         if graphics_mode is None and filter_profanity is None:
             raise ValueError("provide graphics_mode or filter_profanity")
@@ -949,6 +960,13 @@ class Bot:
             raise TypeError("filter_profanity must be bool or None")
         graphics = None if graphics_mode is None else _client_option(b.GraphicsMode, graphics_mode)
         await packets.send(b.UpdateClientOptionsPacket(graphics_mode=graphics, filter_profanity=filter_profanity))
+        if self._session is session and session._end_state.result is None:
+            current = session.submitted_client_settings
+            session.submitted_client_settings = SubmittedClientSettings(
+                current.locale,
+                current.graphics_mode if graphics is None else graphics.name,
+                current.filter_profanity if filter_profanity is None else filter_profanity,
+            )
 
     async def stage_crafting_ingredient(self, source_slot: int, grid_slot: int = 28,
                                         amount: int = 1, *, timeout: float = 15):

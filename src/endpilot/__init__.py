@@ -1,7 +1,7 @@
 """Python SDK for headless Bedrock players."""
 
 from .anvil import AnvilPreview
-from .authentication import BedrockCredentialProvider, BedrockCredentials
+from .authentication import BedrockCredentialProvider, BedrockCredentials, SubmittedClientSettings
 from .beds import BedObservation, PlayerRespawnPoint, SleepRejected
 from .biome_data import BiomeDefinition, VanillaBiome, vanilla_biomes
 from .block_catalog import VanillaBlock, VanillaBlockToolProperties, vanilla_blocks
@@ -218,6 +218,7 @@ __all__ = [
     "SleepRejected",
     "SoundEvent",
     "SoundKind",
+    "SubmittedClientSettings",
     "TextEvent",
     "TextTranslations",
     "TextPacketType",
