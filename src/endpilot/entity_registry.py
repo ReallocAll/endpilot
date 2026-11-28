@@ -3,14 +3,14 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
+from typing import NamedTuple
 
 from bedrock_protocol import nbt
 
 from ._entity_dimensions_2225 import ENTITY_DIMENSIONS as _DIMENSIONS_2225
 
 
-@dataclass(frozen=True, slots=True)
-class VanillaEntityDimensions:
+class VanillaEntityDimensions(NamedTuple):
     """Measured default width and height of a vanilla entity type, in blocks."""
 
     width: float

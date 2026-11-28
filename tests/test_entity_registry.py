@@ -14,16 +14,28 @@ from test_scheduled_input import Wire
 class VanillaEntityDimensionsTests(unittest.TestCase):
     def test_exact_names_and_read_only_dimensions(self):
         dimensions = vanilla_entity_dimensions()
+        self.assertEqual(dimensions["minecraft:horse"], VanillaEntityDimensions(width=1.4, height=1.6))
         self.assertEqual(dimensions["minecraft:pig"], VanillaEntityDimensions(width=.9, height=.9))
         self.assertEqual(dimensions["minecraft:sheep"], VanillaEntityDimensions(width=.9, height=1.3))
+        self.assertEqual(dimensions["minecraft:villager_v2"], VanillaEntityDimensions(width=.6, height=1.9))
         self.assertEqual(vanilla_entity_dimensions(2225), dimensions)
-        for name in ("sheep", "Minecraft:sheep", "custom:sheep", "minecraft:ender_dragon", "minecraft:rabbit"):
+        for name in ("sheep", "Minecraft:sheep", "custom:sheep", "minecraft:ender_dragon", "minecraft:rabbit",
+                     "minecraft:villager"):
             with self.subTest(name=name):
                 self.assertIsNone(dimensions.get(name))
         with self.assertRaises(TypeError):
             dimensions["minecraft:sheep"] = VanillaEntityDimensions(1, 1)
-        with self.assertRaises(FrozenInstanceError):
+        with self.assertRaises(AttributeError):
             dimensions["minecraft:sheep"].width = 1
+
+    def test_catalog_value_cannot_be_reset_by_reinitialization(self):
+        pig = vanilla_entity_dimensions()["minecraft:pig"]
+        try:
+            pig.__init__(width=7, height=8)
+        except TypeError:
+            pass
+        self.assertEqual((pig.width, pig.height), (.9, .9))
+        self.assertEqual(vanilla_entity_dimensions()["minecraft:pig"], VanillaEntityDimensions(.9, .9))
 
     def test_other_protocols_and_nonintegers_are_rejected(self):
         for protocol in (2168, 2224, 2226, "2225", 2225.0, True, None):

@@ -153,7 +153,8 @@ unsupported protocol raises `ValueError`. The lookup is available offline
 and sends no packets.
 
 The catalog covers measured default forms on BDS 1.26.66.1, including adult
-standing animals and ordinary monster spawns. A live entity's age, posture,
+standing animals and ordinary monster spawns. The measured adult farmer and
+librarian use the `minecraft:villager_v2` key. A live entity's age, posture,
 variant or scale can give it a different box. Use live observations when an
 action depends on the current shape.
 

@@ -7,11 +7,13 @@ ENTITY_DIMENSIONS = {
     "minecraft:creeper": (0.6, 1.8),
     "minecraft:enderman": (0.6, 2.9),
     "minecraft:goat": (0.9, 1.3),
+    "minecraft:horse": (1.4, 1.6),
     "minecraft:pig": (0.9, 0.9),
     "minecraft:sheep": (0.9, 1.3),
     "minecraft:skeleton": (0.6, 1.9),
     "minecraft:snow_golem": (0.4, 1.8),
     "minecraft:spider": (1.4, 0.9),
+    "minecraft:villager_v2": (0.6, 1.9),
     "minecraft:wolf": (0.6, 0.8),
     "minecraft:zombie": (0.6, 1.9),
 }
