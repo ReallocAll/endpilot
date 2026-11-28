@@ -8,6 +8,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from nethernet import ConnectionFailed, InvalidIdentity, PlayerSigner, SessionError
 from nethernet.identity import build_envelope, insert_identity, sign_fingerprints
 
+from .._join_failure import _set_join_stage
 from ._nethernet_http import _check_signaling_endpoint, _protocol_number, connect_http
 
 
@@ -62,6 +63,7 @@ async def connect(
         else:
             await _on_protocol(await _check_signaling_endpoint(url, read_protocol=True))
             _on_protocol = None
+    _set_join_stage("transport_connect")
     if multiplayer_token is None and issuer is None:
         key = private_key or ec.generate_private_key(ec.SECP384R1())
         signer = PlayerSigner(key, domain="self")

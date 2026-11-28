@@ -1,18 +1,19 @@
 import asyncio
 import base64
+import errno
 import json
 import struct
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from uuid import UUID
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
-from endpilot import BedrockCredentials, ResourcePackDecision
+from endpilot import BedrockCredentials, JoinFailureDetails, ResourcePackDecision
 from endpilot.authentication import OfflineIdentity, _OnlineIdentity
 from endpilot.blocks import Blocks
 from endpilot.bot import Bot
@@ -59,6 +60,65 @@ def _online_identity() -> _OnlineIdentity:
 
 
 class JoinTests(unittest.IsolatedAsyncioTestCase):
+    async def test_raknet_dial_and_send_os_errors_keep_the_original_exception_and_cause(self):
+        from endpilot.transport.raknet import RakNetTransport
+
+        bot = Bot()
+        self.addAsyncCleanup(bot.close)
+        for stage in ("transport_connect", "transport_send"):
+            with self.subTest(stage=stage):
+                cause = RuntimeError("private diagnostics from the OS adapter")
+                error = OSError(errno.EMSGSIZE, "private endpoint or transport data")
+                args = error.args
+
+                async def fail(*_args, **_options):
+                    raise error from cause
+
+                connection = SimpleNamespace(send=AsyncMock(), close=AsyncMock())
+                peer = SimpleNamespace(connect=AsyncMock(return_value=connection), close=AsyncMock())
+                if stage == "transport_connect":
+                    peer.connect.side_effect = fail
+                else:
+                    connection.send.side_effect = fail
+                with (
+                    patch("endpilot.transport.raknet._create_peer", return_value=peer),
+                    self.assertRaises(OSError) as caught,
+                ):
+                    await bot.join_raknet("127.0.0.1", timeout=1)
+                self.assertIs(caught.exception, error)
+                self.assertIs(error.__cause__, cause)
+                self.assertEqual((error.args, error.errno), (args, errno.EMSGSIZE))
+                self.assertEqual(error.join_failure, JoinFailureDetails("raknet", stage, "os_error", "errno", errno.EMSGSIZE))
+                peer.close.assert_awaited_once_with(0 if stage == "transport_connect" else 0.5)
+                if stage == "transport_send":
+                    connection.close.assert_awaited_once_with()
+
+    async def test_join_deadline_identifies_the_last_entered_stage_without_inventing_a_code(self):
+        bot = Bot()
+        self.addAsyncCleanup(bot.close)
+
+        async def block(*_args):
+            await asyncio.Future()
+
+        for stage in ("transport_connect", "network_settings_send", "network_settings_wait", "login"):
+            with self.subTest(stage=stage):
+                wire = FakeTransport()
+                if stage == "network_settings_send":
+                    wire.send = AsyncMock(side_effect=block)
+                elif stage == "login":
+                    b = bot.protocol.binding
+                    settings = b.NetworkSettingsPacket(compression_algorithm=b.PacketCompressionAlgorithm.NONE)
+                    wire.received.put_nowait(write_batch([bot.protocol.encode(settings)]))
+                with (
+                    patch("endpilot.transport.raknet.connect", return_value=wire,
+                          side_effect=block if stage == "transport_connect" else None),
+                    self.assertRaises(TimeoutError) as caught,
+                ):
+                    await bot.join_raknet("127.0.0.1", timeout=0.05)
+                self.assertIsInstance(caught.exception.__cause__, asyncio.CancelledError)
+                self.assertEqual(caught.exception.join_failure, JoinFailureDetails("raknet", stage, "timeout"))
+                self.assertEqual(getattr(wire, "closed", False), stage != "transport_connect")
+
     async def test_acquired_identity_drives_transport_and_player_packets(self):
         bot = Bot("OfflineName")
         offline = bot.identity
@@ -314,6 +374,7 @@ class JoinTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError) as captured:
                 await bot.join_nethernet(endpoint, credential_provider=fail)
             self.assertIs(captured.exception, problem)
+            self.assertIsNone(getattr(captured.exception, "join_failure", None))
 
             authorized = asyncio.Event()
             cleaning = asyncio.Event()

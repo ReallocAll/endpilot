@@ -44,6 +44,7 @@ from .game_hp_estimate import TntDamageEstimate
 from .inventory import CursorObservation, HeldItemSnapshot, HeldItemStack, InventorySlotChange
 from .item_registry import ItemRegistrySnapshot, vanilla_item_stack_limits
 from .item_use import ItemCooldownEvent
+from ._join_failure import JoinFailureDetails
 from .login import LoginRefused, SessionEnd
 from .movement import BlockApproach, ForwardInput, MovementState
 from .navigation import (
@@ -167,6 +168,7 @@ __all__ = [
     "ItemCooldownEvent",
     "ItemPickup",
     "ItemRegistrySnapshot",
+    "JoinFailureDetails",
     "LoginRefused",
     "LoadedResourcePack",
     "MiningFaceResult",

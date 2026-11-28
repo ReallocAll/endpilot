@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from ipaddress import IPv4Address
 from pathlib import Path
+import socket
 import ssl
 import sys
 from tempfile import TemporaryDirectory
@@ -10,13 +11,13 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
-from aiohttp import ClientConnectorCertificateError, ClientResponseError, web
+from aiohttp import ClientConnectorCertificateError, ClientConnectorSSLError, ClientResponseError, web
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from nethernet import ConnectionFailed, InvalidIdentity, SessionError
 
-from endpilot import Bot
+from endpilot import Bot, JoinFailureDetails
 from endpilot._join_address import _parse_join_address
 from endpilot.protocol import Protocol
 from endpilot.transport._nethernet_http import _NetherNetUnavailable, _request, connect_http
@@ -92,10 +93,36 @@ class JoinAddressTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(status=status), self.assertRaises(ClientResponseError) as caught:
                     await _check_signaling_endpoint(f"http://{authority}/{status}")
                 self.assertEqual(caught.exception.status, status)
+                self.assertEqual(caught.exception.join_failure, JoinFailureDetails(
+                    "nethernet_http", "signaling_discovery", "http_error", "http_status", status,
+                ))
             await _check_signaling_endpoint(f"http://{authority}/204")
             with self.assertRaises(_NetherNetUnavailable) as caught:
                 await _check_signaling_endpoint(f"http://{authority}/404")
             self.assertEqual(caught.exception.error.status, 404)
+            self.assertIs(caught.exception.error, caught.exception.__cause__)
+
+    async def test_explicit_signaling_get_keeps_connection_error_and_http_cause(self):
+        async def deny(_request):
+            return web.Response(status=403, reason="custom assertion from a private server")
+
+        bot = Bot("Knight")
+        self.addAsyncCleanup(bot.close)
+        async with _listen([web.get("/v1/join", deny)]) as authority:
+            with (
+                patch("endpilot.transport._nethernet_http._make_http_session", return_value=self._mock_connection()),
+                self.assertRaises(ConnectionFailed) as caught,
+            ):
+                await bot.join_nethernet(f"http://{authority}", timeout=1)
+        error = caught.exception
+        self.assertIs(error.error, SessionError.NO_SIGNALING_CHANNEL)
+        self.assertEqual(error.args, ConnectionFailed(SessionError.NO_SIGNALING_CHANNEL).args)
+        self.assertIsInstance(error.__cause__, ClientResponseError)
+        self.assertEqual(error.__cause__.status, 403)
+        self.assertIs(error.join_failure, error.__cause__.join_failure)
+        self.assertEqual(error.join_failure, JoinFailureDetails(
+            "nethernet_http", "signaling_discovery", "http_error", "http_status", 403,
+        ))
 
     async def test_signaling_requests_disable_redirects(self):
         url = "http://127.0.0.1:19132/v1/join"
@@ -132,9 +159,18 @@ class JoinAddressTests(unittest.IsolatedAsyncioTestCase):
                             )
                         if status == 200:
                             self.assertIs(caught.exception.error, SessionError.NEGOTIATION_TIMEOUT_WAITING_FOR_ACCEPT)
+                            expected = JoinFailureDetails(
+                                "nethernet_http", "signaling_connect", "timeout", "nethernet_session_error",
+                                "NEGOTIATION_TIMEOUT_WAITING_FOR_ACCEPT",
+                            )
                         else:
                             self.assertIs(caught.exception.error, SessionError.SIGNALING_FAILED_TO_SEND)
                             self.assertEqual(caught.exception.__cause__.status, status)
+                            self.assertIs(caught.exception.join_failure, caught.exception.__cause__.join_failure)
+                            expected = JoinFailureDetails(
+                                "nethernet_http", "signaling_connect", "http_error", "http_status", status,
+                            )
+                        self.assertEqual(caught.exception.join_failure, expected)
                         connection._session.accept_answer.assert_not_awaited()
                         connection._session.aclose.assert_awaited_once_with(SessionError.GENERIC_FAILURE)
 
@@ -183,12 +219,62 @@ class JoinAddressTests(unittest.IsolatedAsyncioTestCase):
                     patch("endpilot.transport.nethernet.connect_http") as offer,
                     patch("endpilot.transport.raknet.connect") as raknet,
                 ):
-                    with self.assertRaises(ClientConnectorCertificateError):
+                    with self.assertRaises(ClientConnectorCertificateError) as caught:
                         await bot.join_address(authority, timeout=2)
+                    error = caught.exception
+                    self.assertIs(error.certificate_error, error.__cause__)
+                    self.assertIsInstance(error.certificate_error, ssl.SSLCertVerificationError)
+                    self.assertEqual(error.join_failure, JoinFailureDetails(
+                        "nethernet_https", "signaling_discovery", "tls_certificate_verification", "verify_code",
+                        error.certificate_error.verify_code,
+                    ))
                     probe.assert_awaited_once_with(f"https://{authority}")
                     offer.assert_not_awaited()
                     raknet.assert_not_awaited()
         await bot.close()
+
+    async def test_tls_handshake_alert_stops_before_offer_or_other_transport(self):
+        bot = Bot("Knight")
+        self.addAsyncCleanup(bot.close)
+        with TemporaryDirectory() as directory, socket.create_server(("127.0.0.1", 0)) as listener:
+            context = _untrusted_tls(Path(directory))
+            context.maximum_version = ssl.TLSVersion.TLSv1_2
+            # The ECDSA server certificate cannot use this RSA-only cipher.
+            context.set_ciphers("ECDHE-RSA-AES256-GCM-SHA384")
+            listener.settimeout(3)
+            authority = f"127.0.0.1:{listener.getsockname()[1]}"
+
+            def serve():
+                connection, _ = listener.accept()
+                with connection:
+                    connection.settimeout(3)
+                    with self.assertRaises(ssl.SSLError) as rejected:
+                        with context.wrap_socket(connection, server_side=True):
+                            self.fail("TLS fixture unexpectedly completed a handshake")
+                    return rejected.exception.reason
+
+            server = asyncio.create_task(asyncio.to_thread(serve))
+            try:
+                with (
+                    patch("endpilot.transport.nethernet._check_signaling_endpoint", wraps=_check_signaling_endpoint) as probe,
+                    patch("endpilot.transport.nethernet.connect_http") as offer,
+                    patch("endpilot.transport.raknet.connect") as raknet,
+                    self.assertRaises(ClientConnectorSSLError) as caught,
+                ):
+                    await bot.join_address(authority, timeout=2)
+                error = caught.exception
+                self.assertIs(error.os_error, error.__cause__)
+                self.assertEqual(error.os_error.reason, "SSLV3_ALERT_HANDSHAKE_FAILURE")
+                self.assertEqual(error.join_failure, JoinFailureDetails(
+                    "nethernet_https", "signaling_discovery", "tls_handshake", "openssl_reason",
+                    "SSLV3_ALERT_HANDSHAKE_FAILURE",
+                ))
+                probe.assert_awaited_once_with(f"https://{authority}")
+                offer.assert_not_awaited()
+                raknet.assert_not_awaited()
+            finally:
+                server_result = await server
+            self.assertEqual(server_result, "NO_SHARED_CIPHER")
 
     async def test_pin_mismatch_stops_selection(self):
         async def wrong_pin(_url, *, on_server_identity, **_kwargs):
@@ -317,8 +403,9 @@ class JoinAddressTests(unittest.IsolatedAsyncioTestCase):
                 await entered.wait()
                 await bot.close()
                 self.assertTrue(exited.is_set())
-                with self.assertRaises(asyncio.CancelledError):
+                with self.assertRaises(asyncio.CancelledError) as cancelled:
                     await joining
+                self.assertIsNone(getattr(cancelled.exception, "join_failure", None))
             probe.assert_awaited_once_with("https://localhost:19132")
 
     async def test_protocol_announcement_is_scoped_to_one_nethernet_candidate(self):
@@ -338,6 +425,7 @@ class JoinAddressTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([call.kwargs for call in get.await_args_list], [{"read_protocol": True}] * 2)
         self.assertEqual(dial.await_count, 2)
         raknet.assert_not_awaited()
+        self.assertEqual(failure.error.join_failure.transport, "nethernet_https")
         self.assertIs(bot.protocol, bot.packets.protocol)
         self.assertEqual((bot.protocol.number, bot.player_id), (2225, 42))
 

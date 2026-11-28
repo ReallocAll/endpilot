@@ -9,11 +9,12 @@ from pathlib import Path
 import re
 import sys
 
-from . import LoginRefused, Skin
+from . import JoinFailureDetails, LoginRefused, Skin
 from ._cli_terminal import (
     _can_read_terminal, _device_terminal, _print_remember_notice, _print_status, _show_device_code, _write_notice,
 )
 from ._join_address import _parse_join_address
+from ._join_failure import _symbol_code
 from .skin import _SkinModel
 
 
@@ -70,6 +71,41 @@ def _nethernet_failure_message(error: BaseException) -> str | None:
                            reason.NEGOTIATION_TIMEOUT_WAITING_FOR_ACCEPT):
             return "NetherNet connection timed out during negotiation."
     return None
+
+
+def _join_failure_message(error: BaseException) -> str | None:
+    details = getattr(error, "join_failure", None)
+    if not isinstance(details, JoinFailureDetails):
+        return None
+    transport = {
+        "nethernet_https": "NetherNet HTTPS", "nethernet_http": "NetherNet HTTP", "raknet": "RakNet",
+    }.get(details.transport, "Connection")
+    stage = {
+        "signaling_discovery": "signaling discovery (GET)",
+        "signaling_connect": "signaling setup (POST)",
+        "protocol_selection": "Bedrock protocol selection",
+        "transport_discovery": "transport discovery",
+        "transport_connect": "transport connection setup",
+        "transport_send": "transport send",
+        "network_settings_send": "Bedrock network settings request submission",
+        "network_settings_wait": "the wait for Bedrock network settings",
+        "login": "Bedrock login",
+    }.get(details.stage, "join")
+    reason = {
+        "tls_certificate_verification": "TLS certificate verification failed",
+        "tls_handshake": "TLS handshake failed",
+        "http_error": "request failed",
+        "timeout": "timed out",
+        "os_error": "reported an OS error",
+    }.get(details.reason, "failed")
+    code: int | str | None = None
+    source = details.code_source
+    if source in ("verify_code", "errno", "winerror", "http_status") and type(details.code) is int:
+        code = details.code
+    elif source in ("openssl_reason", "raknet_result", "nethernet_session_error"):
+        code = _symbol_code(details.code)
+    suffix = f" [{source}={code}]" if code is not None else ""
+    return f"{transport} {reason} during {stage}{suffix}."
 
 
 def _choose_account(labels: list[str], owned: ExitStack, *, allow_name: bool) -> int:
@@ -381,10 +417,13 @@ def main(argv: list[str] | None = None) -> int:
         _print_status(str(error), file=sys.stderr)
         return 1
     except (Exception, SystemExit) as error:
-        if isinstance(error, TimeoutError):
+        join_message = None
+        if args.command == "join":
+            join_message = _nethernet_failure_message(error) or _join_failure_message(error)
+        if join_message is not None:
+            message = join_message
+        elif isinstance(error, TimeoutError):
             message = "Join timed out." if args.command == "join" else "Xbox account authorization timed out."
-        elif args.command == "join" and (nethernet_message := _nethernet_failure_message(error)) is not None:
-            message = nethernet_message
         elif not xbox_command:
             message = "Connection failed. Check the server address, settings and transport dependencies."
         elif args.command == "join":

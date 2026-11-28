@@ -1,5 +1,7 @@
 import asyncio
 from contextlib import chdir, redirect_stderr, redirect_stdout
+from dataclasses import FrozenInstanceError
+import errno
 from importlib.util import find_spec
 from io import StringIO
 import json
@@ -12,13 +14,11 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import ANY, AsyncMock, patch
 
-from endpilot import BedrockCredentials, LoginRefused, ResourcePackDecision, SessionEnd, Skin, _cli_terminal
+from endpilot import BedrockCredentials, JoinFailureDetails, LoginRefused, ResourcePackDecision, SessionEnd, Skin, _cli_terminal
 from endpilot import __main__ as cli
 from endpilot.__main__ import main
-from endpilot.authentication import OfflineIdentity
 from endpilot.bot import Bot
-from endpilot.compression import PacketConnection
-from endpilot.login import JoinSession, request_network_settings
+from endpilot.login import JoinSession
 from endpilot.protocol import Protocol, write_batch
 from test_join import FakeTransport, _spawn_transport
 from test_skin import _png
@@ -128,14 +128,16 @@ class GeneralCliTests(_CliTestCase):
 
         async def refuse(packet, *, during_settings):
             wire = FakeTransport()
+            if not during_settings:
+                settings = b.NetworkSettingsPacket(compression_algorithm=b.PacketCompressionAlgorithm.NONE)
+                wire.received.put_nowait(write_batch([protocol.encode(settings)]))
             wire.received.put_nowait(write_batch([protocol.encode(packet)]))
-            async with asyncio.timeout(1):
-                if during_settings:
-                    await request_network_settings(wire, protocol)
-                else:
-                    settings = b.NetworkSettingsPacket(compression_algorithm=b.PacketCompressionAlgorithm.NONE)
-                    connection = PacketConnection(wire, protocol, settings)
-                    await JoinSession(connection, OfflineIdentity("EndPilot"), "play.example:19132").join()
+            bot = Bot("EndPilot")
+            try:
+                with patch("endpilot.transport.raknet.connect", return_value=wire):
+                    await bot.join_raknet("127.0.0.1", timeout=1)
+            finally:
+                await bot.close()
 
         for packet, during_settings, detail, expected in (
             (allowlist, False, f"server rejected login: {allowlist!r}",
@@ -153,6 +155,11 @@ class GeneralCliTests(_CliTestCase):
                     asyncio.run(refuse(packet, during_settings=during_settings))
                 self.assertEqual(str(refused.exception), detail)
                 self.assertEqual(refused.exception.args, (detail,))
+                stage = "network_settings_wait" if during_settings else "login"
+                code = refused.exception.reason_name
+                self.assertEqual(refused.exception.join_failure, JoinFailureDetails(
+                    "raknet", stage, "bedrock_refusal", "bedrock_reason" if code else None, code,
+                ))
                 self.bot.join_address.side_effect = refused.exception
                 self.assertEqual(main(["join", "play.example:19132", "--hold", "0"]), 1)
                 self.assertEqual(output.getvalue(), expected + "\n")
@@ -162,6 +169,35 @@ class GeneralCliTests(_CliTestCase):
         self.assertEqual(main(["join", "play.example:19132", "--hold", "0"]), 1)
         self.assertEqual(self.stderr.getvalue(), "Join timed out.\n")
         self.bot.close.assert_awaited_once()
+
+    def test_join_renders_only_fixed_candidate_stage_and_safe_code(self):
+        private = "https://private.example/path Authorization: secret v=0 playerid\n\x1b[31m"
+        for details, message in (
+            (JoinFailureDetails("nethernet_https", "signaling_discovery", "tls_certificate_verification", "verify_code", 18),
+             "NetherNet HTTPS TLS certificate verification failed during signaling discovery (GET) [verify_code=18]."),
+            (JoinFailureDetails("nethernet_https", "signaling_discovery", "tls_handshake", "openssl_reason",
+                                "SSLV3_ALERT_HANDSHAKE_FAILURE"),
+             "NetherNet HTTPS TLS handshake failed during signaling discovery (GET) "
+             "[openssl_reason=SSLV3_ALERT_HANDSHAKE_FAILURE]."),
+            (JoinFailureDetails("nethernet_http", "signaling_connect", "http_error", "http_status", 403),
+             "NetherNet HTTP request failed during signaling setup (POST) [http_status=403]."),
+            (JoinFailureDetails("raknet", "transport_connect", "timeout"),
+             "RakNet timed out during transport connection setup."),
+            (JoinFailureDetails("raknet", "transport_send", "os_error", "errno", errno.EMSGSIZE),
+             f"RakNet reported an OS error during transport send [errno={errno.EMSGSIZE}]."),
+            (JoinFailureDetails("raknet", "network_settings_wait", "timeout"),
+             "RakNet timed out during the wait for Bedrock network settings."),
+            (JoinFailureDetails(private, private, private, "openssl_reason", private),
+             "Connection failed during join."),
+        ):
+            with self.subTest(message=message), redirect_stderr(StringIO()) as output:
+                error = OSError(private)
+                error.join_failure = details
+                self.bot.join_address.side_effect = error
+                self.assertEqual(main(["join", "play.example:19132", "--hold", "0"]), 1)
+                self.assertEqual(output.getvalue(), message + "\n")
+        with self.assertRaises(FrozenInstanceError):
+            details.stage = "changed"
 
     @unittest.skipUnless(find_spec("nethernet"), "requires the NetherNet extra")
     def test_nethernet_identity_errors_have_fixed_messages(self):

@@ -8,6 +8,8 @@ import raknet
 import raknet.asyncio
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
+from .._join_failure import _join_stage, _record_connection_failure, _record_join_failure, _symbol_code
+
 
 def _checksum(counter: int, payload: bytes, key: bytes) -> bytes:
     return hashlib.sha256(struct.pack("<Q", counter) + payload + key).digest()[:8]
@@ -70,12 +72,17 @@ class RakNetTransport:
         if self._key is not None:
             data = self._encryptor.update(data + _checksum(self._sent, data, self._key))
             self._sent += 1
-        await self._connection.send(
-            b"\xfe" + data,
-            reliability=raknet.PacketReliability.RELIABLE_ORDERED,
-            priority=raknet.PacketPriority.MEDIUM_PRIORITY,
-            channel=0,
-        )
+        try:
+            await self._connection.send(
+                b"\xfe" + data,
+                reliability=raknet.PacketReliability.RELIABLE_ORDERED,
+                priority=raknet.PacketPriority.MEDIUM_PRIORITY,
+                channel=0,
+            )
+        except OSError as error:
+            if _join_stage.get() is not None:
+                _record_connection_failure(error, "raknet", "transport_send")
+            raise
 
     async def recv(self) -> bytes:
         while True:
@@ -103,11 +110,19 @@ class RakNetTransport:
 
 
 async def connect(host: str, port: int) -> RakNetTransport:
-    peer = await _create_peer()
+    try:
+        peer = await _create_peer()
+    except raknet.StartupError as error:
+        _record_join_failure(error, "raknet", "transport_connect", "transport_error", "raknet_result",
+                             _symbol_code(getattr(error.result, "name", None)))
+        raise
     try:
         connection = await peer.connect((host, port))
-    except BaseException:
+    except BaseException as error:
         await _close_peer(peer, 0)
+        if isinstance(error, raknet.ConnectError):
+            _record_join_failure(error, "raknet", "transport_connect", "transport_error", "raknet_result",
+                                 _symbol_code(getattr(error.reason, "name", None)))
         raise
     return RakNetTransport(connection, peer=peer)
 

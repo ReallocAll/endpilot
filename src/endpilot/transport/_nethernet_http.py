@@ -25,13 +25,20 @@
 
 import errno
 import inspect
+import ssl
 from collections.abc import Awaitable, Callable
 
-from nethernet import Connection, ConnectionFailed, NetworkID, SessionError, new_connection_id
+from nethernet import (
+    Connection, ConnectionClosed, ConnectionFailed, InvalidIdentity, NetworkID, SessionError, new_connection_id,
+)
 from nethernet.api import _make_http_session
 from nethernet.constants import DEFAULT_NEGOTIATION_TIMEOUT
 from nethernet.identity import strip_identity, verify_server_identity
 from nethernet.signaling.http import SDP_CONTENT_TYPE, _parse_answer, _require_aiohttp
+
+from .._join_failure import (
+    _nethernet_transport, _os_error_code, _record_connection_failure, _record_join_failure, _set_join_stage, _symbol_code,
+)
 
 
 class _NetherNetUnavailable(Exception):
@@ -67,24 +74,76 @@ def _protocol_number(advertisement) -> int | None:
     return number if number > 0 else None
 
 
+def _record_signaling_failure(error, url: str, stage: str) -> None:
+    import aiohttp
+
+    transport = _nethernet_transport(url)
+    if isinstance(error, (aiohttp.ClientConnectorCertificateError, ssl.SSLCertVerificationError)):
+        certificate_error = getattr(error, "certificate_error", error)
+        error_code = getattr(certificate_error, "verify_code", None)
+        _record_join_failure(error, transport, stage, "tls_certificate_verification", "verify_code",
+                             error_code if type(error_code) is int else None)
+    elif isinstance(error, (aiohttp.ClientSSLError, ssl.SSLError)):
+        tls_error = error.os_error if isinstance(error, aiohttp.ClientConnectorSSLError) else error
+        code = _symbol_code(getattr(tls_error, "reason", None))
+        _record_join_failure(error, transport, stage, "tls_handshake", "openssl_reason", code)
+    elif isinstance(error, aiohttp.ClientResponseError):
+        status = error.status
+        _record_join_failure(error, transport, stage, "http_error", "http_status",
+                             status if type(status) is int and 100 <= status <= 599 else None)
+    elif isinstance(error, aiohttp.ClientConnectorError):
+        os_error = error.os_error
+        reason = "timeout" if isinstance(os_error, TimeoutError) else "os_error"
+        _record_join_failure(error, transport, stage, reason, *_os_error_code(os_error))
+    else:
+        _record_connection_failure(error, transport, stage)
+
+
+def _signaling_connection_failed(reason: SessionError, cause: Exception) -> ConnectionFailed:
+    error = ConnectionFailed(reason)
+    if details := getattr(cause, "join_failure", None):
+        error.join_failure = details
+    return error
+
+
+def _record_nethernet_failure(error: ConnectionClosed | ConnectionFailed, transport: str | None, stage: str) -> None:
+    code = error.error
+    reason = "transport_error"
+    if code == SessionError.IDENTITY_NOT_ALLOWED:
+        reason = "identity_rejected"
+    elif code in (
+        SessionError.NEGOTIATION_TIMEOUT, SessionError.NEGOTIATION_TIMEOUT_WAITING_FOR_RESPONSE,
+        SessionError.NEGOTIATION_TIMEOUT_WAITING_FOR_ACCEPT, SessionError.INACTIVITY_TIMEOUT,
+    ):
+        reason = "timeout"
+    name = code.name if isinstance(code, SessionError) else None
+    _record_join_failure(error, transport, stage, reason, "nethernet_session_error", name)
+
+
 async def _request(client, method: str, url: str, *, read_protocol: bool = False, **options) -> str | int | None:
     import aiohttp
 
-    async with client.request(method, url, allow_redirects=False, **options) as response:
-        if response.status // 100 != 2:
-            raise aiohttp.ClientResponseError(
-                response.request_info, response.history, status=response.status,
-                message=response.reason, headers=response.headers,
-            )
-        if method == "POST":
-            return await response.text()
-        if read_protocol:
-            try:
-                advertisement = await response.json(content_type=None)
-            except (ValueError, LookupError):
-                return None
-            return _protocol_number(advertisement)
-        return ""
+    stage = "signaling_discovery" if method == "GET" else "signaling_connect"
+    _set_join_stage(stage)
+    try:
+        async with client.request(method, url, allow_redirects=False, **options) as response:
+            if response.status // 100 != 2:
+                raise aiohttp.ClientResponseError(
+                    response.request_info, response.history, status=response.status,
+                    message=response.reason, headers=response.headers,
+                )
+            if method == "POST":
+                return await response.text()
+            if read_protocol:
+                try:
+                    advertisement = await response.json(content_type=None)
+                except (ValueError, LookupError):
+                    return None
+                return _protocol_number(advertisement)
+            return ""
+    except (aiohttp.ClientError, OSError) as error:
+        _record_signaling_failure(error, url, stage)
+        raise
 
 
 async def _check_signaling_endpoint(url: str, *, read_protocol: bool = False) -> int | None:
@@ -116,7 +175,7 @@ async def _request_answer(
             try:
                 number = await _request(client, "GET", endpoint, read_protocol=on_protocol is not None)
             except (aiohttp.ClientError, OSError) as error:
-                raise ConnectionFailed(SessionError.NO_SIGNALING_CHANNEL) from error
+                raise _signaling_connection_failed(SessionError.NO_SIGNALING_CHANNEL, error) from error
             if on_protocol is not None:
                 await on_protocol(number)
         try:
@@ -127,8 +186,12 @@ async def _request_answer(
         except (aiohttp.ClientError, OSError) as error:
             if not capability_check and _connection_unavailable(error):
                 raise _NetherNetUnavailable(error) from error
-            raise ConnectionFailed(SessionError.SIGNALING_FAILED_TO_SEND) from error
-    return _parse_answer(body)
+            raise _signaling_connection_failed(SessionError.SIGNALING_FAILED_TO_SEND, error) from error
+    try:
+        return _parse_answer(body)
+    except ConnectionFailed as error:
+        _record_nethernet_failure(error, _nethernet_transport(url), "signaling_connect")
+        raise
 
 
 async def connect_http(
@@ -153,6 +216,7 @@ async def connect_http(
         answer = await _request_answer(
             url, local, offer, capability_check=capability_check, on_protocol=_on_protocol,
         )
+        _set_join_stage("transport_connect")
         if on_server_identity is not None:
             answer, server_identity = verify_server_identity(answer)
             result = on_server_identity(server_identity)
@@ -164,6 +228,7 @@ async def connect_http(
         try:
             await conn._await_connected(None)
         except ConnectionFailed as error:
+            _record_nethernet_failure(error, _nethernet_transport(url), "transport_connect")
             # The SDP answer has been accepted. Only the local session can
             # report these HTTP-dial negotiation timeouts at this point.
             if not capability_check and error.error in (
@@ -173,6 +238,8 @@ async def connect_http(
                 raise _NetherNetUnavailable(error) from error
             raise
         return conn
-    except BaseException:
+    except BaseException as error:
+        if isinstance(error, InvalidIdentity):
+            _record_join_failure(error, _nethernet_transport(url), "transport_connect", "identity_verification")
         await session.aclose(SessionError.GENERIC_FAILURE)
         raise

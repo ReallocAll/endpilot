@@ -28,6 +28,50 @@ version string as sent in the active session's `StartGame`, or `None` if
 unavailable. RakNet startup and shutdown cleanup can extend the time
 before a cancelled or timed-out join returns.
 
+## Inspect a join failure
+
+Join exceptions can carry an immutable `endpilot.JoinFailureDetails` in
+`error.join_failure`. The original exception type, arguments, `errno`, and
+explicit cause remain available. Use `getattr` because errors before a candidate
+is selected, such as Xbox authorization failures, may have no join details.
+
+```python
+try:
+    await bot.join_address(address)
+except Exception as error:
+    failure = getattr(error, "join_failure", None)
+    if failure is not None:
+        print(failure.transport, failure.stage, failure.reason, failure.code_source, failure.code)
+    raise
+```
+
+`transport` identifies the failed candidate as `nethernet_https`,
+`nethernet_http`, or `raknet`. It can be `None` when the transport is unknown.
+
+| `stage` | Operation |
+| --- | --- |
+| `signaling_discovery` | NetherNet signaling discovery (GET) |
+| `signaling_connect` | NetherNet signaling setup (POST) |
+| `transport_discovery` | RakNet advertisement probe |
+| `protocol_selection` | Preparing the protocol selected from an announcement or the default |
+| `transport_connect` | Preparing or establishing the transport connection |
+| `transport_send` | Sending through the transport, when RakNet surfaces an OS error |
+| `network_settings_send` | Submitting the Bedrock network settings request |
+| `network_settings_wait` | Waiting for the Bedrock network settings response |
+| `login` | Bedrock login through initial spawn |
+
+`reason` distinguishes `tls_certificate_verification`, `tls_handshake`,
+`http_error`, `timeout`, `os_error`, `identity_verification`, `identity_rejected`,
+and `bedrock_refusal`. When an error supplies only a transport failure or
+has no more precise classification, it uses `transport_error` or
+`connection_error`.
+
+When available, `code_source` and `code` carry one underlying value. The source
+can be `verify_code`, `openssl_reason`, `errno`, `winerror`, `http_status`,
+`raknet_result`, `nethernet_session_error`, or `bedrock_reason`. An elapsed join
+deadline can identify the stage with both fields set to `None`. The CLI uses
+fixed messages for these failures and retains its server refusal messages.
+
 ## Check SDK features for a protocol
 
 `bot.protocol.supports_feature(name)` is a synchronous query for the selected

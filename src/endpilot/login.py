@@ -16,6 +16,10 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 from ._join_address import _JoinAddress
+from ._join_failure import (
+    JoinFailureDetails, _join_stage, _nethernet_transport, _record_connection_failure, _record_join_failure,
+    _set_join_stage, _symbol_code,
+)
 from .authentication import (
     DEFAULT_LOCALE, SubmittedClientSettings, _OnlineIdentity, _read_submitted_client_settings, _validate_locale,
 )
@@ -130,15 +134,34 @@ def _experiments_allow_vanilla_recipe_tags(experiments) -> bool:
     return all(not toggle.enabled or toggle.name == "gametest" for toggle in experiments.toggles)
 
 
+def _record_candidate_failure(error: BaseException, transport: str | None, closed: type[Exception] | None) -> None:
+    stage = _join_stage.get()
+    if stage is None or not isinstance(error, Exception):
+        return
+    details = error.__dict__.get("join_failure")
+    if isinstance(details, JoinFailureDetails) and details.transport == transport:
+        return
+    if isinstance(error, LoginRefused):
+        _record_join_failure(error, transport, stage, "bedrock_refusal", "bedrock_reason", _symbol_code(error.reason_name))
+    elif closed is not None and isinstance(error, closed):
+        from .transport._nethernet_http import _record_nethernet_failure
+
+        _record_nethernet_failure(error, transport, stage)
+    else:
+        _record_connection_failure(error, transport, stage)
+
+
 async def request_network_settings(connection, protocol: Protocol, *, timeline: PacketTimeline | None = None,
                                    clock: ClientClock | None = None):
     """Exchange the first game message on a newly opened batch transport."""
     request = protocol.binding.RequestNetworkSettingsPacket()
     request.client_network_version = protocol.number
+    _set_join_stage("network_settings_send")
     await connection.send(write_batch([protocol.encode(request)]))
     if timeline is not None:
         timeline._record_sent(type(request).__name__)
 
+    _set_join_stage("network_settings_wait")
     while True:
         batch = await connection.recv()
         tick = clock.tick if timeline is not None and clock is not None else None
@@ -296,7 +319,8 @@ class JoinSession:
         return await cls._connect_transport(
             partial(connect, url, private_key=identity.key, server_key_sha256=server_key_sha256, **credentials),
             identity, url, protocol, timeout, timeline, clock, _online_join=_online_join,
-            _retry_before_link=_check_endpoint, _transport_closed=ConnectionClosed,
+            _candidate_transport=_nethernet_transport(url), _retry_before_link=_check_endpoint,
+            _transport_closed=ConnectionClosed,
             chunk_radius=chunk_radius, locale=locale, load_screen=load_screen,
             retain_initial_chunks=retain_initial_chunks, on_resource_packs=on_resource_packs,
         )
@@ -320,24 +344,26 @@ class JoinSession:
             async def discover_and_dial(*, _on_protocol):
                 # Reserve part of this candidate's deadline for the connection and login.
                 ping_timeout = 5 if timeout is None else min(5, timeout / 2)
+                _set_join_stage("transport_discovery")
                 try:
                     number = await advertised_protocol(host, port, timeout=ping_timeout)
                 except (TimeoutError, ValueError, RakNetError):
                     number = None
                 await _on_protocol(number)
+                _set_join_stage("transport_connect")
                 return await connect(host, port)
 
             dial = discover_and_dial
         return await cls._connect_transport(
             dial, identity, _address or f"{host}:{port}", protocol, timeout, timeline, clock,
-            _online_join=_online_join, chunk_radius=chunk_radius, locale=locale,
+            _online_join=_online_join, _candidate_transport="raknet", chunk_radius=chunk_radius, locale=locale,
             retain_initial_chunks=retain_initial_chunks, on_resource_packs=on_resource_packs,
         )
 
     @classmethod
     async def _connect_transport(
         cls, dial, identity, address, protocol, timeout, timeline, clock,
-        *, _online_join: _PendingOnlineJoin | None, _retry_before_link: bool = False,
+        *, _online_join: _PendingOnlineJoin | None, _candidate_transport: str | None, _retry_before_link: bool = False,
         _transport_closed: type[Exception] | None = None, **join_options,
     ):
         transport = None
@@ -345,6 +371,7 @@ class JoinSession:
 
         async def select_protocol(number: int | None) -> None:
             nonlocal protocol
+            _set_join_stage("protocol_selection")
             number = DEFAULT_PROTOCOL if number is None else number
             try:
                 protocol = Protocol(number)
@@ -357,6 +384,7 @@ class JoinSession:
             if number == DEFAULT_PROTOCOL:
                 await _prepare_block_palette()
 
+        stage_token = _join_stage.set("transport_connect")
         try:
             async with deadline:
                 transport = await (dial(_on_protocol=select_protocol) if protocol is None else dial())
@@ -376,7 +404,10 @@ class JoinSession:
                 from .transport._nethernet_http import _NetherNetUnavailable
 
                 if isinstance(error, _NetherNetUnavailable):
+                    _record_candidate_failure(error.error, _candidate_transport, _transport_closed)
                     return error
+            _record_candidate_failure(error, _candidate_transport, _transport_closed)
+            if _retry_before_link and transport is None:
                 if isinstance(error, TimeoutError) and deadline.expired():
                     cancelled = error.__cause__
                     # The deadline can interrupt the library while it is unwinding a refusal.
@@ -389,6 +420,8 @@ class JoinSession:
                 if _online_join is not None:
                     _online_join.transport_close_error = cleanup_error
             raise
+        finally:
+            _join_stage.reset(stage_token)
 
     @classmethod
     async def _join_connected(
@@ -402,6 +435,7 @@ class JoinSession:
             if _online_join is not None:
                 clock.get_tick()
             settings = await request_network_settings(transport, protocol, timeline=timeline, clock=clock)
+            _set_join_stage("login")
             if _online_join is not None:
                 clock.get_tick()
             packets = PacketConnection(transport, protocol, settings, timeline=timeline, clock=clock)
