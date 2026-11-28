@@ -373,7 +373,10 @@ when all 36 main inventory slots are full. Use 0 for head, 1 for chest, 2 for
 legs, or 3 for feet. The method checks the current inventory window, creative
 mode, catalog entry and target slot again before sending. It returns the
 matching server verdict. Check `bot.armor_slots` for the resulting slot
-observation.
+observation. When a creative equip overlaps an armor transfer to or from the
+same slot, the second write is rejected while the first is in flight. If the
+catalog description changes during a request, a successful receipt can leave
+the slot unknown until the server supplies a full slot description.
 
 `await bot.clear_creative_inventory([0, 8, 17])` clears selected slots in
 order. Omit the list to check all 36 main inventory slots. Each result includes

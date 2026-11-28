@@ -138,6 +138,7 @@ class _PendingStackRequest:
     automatic_unequip: bool = False
     exact_offhand_take: bool = False
     cursor_exchange: bool = False
+    creative_armor: bool = False
 
     def retain_uncertain_personal_grid(self) -> bool:
         # Only the write hook establishes a possible submission for these endpoints.
@@ -690,7 +691,7 @@ class Inventory:
                                   after_send=None, _endpoints=None, _range_step=False,
                                   _wait_for=(), _on_unconfirmed=None, _on_slot_observed=None,
                                   _at_write=None, _automatic_unequip=False, _exact_offhand_take=False,
-                                  _cursor_exchange=False):
+                                  _cursor_exchange=False, _creative_armor=False):
         """Own pending replies for inventory, containers, trading, recipes, enchanting and creative actions.
 
         The operation owns its slot/window checks and supplies synchronous hooks.
@@ -707,22 +708,29 @@ class Inventory:
         Caller timeout or cancellation withdraws only an unsubmitted deferred or
         write-checked request. Other requests may still send or apply a late
         verdict. Disconnect or reader end fails pending replies and cancels sends.
+        A creative armor request cannot overlap a submitted request for the same armor slot.
         """
         if self._request_stream_ended:
             raise ConnectionError("item-stack request stream is closed")
         request_id = int(request.client_request_id.raw_id)
         reply = asyncio.get_running_loop().create_future()
         endpoints = self._request_player_endpoints(request) if _endpoints is None else _endpoints
+        armor_endpoints = endpoints.intersection(_DAMAGE_ARMOR_SLOTS)
         pending = _PendingStackRequest(
             reply, apply, endpoints, _range_step, _on_unconfirmed, _on_slot_observed,
             checked_at_write=_at_write is not None, automatic_unequip=_automatic_unequip,
             exact_offhand_take=_exact_offhand_take, cursor_exchange=_cursor_exchange,
+            creative_armor=_creative_armor,
         )
         self._pending_requests[request_id] = pending
         if queued:
             self._qa_requests[request_id] = reply
 
         def submit():
+            if armor_endpoints and any(other is not pending and other.submitted
+                                       and (pending.creative_armor or other.creative_armor)
+                                       for other in self._requests_for_endpoints(armor_endpoints)):
+                raise RuntimeError("the armor slot has an item-stack request in flight")
             if any(other is not pending and other.submitted and other.cursor_exchange
                    for other in self._requests_for_endpoints(endpoints)):
                 raise _InventoryMoveNotSubmitted("unconfirmed")

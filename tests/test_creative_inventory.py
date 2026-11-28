@@ -36,11 +36,11 @@ class CreativeInventoryTests(unittest.IsolatedAsyncioTestCase):
         self.mode = self.b.GameType
         self.addAsyncCleanup(self.bot.close)
 
-    def catalog(self, item_id=7):
+    def catalog(self, item_id=7, *, data=_NBT):
         b = self.b
         item = b.SerializedNetworkItemInstanceDescriptor(
             id=item_id, stack_size=1, aux_value=7, block_runtime_id=-2147483647,
-            user_data_buffer=_NBT,
+            user_data_buffer=data,
         )
         return b.CreativeContentPacket(
             groups=[b.CreativeGroupInfoPayload(
@@ -673,6 +673,7 @@ class CreativeInventoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.bot.armor_slots[0].id)
         with self.assertRaisesRegex(RuntimeError, "request in flight"):
             await self.bot.equip_creative_armor(entry, armor_slot=0, timeout=1)
+        await self.deliver(self.catalog())
         await self.deliver(self.transfer_reply(request, slot=0, domain="ARMOR_CONTAINER", source_empty=False))
         self.assertEqual((await pending).result.name, "SUCCESS")
         helmet = self.bot.armor_slots[0]
@@ -683,6 +684,44 @@ class CreativeInventoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(self.bot.offhand_item, offhand)
         self.assertIs(self.bot.last_cursor_observation, cursor)
         self.assertTrue(self.transport.sent.empty())
+
+    async def test_catalog_and_ordinary_armor_share_in_flight_slots_in_both_orders(self):
+        for catalog_first in (True, False):
+            with self.subTest(catalog_first=catalog_first):
+                entry = await self.catalog_armor_ready()
+                await self.deliver(self.item_slot("INVENTORY", 1, 47))
+
+                async def catalog():
+                    return await self.bot.equip_creative_armor(entry, 0, timeout=1)
+
+                async def ordinary():
+                    return await self.bot.equip_armor(0, 0, timeout=1)
+
+                first, second = (catalog, ordinary) if catalog_first else (ordinary, catalog)
+                pending = asyncio.create_task(first())
+                head = await self.request()
+                if catalog_first:
+                    pending.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await pending
+                with self.assertRaisesRegex(RuntimeError, "request in flight"):
+                    await second()
+                self.assertTrue(self.transport.sent.empty())
+
+                other = asyncio.create_task(self.bot.equip_armor(1, 1, timeout=1))
+                chest = await self.request()
+                self.assertEqual(chest.actions[0].destination.slot, 1)
+                await self.deliver(self.transfer_reply(chest, slot=1, net_id=52, domain="ARMOR_CONTAINER",
+                                                       source_empty=False))
+                self.assertEqual((await other).result.name, "SUCCESS")
+                await self.deliver(self.transfer_reply(head, slot=0, domain="ARMOR_CONTAINER", source_empty=False))
+                if not catalog_first:
+                    self.assertEqual((await pending).result.name, "SUCCESS")
+                self.assertEqual([self.bot.armor_slots[i].net_id_variant for i in (0, 1)], [51, 52])
+                with self.assertRaisesRegex(ValueError, "observed empty"):
+                    await catalog()
+                self.assertTrue(self.transport.sent.empty())
+            await self.bot.close()
 
     async def test_equip_creative_armor_rejects_wrong_item_unknown_occupied_stale_or_disabled(self):
         b = self.b
@@ -749,6 +788,52 @@ class CreativeInventoryTests(unittest.IsolatedAsyncioTestCase):
                                                              source_empty=False))
             self.assertEqual((await pending).result.name, "SUCCESS")
             self.assertEqual(int(self.bot.armor_slots[0].net_id_variant or 0), expected)
+            await self.bot.close()
+
+    async def test_changed_catalog_armor_receipt_requires_new_observation(self):
+        b = self.b
+        updated = _NBT.replace(b"\x07\x00\x00\x00", b"\x08\x00\x00\x00", 1)
+        for restored in (False, True):
+            with self.subTest(restored=restored):
+                entry = await self.catalog_armor_ready()
+                pending = asyncio.create_task(self.bot.equip_creative_armor(entry, 0, timeout=1))
+                request = await self.request()
+                await self.deliver(self.catalog(data=updated))
+                if restored:
+                    await self.deliver(self.catalog())
+                await self.deliver(self.transfer_reply(request, slot=0, domain="ARMOR_CONTAINER", source_empty=False))
+                reply = await pending
+                self.assertEqual(reply.result.name, "SUCCESS")
+                self.assertEqual(reply.containers[0].slots[0].item_stack_net_id.raw_id, 51)
+                self.assertNotIn(0, self.bot.armor_slots)
+                with self.assertRaisesRegex(ValueError, "observed empty"):
+                    await self.bot.equip_creative_armor(self.bot.creative_catalog.entries[0], 0, timeout=1)
+                self.assertTrue(self.transport.sent.empty())
+
+                observed = self.item_slot("ARMOR", 0, 51, data=updated).item
+                await self.deliver(b.InventoryContentPacket(inventory_id=b.ContainerID.ARMOR, slots=[observed]))
+                equipped = self.bot.armor_slots[0]
+                self.assertEqual((equipped.net_id_variant, equipped.user_data_buffer), (51, updated))
+            await self.bot.close()
+
+    async def test_catalog_armor_changed_receipt_preserves_newer_slot_announcement(self):
+        updated = _NBT.replace(b"\x07\x00\x00\x00", b"\x08\x00\x00\x00", 1)
+        for net_id in (66, None):
+            with self.subTest(net_id=net_id):
+                entry = await self.catalog_armor_ready()
+                pending = asyncio.create_task(self.bot.equip_creative_armor(entry, 0, timeout=1))
+                request = await self.request()
+                await self.deliver(self.catalog(data=updated), self.item_slot("ARMOR", 0, net_id, data=updated))
+                observation = self.bot.armor_slots[0]
+                if net_id is not None:
+                    with self.assertRaisesRegex(RuntimeError, "request in flight"):
+                        await self.bot.unequip_armor(0, destination_slot=1, timeout=1)
+                    with self.assertRaisesRegex(RuntimeError, "request in flight"):
+                        await self.bot.unequip_armor(0, timeout=1)
+                    self.assertTrue(self.transport.sent.empty())
+                await self.deliver(self.transfer_reply(request, slot=0, domain="ARMOR_CONTAINER", source_empty=False))
+                self.assertEqual((await pending).result.name, "SUCCESS")
+                self.assertIs(self.bot.armor_slots[0], observation)
             await self.bot.close()
 
     async def test_catalog_armor_requires_an_explicit_successful_armor_correction(self):

@@ -214,15 +214,21 @@ class CreativeInventory:
         )
 
     def _load(self, packet):
-        entries = tuple(
-            CreativeEntry(int(entry.creative_item_net_id), getattr(entry, "group_index", None),
-                          self._item(entry.item_descriptor))
-            for entry in packet.entries
-        )
+        entries = []
+        for entry in packet.entries:
+            net_id = int(entry.creative_item_net_id)
+            item = self._item(entry.item_descriptor)
+            if item.name in _IRON_ARMOR_ITEMS:
+                # Preserve the descriptor across identical announcements. A change and
+                # later restoration still has a new identity when an equip reply arrives.
+                previous = self._entries.get(net_id)
+                if previous is not None and previous.item == item:
+                    item = previous.item
+            entries.append(CreativeEntry(net_id, getattr(entry, "group_index", None), item))
         self.catalog = CreativeCatalog(
             tuple(CreativeGroup(group.creative_item_category.name, group.name, self._item(group.icon))
                   for group in getattr(packet, "groups", ())),
-            entries,
+            tuple(entries),
         )
         self._entries = {entry.net_id: entry for entry in entries}
 
@@ -378,16 +384,15 @@ class CreativeInventory:
             strings_to_filter=[], strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
         )
         changed = False
+        empty_at_write = None
 
         def at_write():
+            nonlocal empty_at_write
             self._require_window(window)
             self._entry(entry)
             if not self._armor_empty(slot):
                 raise RuntimeError("the creative armor slot changed before submission")
-            pending = self._inventory._pending_requests[request_id]
-            if any(other is not pending and other.submitted
-                   for other in self._inventory._requests_for_endpoints(pending.endpoints)):
-                raise RuntimeError("the creative armor slot has an item-stack request in flight")
+            empty_at_write = self._inventory.armor_slots[slot]
 
         def uncertain():
             nonlocal changed
@@ -400,6 +405,12 @@ class CreativeInventory:
         def apply(response):
             if (response.result.name != "SUCCESS" or changed or self._containers.window is not window
                     or not self._armor_empty(slot)):
+                return
+            latest = self._entries.get(entry.net_id)
+            if latest is None or latest.item is not item:
+                # The receipt can't identify which version of the catalog item was equipped.
+                if self._inventory.armor_slots.get(slot) is empty_at_write:
+                    self._inventory._set_armor_slot(slot, None)
                 return
             corrections = [correction for container in response.containers or ()
                            if container.full_container_name.name.name == _ARMOR
@@ -418,7 +429,7 @@ class CreativeInventory:
 
         return await self._inventory._request_item_stack(
             request, apply, timeout=timeout, _at_write=at_write, _on_slot_observed=observe,
-            _on_unconfirmed=uncertain,
+            _on_unconfirmed=uncertain, _creative_armor=True,
         )
 
     async def clear(self, slot, *, timeout):
