@@ -7,7 +7,9 @@ from endpilot import Bot, ItemRegistrySnapshot
 from endpilot.block_data import _catalog
 from endpilot.blocks import ColumnCoverageInvalidated, HASHED_UNKNOWN_RUNTIME_ID
 from endpilot.compression import PacketConnection
-from endpilot.harvest import HarvestTool, equip_harvest_tool_from_chest
+from endpilot.harvest import (
+    HarvestTool, HarvestToolChest, HarvestToolSupply, equip_harvest_tool_from_chest, equip_harvest_tool_from_chests,
+)
 from endpilot.inventory import _InventoryMoveNotSubmitted
 from endpilot.login import JoinSession
 
@@ -19,6 +21,7 @@ from test_subchunks import solid_sub_chunk
 
 TARGET = (3, 100, 0)
 CHEST = (0, 100, 2)
+SECOND_CHEST = (2, 100, 2)
 IRON, GOLD, PAPER = 1201, 1202, 1203
 IRON_NAME = "minecraft:iron_pickaxe"
 STORAGE = "LEVEL_ENTITY_CONTAINER"
@@ -50,6 +53,7 @@ class HarvestChestRefillTests(unittest.IsolatedAsyncioTestCase):
                         if palette[index] is not None and palette[index].name == "minecraft:chest")
         self.block(TARGET, DIAMOND_ORE)
         self.block(CHEST, chest_id)
+        self.block(SECOND_CHEST, chest_id)
         self.contents(0, 36, {0: self.stack(GOLD, 10)})
         self.before_write = None
         self.after_write = None
@@ -105,10 +109,10 @@ class HarvestChestRefillTests(unittest.IsolatedAsyncioTestCase):
             container_id=2, container_type=self.b.ContainerType.CONTAINER, server_initiated_close=False,
         ))
 
-    def reply(self, request, *corrections):
+    def reply(self, request, *corrections, verdict="SUCCESS"):
         b = self.b
         self.emit(b.ItemStackResponsePacket(responses=[b.ItemStackResponseInfo(
-            client_request_id=request.client_request_id, result=b.ItemStackNetResult.SUCCESS,
+            client_request_id=request.client_request_id, result=b.ItemStackNetResult[verdict],
             containers=[b.ItemStackResponseContainerInfo(
                 full_container_name=b.FullContainerName(name=b.ContainerEnumName[group]),
                 slots=[b.ItemStackResponseSlotInfo(
@@ -117,7 +121,7 @@ class HarvestChestRefillTests(unittest.IsolatedAsyncioTestCase):
                     custom_name=b.RedactableString(unredacted_string="", redacted_string=None),
                     durability_correction=0,
                 )],
-            ) for group, slot, count, net_id in corrections],
+            ) for group, slot, count, net_id in corrections] if corrections else None,
         )]))
 
     def actions(self):
@@ -131,6 +135,256 @@ class HarvestChestRefillTests(unittest.IsolatedAsyncioTestCase):
         return await equip_harvest_tool_from_chest(
             self.bot, TARGET, chest=CHEST, chest_slots=allowed, inventory_slots=destinations, face=2, timeout=timeout,
         )
+
+    async def supply(self, *, chests=None, timeout=1):
+        if chests is None:
+            chests = (HarvestToolChest(CHEST, range(4, 5), range(3, 4)),
+                      HarvestToolChest(SECOND_CHEST, range(6, 7), range(3, 4)))
+        return await equip_harvest_tool_from_chests(self.bot, TARGET, chests=chests, face=2, timeout=timeout)
+
+    def supply_server(self, packet):
+        if isinstance(packet, self.b.InventoryTransactionPacket):
+            pos = packet.variant_transaction.pos
+            position = (pos.x, pos.y, pos.z)
+            stacks = ({4: self.stack(GOLD, 14)} if position == CHEST else
+                      {6: self.stack(IRON, 16), 8: self.stack(IRON, 18, efficiency=5)})
+            self.open_storage(position=position, stacks=stacks)
+        elif isinstance(packet, self.b.ContainerClosePacket):
+            self.emit(packet)
+
+    def chest_clicks(self):
+        return [packet.variant_transaction.pos for packet in self.stream.sent
+                if isinstance(packet, self.b.InventoryTransactionPacket)]
+
+    async def test_ordered_supply_waits_for_close_and_takes_only_authorized_tool(self):
+        first_close = asyncio.Event()
+        b = self.b
+        chests = [HarvestToolChest(CHEST, range(4, 5)), HarvestToolChest(SECOND_CHEST, range(6, 7), range(3, 4))]
+
+        def server(packet):
+            if isinstance(packet, b.ContainerClosePacket) and self.bot.open_window.position == CHEST:
+                first_close.set()
+            elif isinstance(packet, b.ItemStackRequestPacket):
+                request, = packet.requests
+                action, = request.actions
+                self.assertEqual((action.source.slot, action.source.net_id_variant, action.destination.slot, action.amount),
+                                 (6, 16, 3, 1))
+                self.reply(request, (STORAGE, 6, 0, None), (PLAYER, 3, 1, 90))
+            else:
+                self.supply_server(packet)
+
+        self.after_write = server
+        task = asyncio.create_task(self.supply(chests=chests))
+        try:
+            await asyncio.wait_for(first_close.wait(), 1)
+            self.assertEqual(len(self.chest_clicks()), 1)
+            chests.clear()
+            self.close_storage()
+            result = await task
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertIsInstance(result, HarvestToolSupply)
+        self.assertEqual((result.status, result.tool), ("equipped", HarvestTool(3, IRON_NAME, 6)))
+        first, second = result.attempts
+        self.assertEqual((first.status, first.window.position, first.transfer), ("tool_unavailable", CHEST, None))
+        self.assertEqual((second.status, second.window.position, second.transfer.confirmed_count), ("equipped", SECOND_CHEST, 1))
+        self.assertIsNone(self.bot.open_window)
+        self.assertEqual([type(packet) for packet in self.stream.sent], [
+            b.InventoryTransactionPacket, b.ContainerClosePacket, b.InventoryTransactionPacket,
+            b.ItemStackRequestPacket, b.MobEquipmentPacket, b.ContainerClosePacket,
+        ])
+        with self.assertRaises(FrozenInstanceError):
+            result.status = "unobserved"
+
+    async def test_ordered_supply_borrows_the_active_first_chest_without_trying_second(self):
+        borrowed = self.open_storage(stacks={4: self.stack(GOLD, 14)})
+        result = await self.supply()
+        attempted, = result.attempts
+        self.assertEqual((result.status, attempted.status), ("tool_unavailable", "tool_unavailable"))
+        self.assertIs(attempted.window, borrowed)
+        self.assertIs(self.bot.open_window, borrowed)
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_ordered_supply_does_not_open_second_when_close_is_unconfirmed(self):
+        self.after_write = lambda packet: (self.supply_server(packet)
+                                           if not isinstance(packet, self.b.ContainerClosePacket) else None)
+        with self.assertRaises(TimeoutError) as caught:
+            await self.supply(timeout=0.05)
+        error = caught.exception
+        attempt, = error.harvest_supply_progress.attempts
+        self.assertIs(attempt, error.harvest_progress)
+        self.assertEqual((error.harvest_supply_progress.status, attempt.status), ("interrupted", "tool_unavailable"))
+        self.assertIs(attempt.window, self.bot.open_window)
+        self.assertEqual([type(packet) for packet in self.stream.sent],
+                         [self.b.InventoryTransactionPacket, self.b.ContainerClosePacket])
+
+    async def test_ordered_supply_timeout_includes_lock_wait(self):
+        async with self.bot._harvest_tools._equip_lock:
+            with self.assertRaises(TimeoutError) as caught:
+                await self.supply(timeout=0.01)
+        self.assertEqual(caught.exception.harvest_supply_progress, HarvestToolSupply("interrupted"))
+        self.assertEqual(self.stream.sent, [])
+
+    async def test_ordered_supply_cancelled_while_closing_keeps_ownership_until_ack(self):
+        closing = asyncio.Event()
+        b = self.b
+
+        def server(packet):
+            if isinstance(packet, b.ContainerClosePacket):
+                closing.set()
+            else:
+                self.supply_server(packet)
+
+        self.after_write = server
+        task = asyncio.create_task(self.supply())
+        await asyncio.wait_for(closing.wait(), 1)
+        task.cancel("cancel after close submission")
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        self.assertTrue(self.bot._harvest_tools._equip_lock.locked())
+        self.close_storage()
+        with self.assertRaisesRegex(asyncio.CancelledError, "cancel after close submission") as caught:
+            await task
+        self.assertIsNone(self.bot.open_window)
+        self.assertEqual(caught.exception.harvest_supply_progress.attempts, (caught.exception.harvest_progress,))
+        self.assertEqual(len(self.chest_clicks()), 1)
+
+    async def test_ordered_supply_repeated_cancellation_does_not_abandon_submitted_open(self):
+        clicked = asyncio.Event()
+        b = self.b
+
+        def server(packet):
+            if isinstance(packet, b.InventoryTransactionPacket):
+                clicked.set()
+            elif isinstance(packet, b.ContainerClosePacket):
+                self.emit(packet)
+
+        self.after_write = server
+        task = asyncio.create_task(self.supply())
+        await asyncio.wait_for(clicked.wait(), 1)
+        task.cancel("first cancellation")
+        await asyncio.sleep(0)
+        task.cancel("second cancellation")
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        self.assertTrue(self.bot._harvest_tools._equip_lock.locked())
+        owned = self.open_storage(stacks={4: self.stack(GOLD, 14)})
+        with self.assertRaisesRegex(asyncio.CancelledError, "first cancellation") as caught:
+            await task
+        error = caught.exception
+        self.assertIs(error.harvest_progress.window, owned)
+        self.assertEqual(error.harvest_supply_progress.attempts, (error.harvest_progress,))
+        self.assertIsNone(self.bot.open_window)
+        self.assertEqual([type(packet) for packet in self.stream.sent], [b.InventoryTransactionPacket, b.ContainerClosePacket])
+
+    async def test_ordered_supply_cancelled_take_preserves_pending_step_and_previous_miss(self):
+        submitted = asyncio.Event()
+        b = self.b
+
+        def server(packet):
+            if isinstance(packet, b.ItemStackRequestPacket):
+                submitted.set()
+            else:
+                self.supply_server(packet)
+
+        self.after_write = server
+        task = asyncio.create_task(self.supply())
+        await asyncio.wait_for(submitted.wait(), 1)
+        task.cancel("cancel after take submission")
+        with self.assertRaisesRegex(asyncio.CancelledError, "cancel after take submission") as caught:
+            await task
+        error = caught.exception
+        first, second = error.harvest_supply_progress.attempts
+        self.assertEqual(first.status, "tool_unavailable")
+        self.assertIs(second, error.harvest_progress)
+        self.assertIs(second.transfer, error.transfer_progress)
+        step, = second.transfer.steps
+        self.assertEqual((step.source_slot, step.destination_slot, step.request_id, step.confirmed), (6, 3, -1, None))
+        self.assertIsNone(self.bot.open_window)
+        self.assertEqual(self.equipment(), [])
+
+    async def test_ordered_supply_stops_after_target_or_epoch_changes_at_close(self):
+        for invalidate in (lambda: self.block(TARGET, DIRT),
+                           lambda: self.bot._blocks._invalidate_mining("dimension_changed")):
+            with self.subTest(invalidate=invalidate):
+                self.block(TARGET, DIAMOND_ORE)
+                self.stream.sent.clear()
+
+                def server(packet):
+                    self.supply_server(packet)
+                    if isinstance(packet, self.b.ContainerClosePacket):
+                        invalidate()
+
+                self.after_write = server
+                result = await self.supply()
+                self.assertEqual(result.status, "unobserved")
+                self.assertEqual([attempt.status for attempt in result.attempts], ["tool_unavailable"])
+                self.assertEqual(len(self.chest_clicks()), 1)
+                self.assertEqual(self.actions(), [])
+
+    async def test_ordered_supply_inventory_only_and_existing_tool_need_no_supply_chest(self):
+        self.assertEqual(await self.supply(chests=[]), HarvestToolSupply("tool_unavailable"))
+        self.assertEqual(self.stream.sent, [])
+        self.contents(0, 36, {7: self.stack(IRON, 11)})
+        for chests in ([], None):
+            with self.subTest(chests=chests):
+                result = await self.supply(chests=chests)
+                self.assertEqual(result, HarvestToolSupply("equipped", tool=HarvestTool(7, IRON_NAME, 6)))
+        self.assertEqual(self.stream.sent, self.equipment())
+
+    async def test_ordered_supply_owned_inventory_screen_is_closed_after_equipment_move(self):
+        self.contents(0, 36, {0: self.stack(GOLD, 10), 14: self.stack(IRON, 11)})
+        b = self.b
+
+        def server(packet):
+            if isinstance(packet, b.InteractPacket):
+                self.emit(b.ContainerOpenPacket(container_id=2, type=b.ContainerType.INVENTORY,
+                                                pos=b.BlockPos(x=0, y=0, z=0), entity_unique_id=-1))
+            elif isinstance(packet, b.ItemStackRequestPacket):
+                self.reply(packet.requests[0], (PLAYER, 14, 0, None), (PLAYER, 1, 1, 90))
+            elif isinstance(packet, b.ContainerClosePacket):
+                self.emit(packet)
+
+        self.after_write = server
+        self.assertEqual(await self.supply(), HarvestToolSupply("equipped", tool=HarvestTool(1, IRON_NAME, 6)))
+        self.assertIsNone(self.bot.open_window)
+        self.assertEqual([type(packet) for packet in self.stream.sent], [
+            b.InteractPacket, b.ItemStackRequestPacket, b.ContainerClosePacket, b.MobEquipmentPacket,
+        ])
+
+    async def test_ordered_supply_stops_after_rejected_or_partial_take(self):
+        b = self.b
+        for verdict, status, stop_reason, corrections in (
+            ("ERROR", "rejected", "rejected", ()),
+            ("SUCCESS", "unobserved", "unconfirmed", ((STORAGE, 4, 0, None),)),
+        ):
+            with self.subTest(verdict=verdict):
+                self.stream.sent.clear()
+
+                def server(packet):
+                    if isinstance(packet, b.InventoryTransactionPacket):
+                        self.open_storage(stacks={4: self.stack(IRON, 14)})
+                    elif isinstance(packet, b.ItemStackRequestPacket):
+                        self.reply(packet.requests[0], *corrections, verdict=verdict)
+                    else:
+                        self.supply_server(packet)
+
+                self.after_write = server
+                result = await self.supply()
+                attempt, = result.attempts
+                self.assertEqual((result.status, attempt.transfer.stop_reason), (status, stop_reason))
+                self.assertEqual(attempt.transfer.steps[0].verdict, verdict)
+                self.assertEqual(len(self.chest_clicks()), 1)
+                self.assertEqual(self.equipment(), [])
+                self.assertIsNone(self.bot.open_window)
+
+    async def test_ordered_supply_validates_all_chests_before_sending(self):
+        for chests in ("chests", iter(()), [HarvestToolChest(CHEST, range(27)), object()]):
+            with self.subTest(chests=chests), self.assertRaises(TypeError):
+                await self.supply(chests=chests)
+        self.assertEqual(self.stream.sent, [])
 
     async def test_takes_one_best_eligible_stack_and_equips_its_receipt(self):
         b = self.b

@@ -46,6 +46,23 @@ chest slots if needed. Read `result.status`, `result.tool`, and
 `result.transfer` together to tell whether the tool was taken and equipped.
 The tutorial shows how to prepare the chest and confirm the pickup.
 
+`endpilot.harvest.equip_harvest_tool_from_chests()` accepts an ordered
+sequence of `HarvestToolChest` entries at the player's current position.
+It checks the main inventory first. An empty sequence limits the operation
+to that inventory. The operation takes at most one tool from the supplied
+chests, within the authorized slots. A confirmed shortage in a chest opened
+by the operation allows the next attempt after the server acknowledges the
+close. A borrowed window stays with its caller and ends the search at that
+chest. Supply runs from the player's current position. Mining is a separate
+operation.
+
+`HarvestToolSupply` reports the terminal `status`, ordered `attempts` as
+`HarvestToolAcquisition` snapshots, and the selected `tool` if known. The
+timeout applies to the entire normal operation, including waiting for another
+equipment operation. Settling a submitted window operation may take longer.
+Inspect `harvest_supply_progress` on an interruption and `harvest_progress`
+for the interrupted single acquisition when available.
+
 ## Collect several blocks
 
 `collect_targets` removes duplicate coordinates, then attempts the remaining

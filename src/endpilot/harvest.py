@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from math import dist, isfinite
 from typing import TYPE_CHECKING
@@ -118,6 +119,15 @@ class HarvestToolAcquisition:
     tool: HarvestTool | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class HarvestToolSupply:
+    """Outcome, ordered chest attempts, and any tool selected during supply."""
+
+    status: str
+    attempts: tuple[HarvestToolAcquisition, ...] = ()
+    tool: HarvestTool | None = None
+
+
 class _HarvestEquipUnavailable(RuntimeError):
     pass
 
@@ -154,6 +164,34 @@ async def equip_harvest_tool_from_chest(
         bot, position, chest=chest, chest_slots=chest_slots,
         inventory_slots=inventory_slots, face=face, timeout=timeout,
     )
+
+
+async def equip_harvest_tool_from_chests(
+    bot: Bot, position: tuple[int, int, int], *, chests: Sequence[HarvestToolChest],
+    face: int = 1, timeout: float = 15,
+) -> HarvestToolSupply:
+    """Equip from the main inventory or the first usable chest in caller order.
+
+    Supply currently reachable chests. An empty sequence tries the main
+    inventory alone. Advance only after a confirmed shortage and the matching
+    close of a chest opened here. Leave a borrowed window to its caller.
+
+    The time budget covers lock acquisition and normal operations. Settling
+    already submitted window operations can take longer. An exception carries
+    ordered evidence on harvest_supply_progress and keeps harvest_progress
+    for the interrupted single acquisition when available.
+    """
+    if not isinstance(chests, Sequence) or isinstance(chests, (str, bytes, bytearray)):
+        raise TypeError("chests must be a sequence of HarvestToolChest")
+    snapshot = tuple(chests)
+    if any(not isinstance(chest, HarvestToolChest) for chest in snapshot):
+        raise TypeError("chests must contain only HarvestToolChest entries")
+    if not isfinite(timeout) or timeout < 0:
+        raise ValueError("timeout must be finite and nonnegative")
+    harvest = bot._harvest_tools
+    if harvest is None:
+        raise RuntimeError("player has not joined")
+    return await harvest._equip_from_chests(bot, position, chests=snapshot, face=face, timeout=timeout)
 
 
 class HarvestTools:
@@ -320,13 +358,109 @@ class HarvestTools:
             return "busy"
         return "window_busy" if containers._block_open_requests else None
 
+    def _check_session(self, bot: Bot) -> None:
+        if bot._harvest_tools is not self or self._inventory._request_stream_ended:
+            raise ConnectionError("harvest tool session ended")
+
+    async def _equip_from_chests(self, bot, position, *, chests, face, timeout):
+        blocks = self._blocks
+        target = blocks.observed_block(position)
+        epoch = blocks._mining_epoch
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        attempts = []
+        tool = None
+        owned_window = None
+
+        def remember_window(window):
+            nonlocal owned_window
+            owned_window = window
+
+        def result(status):
+            return HarvestToolSupply(status, tuple(attempts), tool)
+
+        async def acquire():
+            nonlocal owned_window, tool
+            async with self._equip_lock:
+                self._check_session(bot)
+                if target is None:
+                    return result("unobserved")
+                for chest in (None, *chests):
+                    owned_window = None
+                    try:
+                        acquisition = await self._equip_from_chest(
+                            bot, position, chest=None if chest is None else chest.position,
+                            chest_slots=range(0) if chest is None else chest.chest_slots,
+                            inventory_slots=range(36) if chest is None else chest.inventory_slots,
+                            face=face, timeout=max(0, deadline - loop.time()), expected_target=target,
+                            expected_epoch=epoch, on_owned_window=remember_window, supply_deadline=deadline,
+                        )
+                    except (Exception, asyncio.CancelledError) as error:
+                        progress = getattr(error, "harvest_progress", None)
+                        if progress is not None:
+                            tool = progress.tool
+                            if chest is not None:
+                                attempts.append(progress)
+                        raise
+                    tool = acquisition.tool
+                    if chest is not None and (acquisition.window is not None or acquisition.status != "equipped"):
+                        attempts.append(acquisition)
+                    self._check_session(bot)
+                    if blocks._mining_epoch != epoch or blocks.observed_block(position) != target:
+                        return result("unobserved")
+                    if acquisition.status != "tool_unavailable" or acquisition.transfer is not None:
+                        return result(acquisition.status)
+                    if chest is not None:
+                        if owned_window is None or acquisition.window is not owned_window:
+                            return result(acquisition.status)
+                        if (busy := self._window_busy()) is not None:
+                            return result(busy)
+                return result("tool_unavailable")
+
+        operation = asyncio.create_task(acquire())
+        try:
+            async with asyncio.timeout_at(deadline):
+                return await asyncio.shield(operation)
+        except (Exception, asyncio.CancelledError) as error:
+            if not operation.done():
+                # Forward the interruption once. Keep the lock with the attempt
+                # while it settles its submitted open or close, even on a second cancel.
+                operation.cancel()
+                while not operation.done():
+                    try:
+                        await asyncio.wait((operation,))
+                    except asyncio.CancelledError:
+                        continue
+            try:
+                operation.result()
+            except (Exception, asyncio.CancelledError) as failure:
+                if failure is not error:
+                    for name in ("harvest_progress", "transfer_progress"):
+                        if hasattr(failure, name):
+                            setattr(error, name, getattr(failure, name))
+                    for note in getattr(failure, "__notes__", ()):
+                        error.add_note(note)
+            error.harvest_supply_progress = result("interrupted")
+            raise
+
+    async def _close_supply_window(self, *, timeout, _expected_window):
+        close = asyncio.create_task(self._containers.close_window(timeout=timeout, _expected_window=_expected_window))
+        try:
+            return await asyncio.shield(close)
+        except asyncio.CancelledError as error:
+            try:
+                await asyncio.shield(close)
+            except (Exception, asyncio.CancelledError) as cleanup_error:
+                error.add_note(f"harvest supply close failed: {cleanup_error!r}")
+            raise
+
     async def _equip_from_chest(
-        self, bot: Bot, position: tuple[int, int, int], *, chest: tuple[int, int, int], chest_slots: range,
+        self, bot: Bot, position: tuple[int, int, int], *, chest: tuple[int, int, int] | None, chest_slots: range,
         inventory_slots: range, face: int, timeout: float, expected_target: BlockObservation | None = None,
         expected_chest: BlockObservation | None = None, expected_epoch: int | None = None,
         click_pos: tuple[float, float, float] | None = None,
         on_owned_window: Callable[[ContainerWindow], None] | None = None,
-        requested_drop_id: int | None = None,
+        requested_drop_id: int | None = None, supply_deadline: float | None = None,
     ) -> HarvestToolAcquisition:
         blocks, inventory, containers = self._blocks, self._inventory, self._containers
         target = blocks.observed_block(position) if expected_target is None else expected_target
@@ -338,18 +472,20 @@ class HarvestTools:
         tool: HarvestTool | None = None
         status = "unobserved"
         failure = None
-
-        def check_session():
-            if bot._harvest_tools is not self or inventory._request_stream_ended:
-                raise ConnectionError("harvest tool session ended")
+        close_window = containers.close_window if supply_deadline is None else self._close_supply_window
 
         def current_inventory():
-            check_session()
+            self._check_session(bot)
             if rule is None or blocks._mining_epoch != epoch or blocks.observed_block(position) != target:
                 return None
             return inventory.slots
 
+        def check_supply_deadline():
+            if supply_deadline is not None and asyncio.get_running_loop().time() >= supply_deadline:
+                raise TimeoutError("harvest tool supply timed out before submission")
+
         def require_shortage(*, submitting=None):
+            check_supply_deadline()
             slots = current_inventory()
             if slots is None:
                 raise _InventoryMoveNotSubmitted("unobserved")
@@ -371,23 +507,34 @@ class HarvestTools:
         async def equip_inventory(choice, slots, *, confirmed=False):
             nonlocal tool
 
-            def before_slot_use(*indices):
-                check_session()
+            def require_equip_window():
+                self._check_session(bot)
                 if window is not None and containers.window is not window:
                     raise _InventoryMoveNotSubmitted("window_changed")
+
+            def before_slot_use(*indices):
+                require_equip_window()
                 if self._inventory_has_pending(indices):
                     raise _InventoryMoveNotSubmitted("equip_unavailable" if confirmed else "unobserved")
+
+            def before_write():
+                check_supply_deadline()
+                require_equip_window()
+                if current_inventory() is None:
+                    raise _InventoryMoveNotSubmitted("unobserved")
 
             try:
                 if choice.slot is not None:
                     before_slot_use(choice.slot)
                 tool = await self._equip_tool(choice, slots, timeout=timeout, confirmed=confirmed,
-                                              before_slot_use=before_slot_use)
+                                              before_slot_use=before_slot_use,
+                                              before_write=before_write if supply_deadline is not None else None,
+                                              close_window=close_window)
             except _InventoryMoveNotSubmitted as stopped:
                 return str(stopped)
             except _HarvestEquipUnavailable:
                 pass
-            check_session()
+            self._check_session(bot)
             if window is not None and containers.window is not window:
                 return "window_changed"
             return "equip_unavailable" if tool is None else "equipped"
@@ -470,7 +617,7 @@ class HarvestTools:
             if transfer.stop_reason == "inventory_available":
                 transfer = None
                 raise _InventoryMoveNotSubmitted("inventory_available")
-            check_session()
+            self._check_session(bot)
             if containers.window is not window or containers._layout_token is not layout:
                 return "window_changed"
             if received is None:
@@ -498,6 +645,8 @@ class HarvestTools:
                 return await equip_inventory(choice, slots)
             if not self._inventory_is_observed(slots, submitting=None):
                 return "unobserved"
+            if chest is None:
+                return "tool_unavailable"
             try:
                 return await take_and_equip()
             except _InventoryMoveNotSubmitted as stopped:
@@ -510,7 +659,7 @@ class HarvestTools:
                 return "unobserved" if choice is None else await equip_inventory(choice, slots)
 
         try:
-            async with self._equip_lock:
+            async with (self._equip_lock if supply_deadline is None else nullcontext()):
                 try:
                     status = await acquire()
                 except (Exception, asyncio.CancelledError) as error:
@@ -520,7 +669,7 @@ class HarvestTools:
                 finally:
                     if owned_window is not None:
                         try:
-                            closed = await containers.close_window(timeout=timeout, _expected_window=owned_window)
+                            closed = await close_window(timeout=timeout, _expected_window=owned_window)
                             if closed is None and failure is None:
                                 status = "window_changed"
                             elif status == "equipped" and expected_chest is not None:
@@ -582,6 +731,7 @@ class HarvestTools:
         self, tool: HarvestTool, slots: dict[int, object], *, timeout: float, confirmed: bool = False,
         before_slot_use: Callable[..., None] | None = None,
         before_write: Callable[[], None] | None = None,
+        close_window=None,
     ) -> HarvestTool | None:
         inventory = self._inventory
         source = tool.slot
@@ -594,7 +744,7 @@ class HarvestTools:
                         key=lambda slot: (slot != selected, slot))
         empty = next((slot for slot in hotbar if int(slots[slot].id) == 0), None)
         if source is None and empty is not None:
-            return await self._select(tool, empty, slots[empty], before_slot_use=before_slot_use)
+            return await self._select(tool, empty, slots[empty], before_slot_use=before_slot_use, before_write=before_write)
         if not hotbar:
             return None
 
@@ -611,7 +761,7 @@ class HarvestTools:
 
         held = await self._transfer(
             source, destination, slots, hotbar_slot=hotbar_slot, timeout=timeout, confirmed=confirmed,
-            before_slot_use=before_slot_use, before_write=before_write,
+            before_slot_use=before_slot_use, before_write=before_write, close_window=close_window,
         )
         return await self._select(tool, hotbar_slot, held, before_slot_use=before_slot_use, before_write=before_write)
 
@@ -651,9 +801,12 @@ class HarvestTools:
     async def _transfer(
         self, source: int, destination: int, slots: dict[int, object], *, hotbar_slot: int, timeout: float,
         confirmed: bool, before_slot_use: Callable[..., None] | None, before_write: Callable[[], None] | None,
+        close_window=None,
     ):
         inventory = self._inventory
         containers = self._containers
+        if close_window is None:
+            close_window = containers.close_window
         owned_window = None
         expected = None if source == hotbar_slot else slots[source]
         check_receipt = confirmed or before_write is not None
@@ -720,8 +873,13 @@ class HarvestTools:
                 raise _HarvestEquipUnavailable(f"harvest tool transfer did not confirm inventory slot {hotbar_slot}")
             if check_receipt:
                 correction = _receipt_slot(response, _PLAYER_CONTAINERS, hotbar_slot)
-                if (correction is None or correction.amount != expected_stack.count
-                        or _stack_snapshot(held) != _receipt_stack(expected_stack, correction)):
+                if expected_stack is None:
+                    net_id = None if correction is None else correction.item_stack_net_id
+                    matched = correction is not None and correction.amount == 0 and (net_id is None or net_id.raw_id == 0)
+                else:
+                    matched = (correction is not None and correction.amount == expected_stack.count
+                               and _stack_snapshot(held) == _receipt_stack(expected_stack, correction))
+                if not matched:
                     raise _HarvestEquipUnavailable(
                         f"harvest tool transfer did not confirm inventory slot {hotbar_slot}",
                     )
@@ -732,7 +890,7 @@ class HarvestTools:
         finally:
             if owned_window is not None:
                 try:
-                    await containers.close_window(timeout=timeout, _expected_window=owned_window)
+                    await close_window(timeout=timeout, _expected_window=owned_window)
                 except Exception as error:
                     if failure is None or (before_write is not None and isinstance(failure, _InventoryMoveNotSubmitted)):
                         raise

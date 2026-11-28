@@ -315,3 +315,26 @@ starting another activity. Check `status` and `transfer` together because a
 confirmed take can precede an equipment failure. A timeout, cancellation, or
 connection failure can carry the known outcome on the exception as
 `harvest_progress`.
+
+To check reachable supply chests in order, pass them to
+`equip_harvest_tool_from_chests` with their own authorized ranges.
+
+```python
+from endpilot.harvest import HarvestToolChest, equip_harvest_tool_from_chests
+
+result = await equip_harvest_tool_from_chests(
+    bot,
+    ore,
+    chests=[
+        HarvestToolChest(first_chest, range(4, 5), range(3, 4)),
+        HarvestToolChest(second_chest, range(6, 7), range(3, 4)),
+    ],
+)
+print(result.status, result.attempts)
+```
+
+The caller supplies chests reachable from the current position. After a
+confirmed shortage, the next chest is considered once an operation-owned
+window has closed with server confirmation. A borrowed chest stays open
+and ends this call. Supply stops after an equipped tool or any uncertain
+result. Start collection separately after checking `result.status`.
