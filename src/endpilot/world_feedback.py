@@ -22,7 +22,13 @@ _Cell = tuple[int, int, int]
 _CRACK_EVENTS = {3600: "crack_start", 3601: "crack_end", 3602: "crack_progress"}
 _BLOCK_PARTICLE_EVENTS_2225 = frozenset((2001, 3603, 3604, 3605, 3606, 3607, 3608))
 _PISTON_STATES = {0: "piston_retracted", 1: "piston_extending", 2: "piston_extended", 3: "piston_retracting"}
-_PAIRABLE_CHESTS = frozenset(("minecraft:chest", "minecraft:trapped_chest"))
+_PAIRABLE_CHESTS = frozenset((
+    "minecraft:chest", "minecraft:trapped_chest",
+    "minecraft:copper_chest", "minecraft:exposed_copper_chest",
+    "minecraft:weathered_copper_chest", "minecraft:oxidized_copper_chest",
+    "minecraft:waxed_copper_chest", "minecraft:waxed_exposed_copper_chest",
+    "minecraft:waxed_weathered_copper_chest", "minecraft:waxed_oxidized_copper_chest",
+))
 _LID_BLOCKS = _SHULKER_BOXES.union(_PAIRABLE_CHESTS, (_ENDER_CHEST,))
 _CHEST_ROOT_TAGS = {"id": nbt.StringTag, "x": nbt.IntTag, "y": nbt.IntTag, "z": nbt.IntTag,
                     "pairx": nbt.IntTag, "pairz": nbt.IntTag, "pairlead": nbt.ByteTag}

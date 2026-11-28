@@ -491,7 +491,8 @@ class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
         b = self.b
         target = (0, 220, 5)
         await self.bot.close()
-        await self.join(block_properties=(ServerBlockProperty(name="fixture:red_shulker_box"),))
+        await self.join(block_properties=(ServerBlockProperty(name="fixture:red_shulker_box"),
+                                          ServerBlockProperty(name="fixture:waxed_copper_chest")))
         event = b.BlockEventPacket(pos=self.pos(target), b0=1, b1=1)
         stone, custom_id, red = 2150698529, 0xD15C0000, 670752730
         for state_id in (None, stone, custom_id):
@@ -511,13 +512,36 @@ class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(self.bot.observed_block_state(target).name, "minecraft:stone")
         self.assertIsNone(self.bot.observed_block_state(target))
 
+    async def test_copper_chest_lids_cover_the_eight_vanilla_block_names(self):
+        b = self.b
+        variants = (
+            ("copper_chest", 3967469775), ("exposed_copper_chest", 987437688),
+            ("weathered_copper_chest", 3584681075), ("oxidized_copper_chest", 2756911751),
+            ("waxed_copper_chest", 2420240159), ("waxed_exposed_copper_chest", 3794255368),
+            ("waxed_weathered_copper_chest", 998383803), ("waxed_oxidized_copper_chest", 1084588487),
+        )
+        for index, (name, runtime_id) in enumerate(variants):
+            with self.subTest(name=name):
+                target = (0, 220, index)
+                position = self.pos(target)
+                opened = await self.block_event(
+                    b.UpdateBlockPacket(pos=position, runtime_id=runtime_id),
+                    b.BlockEventPacket(pos=position, b0=1, b1=1), position=target,
+                )
+                closed = await self.block_event(b.BlockEventPacket(pos=position, b0=1, b1=0), position=target)
+                self.assertEqual(self.bot.observed_block_state(target).name, f"minecraft:{name}")
+                self.assertEqual((opened.kind, closed.kind), ("chest_open", "chest_close"))
+                self.assertIsNone(opened.chest_partner)
+                self.assertIsNone(closed.chest_partner)
+
     async def test_chest_partner_needs_two_current_reciprocal_roots_and_filters_original_position(self):
         b = self.b
         lead, partner = (3, 220, 7), (3, 220, 8)
         opened = b.BlockEventPacket(pos=self.pos(lead), b0=1, b1=1)
         closed = b.BlockEventPacket(pos=self.pos(partner), b0=1, b1=0)
         for variant, lead_id, partner_id in (("ordinary", 0x2C383C60, 0x553014DD),
-                                             ("trapped", 0x316625E3, 0x499CF151)):
+                                             ("trapped", 0x316625E3, 0x499CF151),
+                                             ("copper", 1415168726, 1415168726)):
             with self.subTest(variant=variant):
                 partner_wait = asyncio.create_task(self.bot.wait_for_block_event(position=partner, timeout=1))
                 self.addCleanup(partner_wait.cancel)
@@ -538,7 +562,8 @@ class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
     async def test_chest_partner_stays_unknown_without_current_matching_typed_chest_roots(self):
         b = self.b
         for index, reason in enumerate(("missing", "one_way", "same_lead", "wrong_type", "wrong_root_cell",
-                                        "mixed_trapped_peer", "mixed_ordinary_peer", "disconnected", "non_lid")):
+                                        "mixed_trapped_peer", "mixed_ordinary_peer", "mixed_copper_variant",
+                                        "disconnected", "non_lid")):
             with self.subTest(reason=reason):
                 pos = (5, 220, index)
                 peer = (7 if reason == "disconnected" else 6, 220, index)
@@ -553,11 +578,14 @@ class WorldFeedbackTests(unittest.IsolatedAsyncioTestCase):
                         peer, (4, 220, index) if reason == "one_way" else pos,
                         1 if reason == "same_lead" else 0, **override,
                     ))
+                lead_id, peer_id = {
+                    "mixed_ordinary_peer": (0x316625E3, 0x2C383C60),
+                    "mixed_trapped_peer": (0x2C383C60, 0x499CF151),
+                    "mixed_copper_variant": (1415168726, 1084588487),
+                }.get(reason, (0x2C383C60, 0x2C383C60))
                 event = await self.block_event(
-                    b.UpdateBlockPacket(pos=self.pos(pos),
-                                        runtime_id=0x316625E3 if reason == "mixed_ordinary_peer" else 0x2C383C60),
-                    b.UpdateBlockPacket(pos=self.pos(peer),
-                                        runtime_id=0x499CF151 if reason == "mixed_trapped_peer" else 0x2C383C60),
+                    b.UpdateBlockPacket(pos=self.pos(pos), runtime_id=lead_id),
+                    b.UpdateBlockPacket(pos=self.pos(peer), runtime_id=peer_id),
                     self.chest_root(pos, peer, 1), *sample,
                     b.BlockEventPacket(pos=self.pos(pos), b0=1, b1=2 if reason == "non_lid" else 1),
                 )

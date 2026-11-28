@@ -486,13 +486,14 @@ and can be called more than once.
 
 In protocol 2225, `chest_open` and `chest_close` apply when the observed main
 layer at the packet's position is an ordinary chest, trapped chest, ender chest,
-or vanilla shulker box, including dyed variants. A `BlockEventPacket` with
-`(b0, b1)` equal to `(1, 1)` reports opening and `(1, 0)` reports closing.
+vanilla copper chest in any wax or oxidation state, or vanilla shulker box,
+including dyed variants. A `BlockEventPacket` with `(b0, b1)` equal to `(1, 1)`
+reports opening and `(1, 0)` reports closing.
 The event kind is `block` for unknown or other block types. For a double chest,
 `event.chest_partner` gives the other half's position when both cells have the
-same ordinary or trapped chest type and current, reciprocal chest block entity
-data. The field is `None` for single containers or when pairing cannot be
-confirmed. The position filter uses the packet's position.
+same ordinary, trapped, or copper chest block name and current, reciprocal
+chest block entity data. The field is `None` for single containers or when
+pairing cannot be confirmed. The position filter uses the packet's position.
 
 For a protocol 2225 `PistonArm` packet, `event.position` is the piston base.
 `event.piston_attached_blocks` is an immutable tuple of signed, absolute
