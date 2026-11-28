@@ -3047,6 +3047,40 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         self.set_position(0.5, 0.5, y=101.62, teleport=True)
         self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unreachable")
 
+    async def test_short_descent_checks_a_buffer_outside_the_search_radius(self):
+        self.prepare_descent()
+        self.blocks._player_game_type = "SURVIVAL"
+        self.movement._gap_jump_allowed = lambda: True
+        for floor in ((0, 99, 0), (1, 98, 0), (2, 98, 0)):
+            self.set_block(floor, 3727763636)  # grass block
+        self.correct_position(0.5, 101.62, 0.5, on_ground=True, tick=0)
+        source, landing, runout = (0, 100, 0), (1, 99, 0), (2, 99, 0)
+        roof = (2, 101, 0)
+        rules = NavigationRules(search_radius=1, vertical_radius=1)
+        goal = FootGoal(landing)
+        self.assertEqual(self.bot.plan_navigation(goal, rules=rules).status, "unreachable")
+
+        self.set_block(roof, 1740500456)  # birch leaves
+        plan = self.bot.plan_navigation(goal, rules=rules)
+        self.assertEqual((plan.status, plan.nodes), ("found", (source, landing)))
+        self.assertEqual(self.bot.plan_navigation(FootGoal(runout), rules=rules).status, "unreachable")
+
+        observed = self.blocks.observed_block
+        def missing_runout_layer(position, *, layer=0):
+            if position == roof and layer == 1:
+                return None
+            return observed(position, layer=layer)
+
+        with patch.object(self.blocks, "observed_block", missing_runout_layer):
+            result = await self.bot.navigate(goal, rules=rules)
+            self.assertEqual((result.status, result.frames), ("unknown", 0))
+        self.assertEqual(self.stream.sent, [])
+
+        self.set_block(roof, self.STONE)
+        result = await self.bot.navigate(goal, rules=rules)
+        self.assertEqual((result.status, result.frames), ("unreachable", 0))
+        self.assertEqual(self.stream.sent, [])
+
     async def test_descent_does_not_switch_to_short_runout_after_launch(self):
         self.prepare_descent()
         self.blocks._player_game_type = "SURVIVAL"

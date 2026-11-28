@@ -662,12 +662,13 @@ class _StandingGraph:
         if self.allow_ladder and (ladder := _ladder_descent_geometry(source, destination)) is not None:
             return self._ladder_descent(ladder, source[1], destination[1])
         buffer = _runout(source, destination)
-        if not self.in_bounds(buffer):
+        buffer_in_bounds = self.in_bounds(buffer)
+        if not buffer_in_bounds and not self.allow_short_descent:
             return False
         if _is_stone_ledge_drop(source, destination):
             last = _runout(destination, buffer)
             return self.blocks._stone_ledge_drop(source, (destination, buffer, last)) if (
-                self.allow_stone_ledge_drop and self.in_bounds(last)
+                self.allow_stone_ledge_drop and buffer_in_bounds and self.in_bounds(last)
             ) else False
         if source[1] - destination[1] != 1:
             return False
@@ -678,7 +679,12 @@ class _StandingGraph:
         if False in required:
             return False
         clearance = self.blocks._descent_landing(buffer, runout=True)
-        if clearance is not True and self.allow_short_descent:
+        if not buffer_in_bounds:
+            # Only the short motion can read the runout without entering it.
+            if clearance is True:
+                return False
+            clearance = self.blocks._short_descent(source, destination, buffer)
+        elif clearance is not True and self.allow_short_descent:
             short = self.blocks._short_descent(source, destination, buffer)
             if short is not False:
                 clearance = short
