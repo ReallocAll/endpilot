@@ -364,7 +364,7 @@ async def observe_water_bucket_fill(
         return None if registry is None or stack.item_id == 0 else registry.name_for_id(stack.item_id)
 
     def confirmed_stack(index: int) -> HeldItemStack | None:
-        if (index in inventory._drop_key_counts or index in inventory._unconfirmed_transfer_slots
+        if (index in inventory._drop_key_counts or inventory._main_transfer_slot_is_unconfirmed(index)
                 or inventory._requests_for_endpoints(((None, index),))):
             return None
         return inventory._observed_stack(index)

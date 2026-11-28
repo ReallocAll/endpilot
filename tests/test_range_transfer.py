@@ -619,7 +619,7 @@ class RangeTransferTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((outcome.stop_reason, outcome.confirmed_count), ("unconfirmed", 0))
         self.assertEqual(self.bot.container_slots[2].stack_size, 0)
 
-    async def test_same_chest_keeps_watching_replacement_until_abandoned_request_is_settled(self):
+    async def test_same_chest_keeps_watching_replacement_until_window_closes(self):
         pending = self.hold_requests()
         for cancel in (True, False):
             with self.subTest(cancel=cancel):
@@ -641,10 +641,10 @@ class RangeTransferTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
                 self.assertEqual([self.bot.container_slots[i].stack_size for i in (3, 20)], [62, 5])
                 self.assertEqual(retained, 1)
-                self.assertFalse(self.bot._containers._transfer_block_watches)
+                self.assertEqual(len(self.bot._containers._transfer_block_watches), 1)
                 self.assertEqual(progress.confirmed_count, 0)
 
-    async def test_same_chest_clears_block_watch_on_unsent_cancellation_window_close_and_session_end(self):
+    async def test_same_chest_keeps_watch_after_cancellation_and_releases_it_on_window_or_session_end(self):
         self.seed_chest_move()
         entered = asyncio.Event()
         send = self.stream.send
@@ -663,7 +663,7 @@ class RangeTransferTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError) as error:
             await moving
         self.assertIsNone(error.exception.transfer_progress.steps[0].request_id)
-        self.assertFalse(self.bot._containers._transfer_block_watches)
+        self.assertEqual(len(self.bot._containers._transfer_block_watches), 1)
         self.assertEqual(self.outgoing(), [])
 
         self.stream.send = send
@@ -676,15 +676,15 @@ class RangeTransferTests(unittest.IsolatedAsyncioTestCase):
                 moving.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await moving
-                self.assertEqual(len(self.bot._containers._transfer_block_watches), 1)
+                containers = self.bot._containers
+                self.assertEqual(len(containers._transfer_block_watches), 1)
                 if close_session:
-                    self.bot._inventory._end_requests()
-                    await asyncio.sleep(0)
+                    await self.bot.close()
                 else:
                     self.emit(self.b.ContainerClosePacket(container_id=2, container_type=self.b.ContainerType.CONTAINER))
-                    self.assertFalse(self.bot._containers._transfer_block_watches)
+                    self.assertFalse(containers._transfer_block_watches)
                     self.reply(request, [(CHEST, 20, 3, 52), (CHEST, 3, 64, 51)])
-                self.assertFalse(self.bot._containers._transfer_block_watches)
+                self.assertFalse(containers._transfer_block_watches)
 
     async def test_take_additional_correction_does_not_confirm_a_pending_same_chest_move(self):
         self.seed_chest_move()

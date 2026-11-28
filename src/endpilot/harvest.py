@@ -376,11 +376,19 @@ class HarvestTools:
         return (equipment.item_id == int(held.id) and equipment.count > 0
                 and self._matches_drop_enchantment(rule, equipment.user_data_buffer))
 
+    def _available_inventory_slots(self, slots: dict[int, object], *, for_write=False) -> dict[int, object]:
+        inventory = self._inventory
+        return {slot: item for slot, item in slots.items()
+                if 0 <= slot < _MAIN_INVENTORY_SIZE and (
+                    inventory._can_plan_main_slot_write(slot) if for_write
+                    else not inventory._main_transfer_slot_is_unconfirmed(slot)
+                )}
+
     def _best_in_inventory(
         self, rule: MiningRule, slots: dict[int, object], *, require_harvest: bool = True,
     ) -> HarvestTool | None:
         return self._best_in_slots(
-            rule, {slot: item for slot, item in slots.items() if 0 <= slot < _MAIN_INVENTORY_SIZE},
+            rule, self._available_inventory_slots(slots),
             selected=self._inventory.selected_slot, require_harvest=require_harvest,
         )
 
@@ -417,11 +425,20 @@ class HarvestTools:
                 best_score = score
         return best
 
-    def _known_item_slots(self, slots, indices: range) -> bool:
+    def _known_item_slots(self, slots, indices: range | tuple[int, ...]) -> bool:
         known = _known_slots(slots, indices)
         return (len(known) == len(indices) and all(
             stack.id == 0 or int(stack.id) in self._item_names for stack in known.values()
         ))
+
+    def _choose_chest_tool(self, rule: MiningRule, slots, indices: range) -> HarvestTool | None:
+        eligible = tuple(slot for slot in indices if self._containers._can_plan_container_slot_write(slot))
+        if not self._known_item_slots(slots, eligible):
+            raise _InventoryMoveNotSubmitted("unobserved")
+        choice = self._best_in_slots(rule, {slot: slots[slot] for slot in eligible})
+        if choice is None and len(eligible) != len(indices):
+            raise _InventoryMoveNotSubmitted("unobserved")
+        return choice
 
     def _inventory_is_observed(self, slots, *, submitting: int | None) -> bool:
         inventory = self._inventory
@@ -434,7 +451,7 @@ class HarvestTools:
 
     def _inventory_has_pending(self, indices: range | tuple[int, ...], *, submitting: int | None = None) -> bool:
         inventory = self._inventory
-        if inventory._unconfirmed_transfer_slots.intersection(indices):
+        if any(inventory._main_transfer_slot_is_unconfirmed(index) for index in indices):
             return True
         own_request = inventory._pending_requests.get(submitting)
         return any(request is not own_request for request in inventory._requests_for_endpoints(
@@ -732,9 +749,7 @@ class HarvestTools:
             _check_range(chest_slots, width, "chest_slots")
             if max_tools > 1:
                 return await take_multiple(layout, require_same_chest)
-            if not self._known_item_slots(chest_items, chest_slots):
-                return "unobserved"
-            choice = self._best_in_slots(rule, {slot: chest_items[slot] for slot in chest_slots})
+            choice = self._choose_chest_tool(rule, chest_items, chest_slots)
             if choice is None:
                 return "tool_unavailable"
             transfer, received = await take_one(choice, chest_items, require_same_chest, time_left=timeout)
@@ -779,9 +794,7 @@ class HarvestTools:
                     require_source()
                     require_shortage(received=received)
                     contents = containers.slots or {}
-                    if not self._known_item_slots(contents, chest_slots):
-                        raise _InventoryMoveNotSubmitted("unobserved")
-                    choice = self._best_in_slots(rule, {slot: contents[slot] for slot in chest_slots})
+                    choice = self._choose_chest_tool(rule, contents, chest_slots)
                     if choice is None:
                         if not steps:
                             return "tool_unavailable"
@@ -836,7 +849,7 @@ class HarvestTools:
                     return busy
                 if self._observed_chest(chest) != expected_chest:
                     return "unobserved"
-            choice = self._best_in_inventory(rule, slots)
+            choice = self._best_in_inventory(rule, self._available_inventory_slots(slots, for_write=True))
             if choice is not None:
                 return await equip_inventory(choice, slots)
             if not self._inventory_is_observed(slots, submitting=None):
@@ -851,7 +864,9 @@ class HarvestTools:
                 if window is not None and containers.window is not window:
                     return "window_changed"
                 slots = current_inventory()
-                choice = None if slots is None else self._best_in_inventory(rule, slots)
+                choice = None if slots is None else self._best_in_inventory(
+                    rule, self._available_inventory_slots(slots, for_write=True),
+                )
                 return "unobserved" if choice is None else await equip_inventory(choice, slots)
 
         try:
@@ -898,7 +913,7 @@ class HarvestTools:
         rule = self._mining_rule(target, requested_drop_id=requested_drop_id, strict_drop=strict_drop)
         if rule is None:
             return None
-        slots = inventory.slots
+        slots = self._available_inventory_slots(inventory.slots, for_write=True)
         ordinary = keep_equipped and requested_drop_id is None
         tool = self._rank_tools(target, rule, slots, require_harvest=require_harvest, keep_current=ordinary)
         if tool is None:
@@ -943,7 +958,8 @@ class HarvestTools:
                                       before_write=before_write)
 
         selected = inventory.selected_slot
-        hotbar = sorted((slot for slot in range(9) if slot in slots),
+        available = self._available_inventory_slots(slots, for_write=True)
+        hotbar = sorted((slot for slot in range(9) if slot in available),
                         key=lambda slot: (slot != selected, slot))
         empty = next((slot for slot in hotbar if int(slots[slot].id) == 0), None)
         if source is None and empty is not None:
@@ -954,8 +970,8 @@ class HarvestTools:
         hotbar_slot = hotbar[0] if empty is None else empty
         if source is None:
             # Stow the current stack before selecting an empty hand.
-            destination = next((slot for slot in range(9, 36)
-                                if slot in slots and int(slots[slot].id) == 0), None)
+            destination = next((slot for slot in range(9, _MAIN_INVENTORY_SIZE)
+                                if slot in available and int(available[slot].id) == 0), None)
             if destination is None:
                 return None
             source = hotbar_slot
@@ -970,12 +986,14 @@ class HarvestTools:
 
     def _matches_slot(self, slot: int, item) -> bool:
         inventory = self._inventory
-        return (_same_slot(item, inventory.slots.get(slot))
+        return (inventory._can_plan_main_slot_write(slot)
+                and _same_slot(item, inventory.slots.get(slot))
                 and _same_slot(item, inventory.item_or_empty(slot)))
 
     def _require_slot_at_write(self, slot: int, expected: HeldItemStack | None) -> None:
         inventory = self._inventory
-        if (inventory._observed_stack(slot) != expected
+        if (not inventory._can_plan_main_slot_write(slot)
+                or inventory._observed_stack(slot) != expected
                 or _stack_snapshot(inventory.item_or_empty(slot)) != expected):
             raise _InventoryMoveNotSubmitted(f"harvest inventory slot {slot} changed")
 

@@ -88,8 +88,8 @@ _MEMBERS = {
             swap_inventory_items equip_armor unequip_armor equip_offhand unequip_offhand drop_inventory_item
             drop_selected_item use_item consume release_using_item
             wait_for_container_slots wait_for_furnace_progress wait_for_brewing_progress take_from_container
-            put_into_container open_inventory_screen close_container open_container open_entity_container
-            craft_recipe_auto open_trade trade_many
+            put_into_container swap_container_items open_inventory_screen close_container open_container
+            open_entity_container craft_recipe_auto open_trade trade_many
             use_item_on place_block place_against place_entity place_oak_boat
             start_mining continue_mining stop_mining finish_mining
             mine_block collect_block collect_targets collect_by_count collect_vein_by_count equip_harvest_tool
@@ -150,7 +150,8 @@ _UNSUPPORTED_PARAMETERS = frozenset({"predicate", "match", "on_plan", "on_event"
 _SLOT_MAPS = frozenset({"inventory_slots", "armor_slots", "container_slots", "wait_for_container_slots"})
 _ITEM_VERDICTS = frozenset({
     "move_inventory_item", "swap_inventory_items", "equip_armor", "unequip_armor", "equip_offhand",
-    "unequip_offhand", "drop_inventory_item", "take_from_container", "put_into_container", "craft_recipe_auto",
+    "unequip_offhand", "drop_inventory_item", "take_from_container", "put_into_container", "swap_container_items",
+    "craft_recipe_auto",
 })
 _ERROR_FIELDS = {SleepRejected: "translation_key", ColumnCoverageInvalidated: "reason", MiningFaceUnavailable: "status"}
 _ERROR_PROGRESS = {"collection_progress": (BlockCollectionBatch, CountedBlockCollection, MixedCollectionBatch),

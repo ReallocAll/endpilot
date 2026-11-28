@@ -1925,7 +1925,8 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
                 with hold:
                     taking = self.start(self.bot.take_from_container(26, 3))
                     await asyncio.wait_for(entered.wait(), 1)
-                    self.assertEqual(self.transfer_observers(), tuple(count + 1 for count in observers))
+                    expected = observers if initial == "minecraft:chest" else tuple(count + 1 for count in observers)
+                    self.assertEqual(self.transfer_observers(), expected)
                     await self.deliver(*changes)
                     sent_before = list(self.wire.sent)
                     released.set()

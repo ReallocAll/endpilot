@@ -398,7 +398,7 @@ class Trading:
     def _require_stable_slot(self, slot, *, request_id=None):
         observed = self.inventory.slots.get(slot)
         own_request = self.inventory._pending_requests.get(request_id)
-        if (observed is None or slot in self.inventory._unconfirmed_transfer_slots
+        if (observed is None or self.inventory._main_transfer_slot_is_unconfirmed(slot)
                 or not _same_slot(observed, self.inventory.client_slots().get(slot))
                 or any(pending is not own_request for pending in self.inventory._requests_for_endpoints({(None, slot)}))):
             raise _TradeStop("inventory_unobserved")
@@ -542,7 +542,7 @@ class Trading:
         slots = self.inventory.slots
         presented = self.inventory.client_slots()
         available = {index: slots[index] for index in range(36)
-                     if index in slots and index not in self.inventory._unconfirmed_transfer_slots
+                     if index in slots and not self.inventory._main_transfer_slot_is_unconfirmed(index)
                      and _same_slot(slots[index], presented.get(index))
                      and not self.inventory._requests_for_endpoints({(None, index)})}
         costs = sorted(((index + 1, item, terms.ingredients[index])
@@ -896,7 +896,7 @@ class Trading:
                     self._require_output_slot(output_slot, offer.sell, batch.terms[1])
                 elif not _same_slot(output_observed, self._require_stable_slot(output_slot, request_id=request_id)):
                     raise _TradeStop("inventory_unobserved")
-            elif previous is not None and (source_slot in self.inventory._unconfirmed_transfer_slots
+            elif previous is not None and (self.inventory._main_transfer_slot_is_unconfirmed(source_slot)
                                            or int(source.net_id_variant or 0) <= 0 or source.stack_size < amount
                                            or not _same_slot(source, self.inventory.client_slots().get(source_slot))):
                 raise RuntimeError("trade source needs a fresh confirmed observation")
@@ -1085,7 +1085,7 @@ class Trading:
                 if observe_destination:
                     corrected = _response_item(b, output, output, player)
                     current = self.inventory.slots.get(destination_slot)
-                    if (output_conflicted or destination_slot in self.inventory._unconfirmed_transfer_slots
+                    if (output_conflicted or self.inventory._main_transfer_slot_is_unconfirmed(destination_slot)
                             or (output_observation is not None and not _same_slot(output_observation, corrected))
                             or not (_same_slot(destination_observed, current) or _same_slot(corrected, current))):
                         # A receipt carries a count and stack ID, so keep a conflicting independent description.

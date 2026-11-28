@@ -69,6 +69,25 @@ error reports the snapshot under
 `error.attributes.transfer_progress` in `observe_script`. Use `stop_script`
 to terminate the worker and drain its actions on the resident connection.
 
+## Swap occupied slots in an ordinary chest window
+
+On protocol 2225, observe the ordinary single chest before opening it and
+wait for its 27-slot contents with `await bot.wait_for_container_slots()`.
+Both endpoints need observed, occupied stacks of different items with valid
+stack network IDs.
+
+- `await bot.swap_container_items(3, 20)` swaps two chest slots.
+- `await bot.swap_container_items(12, 12, other_area="inventory")` swaps chest
+  slot 12 with main inventory slot 12.
+
+The call sends one whole-stack exchange and returns the matching BDS verdict.
+The SDK publishes exchanged slot descriptions when both corrections corroborate
+the original stacks in their new slots. Check `bot.container_slots` and, for
+a mixed exchange, `bot.inventory_slots`. If the verdict is rejected or lacks
+the required evidence, wait for fresh descriptions of affected slots before
+retrying. A timeout or cancellation after submission can still be followed by
+a server verdict.
+
 ## Return workbench cursor items to the main inventory
 
 With a protocol 2225 crafting table window open, call

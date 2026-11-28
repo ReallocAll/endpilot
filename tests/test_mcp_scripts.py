@@ -933,6 +933,93 @@ async def main(bot):
 """)
             self.assertEqual((await self.completed(run))["result"], "denied")
 
+    async def test_container_swap_forwards_scope_and_projects_the_native_verdict(self):
+        b = self.bot.protocol.binding
+
+        def receipt(body):
+            reply, = self.bot.protocol.decode(RawPacket(b.ItemStackResponsePacket.ID, bytes.fromhex(body))).responses
+            return reply
+
+        # Stock protocol 2225 receipts for the two container swap layouts.
+        local = receipt("0100010101070002030307014c000000141405014a000000")
+        cross = receipt("01000101020700010c0c09019e010000000c00010c0c0501a001000000")
+        rejected = b.ItemStackResponseInfo(client_request_id=b.ItemStackRequestId(raw_id=-9),
+                                           result=b.ItemStackNetResult.ERROR)
+        calls = []
+
+        async def swap(container_slot, other_slot, *, other_area="container", timeout=15):
+            calls.append((container_slot, other_slot, other_area, timeout))
+            if other_area not in ("container", "inventory"):
+                raise ValueError("invalid other_area")
+            return {(3, 20): local, (12, 12): cross, (7, 8): rejected}[container_slot, other_slot]
+
+        with patch.object(self.bot, "swap_container_items", swap, create=True):
+            run = await self.start("""
+async def main(bot):
+    try:
+        await bot.swap_container_items(2, 3, other_area='offhand')
+    except ValueError as error:
+        assert str(error) == 'invalid other_area'
+    else:
+        raise AssertionError('missing resident error')
+    local = await bot.swap_container_items(3, 20)
+    cross = await bot.swap_container_items(12, 12, other_area='inventory', timeout=2.5)
+    rejected = await bot.swap_container_items(container_slot=7, other_slot=8, other_area='container')
+    assert local.result.name == cross.result.name == 'SUCCESS'
+    assert rejected.result.name == 'ERROR' and rejected.client_request_id.raw_id == -9
+    return [local, cross, rejected]
+""")
+            final = await self.completed(run)
+        self.assertEqual(final["state"], "succeeded", final)
+        self.assertEqual(calls, [(2, 3, "offhand", 15), (3, 20, "container", 15),
+                                 (12, 12, "inventory", 2.5), (7, 8, "container", 15)])
+        self.assertEqual(final["result"], [
+            {"result": {"name": "SUCCESS"}, "client_request_id": {"raw_id": -1}},
+            {"result": {"name": "SUCCESS"}, "client_request_id": {"raw_id": -1}},
+            {"result": {"name": "ERROR"}, "client_request_id": {"raw_id": -9}},
+        ])
+
+    async def test_container_swap_worker_cancellation_settles_resident_call(self):
+        b = self.bot.protocol.binding
+        admitted = asyncio.Event()
+        order = []
+
+        async def swap(container_slot, other_slot, *, other_area="container", timeout=15):
+            order.append((container_slot, other_slot, other_area, timeout))
+            if other_area == "inventory":
+                admitted.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    order.append("resident cleanup")
+            return b.ItemStackResponseInfo(client_request_id=b.ItemStackRequestId(raw_id=-3),
+                                           result=b.ItemStackNetResult.SUCCESS)
+
+        async def wait_ticks(ticks):
+            await admitted.wait()
+
+        with (patch.object(self.bot, "swap_container_items", swap, create=True),
+              patch.object(self.bot, "wait_ticks", wait_ticks)):
+            run = await self.start("""
+import asyncio
+
+async def main(bot):
+    pending = asyncio.create_task(bot.swap_container_items(12, 12, other_area='inventory'))
+    await bot.wait_ticks(1)
+    pending.cancel('cancel swap')
+    try:
+        await pending
+    except asyncio.CancelledError as error:
+        assert str(error) == 'cancel swap'
+    else:
+        raise AssertionError('missing worker cancellation')
+    return await bot.swap_container_items(3, 20)
+""")
+            final = await self.completed(run)
+        self.assertEqual(final["state"], "succeeded", final)
+        self.assertEqual(order, [(12, 12, "inventory", 15), "resident cleanup", (3, 20, "container", 15)])
+        self.assertEqual(final["result"], {"result": {"name": "SUCCESS"}, "client_request_id": {"raw_id": -3}})
+
     async def test_inventory_range_exposes_ordered_host_verdicts_and_rejects_bad_inputs(self):
         b = self.bot.protocol.binding
         paper = 389

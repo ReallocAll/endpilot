@@ -594,7 +594,7 @@ class CreativeInventory:
         return replace(source, net_id=int(net_id.raw_id))
 
     def _staged_armor_matches(self, slot, expected):
-        return (expected is not None and slot not in self._inventory._unconfirmed_transfer_slots
+        return (expected is not None and not self._inventory._main_transfer_slot_is_unconfirmed(slot)
                 and slot not in self._inventory._drop_key_counts
                 and _stack_snapshot(self._inventory.slots.get(slot)) == expected)
 
@@ -653,7 +653,7 @@ class CreativeInventory:
         elif destroy is not None and destroy.verdict is not None and destroy.verdict.result.name == "SUCCESS":
             observed = self._inventory.slots.get(slot)
             empty = (observed is not None and not observed.id and not observed.stack_size and not observed.net_id_variant
-                     and slot not in self._inventory._unconfirmed_transfer_slots
+                     and not self._inventory._main_transfer_slot_is_unconfirmed(slot)
                      and slot not in self._inventory._drop_key_counts)
             if not empty:
                 staged = "unknown"

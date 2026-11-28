@@ -137,7 +137,7 @@ class _PendingStackRequest:
     submitted: bool = False
     automatic_unequip: bool = False
     exact_offhand_take: bool = False
-    cursor_exchange: bool = False
+    exclusive_exchange: bool = False
     creative_armor: bool = False
 
     def retain_uncertain_personal_grid(self) -> bool:
@@ -183,7 +183,7 @@ def _correct_observed_item(binding, item, response_slot):
     return _response_item(binding, item, item, response_slot)
 
 
-def _valid_cursor_transfer_stack(item) -> bool:
+def _valid_transfer_stack(item) -> bool:
     if item is None:
         return False
     net_id = int(item.net_id_variant or 0)
@@ -192,7 +192,7 @@ def _valid_cursor_transfer_stack(item) -> bool:
     return 0 < item.stack_size <= 255 and net_id > 0
 
 
-def _cursor_exchange_receipt(response, names, index):
+def _exchange_receipt(response, names, index):
     matches = [(group, slot) for group in response.containers or ()
                if group.full_container_name.name.name in names
                for slot in group.slots if slot.slot == index or slot.requested_slot == index]
@@ -235,6 +235,9 @@ class Inventory:
         self._count_observation_gaps: set[int] = set()
         self._pending_requests = {}
         self._unconfirmed_transfer_slots: set[int] = set()
+        # An ambiguous container swap can change either item identity. All
+        # subsequent item-stack writes need fresh evidence for those endpoints.
+        self._unconfirmed_swap_slots: set[_TransferEndpoint] = set()
         self._qa_requests = {}
         self._request_sends = set()
         self._request_stream_ended = False
@@ -299,7 +302,7 @@ class Inventory:
 
     def _observe_cursor_item(self, source: Literal["inventory_content", "inventory_slot"], item) -> None:
         if self._cursor_window is not None:
-            self._cursor_item = item if _valid_cursor_transfer_stack(item) else None
+            self._cursor_item = item if _valid_transfer_stack(item) else None
             self._observe_transfer_slot((id(self._cursor_window), 0), self._cursor_item)
         if self._request_stream_ended or item is None:
             return
@@ -346,11 +349,11 @@ class Inventory:
                     self._pending_requests.pop(request_id)
                     continue
                 try:
-                    if pending.cursor_exchange and any(
+                    if pending.exclusive_exchange and any(
                         other is not response and int(other.client_request_id.raw_id) == request_id
                         for other in responses
                     ):
-                        raise ValueError("duplicate verdict for a cursor transfer request")
+                        raise ValueError("duplicate verdict for an item-stack exchange request")
                     self._mark_range_overlap({
                         (None, int(slot.slot))
                         for container in response.containers or ()
@@ -560,7 +563,7 @@ class Inventory:
                 and (expected.item_id == 0 or len(expected.user_data_buffer) >= 10)
                 and not self._request_stream_ended and not self._selection_writes
                 and slot == self._selected_slot and self._selected_equipment == self._observed_stack(slot) == expected
-                and slot not in self._unconfirmed_transfer_slots and slot not in self._drop_key_counts
+                and not self._main_transfer_slot_is_unconfirmed(slot) and slot not in self._drop_key_counts
                 and not self._requests_for_endpoints(((None, slot),)))
 
     def _observed_damage_equipment(self) -> tuple[tuple[HeldItemStack, ...], tuple[HeldItemStack, ...]] | None:
@@ -568,7 +571,7 @@ class Inventory:
         if self._request_stream_ended:
             return None
         hotbar = (self._selected_slot,) if self._selection_source == "server" else tuple(range(9))
-        if any(slot in self._unconfirmed_transfer_slots or slot in self._drop_key_counts for slot in hotbar):
+        if any(self._main_transfer_slot_is_unconfirmed(slot) or slot in self._drop_key_counts for slot in hotbar):
             return None
         armor = tuple(_stack_snapshot(self._damage_descriptors.get(slot)) for slot in _DAMAGE_ARMOR_SLOTS)
         hands = (_stack_snapshot(self._damage_descriptors.get(_DAMAGE_OFFHAND_SLOT)),
@@ -616,7 +619,7 @@ class Inventory:
         reply.exception()
 
     def _fail_stack_request(self, pending, error):
-        if pending.cursor_exchange and pending.submitted:
+        if pending.exclusive_exchange and pending.submitted:
             pending.on_unconfirmed()
         self._fail_request(pending.reply, error)
 
@@ -642,6 +645,7 @@ class Inventory:
                 self._fail_request(waiter, error)
         self._held_item_waiters.clear()
         self._unconfirmed_transfer_slots.clear()
+        self._unconfirmed_swap_slots.clear()
         for task in tuple(self._request_sends):
             task.cancel()
 
@@ -651,13 +655,28 @@ class Inventory:
             for owned in pending.endpoints for requested in endpoints
         ))
 
+    def _has_submitted_exchange(self, endpoints, *, except_request=None):
+        return any(other is not except_request and other.submitted and other.exclusive_exchange
+                   for other in self._requests_for_endpoints(endpoints))
+
+    def _swap_slots_need_observation(self, endpoints):
+        return any(_transfer_endpoints_match(old, endpoint, allow_possible=True)
+                   for old in self._unconfirmed_swap_slots for endpoint in endpoints)
+
+    def _main_transfer_slot_is_unconfirmed(self, index: int) -> bool:
+        return index in self._unconfirmed_transfer_slots or self._swap_slots_need_observation(((None, index),))
+
+    def _can_plan_main_slot_write(self, index: int) -> bool:
+        return (not self._main_transfer_slot_is_unconfirmed(index)
+                and not self._has_submitted_exchange(((None, index),)))
+
     def _mark_range_overlap(self, endpoints, *, except_request):
         for pending in self._requests_for_endpoints(endpoints, allow_possible=False):
             if pending is not except_request and pending.on_unconfirmed is not None:
                 pending.on_unconfirmed()
 
     def _observe_transfer_content(self, container, previous, current) -> None:
-        if self._pending_requests:
+        if self._pending_requests or self._unconfirmed_swap_slots:
             for index, item in current.items():
                 self._observe_transfer_slot((container, index), item)
             # A content packet replaces the previous observation, including omitted slots.
@@ -665,6 +684,10 @@ class Inventory:
                 self._observe_transfer_slot((container, index), None)
 
     def _observe_transfer_slot(self, endpoint: _TransferEndpoint, item: object | None) -> None:
+        if self._unconfirmed_swap_slots and _valid_transfer_stack(item):
+            self._unconfirmed_swap_slots = {
+                old for old in self._unconfirmed_swap_slots if not _transfer_endpoints_match(old, endpoint)
+            }
         for pending in self._pending_requests.values():
             if pending.submitted and pending.on_slot_observed is not None:
                 for owned in pending.endpoints:
@@ -691,7 +714,7 @@ class Inventory:
                                   after_send=None, _endpoints=None, _range_step=False,
                                   _wait_for=(), _on_unconfirmed=None, _on_slot_observed=None,
                                   _at_write=None, _automatic_unequip=False, _exact_offhand_take=False,
-                                  _cursor_exchange=False, _creative_armor=False):
+                                  _exclusive_exchange=False, _creative_armor=False):
         """Own pending replies for inventory, containers, trading, recipes, enchanting and creative actions.
 
         The operation owns its slot/window checks and supplies synchronous hooks.
@@ -713,13 +736,24 @@ class Inventory:
         if self._request_stream_ended:
             raise ConnectionError("item-stack request stream is closed")
         request_id = int(request.client_request_id.raw_id)
-        reply = asyncio.get_running_loop().create_future()
         endpoints = self._request_player_endpoints(request) if _endpoints is None else _endpoints
         armor_endpoints = endpoints.intersection(_DAMAGE_ARMOR_SLOTS)
+
+        def require_confirmed_swap_slots():
+            if self._swap_slots_need_observation(endpoints):
+                reason = "unconfirmed" if _range_step else "unconfirmed item-stack slot needs a fresh server observation"
+                raise _InventoryMoveNotSubmitted(reason)
+
+        # A request prepared from a stale descriptor stays stale even if an
+        # observation arrives before the send task runs. Deferred transfers
+        # build their request after the pending exchange has settled.
+        if not _wait_for:
+            require_confirmed_swap_slots()
+        reply = asyncio.get_running_loop().create_future()
         pending = _PendingStackRequest(
             reply, apply, endpoints, _range_step, _on_unconfirmed, _on_slot_observed,
             checked_at_write=_at_write is not None, automatic_unequip=_automatic_unequip,
-            exact_offhand_take=_exact_offhand_take, cursor_exchange=_cursor_exchange,
+            exact_offhand_take=_exact_offhand_take, exclusive_exchange=_exclusive_exchange,
             creative_armor=_creative_armor,
         )
         self._pending_requests[request_id] = pending
@@ -731,9 +765,9 @@ class Inventory:
                                        and (pending.creative_armor or other.creative_armor)
                                        for other in self._requests_for_endpoints(armor_endpoints)):
                 raise RuntimeError("the armor slot has an item-stack request in flight")
-            if any(other is not pending and other.submitted and other.cursor_exchange
-                   for other in self._requests_for_endpoints(endpoints)):
+            if self._has_submitted_exchange(endpoints, except_request=pending):
                 raise _InventoryMoveNotSubmitted("unconfirmed")
+            require_confirmed_swap_slots()
             if _at_write is not None:
                 if reply.done():
                     raise RuntimeError("item-stack request ended before submission")
@@ -1026,7 +1060,7 @@ class Inventory:
         complete = True
         for index in range(_MAIN_INVENTORY_SIZE):
             item = self._slots.get(index)
-            if (item is None or index in self._unconfirmed_transfer_slots or index in self._drop_key_counts
+            if (item is None or self._main_transfer_slot_is_unconfirmed(index) or index in self._drop_key_counts
                     or self._requests_for_endpoints(((None, index),))):
                 complete = False
                 continue
@@ -1125,7 +1159,7 @@ class Inventory:
                 raise RuntimeError("an armor transfer slot has an item-stack request in flight")
             armor = self._armor_slots.get(armor_slot)
             inventory = self._slots.get(destination_slot)
-            if (destination_slot in self._unconfirmed_transfer_slots or destination_slot in self._drop_key_counts
+            if (self._main_transfer_slot_is_unconfirmed(destination_slot) or destination_slot in self._drop_key_counts
                     or _stack_snapshot(armor) != original[armor_endpoint]
                     or _stack_snapshot(inventory) != original[inventory_endpoint]):
                 raise RuntimeError("an armor transfer slot changed before submission")
@@ -1276,7 +1310,8 @@ class Inventory:
                     raise RuntimeError("an offhand transfer slot has an item-stack request in flight")
                 if (_stack_snapshot(current_player) != expected[player_endpoint]
                         or _stack_snapshot(current_offhand) != expected[_DAMAGE_OFFHAND_SLOT]
-                        or automatic and (index in self._unconfirmed_transfer_slots or index in self._drop_key_counts)):
+                        or automatic and (self._main_transfer_slot_is_unconfirmed(index)
+                                          or index in self._drop_key_counts)):
                     raise RuntimeError("an offhand transfer slot changed before submission")
                 player_item, offhand_item = current_player, current_offhand
             elif current_player is not player_item or current_offhand is not offhand_item:
@@ -1330,10 +1365,10 @@ class Inventory:
             _automatic_unequip=automatic, _exact_offhand_take=exact_take,
         )
 
-    def _cursor_inventory_slot(self, index):
+    def _known_main_transfer_slot(self, index):
         item = self._slots.get(index)
-        if (index not in self._unconfirmed_transfer_slots and index not in self._count_observation_gaps
-                and _valid_cursor_transfer_stack(item)
+        if (not self._main_transfer_slot_is_unconfirmed(index) and index not in self._count_observation_gaps
+                and _valid_transfer_stack(item)
                 and _stack_snapshot(item) == _stack_snapshot(self.item_or_empty(index))):
             return item
         return None
@@ -1370,7 +1405,7 @@ class Inventory:
                 raise _InventoryMoveNotSubmitted("window_changed")
             own = self._pending_requests[request_id]
             if (any(other is not own and other.submitted for other in self._requests_for_endpoints(endpoints))
-                    or _stack_snapshot(self._cursor_inventory_slot(index)) != expected[player_endpoint]
+                    or _stack_snapshot(self._known_main_transfer_slot(index)) != expected[player_endpoint]
                     or _stack_snapshot(self._cursor_item) != expected[cursor_endpoint]):
                 raise _InventoryMoveNotSubmitted("unconfirmed")
             # The request may change both slots before the next authoritative report.
@@ -1393,7 +1428,7 @@ class Inventory:
                 return
             observed_cursor = self._cursor_item
             self._cursor_item = None
-            player_receipt = _cursor_exchange_receipt(response, _PLAYER_CONTAINERS, index)
+            player_receipt = _exchange_receipt(response, _PLAYER_CONTAINERS, index)
             if response.result.name != "SUCCESS":
                 # A rejection alone does not verify the cached main inventory slot.
                 # A full description received while pending has already cleared the mark.
@@ -1403,7 +1438,7 @@ class Inventory:
                         self._set_slot(index, corrected)
                         self._unconfirmed_transfer_slots.discard(index)
                 return
-            cursor_receipt = _cursor_exchange_receipt(response, (_CURSOR_CONTAINER,), 0)
+            cursor_receipt = _exchange_receipt(response, (_CURSOR_CONTAINER,), 0)
             if overlapped or player_receipt is None or cursor_receipt is None:
                 return
             player_delta = int(player_receipt.amount) - int(player_item.stack_size)
@@ -1423,7 +1458,7 @@ class Inventory:
             on_confirmed(moved, _stack_snapshot(cursor_after))
 
         return await self._request_item_stack(
-            request, apply, timeout=timeout, _endpoints=endpoints, _range_step=True, _cursor_exchange=True,
+            request, apply, timeout=timeout, _endpoints=endpoints, _range_step=True, _exclusive_exchange=True,
             _on_unconfirmed=mark_overlap, _on_slot_observed=observe, _at_write=at_write,
         )
 
@@ -1529,7 +1564,7 @@ class Inventory:
             if any(pending is not own_request for pending in self._requests_for_endpoints(endpoints)):
                 raise _InventoryMoveNotSubmitted("unconfirmed")
             slots = (source, destination)
-            if (self._unconfirmed_transfer_slots.intersection(slots)
+            if (any(self._main_transfer_slot_is_unconfirmed(index) for index in slots)
                     or tuple(self._observed_stack(index) for index in slots) != expected
                     or tuple(_stack_snapshot(self.item_or_empty(index)) for index in slots) != expected):
                 raise RuntimeError("inventory transfer slots changed before submission")
@@ -1725,6 +1760,9 @@ class Inventory:
 
     async def _drop_hotbar_stack(self, whole_stack: bool) -> None:
         slot = self.selected_slot
+        endpoints = ((None, slot),)
+        if self._swap_slots_need_observation(endpoints) or self._has_submitted_exchange(endpoints):
+            raise _InventoryMoveNotSubmitted("unconfirmed drop slot needs a fresh server observation")
         observed = self._slots.get(slot)
         if observed is None:
             return

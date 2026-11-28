@@ -2302,6 +2302,22 @@ class Bot:
             source_slot, destination_slot, timeout=timeout
         )
 
+    async def swap_container_items(
+        self, container_slot: int, other_slot: int, *,
+        other_area: Literal["container", "inventory"] = "container", timeout: float = 15,
+    ):
+        """Swap two occupied, different stacks in an observed ordinary single chest window.
+
+        The second slot can be in the chest or main inventory. Return the
+        matching BDS verdict. Matched corrections to both endpoints update
+        the observed slots when they corroborate the exchange.
+        """
+        if self._containers is None:
+            raise RuntimeError("player has not joined")
+        return await self._containers.swap_items(
+            container_slot, other_slot, other_area=other_area, timeout=timeout
+        )
+
     async def put_into_container(
         self, source_slot: int, destination_slot: int, amount: int = 1, *, timeout: float = 15
     ):

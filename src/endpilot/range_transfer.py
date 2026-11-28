@@ -81,7 +81,7 @@ def _merge_key(stack):
 
 
 def _plan_step(source, destination, item_id, remaining, limit, source_slots, destination_slots, *,
-               match=None, window_is_current=None):
+               match=None, window_is_current=None, writable_source=None, writable_destination=None):
     candidates = []
     for index, stack in source.items():
         if stack.id != item_id:
@@ -97,20 +97,25 @@ def _plan_step(source, destination, item_id, remaining, limit, source_slots, des
                 return "window_changed"
             if not selected:
                 continue
-        candidates.append((index, _merge_key(stack)))
+        candidates.append((index, _merge_key(stack), writable_source is None or index in writable_source))
     source_unknown = len(source) < len(source_slots)
     if not candidates:
         return "unobserved" if source_unknown else "source_exhausted"
 
     empty = None
+    first_writable = next((origin for origin, _, writable in candidates if writable), None)
     capacity_unknown = False
+    blocked = False
     for target, stack in destination.items():
+        target_writable = writable_destination is None or target in writable_destination
         if stack.id == 0:
-            if empty is None:
+            if not target_writable or first_writable is None:
+                blocked = True
+            elif empty is None:
                 empty = target
             continue
         key = _merge_key(stack)
-        for origin, source_key in candidates:
+        for origin, source_key, origin_writable in candidates:
             if key != source_key:
                 continue
             if limit is None:
@@ -118,12 +123,17 @@ def _plan_step(source, destination, item_id, remaining, limit, source_slots, des
                 break
             spare = limit - stack.stack_size
             if spare > 0:
-                return origin, target, min(remaining, source[origin].stack_size, spare)
+                if origin_writable and target_writable:
+                    return origin, target, min(remaining, source[origin].stack_size, spare)
+                blocked = True
+                continue
             break
 
     if empty is not None:
-        origin = candidates[0][0]
-        return origin, empty, min(remaining, source[origin].stack_size)
+        return first_writable, empty, min(remaining, source[first_writable].stack_size)
+    if blocked:
+        # A feasible step is still waiting for slot observations or ownership.
+        return "unconfirmed"
     if source_unknown or len(destination) < len(destination_slots) or capacity_unknown:
         return "unobserved"
     return "destination_full"
@@ -161,7 +171,7 @@ async def _transfer_cursor(bot: Bot, slots: int | range, *, take: bool, timeout:
         raise RuntimeError("open a protocol 2225 workbench before transferring cursor items")
 
     steps = []
-    player_item = inventory._cursor_inventory_slot(slots) if take else None
+    player_item = inventory._known_main_transfer_slot(slots) if take else None
     cursor_item = inventory._cursor_item
     source_item = player_item if take else cursor_item
     requested = 0 if source_item is None else int(source_item.stack_size)
@@ -198,8 +208,10 @@ async def _transfer_cursor(bot: Bot, slots: int | range, *, take: bool, timeout:
                 index, amount = slots, requested
             else:
                 destinations = {index: item for index in slots
-                                if (item := inventory._cursor_inventory_slot(index)) is not None}
-                plan = _plan_step({0: cursor_item}, destinations, item_id, remaining, limit, range(1), slots)
+                                if (item := inventory._known_main_transfer_slot(index)) is not None}
+                writable = {index for index in destinations if inventory._can_plan_main_slot_write(index)}
+                plan = _plan_step({0: cursor_item}, destinations, item_id, remaining, limit, range(1), slots,
+                                  writable_destination=writable)
                 if isinstance(plan, str):
                     return result(plan)
                 _, index, amount = plan
@@ -448,6 +460,7 @@ async def _transfer_range(
         def window_is_current():
             return (bot._containers is containers and bot._inventory is inventory
                     and containers.window is window and containers._layout_token is layout
+                    and not containers._ordinary_chest_replaced()
                     and (not tracked_pair or containers._paired_chest_window_is_current(window))
                     and (utility_layout is None or utility_is_current())
                     and (entity is None or (containers._entity_container is entity and entity.is_visible())))
@@ -469,11 +482,23 @@ async def _transfer_range(
                 return result("unobserved")
             player = _known_slots(bot.inventory_slots, player_slots)
             predicted = inventory.client_slots()
-            player = {index: stack for index, stack in player.items() if _same_slot(stack, predicted.get(index))}
+            player = {index: stack for index, stack in player.items()
+                      if not inventory._swap_slots_need_observation(((None, index),))
+                      and _same_slot(stack, predicted.get(index))}
             block = _known_slots(block, block_slots)
+            if entity is None and inventory._unconfirmed_swap_slots:
+                block = {index: stack for index, stack in block.items() if not inventory._swap_slots_need_observation(
+                    (containers._block_transfer_endpoint(index),)
+                )}
             source, destination = (player, block) if into_container else (block, player)
+            player_writable = {index for index in player if inventory._can_plan_main_slot_write(index)}
+            block_writable = {index for index in block if containers._can_plan_container_slot_write(index)}
+            source_writable, destination_writable = (
+                (player_writable, block_writable) if into_container else (block_writable, player_writable)
+            )
             plan = _plan_step(source, destination, item_id, remaining, limit, source_slots, destination_slots,
-                              match=match, window_is_current=window_is_current)
+                              match=match, window_is_current=window_is_current,
+                              writable_source=source_writable, writable_destination=destination_writable)
             if any(containers._block_transfer_endpoint(slot) != endpoint for slot, endpoint in paired_endpoints):
                 return result("window_changed")
             if isinstance(plan, str):
@@ -701,7 +726,8 @@ async def _transfer_within(bot, *, item, count, source_slots, destination_slots,
         item_id = None if registry is None else registry.id_for_name(item)
         if not item_id:
             return result("unobserved")
-        if in_container and name != _ENDER_CHEST:
+        if (in_container and name != _ENDER_CHEST
+                and (name != "minecraft:chest" or containers._storage_block_replaced is None)):
             stop_watching = containers._watch_transfer_block(window.position, observe_target)
         limit = STACK_LIMITS.get(item) if bot.protocol.number == 2225 else None
         loop = asyncio.get_running_loop()
@@ -712,6 +738,7 @@ async def _transfer_within(bot, *, item, count, source_slots, destination_slots,
                 return result("window_changed")
             if in_container:
                 slots = containers.slots
+                writable = containers._can_plan_container_slot_write
 
                 def observed(indices):
                     return {index: stack for index, stack in _known_slots(slots, indices).items()
@@ -719,15 +746,18 @@ async def _transfer_within(bot, *, item, count, source_slots, destination_slots,
             else:
                 slots = inventory.slots
                 predicted = inventory.client_slots()
+                writable = inventory._can_plan_main_slot_write
 
                 def observed(indices):
                     return {index: stack for index, stack in _known_slots(slots, indices).items()
-                            if index not in inventory._unconfirmed_transfer_slots
+                            if not inventory._main_transfer_slot_is_unconfirmed(index)
                             and _same_slot(stack, predicted.get(index))}
 
             source, destination = observed(source_slots), observed(destination_slots)
             plan = _plan_step(source, destination, item_id, remaining, limit, source_slots, destination_slots,
-                              match=match, window_is_current=window_is_current if in_container else None)
+                              match=match, window_is_current=window_is_current if in_container else None,
+                              writable_source={index for index in source if writable(index)},
+                              writable_destination={index for index in destination if writable(index)})
             if isinstance(plan, str):
                 return result(plan)
             origin, target, amount = plan

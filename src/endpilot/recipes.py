@@ -11,8 +11,8 @@ from operator import index
 from typing import Literal
 
 from .inventory import (
-    _MAIN_INVENTORY_SIZE, _PLAYER_CONTAINERS, _CraftingGridEndpoint, _correct_observed_item, _response_item,
-    _stack_snapshot,
+    _MAIN_INVENTORY_SIZE, _PLAYER_CONTAINERS, _CraftingGridEndpoint, _InventoryMoveNotSubmitted, _correct_observed_item,
+    _response_item, _stack_snapshot,
 )
 
 
@@ -364,14 +364,16 @@ class Recipes:
             and self._allocate_materials(recipe, materials, (requested + output - 1) // output) is not None
         )
 
-    def _observed_materials(self) -> Counter[tuple[str, int, int]]:
+    def _material_slot_is_observed(self, slot: int) -> bool:
         inventory = self.inventory
+        return (not inventory._main_transfer_slot_is_unconfirmed(slot)
+                and slot not in inventory._count_observation_gaps
+                and slot not in inventory._drop_key_counts)
+
+    def _observed_materials(self) -> Counter[tuple[str, int, int]]:
         materials = Counter()
-        uncertain = (
-            inventory._count_observation_gaps | inventory._unconfirmed_transfer_slots | inventory._drop_key_counts.keys()
-        )
-        for slot, stack in inventory.slots.items():
-            if not 0 <= slot < _MAIN_INVENTORY_SIZE or slot in uncertain:
+        for slot, stack in self.inventory.slots.items():
+            if not 0 <= slot < _MAIN_INVENTORY_SIZE or not self._material_slot_is_observed(slot):
                 continue
             item_id = int(stack.id)
             name = self.item_names.get(item_id) if item_id else None
@@ -566,51 +568,11 @@ class Recipes:
         return self.snapshot()
 
 
-    async def craft_auto(
-        self, recipe_id: str | int, destination_slot: int, *,
-        times: int = 1, timeout: float = 15, _queued: bool = False,
-    ):
-        """Craft from observed player inventory and return the matching BDS item-stack verdict.
-
-        Send the CraftRecipeAuto/CraftResults/Consume/Place sequence.
-        Update inventory only from response slots.
-        BDS 1.26.52 requires an open player inventory window for this action.
-        Each recipe position uses one concrete variant for a tagged recipe.
-        Automatic crafting requires one output stack.
-        """
-        recipe = self.get(recipe_id)
-        if recipe is None:
-            raise KeyError(f"the server sent no recipe {recipe_id!r}")
-        if self.inventory is None:
-            raise RuntimeError("crafting requires player inventory")
-        if not 0 <= destination_slot <= 255:
-            raise ValueError("destination slot must fit in a byte")
-        if not 1 <= times <= 255:
-            raise ValueError("craft count must be between 1 and 255")
-        if len(recipe.results) != 1 or not recipe.ingredients:
-            raise ValueError("automatic crafting requires ingredients and one result stack")
-        output = recipe.results[0]
-        if not 1 <= output.count * times <= 255:
-            raise ValueError("result stack count must fit in a byte")
-
-        b = self.packets.protocol.binding
-        cereal = b.ItemStackRequestCereal
-        inventory = self.inventory
-        items = inventory.slots
+    def _select_auto_ingredients(self, recipe, items, times, cereal, slot_info, *, tagged):
         remaining = {slot: int(item.stack_size) for slot, item in items.items()}
         consumes_by_ingredient = [[] for _ in recipe.ingredients]
         ingredients = [None] * len(recipe.ingredients)
 
-        def slot_info(name, slot, net_id):
-            return cereal.SlotInfoData(
-                full_container_name=b.FullContainerName(
-                    name=b.ContainerEnumName[name], dynamic_id=None,
-                ),
-                slot=slot, net_id_variant=net_id,
-            )
-
-        tagged = any(ingredient.tag is not None for ingredient in recipe.ingredients)
-        window = None if self.containers is None else self.containers.window
         if tagged:
             materials = self._tagged_auto_materials(recipe, items, times)
         else:
@@ -651,6 +613,64 @@ class Recipes:
                 raise ValueError(f"not enough {name} to craft {recipe.recipe_id}")
 
         consumes = [action for group in consumes_by_ingredient for action in group]
+        return ingredients, consumes
+
+    async def craft_auto(
+        self, recipe_id: str | int, destination_slot: int, *,
+        times: int = 1, timeout: float = 15, _queued: bool = False,
+    ):
+        """Craft from observed player inventory and return the matching BDS item-stack verdict.
+
+        Send the CraftRecipeAuto/CraftResults/Consume/Place sequence.
+        Update inventory only from response slots.
+        BDS 1.26.52 requires an open player inventory window for this action.
+        Each recipe position uses one concrete variant for a tagged recipe.
+        Automatic crafting requires one output stack.
+        """
+        recipe = self.get(recipe_id)
+        if recipe is None:
+            raise KeyError(f"the server sent no recipe {recipe_id!r}")
+        if self.inventory is None:
+            raise RuntimeError("crafting requires player inventory")
+        if not 0 <= destination_slot <= 255:
+            raise ValueError("destination slot must fit in a byte")
+        if not 1 <= times <= 255:
+            raise ValueError("craft count must be between 1 and 255")
+        if len(recipe.results) != 1 or not recipe.ingredients:
+            raise ValueError("automatic crafting requires ingredients and one result stack")
+        output = recipe.results[0]
+        if not 1 <= output.count * times <= 255:
+            raise ValueError("result stack count must fit in a byte")
+
+        b = self.packets.protocol.binding
+        cereal = b.ItemStackRequestCereal
+        inventory = self.inventory
+        carried = inventory.slots
+        observed = {slot: item for slot, item in carried.items() if self._material_slot_is_observed(slot)}
+        items = {slot: item for slot, item in observed.items() if inventory._can_plan_main_slot_write(slot)}
+
+        def slot_info(name, slot, net_id):
+            return cereal.SlotInfoData(
+                full_container_name=b.FullContainerName(
+                    name=b.ContainerEnumName[name], dynamic_id=None,
+                ),
+                slot=slot, net_id_variant=net_id,
+            )
+
+        tagged = any(ingredient.tag is not None for ingredient in recipe.ingredients)
+        window = None if self.containers is None else self.containers.window
+        try:
+            ingredients, consumes = self._select_auto_ingredients(recipe, items, times, cereal, slot_info, tagged=tagged)
+        except ValueError as unavailable:
+            if len(items) == len(observed):
+                raise
+            # A complete observed recipe can be temporarily blocked by an exchange.
+            try:
+                self._select_auto_ingredients(recipe, observed, times, cereal, slot_info, tagged=tagged)
+            except ValueError:
+                raise unavailable from None
+            raise _InventoryMoveNotSubmitted("unconfirmed") from None
+
         request_id = inventory._allocate_request_id()
         # Recipe data can expose this unsigned runtime ID as a signed int32.
         output_descriptor = b.SerializedNetworkItemStackDescriptor(
@@ -695,7 +715,7 @@ class Recipes:
         )
         touched = {int(action.source.slot) for action in consumes}
         touched.add(destination_slot)
-        planned_slots = {slot: _stack_snapshot(items.get(slot)) for slot in touched} if tagged else None
+        planned_slots = {slot: _stack_snapshot(carried.get(slot)) for slot in touched} if tagged else None
         result_stack = _stack_snapshot(output_descriptor) if tagged else None
 
         def before_send():
@@ -740,7 +760,7 @@ class Recipes:
                                 if corrected is not None:
                                     inventory._set_slot(index, corrected)
                             continue
-                    elif current is not items.get(index):
+                    elif current is not carried.get(index):
                         inventory._set_slot(index, _correct_observed_item(b, current, slot))
                         continue
                     previous = current or inventory.item_or_empty(index)
@@ -1046,7 +1066,7 @@ class Recipes:
             carried = inventory.slots
             current_destinations = {slot: carried.get(slot) for slot in destination_slots}
             if ({slot: _stack_snapshot(item) for slot, item in current_destinations.items()} != expected_destinations
-                    or any(slot in inventory._unconfirmed_transfer_slots or slot in inventory._count_observation_gaps
+                    or any(inventory._main_transfer_slot_is_unconfirmed(slot) or slot in inventory._count_observation_gaps
                            for slot in destination_slots)):
                 raise RuntimeError("crafting destinations are no longer confirmed empty")
             owner = inventory._pending_requests[request_id]

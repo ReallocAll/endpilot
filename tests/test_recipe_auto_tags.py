@@ -33,7 +33,8 @@ class RecipeAutoTagTests(unittest.IsolatedAsyncioTestCase):
         for packet in (
             b.NetworkSettingsPacket(compression_algorithm=b.PacketCompressionAlgorithm.NONE),
             b.ResourcePacksInfoPacket(), b.ResourcePackStackPacket(experiments=experiments(stack_toggles)),
-            b.StartGamePacket(runtime_id=7, entity_id=17, server_version="1.26.66", settings=b.LevelSettings(
+            b.StartGamePacket(runtime_id=7, entity_id=17, server_version="1.26.66",
+                              block_network_ids_are_hashes=True, settings=b.LevelSettings(
                 game_rules=b.GameRulesChangedPacketData(rules=[b.GameRule(name="doLimitedCrafting", value=False)]),
                 experiments=experiments(game_toggles),
             )),
@@ -51,12 +52,12 @@ class RecipeAutoTagTests(unittest.IsolatedAsyncioTestCase):
             user_data_buffer=data, block_runtime_id=runtime_id,
         )
 
-    def recipe(self, *descriptors, result_id=3, result_aux=0):
+    def recipe(self, *descriptors, result_id=3, result_aux=0, net_id=40):
         b = self.b
         ingredients = [b.SerializedRecipeIngredient(descriptor=descriptor, stack_size=1, aux_value=aux)
                        for descriptor, aux in descriptors]
         return b.CraftingDataPacket(shapeless_recipes=[b.ShapelessRecipePayload(
-            recipe_id="test:auto", net_id=40, tag="crafting_table", ingredients=ingredients,
+            recipe_id="test:auto", net_id=net_id, tag="crafting_table", ingredients=ingredients,
             results=[b.SerializedNetworkItemInstanceDescriptor(id=result_id, stack_size=1, aux_value=result_aux)],
         )])
 
@@ -71,11 +72,15 @@ class RecipeAutoTagTests(unittest.IsolatedAsyncioTestCase):
         await self.deliver(recipe, self.b.InventoryContentPacket(inventory_id=self.b.ContainerID.INVENTORY, slots=items))
 
     async def submit(self, destination, *, times=1):
+        return await self.submit_request(self.bot.craft_recipe_auto(40, destination, times=times, timeout=2))
+
+    async def submit_request(self, operation):
         sent = asyncio.Event()
         unsubscribe = self.bot.packets.subscribe_sent(
             lambda packet_id: sent.set() if packet_id == self.b.ItemStackRequestPacket.ID else None,
         )
-        task = asyncio.create_task(self.bot.craft_recipe_auto(40, destination, times=times, timeout=2))
+        task = asyncio.create_task(operation)
+        sent_waiter = asyncio.create_task(sent.wait())
 
         async def cleanup():
             task.cancel()
@@ -83,11 +88,16 @@ class RecipeAutoTagTests(unittest.IsolatedAsyncioTestCase):
 
         self.addAsyncCleanup(cleanup)
         try:
-            await asyncio.wait_for(sent.wait(), 1)
+            await asyncio.wait((sent_waiter, task), timeout=1, return_when=asyncio.FIRST_COMPLETED)
+            if task.done():
+                task.result()
+            self.assertTrue(sent.is_set(), "item-stack request was not sent")
             request, = self.wire.sent[-1].requests
             return task, request
         finally:
             unsubscribe()
+            sent_waiter.cancel()
+            await asyncio.gather(sent_waiter, return_exceptions=True)
 
     def verdict(self, request_id, *slots, result="SUCCESS"):
         b = self.b
@@ -174,6 +184,61 @@ class RecipeAutoTagTests(unittest.IsolatedAsyncioTestCase):
         inputs, sources = self.actions(request)[2:4]
         self.assertEqual(inputs, [(OAK, 32767, 1), (OAK, 3, 1)])
         self.assertEqual(sources, [(1, 52, 1), (2, 53, 1), (0, 51, 2)])
+
+    async def test_auto_craft_uses_trusted_material_until_mixed_swap_slot_is_refreshed(self):
+        for descriptor in ({"name": OAK}, {"item_tag": WOOD}):
+            with self.subTest(descriptor=descriptor):
+                await self.join(item_names=(OAK, BIRCH, TABLE, "minecraft:paper"))
+                b = self.b
+                inventory_id = b.ContainerID.INVENTORY
+                await self.arrange(
+                    *[self.item() for _ in range(12)], self.item(1, 1, 0, 52), self.item(1, 1, 0, 55),
+                    self.item(), self.item(), recipe=self.recipe((descriptor, 32767), net_id=3587),
+                )
+                pos = b.BlockPos(x=1, y=100, z=0)
+                chest = b.ContainerEnumName.LEVEL_ENTITY_CONTAINER
+                await self.deliver(
+                    b.ContainerClosePacket(container_id=inventory_id, container_type=b.ContainerType.INVENTORY),
+                    b.UpdateBlockPacket(pos=pos, runtime_id=3162850062),
+                    b.ContainerOpenPacket(container_id=2, type=b.ContainerType.CONTAINER, pos=pos, entity_unique_id=-1),
+                    b.InventoryContentPacket(inventory_id=2, slots=[
+                        *[self.item() for _ in range(12)], self.item(4, 1, 0, 31),
+                        *[self.item() for _ in range(14)],
+                    ], full_container_name=b.FullContainerName(name=chest), storage_item=self.item()),
+                )
+                swap, request = await self.submit_request(self.bot.swap_container_items(12, 12, other_area="inventory"))
+                receipt = self.verdict(request.client_request_id.raw_id, (12, 1, 52))
+                receipt.containers[0].full_container_name = b.FullContainerName(name=chest)
+                await self.deliver(
+                    b.ItemStackResponsePacket(responses=[receipt]),
+                    b.ContainerClosePacket(container_id=2, container_type=b.ContainerType.CONTAINER),
+                    b.ContainerOpenPacket(container_id=inventory_id, type=b.ContainerType.INVENTORY),
+                )
+                self.assertEqual((await swap).result.name, "SUCCESS")
+                self.assertEqual(self.bot.inventory_slots[12].net_id_variant, 52)
+                self.assertEqual(self.bot.recipes_for(TABLE), (self.bot.get_recipe(3587),))
+
+                craft, request = await self.submit_request(self.bot.craft_recipe_auto(3587, 14))
+                self.assertEqual(self.actions(request)[3], [(13, 55, 1)])
+                await self.deliver(b.ItemStackResponsePacket(responses=[self.verdict(
+                    request.client_request_id.raw_id, (13, 0, None), (14, 1, 71),
+                )]))
+                self.assertEqual((await craft).result.name, "SUCCESS")
+                sent = list(self.wire.sent)
+                with self.assertRaisesRegex(ValueError, "not enough"):
+                    await self.bot.craft_recipe_auto(3587, 15)
+                self.assertEqual(self.wire.sent, sent)
+
+                await self.deliver(b.InventorySlotPacket(
+                    inventory_id=inventory_id, slot=12, item=self.item(1, 1, 0, 61),
+                ))
+                craft, request = await self.submit_request(self.bot.craft_recipe_auto(3587, 15))
+                self.assertEqual(self.actions(request)[3], [(12, 61, 1)])
+                await self.deliver(b.ItemStackResponsePacket(responses=[self.verdict(
+                    request.client_request_id.raw_id, (12, 0, None), (15, 1, 72),
+                )]))
+                self.assertEqual((await craft).result.name, "SUCCESS")
+            await self.bot.close()
 
     async def test_tag_assignment_reserves_the_fixed_ingredient_and_applies_only_the_matching_verdict(self):
         await self.join()
