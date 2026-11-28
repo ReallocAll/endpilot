@@ -1597,6 +1597,7 @@ class Blocks:
         # The bounded descent stops before this column. Admit dry masonry
         # only when its geometry stays inside the cell, outside that sweep.
         covered_floor = None
+        masonry_below = True
         x, y, z = buffer
         for height in range(y, y + 3):
             cell = (x, height, z)
@@ -1608,13 +1609,16 @@ class Blocks:
                 solid = (state.unit_cube and state.outline == _UNIT_BOX
                          and not state.unsafe_support and not state.unresolved_overhang)
                 masonry = solid and state.plain_masonry
-                primary = (masonry
-                           or (height == y and state.name == "minecraft:leaf_litter"
-                               and not state.unsafe_support and not state.unresolved_overhang)
+                # A floating obstruction is not a wall rooted at the runout foot.
+                primary = (masonry_below if masonry else
+                           (height == y and state.name == "minecraft:leaf_litter"
+                            and not state.unsafe_support and not state.unresolved_overhang)
                            or (height == y + 2 and solid and state.name == "minecraft:birch_leaves"))
             required.extend((primary, self._stance_air(self.observed_block(cell, layer=1))))
             if height == y:
                 covered_floor = masonry
+            if masonry_below is not False and masonry is not True:
+                masonry_below = masonry
         for x, y, z in (source, landing, buffer):
             floor = (x, y - 1, z)
             block = self.observed_block(floor)
