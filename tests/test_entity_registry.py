@@ -5,10 +5,30 @@ from unittest.mock import patch
 
 from bedrock_protocol import nbt
 
-from endpilot import Bot, EntityRegistryEntry, EntityRegistrySnapshot
+from endpilot import Bot, EntityRegistryEntry, EntityRegistrySnapshot, VanillaEntityDimensions, vanilla_entity_dimensions
 from endpilot.protocol import RawPacket, write_batch
 
 from test_scheduled_input import Wire
+
+
+class VanillaEntityDimensionsTests(unittest.TestCase):
+    def test_exact_names_and_read_only_dimensions(self):
+        dimensions = vanilla_entity_dimensions()
+        self.assertEqual(dimensions["minecraft:pig"], VanillaEntityDimensions(width=.9, height=.9))
+        self.assertEqual(dimensions["minecraft:sheep"], VanillaEntityDimensions(width=.9, height=1.3))
+        self.assertEqual(vanilla_entity_dimensions(2225), dimensions)
+        for name in ("sheep", "Minecraft:sheep", "custom:sheep", "minecraft:ender_dragon", "minecraft:rabbit"):
+            with self.subTest(name=name):
+                self.assertIsNone(dimensions.get(name))
+        with self.assertRaises(TypeError):
+            dimensions["minecraft:sheep"] = VanillaEntityDimensions(1, 1)
+        with self.assertRaises(FrozenInstanceError):
+            dimensions["minecraft:sheep"].width = 1
+
+    def test_other_protocols_and_nonintegers_are_rejected(self):
+        for protocol in (2168, 2224, 2226, "2225", 2225.0, True, None):
+            with self.subTest(protocol=protocol), self.assertRaisesRegex(ValueError, "unsupported vanilla entity dimensions"):
+                vanilla_entity_dimensions(protocol)
 
 
 class EntityRegistryTests(unittest.IsolatedAsyncioTestCase):
@@ -45,6 +65,16 @@ class EntityRegistryTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.push(*packets, barrier)
         await pending
+
+    async def test_base_dimensions_are_independent_of_the_joined_registry_and_send_nothing(self):
+        dims = vanilla_entity_dimensions()
+        await self.join(self.registry(self.row("test:sheep", 58)))
+        sent = list(self.wire.sent)
+        self.assertIsNone(self.bot.entity_registry.entry_for_name("minecraft:sheep"))
+        self.assertIsNone(vanilla_entity_dimensions().get("test:sheep"))
+        self.assertEqual(vanilla_entity_dimensions()["minecraft:sheep"], dims["minecraft:sheep"])
+        self.assertEqual(self.bot.observed_entities, ())
+        self.assertEqual(self.wire.sent, sent)
 
     async def test_exact_lookups_and_independent_immutable_entries_in_wire_order(self):
         self.assertIsNone(self.bot.entity_registry)

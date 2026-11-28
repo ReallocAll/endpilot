@@ -144,6 +144,19 @@ preserves announcement order, including duplicate entries. The type ID
 identifies a kind of entity. `bot.observed_entities` reports visible instances
 with their own `runtime_id` values.
 
+## Look up vanilla entity base dimensions
+
+`vanilla_entity_dimensions(protocol=2225)` returns a read-only mapping of
+exact namespaced entity names to immutable `VanillaEntityDimensions` values.
+`width` and `height` are in blocks. An unmeasured name has no entry, and an
+unsupported protocol raises `ValueError`. The lookup is available offline
+and sends no packets.
+
+The catalog covers measured default forms on BDS 1.26.66.1, including adult
+standing animals and ordinary monster spawns. A live entity's age, posture,
+variant or scale can give it a different box. Use live observations when an
+action depends on the current shape.
+
 ## Observe the server player list
 
 `bot.observed_players` is an immutable snapshot of the player list the server

@@ -35,7 +35,7 @@ from .entities import (
     EntitySwing, EntityVisibleEffectUpdate, ItemPickup, PaintingSnapshot, PlayerEquipmentSnapshot,
     PlayerListChange, PlayerListEntry, ShieldBlockEvent, VehicleLink, VehicleLinkChange,
 )
-from .entity_registry import EntityRegistryEntry, EntityRegistrySnapshot
+from .entity_registry import EntityRegistryEntry, EntityRegistrySnapshot, VanillaEntityDimensions, vanilla_entity_dimensions
 from .fishing import FishingResult
 from .game_hp_estimate import TntDamageEstimate
 from .inventory import CursorObservation, HeldItemSnapshot, HeldItemStack, InventorySlotChange
@@ -230,6 +230,7 @@ __all__ = [
     "VanillaBiome",
     "VanillaBlock",
     "VanillaBlockToolProperties",
+    "VanillaEntityDimensions",
     "VehicleLink",
     "VehicleLinkChange",
     "WaterBucketFillResult",
@@ -246,6 +247,7 @@ __all__ = [
     "transfer_range",
     "vanilla_biomes",
     "vanilla_blocks",
+    "vanilla_entity_dimensions",
     "vanilla_item_stack_limits",
     "vanilla_note_instruments",
 ]

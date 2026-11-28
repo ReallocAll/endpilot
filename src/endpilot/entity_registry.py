@@ -1,8 +1,32 @@
-"""Entity types advertised by the server for a player session."""
+"""Server-advertised entity types and versioned vanilla base dimensions."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 
 from bedrock_protocol import nbt
+
+from ._entity_dimensions_2225 import ENTITY_DIMENSIONS as _DIMENSIONS_2225
+
+
+@dataclass(frozen=True, slots=True)
+class VanillaEntityDimensions:
+    """Measured default width and height of a vanilla entity type, in blocks."""
+
+    width: float
+    height: float
+
+
+_VANILLA_DIMENSIONS_2225 = MappingProxyType({
+    name: VanillaEntityDimensions(width, height) for name, (width, height) in _DIMENSIONS_2225.items()
+})
+
+
+def vanilla_entity_dimensions(protocol: int = 2225) -> Mapping[str, VanillaEntityDimensions]:
+    """Return measured vanilla base dimensions by exact namespaced entity name."""
+    if type(protocol) is not int or protocol != 2225:
+        raise ValueError(f"unsupported vanilla entity dimensions protocol {protocol!r}")
+    return _VANILLA_DIMENSIONS_2225
 
 
 @dataclass(frozen=True, slots=True)
