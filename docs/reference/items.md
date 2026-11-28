@@ -3,9 +3,11 @@
 ## Move items within a storage window
 
 Call `transfer_container_range()` with two non-overlapping ranges in an
-active 27-slot ordinary chest, trapped chest, barrel, or vanilla shulker
-box, or in an ordinary double chest with 54 slots. For a double chest, the
-SDK must observe both halves and their pairing before the window opens.
+active 27-slot ordinary chest, trapped chest, barrel, vanilla shulker box,
+or personal ender chest, or in an ordinary double chest with 54 slots.
+For a double chest, the SDK must observe both halves and their pairing
+before the window opens. For an ender chest, the SDK must observe the
+block before opening and receive the complete 27-slot contents.
 Use `await bot.wait_for_container_slots()` after opening the window. The
 helper fills compatible stacks before using observed empty slots and can
 move items across multiple stacks. Check `confirmed_count` and

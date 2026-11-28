@@ -10,7 +10,7 @@ from math import isfinite
 from typing import TYPE_CHECKING, Literal
 
 from ._stack_limits_2225 import STACK_LIMITS
-from .containers import _PLAYER_CONTAINERS, _same_slot, _shared_storage_domain
+from .containers import _ENDER_CHEST, _PLAYER_CONTAINERS, _same_slot, _storage_window_domain
 from .inventory import HeldItemStack, _InventoryMoveNotSubmitted, _stack_snapshot
 
 if TYPE_CHECKING:
@@ -485,10 +485,11 @@ async def transfer_container_range(
 ) -> RangeTransferResult:
     """Move a registered item between disjoint ranges in an open storage window.
 
-    Use an observed 27-slot ordinary chest, trapped chest, barrel or shulker
-    box, or an ordinary double chest with both halves observed and paired.
-    Use the server's 54-slot order for double chests. Fill compatible
-    stacks before empty slots and count only moves
+    Use an observed 27-slot ordinary chest, trapped chest, barrel, vanilla
+    shulker box or personal ender chest, or an ordinary double chest with
+    both halves observed and paired. Observe the ender chest block before
+    opening the window. Use the server's 54-slot order for double chests.
+    Fill compatible stacks before empty slots and count only moves
     confirmed by matching corrections to both slots. The optional
     synchronous match and transfer_progress follow transfer_inventory_range.
     """
@@ -546,23 +547,25 @@ async def _transfer_within(bot, *, item, count, source_slots, destination_slots,
         if in_container:
             if window.position is None or window.entity_unique_id != -1:
                 raise RuntimeError("open a block storage window before transferring items")
-            if containers._window_chest_pair_changed:
+            if containers._window_chest_pair_changed or (
+                containers._tracks_ender_chest(window) and containers._storage_block_replaced
+            ):
                 return result("window_changed")
             name = containers._observed_window_block_name(window)
             current_name = containers._current_window_block_name(window)
             slot_count = containers._observed_window_slot_count(window)
             if name is None or slot_count is None or current_name is None:
                 return result("unobserved")
-            domain = _shared_storage_domain(name)
+            domain = _storage_window_domain(name)
             paired = name == "minecraft:chest" and slot_count == _DOUBLE_CHEST_SIZE
             if (domain is None or (slot_count != _SINGLE_CONTAINER_SIZE and not paired)
                     or (name != "minecraft:chest" and bot.protocol.number != 2225)):
                 raise RuntimeError("open a supported storage block with 27 slots or an ordinary double chest")
             _check_range(source_slots, slot_count, "source_slots")
             _check_range(destination_slots, slot_count, "destination_slots")
-            if current_name != name or containers._shared_storage_replaced:
+            if current_name != name or containers._storage_block_replaced:
                 return result("window_changed")
-            if name != "minecraft:chest" and containers._shared_storage_replaced is None:
+            if name != "minecraft:chest" and containers._storage_block_replaced is None:
                 return result("unobserved")
             if paired:
                 if containers._window_chest_halves is None:
@@ -583,14 +586,14 @@ async def _transfer_within(bot, *, item, count, source_slots, destination_slots,
                     and containers.window is window and containers._layout_token is layout
                     and not target_replaced
                     and (not paired or containers._paired_chest_window_is_current(window))
-                    and (not in_container or (not containers._shared_storage_replaced
+                    and (not in_container or (not containers._storage_block_replaced
                                               and containers._current_window_block_name(window) == name)))
 
         registry = bot.item_registry
         item_id = None if registry is None else registry.id_for_name(item)
         if not item_id:
             return result("unobserved")
-        if in_container:
+        if in_container and name != _ENDER_CHEST:
             stop_watching = containers._watch_transfer_block(window.position, observe_target)
         limit = STACK_LIMITS.get(item) if bot.protocol.number == 2225 else None
         loop = asyncio.get_running_loop()

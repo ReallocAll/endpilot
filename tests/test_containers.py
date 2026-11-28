@@ -671,15 +671,17 @@ class EntityContainerTests(unittest.IsolatedAsyncioTestCase):
         await self.reply_stack(request, ("COMBINED_HOTBAR_AND_INVENTORY_CONTAINER", 0, 1, 41))
         await taking
 
-        for half in (0, 1, 2):
-            await self.deliver(self.closed(server=True), self.opened(-1, x=half),
-                               self.storage_content(27, (0, 4, 32)))
+        for half, observed in ((0, False), (1, True), (2, True), (0, True)):
+            await self.deliver(self.closed(server=True))
+            if observed:
+                await self.deliver(self.north_chest(half))
+            await self.deliver(self.opened(-1, x=half), self.storage_content(27, (0, 4, 32)))
             await self.deliver(self.closed(server=True), self.opened(-1, x=1), double)
-            if half < 2:
+            if half != 0 or not observed:
                 before = sum(isinstance(packet, b.ItemStackRequestPacket) for packet in self.wire.sent)
                 attempt = self.start(self.planned_take(0, 1, 54))
                 await asyncio.sleep(0)
-                self.assertTrue(attempt.done(), "one definite observation must leave other possible halves blocked")
+                self.assertTrue(attempt.done(), "each possible half needs a definite observation")
                 self.assertIsNone(attempt.result())
                 self.assertEqual(sum(isinstance(packet, b.ItemStackRequestPacket) for packet in self.wire.sent), before)
 

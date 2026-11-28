@@ -218,13 +218,18 @@ a discounted first ingredient such as a Hero of the Village quote.
   player inventory screen and use two non-overlapping main inventory ranges.
 - Use `transfer_container_range()` to move items within the open window
   of a 27-slot ordinary chest, trapped chest, barrel, vanilla shulker box,
-  or a 54-slot ordinary double chest with two non-overlapping ranges.
+  personal ender chest, or a 54-slot ordinary double chest with two
+  non-overlapping ranges.
   For example, `await transfer_container_range(bot, item="minecraft:paper",
   count=6, source_slots=range(20, 22), destination_slots=range(2, 4))`
   fills compatible stacks first, then uses observed empty container slots.
   For an ordinary double chest, observe both halves and their pairing before
   opening the window. Use its 54-slot order even when opening from the other
   half. Reopen the window after an observed split or replacement.
+  For an ender chest, observe the block before opening and wait for the
+  complete 27-slot contents. Within one connection, ender chests at
+  different positions or in different dimensions open the same personal
+  slots. Reopen the window after an observed block replacement.
 - Use the exact registered item name. The range helpers accept an optional
   synchronous `match` that sees immutable `HeldItemStack` observations
   with fields such as `aux_value` and `user_data_buffer`. Keep the

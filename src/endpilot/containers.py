@@ -148,8 +148,11 @@ _SHULKER_BOXES = frozenset(
 )
 
 
-def _shared_storage_domain(block_name: str | None) -> str | None:
-    if block_name in ("minecraft:chest", "minecraft:trapped_chest"):
+_ENDER_CHEST = "minecraft:ender_chest"
+
+
+def _storage_window_domain(block_name: str | None) -> str | None:
+    if block_name in ("minecraft:chest", "minecraft:trapped_chest", _ENDER_CHEST):
         return "LEVEL_ENTITY_CONTAINER"
     if block_name == "minecraft:barrel":
         return "BARREL_CONTAINER"
@@ -190,9 +193,11 @@ class Containers:
         self._item_names = {} if item_names is None else item_names
         self.window: ContainerWindow | None = None
         self._dimension = None if blocks is None else blocks.dimension_id
+        self._ender_session = object()
         self._layout_token = object()
         self._window_block_name: str | None = None
-        self._shared_storage_replaced: bool | None = None
+        self._window_open_block_name: str | None = None
+        self._storage_block_replaced: bool | None = None
         self._window_chest_halves: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None
         self._window_chest_pair_changed = False
         self._window_slot_count: int | None = None
@@ -243,7 +248,8 @@ class Containers:
         self._furnace_progress_observers.clear()
         self._layout_token = object()
         self._window_block_name = None
-        self._shared_storage_replaced = None
+        self._window_open_block_name = None
+        self._storage_block_replaced = None
         self._window_chest_halves = None
         self._window_chest_pair_changed = False
         self._window_slot_count = None
@@ -281,22 +287,27 @@ class Containers:
     def _watch_transfer_block(
         self, position: tuple[int, int, int], observe: Callable[[str | None], None],
     ) -> Callable[[], None]:
+        def observe_block(block):
+            observe("minecraft:air" if block is not None and block.is_air is True else self._block_name(block))
+
+        return self._watch_block_observation(position, observe_block)
+
+    def _watch_block_observation(
+        self, position: tuple[int, int, int], observe: Callable[[BlockObservation | None], None],
+    ) -> Callable[[], None]:
         blocks = self._blocks
         b = self.packets.protocol.binding
         snapshots = (b.SubChunkPacket.ID, b.LevelChunkPacket.ID)
 
-        def observe_block(block):
-            observe("minecraft:air" if block is not None and block.is_air is True else self._block_name(block))
-
         stop_updates = blocks.subscribe_block_changes(
-            lambda change: observe_block(change.after),
+            lambda change: observe(change.after),
             position=position, layer=0, dimension_id=blocks.dimension_id,
         )
 
         def observe_snapshot(raw):
             if raw.packet_id in snapshots:
                 # The terrain reader applies full sections before this observer.
-                observe_block(blocks.observed_block(position))
+                observe(blocks.observed_block(position))
 
         stop_snapshots = self.packets.subscribe_raw(observe_snapshot)
 
@@ -394,8 +405,9 @@ class Containers:
         self._slots_updated.set()
 
     def _mark_late_container_overlap(self, anchor, index, *, halves, except_request):
-        # A late extra correction still identifies the old physical slot.
-        # The replacement window has its own observations of that slot.
+        # A late correction needs a physical identity from the old window.
+        if anchor.window_only:
+            return
         if halves is None:
             endpoint = replace(anchor, slot=index, local_slot=index)
         else:
@@ -517,6 +529,14 @@ class Containers:
                 and not self._window_chest_pair_changed and halves is not None
                 and self._verified_chest_halves(window.position, self._chest_facing(window.position)) == halves)
 
+    def _tracks_ender_chest(self, window):
+        return (self.window is window and self._window_open_block_name == _ENDER_CHEST
+                and self._storage_block_replaced is not None)
+
+    def _ender_window_is_current(self, window):
+        return (self._tracks_ender_chest(window) and self._storage_block_replaced is False
+                and self._window_slot_count == 27 and self._current_window_block_name(window) == _ENDER_CHEST)
+
     def _watch_paired_chest(self, halves):
         blocks = self._blocks
         b = self.packets.protocol.binding
@@ -555,17 +575,25 @@ class Containers:
 
         self._transfer_block_watches.add(stop)
 
-    def _block_transfer_endpoint(self, index: int) -> _BlockTransferEndpoint | None:
+    def _block_transfer_endpoint(self, index: int, *, domain: str | None = None) -> _BlockTransferEndpoint | None:
         window = self.window
         # An entity window's position does not identify a physical block slot.
         if window is None or window.position is None or window.entity_unique_id not in (-1, 0):
             return None
+        if self._tracks_ender_chest(window):
+            if not 0 <= index < 27 or not self._ender_window_is_current(window):
+                return None
+            return _BlockTransferEndpoint(
+                self._dimension, self._layout_token, index, index, None, frozenset(),
+                ender_session=self._ender_session, ender_known=True,
+            )
         position = window.position
         local_slot = index
         half = position
         possible = {position}
+        block_name = self._observed_window_block_name(window)
         if (self._window_slot_count == 54 and 0 <= index < 54 and window.container_type == "CONTAINER"
-                and self._observed_window_block_name(window) in (None, "minecraft:chest")):
+                and block_name in (None, "minecraft:chest")):
             half_index, local_slot = divmod(index, 27)
             facing = self._chest_facing(position)
             halves = self._verified_chest_halves(position, facing)
@@ -579,7 +607,32 @@ class Containers:
                     possible.update(((x - 1, y, z), (x + 1, y, z)))
                 if facing not in ("north", "south"):
                     possible.update(((x, y, z - 1), (x, y, z + 1)))
-        return _BlockTransferEndpoint(self._dimension, self._layout_token, index, local_slot, half, frozenset(possible))
+        # Only a storage block identified at open can provide cross-window
+        # evidence. An unproven slot can still overlap an unsettled request.
+        window_only = (self._blocks is not None and self.packets.protocol.number == 2225
+                       and window.container_type == "CONTAINER"
+                       and _storage_window_domain(self._window_open_block_name) is None)
+        possible_ender = (window_only and domain == "LEVEL_ENTITY_CONTAINER"
+                          and 0 <= index < 27 and self._window_slot_count in (None, 27))
+        return _BlockTransferEndpoint(
+            self._dimension, self._layout_token, index, local_slot, half, frozenset(possible),
+            window_only=window_only,
+            ender_session=self._ender_session if possible_ender else None,
+        )
+
+    def _transfer_slot_is_unconfirmed(self, index, endpoint):
+        return index in self._unconfirmed_transfer_slots or (
+            endpoint is not None and not endpoint.window_only and any(
+                old.matches(endpoint, allow_possible=True) for old in self._unconfirmed_block_slots
+            )
+        )
+
+    def _mark_transfer_slot_unconfirmed(self, index, endpoint, *, window_current):
+        if (endpoint is not None and not endpoint.window_only
+                and (window_current or not endpoint.ender_known)):
+            self._unconfirmed_block_slots.add(endpoint)
+        elif window_current:
+            self._unconfirmed_transfer_slots.add(index)
 
     def _observe_transfer_slot(self, index: int, item: object) -> None:
         entity = self._entity_container
@@ -599,7 +652,7 @@ class Containers:
             return
         endpoint = self._block_transfer_endpoint(index)
         if endpoint is not None:
-            if self._unconfirmed_block_slots:
+            if self._unconfirmed_block_slots and not endpoint.window_only:
                 unresolved = set()
                 for old in self._unconfirmed_block_slots:
                     if old.matches(endpoint):
@@ -626,22 +679,33 @@ class Containers:
         elif raw.packet_id == b.ContainerOpenPacket.ID:
             window = self._decode_open(raw)
             self._set_window(window)
-            block_name = self._observed_window_block_name(window)
+            block_name = self._window_open_block_name = self._observed_window_block_name(window)
             if block_name == "minecraft:chest":
                 facing = self._chest_facing(window.position)
                 halves = self._verified_chest_halves(window.position, facing)
                 if halves is not None:
                     self._window_chest_halves = halves
                     self._watch_paired_chest(halves)
-            if (block_name != "minecraft:chest" and _shared_storage_domain(block_name) is not None
+            if (block_name != "minecraft:chest" and _storage_window_domain(block_name) is not None
                     and self.packets.protocol.number == 2225):
-                self._shared_storage_replaced = False
+                self._storage_block_replaced = False
 
-                def observe_target(current_name):
-                    if current_name is not None and current_name != block_name:
-                        self._shared_storage_replaced = True
+                if block_name == _ENDER_CHEST:
+                    opening_id = self._blocks.observed_block(window.position).runtime_id
 
-                self._watch_transfer_block(window.position, observe_target)
+                    def observe_ender(block):
+                        if block is not None and (block.is_air is True or (
+                            block.runtime_id is not None and block.runtime_id != opening_id
+                        )):
+                            self._storage_block_replaced = True
+
+                    self._watch_block_observation(window.position, observe_ender)
+                else:
+                    def observe_target(current_name):
+                        if current_name is not None and current_name != block_name:
+                            self._storage_block_replaced = True
+
+                    self._watch_transfer_block(window.position, observe_target)
             if self._entities is not None:
                 actor = self._entities._get_by_unique_id(window.entity_unique_id)
                 entity = _observed_entity_container(self._entities, actor)
@@ -697,6 +761,8 @@ class Containers:
                 if self._window_slot_count != count:
                     if self._window_slot_count == 54 and self._window_chest_halves is not None:
                         self._window_chest_pair_changed = True
+                    if self._window_slot_count == 27 and self._tracks_ender_chest(window):
+                        self._storage_block_replaced = True
                     self._layout_token = object()
                     self._window_slot_count = count
                 self._slots = dict(enumerate(packet.slots))
@@ -1517,7 +1583,9 @@ class Containers:
         layout = self._layout_token
         observed_slot_count = self._observed_window_slot_count(window)
         opening_pair = self._observed_paired_chest_halves(window)
-        if opening_pair is not None and not self._paired_chest_window_is_current(window):
+        tracked_ender = self._tracks_ender_chest(window)
+        if ((opening_pair is not None and not self._paired_chest_window_is_current(window))
+                or (tracked_ender and not self._ender_window_is_current(window))):
             if _range_window_current is not None:
                 raise _InventoryMoveNotSubmitted("window_changed")
             if _expected_slots is not None:
@@ -1603,12 +1671,12 @@ class Containers:
         slot_names = _WINDOW_SLOT_NAMES.get(window.container_type)
         brewing = window.container_type == "BREWING_STAND"
         player_endpoint = (None, player_slot)
-        block_endpoint = self._block_transfer_endpoint(chest_slot)
+        block_endpoint = self._block_transfer_endpoint(chest_slot, domain=container_name)
         paired_halves = opening_pair
-        if paired_halves is None and observed_slot_count == 54 and self._window_block_name == "minecraft:chest":
+        if paired_halves is None and observed_slot_count == 54 and self._window_open_block_name == "minecraft:chest":
             paired_halves = self._verified_chest_halves(window.position, self._chest_facing(window.position))
         shared_anchor = block_endpoint if (paired_halves is not None or (
-            observed_slot_count == 27 and _shared_storage_domain(self._window_block_name) == container_name
+            observed_slot_count == 27 and _storage_window_domain(self._window_open_block_name) == container_name
         )) else None
         chest_endpoint = block_endpoint if entity_container is None else (entity_container.instance, chest_slot)
         endpoints = {player_endpoint}
@@ -1618,17 +1686,26 @@ class Containers:
         endpoints = frozenset(endpoints)
         pending = self.inventory._requests_for_endpoints(endpoints)
 
+        def has_pending_ender_overlap(requests, *, own=None):
+            return block_endpoint is not None and block_endpoint.ender_session is not None and any(
+                request is not own and any(
+                    isinstance(endpoint, _BlockTransferEndpoint)
+                    and block_endpoint.same_ender_slot(endpoint, allow_possible=True)
+                    for endpoint in request.endpoints
+                )
+                for request in requests
+            )
+
         def slots_unconfirmed():
-            return (chest_slot in self._unconfirmed_transfer_slots
-                    or player_slot in self.inventory._unconfirmed_transfer_slots
-                    or (block_endpoint is not None and any(
-                        old.matches(block_endpoint, allow_possible=True) for old in self._unconfirmed_block_slots
-                    )))
+            return (player_slot in self.inventory._unconfirmed_transfer_slots
+                    or self._transfer_slot_is_unconfirmed(chest_slot, block_endpoint))
 
         if horse and (pending or slots_unconfirmed()):
             raise RuntimeError("horse transfer slots need a fresh server observation and no pending item request")
         if _expected_slots is not None and (pending or slots_unconfirmed()):
             return None
+        if has_pending_ender_overlap(pending):
+            raise RuntimeError("ender chest slot has an unsettled item-stack request")
         blockers = tuple(request.reply for request in pending if request.range_step)
 
         if into_container:
@@ -1771,6 +1848,7 @@ class Containers:
         def window_is_current():
             return (self.window is window and self._layout_token is layout
                     and (opening_pair is None or self._paired_chest_window_is_current(window))
+                    and (not tracked_ender or self._ender_window_is_current(window))
                     and (entity_container is None or
                          (self._entity_container is entity_container and entity_container.is_visible())))
 
@@ -1930,16 +2008,16 @@ class Containers:
                                 and self._anvil_origins.get(chest_slot) is anvil_origins.get(chest_slot)
                                 and self._slots.get(chest_slot) is anvil_observation):
                             self._unconfirmed_transfer_slots.add(chest_slot)
-                    elif block_endpoint is not None:
-                        self._unconfirmed_block_slots.add(block_endpoint)
-                    elif window_is_current():
-                        self._unconfirmed_transfer_slots.add(chest_slot)
+                    else:
+                        self._mark_transfer_slot_unconfirmed(chest_slot, block_endpoint,
+                                                             window_current=window_is_current())
                 if player_receipts != 1:
                     self.inventory._unconfirmed_transfer_slots.add(player_slot)
             self._notify_slot_changes(window, before)
 
         def check_range_window():
-            if not _range_window_current() or self._block_transfer_endpoint(chest_slot) != block_endpoint:
+            if (not _range_window_current()
+                    or self._block_transfer_endpoint(chest_slot, domain=container_name) != block_endpoint):
                 raise _InventoryMoveNotSubmitted("window_changed")
 
         def expected_endpoints():
@@ -1966,6 +2044,10 @@ class Containers:
                         entity_container.require_visible()
                     if not window_is_current():
                         raise RuntimeError("container transfer endpoint changed before submission")
+                    if block_endpoint is not None and block_endpoint.ender_session is not None:
+                        own = self.inventory._pending_requests[request_id]
+                        if has_pending_ender_overlap(self.inventory._requests_for_endpoints((block_endpoint,)), own=own):
+                            raise RuntimeError("ender chest slot has an unsettled item-stack request")
                     if horse:
                         own_request = self.inventory._pending_requests[request_id]
                         current_player = self.inventory.slots.get(player_slot)
@@ -1998,8 +2080,10 @@ class Containers:
             else:
                 if window.container_type != "ANVIL" and self.window is not window:
                     raise RuntimeError("container window closed or changed before the transfer was sent")
-                if self.window is window and (self._layout_token is not layout
-                                              or self._block_transfer_endpoint(chest_slot) != block_endpoint):
+                if self.window is window and (
+                    self._layout_token is not layout
+                    or self._block_transfer_endpoint(chest_slot, domain=container_name) != block_endpoint
+                ):
                     raise RuntimeError("container transfer endpoint changed before submission")
             if entity_container is not None:
                 entity_container.require_visible()
@@ -2017,7 +2101,8 @@ class Containers:
         if exact_block and not _queued:
             stop_watching = self._watch_transfer_block(window.position, observe_target)
         check_at_write = (stop_watching is not None or _range_window_current is not None
-                          or strict_slot_count is not None or opening_pair is not None)
+                          or strict_slot_count is not None or opening_pair is not None
+                          or (block_endpoint is not None and block_endpoint.ender_session is not None))
         try:
             return await self.inventory._request_item_stack(
                 request, apply_horse if horse else apply, timeout=timeout, queued=_queued, before_send=before_send,
@@ -2032,15 +2117,14 @@ class Containers:
 
     def _can_plan_container_slot(self, index: int) -> bool:
         endpoint = self._block_transfer_endpoint(index)
-        return (index not in self._unconfirmed_transfer_slots and endpoint is not None
-                and not any(old.matches(endpoint, allow_possible=True) for old in self._unconfirmed_block_slots))
+        return endpoint is not None and not self._transfer_slot_is_unconfirmed(index, endpoint)
 
     async def _move_within_container(self, window, source, destination, amount, *, domain, timeout, expected,
                                      window_is_current, on_submitted, on_confirmed):
         indices = source, destination
         originals = dict(zip(indices, expected, strict=True))
-        anchor = self._block_transfer_endpoint(source)
-        endpoints = frozenset((anchor, self._block_transfer_endpoint(destination)))
+        anchor = self._block_transfer_endpoint(source, domain=domain)
+        endpoints = frozenset((anchor, self._block_transfer_endpoint(destination, domain=domain)))
         if None in endpoints:
             raise _InventoryMoveNotSubmitted("window_changed")
         slot_count = self._window_slot_count
@@ -2135,9 +2219,9 @@ class Containers:
             if moved is not None:
                 on_confirmed(moved)
             else:
-                self._unconfirmed_block_slots.update(
-                    endpoint for endpoint in endpoints if current[endpoint.slot] is originals[endpoint.slot]
-                )
+                for endpoint in endpoints:
+                    if current[endpoint.slot] is originals[endpoint.slot]:
+                        self._mark_transfer_slot_unconfirmed(endpoint.slot, endpoint, window_current=True)
 
             # Unrelated corrections can resolve a known stack, but do not
             # establish that another pending request moved it.

@@ -77,12 +77,24 @@ class _BlockTransferEndpoint:
     local_slot: int
     half: tuple[int, int, int] | None
     possible_halves: frozenset[tuple[int, int, int]]
+    window_only: bool = False
+    ender_session: object | None = None
+    ender_known: bool = False
+
+    def same_ender_slot(self, other: "_BlockTransferEndpoint", *, allow_possible: bool = False) -> bool:
+        return (self.ender_session is not None and self.ender_session is other.ender_session
+                and self.slot == other.slot and (self.ender_known and other.ender_known
+                                                 or allow_possible and (self.ender_known or other.ender_known)))
 
     def matches(self, other: "_BlockTransferEndpoint", *, allow_possible: bool = False) -> bool:
+        if self.ender_known or other.ender_known:
+            return self.same_ender_slot(other)
         if self.dimension != other.dimension:
             return False
         if self.layout is other.layout:
             return self.slot == other.slot
+        if (self.window_only or other.window_only) and not allow_possible:
+            return False
         if self.local_slot != other.local_slot:
             return False
         if self.half is not None and other.half is not None:
@@ -105,7 +117,10 @@ _TransferEndpoint = tuple[object, int] | _BlockTransferEndpoint | _CraftingGridE
 
 def _transfer_endpoints_match(first: _TransferEndpoint, second: _TransferEndpoint, *, allow_possible=False) -> bool:
     if isinstance(first, _BlockTransferEndpoint):
-        return isinstance(second, _BlockTransferEndpoint) and first.matches(second, allow_possible=allow_possible)
+        return isinstance(second, _BlockTransferEndpoint) and (
+            first.matches(second, allow_possible=allow_possible)
+            or allow_possible and first.same_ender_slot(second, allow_possible=True)
+        )
     return first == second
 
 
