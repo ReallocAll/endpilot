@@ -82,6 +82,80 @@ class EntityLifecycleTests(unittest.IsolatedAsyncioTestCase):
             fields.append(b.DataItemEntry(id=int(b.ActorDataIDs.OWNER), payload=payload(value=owner)))
         return b.SynchedActorData.CopyableDataList(data=fields)
 
+    def test_trade_progress_defaults_to_unknown(self):
+        entity = EntityState(108, 8, "minecraft:villager_v2", (1.5, 100, 2.5))
+        self.assertIsNone(entity.trade_tier)
+        self.assertIsNone(entity.trade_experience)
+
+    def villager_metadata(self, *, tier=None, experience=None, other=()):
+        b = self.b
+        fields = list(other)
+        for field, value in ((b.ActorDataIDs.TRADE_TIER, tier), (b.ActorDataIDs.TRADE_EXPERIENCE, experience)):
+            if value is not None:
+                fields.append(b.DataItemEntry(id=int(field), payload=b.DataItemIntPayload(value=value)))
+        return b.SynchedActorData.CopyableDataList(data=fields)
+
+    async def test_villager_trade_progress_merges_only_typed_metadata(self):
+        b = self.b
+        villager = self.actor(actor_type="minecraft:villager_v2")
+        wrong_tier = b.DataItemEntry(id=int(b.ActorDataIDs.TRADE_TIER), payload=b.DataItemInt64Payload(value=7))
+        wrong_experience = b.DataItemEntry(id=int(b.ActorDataIDs.TRADE_EXPERIENCE),
+                                           payload=b.DataItemShortPayload(value=9))
+        max_tier = b.DataItemEntry(id=int(b.ActorDataIDs.MAX_TRADE_TIER), payload=b.DataItemIntPayload(value=4))
+        villager.data = self.villager_metadata(tier=0, other=(wrong_experience, max_tier))
+        await self.join(villager)
+        initial, = self.bot.observed_entities
+        self.assertEqual((initial.trade_tier, initial.trade_experience), (0, None))
+
+        async def update(**entries):
+            await self.deliver(b.SetActorDataPacket(id=villager.runtime_id,
+                                                   packed_items=self.villager_metadata(**entries)))
+            current, = self.bot.observed_entities
+            return current
+
+        novice = await update(experience=0)
+        promoted = await update(tier=1, other=(wrong_experience,))
+        current = await update(experience=10, other=(wrong_tier, max_tier))
+        self.assertEqual((novice.trade_tier, novice.trade_experience), (0, 0))
+        self.assertEqual((promoted.trade_tier, promoted.trade_experience), (1, 0))
+        self.assertEqual((current.trade_tier, current.trade_experience), (1, 10))
+        self.assertIs(await update(other=(wrong_tier, wrong_experience, max_tier)), current)
+        self.assertEqual((initial.trade_tier, initial.trade_experience), (0, None))
+
+    async def test_villager_trade_progress_is_scoped_to_the_visible_actor_instance(self):
+        b = self.b
+        await self.join()
+        villager = self.actor(actor_type="minecraft:villager_v2")
+        villager.data = self.villager_metadata(tier=1, experience=10)
+        neighbor = self.actor(entity_id=109, runtime_id=9, actor_type="minecraft:villager_v2")
+        other = self.actor(entity_id=110, runtime_id=10, actor_type="minecraft:wandering_trader")
+        other.data = villager.data
+        update = b.SetActorDataPacket(id=other.runtime_id, packed_items=villager.data)
+        await self.deliver(villager, neighbor, other, update)
+
+        def states():
+            return {entity.runtime_id: entity for entity in self.bot.observed_entities}
+
+        def progress(entity):
+            return entity.trade_tier, entity.trade_experience
+
+        original = states()[villager.runtime_id]
+        self.assertEqual(progress(original), (1, 10))
+        self.assertEqual(progress(states()[neighbor.runtime_id]), (None, None))
+        self.assertEqual(progress(states()[other.runtime_id]), (None, None))
+
+        replacement = self.actor(entity_id=111, actor_type="minecraft:villager_v2")
+        replacement.data = self.villager_metadata(experience=0)
+        await self.deliver(replacement)
+        new = states()[villager.runtime_id]
+        self.assertEqual((new.entity_id, progress(new)), (replacement.entity_id, (None, 0)))
+        await self.deliver(b.RemoveActorPacket(entity_id=replacement.entity_id),
+                           b.SetActorDataPacket(id=villager.runtime_id, packed_items=villager.data))
+        self.assertNotIn(villager.runtime_id, states())
+        await self.deliver(self.actor(actor_type="minecraft:villager_v2"))
+        self.assertEqual(progress(states()[villager.runtime_id]), (None, None))
+        self.assertEqual(progress(original), (1, 10))
+
     async def test_wolf_owner_updates_only_from_typed_owner_metadata(self):
         b = self.b
         owner_id = -4294967295

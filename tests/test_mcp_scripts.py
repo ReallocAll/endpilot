@@ -327,7 +327,8 @@ async def main(bot):
         world_time = WorldTime(daylight_ticks=48_123, clocks=clocks)
         entities = (EntityState(1, 2, "minecraft:sheep", (0, 0, 0), visible_effects_value=18 | (6 << 7)),
                     EntityState(3, 4, "minecraft:sheep", (1, 0, 0), visible_effects_value=0),
-                    EntityState(5, 6, "minecraft:sheep", (2, 0, 0)))
+                    EntityState(5, 6, "minecraft:villager_v2", (2, 0, 0), trade_tier=1, trade_experience=10),
+                    EntityState(7, 8, "minecraft:villager_v2", (3, 0, 0), trade_tier=0))
         with (
             patch.object(Bot, "world_time", new_callable=PropertyMock, return_value=world_time),
             patch.object(Bot, "observed_entities", new_callable=PropertyMock, return_value=entities),
@@ -335,12 +336,16 @@ async def main(bot):
             run = await self.start("""
 async def main(bot):
     time = bot.world_time
+    entities = bot.observed_entities
     return [time.daytime, time.day, time.observed_moon_phase,
-            [entity.visible_effect_ids for entity in bot.observed_entities]]
+            [entity.visible_effect_ids for entity in entities],
+            [[entity.trade_tier, entity.trade_experience] for entity in entities]]
 """)
             report = await self.completed(run)
         self.assertEqual(report["state"], "succeeded", report)
-        self.assertEqual(report["result"], [123, 2, 5, [[9, 3], [], None]])
+        self.assertEqual(report["result"], [
+            123, 2, 5, [[9, 3], [], None, None], [[None, None], [None, None], [1, 10], [0, None]],
+        ])
 
     async def test_ability_speeds_are_projected_in_read_and_wait_snapshots(self):
         b = self.bot.protocol.binding

@@ -205,6 +205,13 @@ exchanges, use `open_trade()` and the current server quote with
 `trade_many()` uses the payable count advertised by the server, including
 a discounted first ingredient such as a Hero of the Village quote.
 
+For a visible `minecraft:villager_v2`, match `TradeOffers.trader_unique_id`
+to an `entity_id` in `bot.observed_entities` to read the villager's latest
+`trade_tier` and `trade_experience` metadata. Each field is `None` until
+observed for that actor instance. `TradeOffers.trader_tier` describes the
+window's last server quote. The actor can level up while that quote still
+reports the earlier tier. Use the server verdict to confirm an exchange.
+
 ## Choose ranges and interpret partial results
 
 - With `direction="take"`, the source range is in the open container and

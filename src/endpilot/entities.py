@@ -105,6 +105,9 @@ class EntityState:
 
     ``status_effects`` holds effects observed through MobEffect packets for this
     actor instance, ordered by effect ID. Durations are the last reported values.
+
+    ``trade_tier`` and ``trade_experience`` hold the latest valid metadata for
+    this visible villager instance. Each is ``None`` until observed.
     """
 
     entity_id: int
@@ -129,6 +132,8 @@ class EntityState:
     firework_attached_entity_id: int | None = None
     visible_effects_value: int | None = None
     sitting: bool | None = None
+    trade_tier: int | None = None
+    trade_experience: int | None = None
 
     @property
     def visible_effect_ids(self) -> tuple[int, ...] | None:
@@ -496,6 +501,20 @@ def _wolf_sitting(metadata, binding, previous: bool | None = None) -> bool | Non
     if words[int(flag) // 64] is None:
         return previous
     return _player_flag(words, flag)
+
+
+def _villager_trade_progress(
+    metadata, binding, tier: int | None = None, experience: int | None = None,
+) -> tuple[int | None, int | None]:
+    ids = binding.ActorDataIDs
+    for entry in metadata:
+        if not isinstance(entry.payload, binding.DataItemIntPayload):
+            continue
+        if entry.id == ids.TRADE_TIER:
+            tier = int(entry.payload.value)
+        elif entry.id == ids.TRADE_EXPERIENCE:
+            experience = int(entry.payload.value)
+    return tier, experience
 
 
 def _unsupported_view_pose(words: _PlayerFlagWords, binding) -> bool:
@@ -1895,6 +1914,11 @@ class Entities:
                 if owner != state.owner_entity_id or sitting != state.sitting:
                     state = replace(state, owner_entity_id=owner, sitting=sitting)
                     self._by_runtime[runtime_id] = state
+            elif state is not None and state.actor_type == _VILLAGER:
+                tier, experience = _villager_trade_progress(metadata, b, state.trade_tier, state.trade_experience)
+                if tier != state.trade_tier or experience != state.trade_experience:
+                    state = replace(state, trade_tier=tier, trade_experience=experience)
+                    self._by_runtime[runtime_id] = state
             visible_observers = ()
             if state is not None and self._visible_effect_target(runtime_id):
                 visible_effects = _visible_effects_value(metadata, b)
@@ -1988,6 +2012,9 @@ class Entities:
             owner = None
             if actor.actor_type in (_WOLF, "minecraft:fishing_hook"):
                 owner = _owner_entity_id(actor.data.data, b)
+            trade_tier, trade_experience = (
+                _villager_trade_progress(actor.data.data, b) if actor.actor_type == _VILLAGER else (None, None)
+            )
             attachment = None
             if actor.actor_type == _FIREWORK:
                 # Fireworks use this metadata for the attached actor's unique ID.
@@ -2014,6 +2041,8 @@ class Entities:
                 visible_effects_value=_visible_effects_value(getattr(getattr(actor, "data", None), "data", ()), b)
                 if runtime_id != self._own_runtime_id else None,
                 sitting=_wolf_sitting(actor.data.data, b) if actor.actor_type == _WOLF else None,
+                trade_tier=trade_tier,
+                trade_experience=trade_experience,
             )
             if (not startup and self._attached_firework_observers and self._own_entity_id
                     and runtime_id != self._own_runtime_id and state.firework_attached_entity_id == self._own_entity_id):
