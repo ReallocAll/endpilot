@@ -523,6 +523,7 @@ class Bot:
             session.packets, session.identity.uuid, session.player_unique_id,
             initial_catalog_packets=session.command_catalog_packets,
             initial_commands_enabled=session.commands_enabled,
+            _on_chat_output=self._chat._on_command_output,
         )
         session.command_catalog_packets.clear()
         self._commands.start()

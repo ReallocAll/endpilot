@@ -104,7 +104,21 @@ python -m pip install -e ".[mcp]"
 Configure your MCP client to launch `python -m endpilot.mcp_server` over stdio
 using the Python environment where you installed the SDK. Call `connect` with a
 NetherNet signaling URL or a `raknet://host:port` address. The default player
-name is `EndPilot`. Call `disconnect` when finished.
+name is `EndPilot` and the default locale is `en_US`. Call `disconnect` when
+finished.
+
+To render translated chat entries, add a local Bedrock `.lang` file to the MCP
+server's launch arguments. Repeat `--chat-language` to provide other locales.
+
+```sh
+python -m endpilot.mcp_server --chat-language zh_CN /path/to/zh_CN.lang
+```
+
+Pass `locale="zh_CN"` to `connect` to use that language for the player.
+`reconnect` and `switch_account` retain the connection locale. File paths are
+configured in the host launch arguments. `subscribe_chat` keeps ordinary text
+and the original translation keys and parameters when no translation is
+available. Inspect untranslated compound text through `raw_message`.
 [MCP tests](../../tests/test_mcp.py)
 
 ## Place a block

@@ -1,7 +1,7 @@
 """Published commands, player command feedback and command block edits."""
 
 import asyncio
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from math import isfinite
 import re
@@ -207,10 +207,12 @@ class Commands:
     def __init__(
         self, packets, player_uuid: uuid.UUID, player_unique_id: int, *,
         initial_catalog_packets: Iterable[RawPacket] = (), initial_commands_enabled: bool | None = None,
+        _on_chat_output: Callable | None = None,
     ):
         self.packets = packets
         self.player_uuid = player_uuid
         self.player_unique_id = player_unique_id
+        self._on_chat_output = _on_chat_output
         self._lock = asyncio.Lock()
         self._command_block_lock = asyncio.Lock()
         self._server_disconnected = False
@@ -382,12 +384,14 @@ class Commands:
         async with asyncio.timeout_at(deadline):
             return await self._request_feedback(
                 packet, binding.CommandOutputPacket.ID, matches, timeout=None, deadline=deadline,
+                on_response=self._on_chat_output,
             )
 
-    async def _request_feedback(self, packet, packet_id, matches, *, timeout, deadline=None):
+    async def _request_feedback(self, packet, packet_id, matches, *, timeout, deadline=None, on_response=None):
         protocol = self.packets.protocol
         disconnect = protocol.binding.DisconnectPacket.ID
         feedback = None
+        send_started = False
 
         def observe(raw):
             nonlocal feedback
@@ -396,14 +400,18 @@ class Commands:
             response = protocol.decode(raw)
             if matches(response):
                 feedback = response
+                if send_started and on_response is not None:
+                    on_response(response)
                 return True
             return False
 
         def check_deadline_and_context():
+            nonlocal send_started
             if self._closed:
                 raise ConnectionError(_DISCONNECT_ERROR)
             if asyncio.get_running_loop().time() >= deadline:
                 raise TimeoutError(_OUTPUT_TIMEOUT_ERROR)
+            send_started = True
 
         async with self._lock:
             if self._server_disconnected:

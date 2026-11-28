@@ -1,17 +1,20 @@
 """Stdio MCP tools over the same player actions used by ordinary Python scripts."""
 
+import argparse
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from functools import wraps
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
 from urllib.parse import urlsplit
 
 from ._join_address import _parse_join_address
 from ._mcp_accounts import AccountError, MCPAccounts
+from .authentication import DEFAULT_LOCALE, _validate_locale
 from .blocks import BlockChange, BlockUpdate
 from .bot import Bot
 from .inventory import HeldItemStack
@@ -37,6 +40,7 @@ class _ConnectionTarget:
     name: str
     xuid: str | None = None
     accept_resource_packs: bool = False
+    locale: str = DEFAULT_LOCALE
 
     def __post_init__(self) -> None:
         if self.xuid is not None:
@@ -144,8 +148,9 @@ def _stack_snapshot(stack: HeldItemStack) -> _StackSnapshot:
 
 
 class MCPPlayer:
-    def __init__(self):
+    def __init__(self, *, chat_languages: Mapping[str, bytes] | None = None):
         self.bot: Bot | None = None
+        self._chat_languages = dict(chat_languages or {})
         self._pending: dict[tuple[tuple[int, int, int], int], asyncio.Task[BlockUpdate]] = {}
         self._observed: dict[tuple[tuple[int, int, int], int], BlockUpdate] = {}
         self._reading: set[asyncio.Task] = set()
@@ -227,16 +232,18 @@ class MCPPlayer:
                 "last_end": end or self._last_end, "last_join_failure": self._join_failure}
 
     async def connect(self, url: str, name: str = "EndPilot", xuid: str | None = None, *,
-                      accept_resource_packs: bool = False) -> dict:
+                      accept_resource_packs: bool = False, locale: str = DEFAULT_LOCALE) -> dict:
         """Join a server explicitly, optionally accepting its resource packs."""
         if type(accept_resource_packs) is not bool:
             raise TypeError("accept_resource_packs must be a boolean")
+        _validate_locale(locale)
         async with self._lifecycle:
             if self.bot is not None and self.bot.session_end is None:
                 raise RuntimeError("a player is already connected")
             if self.bot is not None:
                 await self._disconnect_owned(self.bot)
-            return await self._join(_ConnectionTarget(url, name, xuid, accept_resource_packs=accept_resource_packs))
+            return await self._join(_ConnectionTarget(url, name, xuid, accept_resource_packs=accept_resource_packs,
+                                                      locale=locale))
 
     async def reconnect(self) -> dict:
         """Explicitly open a fresh connection using the last requested server and identity."""
@@ -294,8 +301,8 @@ class MCPPlayer:
 
             self._target = target
             try:
-                bot = Bot(target.name)
-                options = {}
+                bot = Bot(target.name, chat_languages=self._chat_languages)
+                options = {"locale": target.locale}
                 if target.xuid is not None:
                     options["credential_provider"] = self._accounts.credential_provider(bot, xuid=target.xuid)
                 if target.accept_resource_packs:
@@ -626,7 +633,8 @@ class MCPPlayer:
             return {"disconnected": True}
 
 
-def create_server(*extensions: Callable[["MCPServer", MCPPlayer], None]) -> "MCPServer":
+def create_server(*extensions: Callable[["MCPServer", MCPPlayer], None],
+                  chat_languages: Mapping[str, bytes] | None = None) -> "MCPServer":
     """Register extra tools against the same player as the built-in tools."""
     from mcp.server.mcpserver import MCPServer
     from mcp.server.mcpserver.exceptions import ToolError
@@ -634,18 +642,19 @@ def create_server(*extensions: Callable[["MCPServer", MCPPlayer], None]) -> "MCP
 
     from ._mcp_scripts import MCPScripts
 
-    player = MCPPlayer()
+    player = MCPPlayer(chat_languages=chat_languages)
     scripts = MCPScripts(player)
     player.add_connection_cleanup(scripts.close)
     server = MCPServer("EndPilot", lifespan=player.lifespan)
 
     async def connect(url: str, name: str = "EndPilot", xuid: str | None = None, *,
-                      accept_resource_packs: StrictBool = False) -> dict:
+                      accept_resource_packs: StrictBool = False, locale: str = DEFAULT_LOCALE) -> dict:
         """Join a server explicitly. Use xuid for a remembered Xbox account.
 
         Set accept_resource_packs to true to download and verify the server's resource packs.
+        Set locale to the Bedrock language code for this connection.
         """
-        return await player.connect(url, name, xuid, accept_resource_packs=accept_resource_packs)
+        return await player.connect(url, name, xuid, accept_resource_packs=accept_resource_packs, locale=locale)
 
     def register_join(tool):
         @wraps(tool)
@@ -680,7 +689,7 @@ def create_server(*extensions: Callable[["MCPServer", MCPPlayer], None]) -> "MCP
     return server
 
 
-async def _run_stdio() -> None:
+async def _run_stdio(*, chat_languages: Mapping[str, bytes] | None = None) -> None:
     import sys
 
     from anyio import wrap_file
@@ -734,7 +743,7 @@ async def _run_stdio() -> None:
                 self.flushing = None
                 self.flushed.set()
 
-    server = create_server()
+    server = create_server(chat_languages=chat_languages)
 
     @server.tool()
     async def shutdown(ctx: Context) -> _ShutdownReply:
@@ -760,5 +769,21 @@ async def _run_stdio() -> None:
             await kernel.run(incoming, outgoing, kernel.create_initialization_options())
 
 
+def _main() -> None:
+    parser = argparse.ArgumentParser(prog="python -m endpilot.mcp_server", description=__doc__)
+    parser.add_argument("--chat-language", nargs=2, action="append", default=[], metavar=("LOCALE", "FILE"),
+                        help="load a local Bedrock language file for this locale (repeatable)")
+    languages = {}
+    for locale, filename in parser.parse_args().chat_language:
+        try:
+            _validate_locale(locale)
+            languages[locale] = Path(filename).read_bytes()
+        except ValueError as error:
+            parser.error(str(error))
+        except OSError as error:
+            parser.error(f"could not read chat language file: {error}")
+    asyncio.run(_run_stdio(chat_languages=languages))
+
+
 if __name__ == "__main__":
-    asyncio.run(_run_stdio())
+    _main()

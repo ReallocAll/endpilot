@@ -5,6 +5,7 @@ from importlib.util import find_spec
 import json
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -19,8 +20,9 @@ from test_placement import PLACED_ID, SUPPORT, TARGET, _PlacementHarness
 
 
 class FakeBot:
-    def __init__(self, name):
+    def __init__(self, name, *, chat_languages=None):
         self.player_id = 17
+        self.chat_languages = chat_languages
         self._session_end = _SessionEndState()
         self.updated = asyncio.Event()
         self.closed = False
@@ -31,11 +33,13 @@ class FakeBot:
         self.walk_done = asyncio.Event()
         self.blocks = {}
 
-    async def join_nethernet(self, url):
+    async def join_nethernet(self, url, *, locale="en_US"):
         self.url = url
+        self.locale = locale
 
-    async def join_raknet(self, host, port):
+    async def join_raknet(self, host, port, *, locale="en_US"):
         self.url = (host, port)
+        self.locale = locale
 
     async def wait_for_block_update(self, position, *, layer, timeout):
         async with asyncio.timeout(timeout):
@@ -179,6 +183,7 @@ class MCPPlayerTests(unittest.IsolatedAsyncioTestCase):
                     await player.connect(address)
                     try:
                         self.assertEqual(player.bot.url, endpoint)
+                        self.assertEqual(player.bot.locale, "en_US")
                     finally:
                         await player.disconnect()
 
@@ -202,6 +207,26 @@ class MCPPlayerTests(unittest.IsolatedAsyncioTestCase):
                         await player.connect(address)
                     self.assertIsNone(player.bot)
             bot_factory.assert_not_called()
+
+    async def test_connect_keeps_locale_and_host_language_bytes_for_replacement(self):
+        language = b"commands.players.list.names=%s\n"
+        config = {"zh_CN": language}
+        player = MCPPlayer(chat_languages=config)
+        config.clear()
+        self.addAsyncCleanup(player.disconnect)
+        with patch("endpilot.mcp_server.Bot", wraps=FakeBot) as bot_factory:
+            with self.assertRaisesRegex(ValueError, "locale"):
+                await player.connect("http://localhost:19132", locale="../zh_CN")
+            bot_factory.assert_not_called()
+            await player.connect("http://localhost:19132", locale="zh_CN")
+            self.assertEqual(player.bot.locale, "zh_CN")
+            self.assertEqual(player.bot.chat_languages, {"zh_CN": language})
+            await player.reconnect()
+            self.assertEqual(player.bot.locale, "zh_CN")
+            await player.switch_account(name="OtherPlayer")
+            self.assertEqual(player.bot.locale, "zh_CN")
+            self.assertEqual(player.bot.chat_languages, {"zh_CN": language})
+            self.assertEqual(bot_factory.call_count, 3)
 
     async def test_disconnect_cancels_pending_block_wait(self):
         with patch("endpilot.mcp_server.Bot", FakeBot):
@@ -759,6 +784,123 @@ class MCPPlacementHandoffTests(_PlacementHarness):
 
 @unittest.skipUnless(find_spec("mcp") is not None, "optional MCP SDK unavailable")
 class MCPStdioTests(unittest.IsolatedAsyncioTestCase):
+    async def test_host_chat_language_reaches_worker_through_stdio_connect(self):
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+
+        source = Path(endpilot.__file__).resolve().parents[1]
+        peer = """
+import asyncio
+import json
+import runpy
+from unittest.mock import patch
+
+from endpilot.protocol import Protocol, RawPacket, read_batch, write_batch
+
+protocol = Protocol(2225)
+b = protocol.binding
+# A compound /tellraw TEXT_OBJECT_WHISPER from the stock resource-pack test.
+compound = RawPacket(b.TextPacket.ID, bytes.fromhex(
+    '0000099b017b2272617774657874223a5b7b2274657874223a22455054582d73657175656e7469616c7c227d2c'
+    '7b227472616e736c617465223a22656e6470696c6f742e7061636b746578742e73657175656e6365222c227769'
+    '7468223a7b2272617774657874223a5b7b2274657874223a22416c696365227d2c7b2274657874223a22736e'
+    '6f77227d5d7d7d2c7b2274657874223a227c656e64227d5d7d0a000000'
+))
+
+class Transport:
+    def __init__(self):
+        self.incoming = asyncio.Queue()
+        self.deliver(b.NetworkSettingsPacket(compression_algorithm=b.PacketCompressionAlgorithm.NONE))
+        self.deliver(b.StartGamePacket(runtime_id=41, entity_id=41),
+                     b.PlayStatusPacket(status=b.PlayStatus.PLAYER_SPAWN))
+
+    def deliver(self, *packets):
+        self.incoming.put_nowait(write_batch(packet if isinstance(packet, RawPacket) else protocol.encode(packet)
+                                            for packet in packets))
+
+    async def send(self, data):
+        for raw in read_batch(data):
+            if raw.packet_id == b.CommandRequestPacket.ID:
+                assert protocol.decode(raw).command == '/list'
+                contents = {'rawtext': [{'translate': 'commands.players.list',
+                                         'with': ['1', '4']}]}
+                self.deliver(
+                    b.TextPacket(body=b.TextPacket.MessageOnly(type=b.TextPacketType.TEXT_OBJECT,
+                                                               message=json.dumps(contents))),
+                    compound,
+                    b.TextPacket(body=b.TextPacket.AuthorAndMessage(type=b.TextPacketType.CHAT,
+                                                                    author='Player', message='barrier')),
+                )
+
+    async def recv(self):
+        return await self.incoming.get()
+
+    async def close(self):
+        pass
+
+async def dial(url, **kwargs):
+    return Transport()
+
+with patch('endpilot.transport.nethernet.connect', dial):
+    runpy.run_module('endpilot.mcp_server', run_name='__main__')
+"""
+        worker = """
+import asyncio
+
+async def main(bot):
+    rows = []
+    barrier = asyncio.Event()
+    def record(event):
+        rows.append([event.message, event.kind, event.translation_key, event.params, event.raw_message])
+        if event.message == 'barrier':
+            barrier.set()
+    unsubscribe = bot.subscribe_chat(record)
+    try:
+        await bot.send_command('/list')
+        await asyncio.wait_for(barrier.wait(), 5)
+        return rows
+    finally:
+        unsubscribe()
+"""
+        with TemporaryDirectory() as folder:
+            language = Path(folder) / "local.zh_CN.lang"
+            language.write_text("commands.players.list=目前有 %1$d/%2$d 个玩家在线：\n"
+                                "endpilot.packtext.sequence=%s 获得 %s\n", encoding="utf-8")
+            raw_message = (
+                '{"rawtext":[{"text":"EPTX-sequential|"},{"translate":"endpilot.packtext.sequence",'
+                '"with":{"rawtext":[{"text":"Alice"},{"text":"snow"}]}},{"text":"|end"}]}\n'
+            )
+            for configured, message in ((False, None), (True, "目前有 1/4 个玩家在线：")):
+                with self.subTest(configured=configured):
+                    args = ["-B", "-c", peer]
+                    if configured:
+                        args.extend(("--chat-language", "zh_CN", str(language)))
+                    params = StdioServerParameters(command=sys.executable, args=args,
+                                                   env={"PYTHONPATH": str(source)})
+                    async with stdio_client(params) as (incoming, outgoing), ClientSession(
+                        incoming, outgoing, read_timeout_seconds=10,
+                    ) as session:
+                        await session.initialize()
+
+                        async def call(tool, **arguments):
+                            result = await session.call_tool(tool, arguments)
+                            self.assertFalse(result.is_error, result)
+                            return result.structured_content or json.loads(result.content[0].text)
+
+                        await call("connect", url="http://127.0.0.1", locale="zh_CN")
+                        run_id = (await call("run_script", source=worker))["run_id"]
+                        async with asyncio.timeout(10):
+                            while (report := await call("observe_script", run_id=run_id))["state"] == "running":
+                                await asyncio.sleep(0.01)
+                        self.assertEqual(report["state"], "succeeded", report)
+                        self.assertEqual(report["result"], [
+                            [message, "command", "commands.players.list", ["1", "4"], None],
+                            ["EPTX-sequential|Alice 获得 snow|end" if configured else None,
+                             "whisper", None, None, raw_message],
+                            ["barrier", "chat", None, None, None],
+                        ])
+                        self.assertEqual(await call("shutdown"), {"shutdown": True})
+
     async def test_cancelled_disconnect_closes_transport_before_reconnect(self):
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import stdio_client
@@ -906,6 +1048,8 @@ with patch("endpilot.mcp_server.MCPPlayer", Player), patch("endpilot.transport.n
                 self.assertIs(tools["shutdown"].output_schema["properties"]["shutdown"]["const"], True)
                 connect = tools["connect"].input_schema
                 self.assertEqual(set(connect["required"]), {"url"})
+                self.assertEqual(set(connect["properties"]), {"url", "name", "xuid", "accept_resource_packs", "locale"})
+                self.assertEqual(connect["properties"]["locale"]["default"], "en_US")
                 self.assertEqual(connect["properties"]["accept_resource_packs"]["type"], "boolean")
                 self.assertIs(connect["properties"]["accept_resource_packs"]["default"], False)
                 rejected = await session.call_tool("connect", {"url": "invalid", "accept_resource_packs": "true"})

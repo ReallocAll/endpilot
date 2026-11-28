@@ -11,7 +11,7 @@ from endpilot import Bot, ResourcePackIndex, TextEvent
 from endpilot.chat import Chat, ChatMessage
 from endpilot.compression import PacketConnection
 from endpilot.login import JoinSession
-from endpilot.protocol import Protocol, read_batch, write_batch
+from endpilot.protocol import Protocol, RawPacket, read_batch, write_batch
 
 
 class ChatTests(unittest.IsolatedAsyncioTestCase):
@@ -59,7 +59,7 @@ class PublicChatPatternTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.bot.close)
         await self.join()
 
-    async def join(self, *, locale="en_US", resource_pack_index=None):
+    async def join(self, *, locale="en_US", resource_pack_index=None, player_unique_id=1):
         self.incoming = asyncio.Queue()
         self.transport = SimpleNamespace(recv=self.incoming.get, send=AsyncMock(), close=AsyncMock())
         settings = self.protocol.binding.NetworkSettingsPacket(
@@ -68,7 +68,7 @@ class PublicChatPatternTests(unittest.IsolatedAsyncioTestCase):
         )
         packets = PacketConnection(self.transport, self.protocol, settings)
         session = JoinSession(packets, self.bot.identity, "http://127.0.0.1:19132")
-        session.player_id = session.player_unique_id = 1
+        session.player_id, session.player_unique_id = 1, player_unique_id
         session.resource_pack_index = resource_pack_index
         with patch.object(JoinSession, "connect_nethernet", return_value=session):
             await self.bot.join_nethernet(session.address, locale=locale)
@@ -509,6 +509,117 @@ class PublicChatPatternTests(unittest.IsolatedAsyncioTestCase):
                   ChatMessage(None, "§ePlayer a quitté la partie", "leave", "§e%multiplayer.player.left", ("Player",))]
         self.assertEqual(old, [ChatMessage(None, "Overlay A Player", "death", "death.attack.lava", ("Player",)), *common])
         self.assertEqual(new, [ChatMessage(None, "Overlay B Player", "death", "death.attack.lava", ("Player",)), *common])
+
+    async def test_list_history_keeps_both_translations_and_repeated_rows(self):
+        await self.bot.close()
+        self.bot = Bot("PatternObserver", chat_languages={"zh_CN": (
+            "commands.players.list=目前有 %1$d/%2$d 个玩家在线：\ncommands.players.list.names=%s\n"
+        ).encode()})
+        self.addAsyncCleanup(self.bot.close)
+        self.protocol = self.bot.protocol
+        await self.join(locale="zh_CN")
+        history, text = [], []
+        self.bot.subscribe_chat(history.append)
+        self.bot.subscribe_text(text.append)
+        binding = self.protocol.binding
+        keys = ("commands.players.list", "commands.players.list.names")
+        bodies = [binding.TextPacket.MessageOnly(type=TextPacketType.TEXT_OBJECT, message=message) for message in (
+            '{"rawtext":[{"translate":"commands.players.list","with":{"rawtext":[{"text":"1"},{"text":"4"}]}}]}',
+            '{"rawtext":[{"translate":"commands.players.list.names","with":{"rawtext":[{"text":"Player"}]}}]}',
+        )]
+        await self.bot.send_command("list")
+        self.assertEqual(history, [])
+        await self.deliver(*bodies)
+
+        async def respond(_message):
+            await self.deliver(*bodies)
+
+        self.transport.send.side_effect = respond
+        native = await self.bot.execute_command("/list", timeout=2)
+        self.assertEqual(native.body.message, bodies[0].message)
+        self.assertEqual([event.message for event in text], [body.message for body in bodies] * 2)
+        self.assertEqual(history, [ChatMessage(None, "目前有 1/4 个玩家在线：", "command", keys[0], ("1", "4")),
+                                   ChatMessage(None, "Player", "command", keys[1], ("Player",))] * 2)
+
+    async def test_compound_chat_rawtext_keeps_position_and_source_without_a_translation(self):
+        b = self.protocol.binding
+        # Stock 2225 /tellraw to EPTextEN. The client received one rawtext whisper.
+        stock = RawPacket(9, bytes.fromhex(
+            "00000995017b2272617774657874223a5b7b2274657874223a22455054582d6275696c742d696e7c227d2c7b2274"
+            "72616e736c617465223a22636861742e747970652e616e6e6f756e63656d656e74222c2277697468223a7b227261"
+            "7774657874223a5b7b2274657874223a22416c696365227d2c7b2274657874223a22736e6f77227d5d7d7d2c7b"
+            "2274657874223a227c656e64227d5d7d0a000000"
+        ))
+        raw_message = self.protocol.decode(stock).body.message
+        multiple = '{"rawtext":[{"translate":"one","with":["A"]},{"translate":"two","with":["B"]}]}'
+        compound = b.TextPacket(body=b.TextPacket.MessageOnly(type=TextPacketType.TEXT_OBJECT, message=multiple))
+        after = b.TextPacket(body=self.player_chat("after"))
+        packets = (stock, self.protocol.encode(compound), self.protocol.encode(after))
+
+        async def observe():
+            values = []
+            self.bot.subscribe_chat(values.append)
+            self.incoming.put_nowait(b"\xff" + write_batch(packets))
+            await asyncio.sleep(0)
+            return values
+
+        original = await observe()
+        self.assertEqual(original, [ChatMessage(None, None, "whisper", raw_message=raw_message),
+                                    ChatMessage(None, None, "server", raw_message=multiple), ChatMessage("Player", "after")])
+        await self.bot.close()
+        self.bot = Bot("PatternObserver", chat_languages={
+            "en_US": b"chat.type.announcement=[%s] %s\none=first %s\ntwo= second %s\n",
+        })
+        self.addAsyncCleanup(self.bot.close)
+        await self.join()
+        translated = await observe()
+        self.assertEqual(translated, [ChatMessage(None, "EPTX-built-in|[Alice] snow|end", "whisper", raw_message=raw_message),
+                                      ChatMessage(None, "first A second B", "server", raw_message=multiple),
+                                      ChatMessage("Player", "after")])
+
+    async def test_list_history_projects_only_the_matched_visible_native_output(self):
+        b = self.protocol.binding
+        history, texts = [], []
+        self.bot.subscribe_chat(history.append)
+        self.bot.subscribe_text(texts.append)
+        keys = ("commands.players.list", "commands.players.list.names")
+        messages = [b.CommandOutputMessage(message_id=key, successful=True, params=params)
+                    for key, params in zip(keys, (["2", "4"], ["Other, Player"]))]
+        previous = self.bot.identity.uuid
+
+        def response(origin_uuid, origin_type, output_type, rows):
+            return b.CommandOutputPacket(
+                origin_data=b.CommandOriginData(type=origin_type, uuid=origin_uuid, request_id="", player_id=0),
+                output=b.CommandOutput(type=output_type, success_count=bool(rows), messages=rows),
+            )
+
+        false_type = b.CommandOriginType.DEDICATED_SERVER
+        all_output = b.CommandOutputType.ALL_OUTPUT
+        player = b.CommandOriginType.PLAYER
+        responses = iter(((all_output, messages), (all_output, messages), (b.CommandOutputType.SILENT, messages),
+                          (all_output, [])))
+
+        async def respond(batch):
+            nonlocal previous
+            raw, = read_batch(zlib.decompress(batch[1:], wbits=-15) if batch[0] == 0 else batch[1:])
+            request = self.protocol.decode(raw)
+            self.assertIsInstance(request, b.CommandRequestPacket)
+            self.assertEqual(request.command, "/list")
+            origin = request.origin.uuid
+            self.assertNotEqual(origin, previous)
+            mode, rows = next(responses)
+            replies = [response(previous, player, all_output, messages), response(origin, false_type, all_output, messages),
+                       response(origin, player, mode, rows), response(origin, player, mode, rows)]
+            self.incoming.put_nowait(b"\xff" + write_batch(self.protocol.encode(reply) for reply in replies))
+            previous = origin
+
+        self.transport.send.side_effect = respond
+        for _ in range(4):
+            await self.bot.execute_command_output("/list", timeout=2)
+
+        self.assertEqual(history, [ChatMessage(None, None, "command", keys[0], ("2", "4")),
+                                   ChatMessage(None, None, "command", keys[1], ("Other, Player",))] * 2)
+        self.assertEqual(texts, [])
 
     async def test_callback_exceptions_do_not_interrupt_other_callbacks_or_waiters(self):
         pattern = self.bot.add_chat_pattern("signal", "^signal")

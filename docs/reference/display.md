@@ -29,7 +29,7 @@ sender name. The callback runs synchronously in receive order. Call the
 returned function to unsubscribe or register again after reconnecting.
 
 `ChatMessage.kind` identifies the entry as `chat`, `whisper`, `join`, `leave`,
-`death`, or `server`. A public player chat keeps its separate `author` and
+`death`, `server`, or `command`. A public player chat keeps its separate `author` and
 verbatim message body. A received whisper also carries its author and body.
 An entry whose sender is unavailable has `author=None`. Repeated messages
 are delivered separately. Tips, popups, jukebox notices, titles, subtitles,
@@ -40,8 +40,15 @@ Translation entries preserve `translation_key` and `params`. Load local
 base language bytes using `Bot(chat_languages={"en_US": lang_bytes})`. The bot
 selects the locale of each login and applies the effective `.lang` file from
 that connection's resource pack stack. When a translation cannot be resolved,
-the callback receives the original key and parameters with `message=None`.
+the callback still receives the entry with `message=None`. Compound rawtext
+keeps its original JSON in `raw_message`.
 Use `subscribe_text()` for the original wire fields, including text objects.
+
+Stock `/list` chat feedback carries the player count and player names as
+separate entries in their received order. The SDK observes the corresponding
+text objects and the visible `ALL_OUTPUT` responses to this session's
+`execute_command_output()` calls. `SILENT` responses remain available to the
+command caller through the existing typed API.
 
 ## Match display text
 
