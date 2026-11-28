@@ -312,7 +312,7 @@ class RecipeDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             b.ItemData(id=5, name="minecraft:egg"),
             b.ItemData(id=6, name="minecraft:blue_egg"),
         ])
-        await self.join(before_spawn=(recipe, registry, self.inventory((5, 1, 0), (6, 1, 0))))
+        await self.join(False, (recipe, registry, self.inventory((5, 1, 0), (6, 1, 0))))
         one = self.bot.plan_recipe_delta(11)
         self.assertIn(one.materials, (
             ((RecipeItemAmount(5, 0, 1, "minecraft:egg"),),),
@@ -325,6 +325,8 @@ class RecipeDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         ),))
         self.assertEqual([(item.item_id, item.count) for item in two.delta], [(5, -1), (6, -1), (3, 4)])
         self.assertIsNone(self.bot.plan_recipe_delta(11, times=3))
+        self.assertEqual(self.bot.recipes_for("stick", min_result_count=4), (two.recipe,))
+        self.assertEqual(self.bot.recipes_for("stick", min_result_count=5), ())
 
         await self.bot.close()
         self.incoming = asyncio.Queue()
@@ -351,33 +353,49 @@ class RecipeDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertEqual(self.bot.packets.transport.send.await_count, sent)
         self.assertIsNone(self.bot.open_window)
-        self.assertNotIn(self.bot.get_recipe(7), self.bot.recipes_for("stick"))
-        self.assertNotIn(self.bot.get_recipe(8), self.bot.recipes_for("stick"))
+        self.assertIn(self.bot.get_recipe(7), self.bot.recipes_for("stick"))
+        self.assertIn(self.bot.get_recipe(8), self.bot.recipes_for("stick"))
 
         await self.delivered(self.inventory((1, 3, 3), (2, 3, 0)))
         self.assertIsNone(self.bot.plan_recipe_delta(8, times=2))
+        self.assertNotIn(self.bot.get_recipe(8), self.bot.recipes_for("stick", min_result_count=2))
         await self.delivered(self.inventory((1, 4, 3), (2, 2, 0)))
         self.assertEqual(self.bot.plan_recipe_delta(8, times=2).materials, ((
             RecipeItemAmount(1, 3, 2, "minecraft:oak_planks"), RecipeItemAmount(2, 0, 2, "minecraft:birch_planks"),
         ), (RecipeItemAmount(1, 3, 2, "minecraft:oak_planks"),)))
+        self.assertIn(self.bot.get_recipe(8), self.bot.recipes_for("stick", min_result_count=2))
 
         # The two whole-batch groups pass their individual bounds, but cannot
         # both consume the same oak. Unrelated inventory does not help.
         await self.delivered(self.inventory((1, 2, 3), (2, 2, 0), (3, 1, 0), (4, 10, 0)))
         self.assertIsNone(self.bot.plan_recipe_delta(12))
+        self.assertNotIn(self.bot.get_recipe(12), self.bot.recipes_for("wooden_pickaxe"))
         await self.delivered(self.inventory((1, 4, 3), (2, 2, 0), (3, 1, 0)))
         plan = self.bot.plan_recipe_delta(12)
         self.assertEqual({plan.materials[i][0].item_id for i in (0, 2)}, {1, 2})
         self.assertEqual(plan.materials[1], (RecipeItemAmount(1, 3, 2, "minecraft:oak_planks"),))
         self.assertEqual(plan.materials[3], (RecipeItemAmount(3, 0, 1, "minecraft:stick"),))
+        self.assertIn(plan.recipe, self.bot.recipes_for("wooden_pickaxe"))
 
     async def test_plan_never_mixes_concrete_ids_with_same_name_and_aux_in_a_batch(self):
         b = self.b
         oak = "minecraft:oak_planks"
-        recipe = self.shapeless("test:concrete_ids", 7, [({"name": oak}, 2, 3)], [(3, 1, 0)])
-        registry = b.ItemRegistryPacket(items=[b.ItemData(id=item_id, name=oak) for item_id in (1, 7)])
-        await self.join(before_spawn=(recipe, registry, self.inventory((1, 1, 3), (7, 1, 3))))
+        recipe = self.shapeless("test:concrete_ids", 7, [({"name": oak}, 2, 3)], [(3, 1, 0)], clear=True)
+        tagged = self.shapeless("test:concrete_tag", 8, [({"item_tag": "minecraft:planks"}, 2, 32767)], [(3, 1, 0)])
+        registry = b.ItemRegistryPacket(items=[
+            b.ItemData(id=1, name=oak), b.ItemData(id=7, name=oak),
+            b.ItemData(id=2, name="minecraft:birch_planks"), b.ItemData(id=3, name="minecraft:stick"),
+        ])
+        await self.join(False, (recipe, tagged, registry, self.inventory((1, 1, 3), (7, 1, 3))))
         self.assertIsNone(self.bot.plan_recipe_delta(7))
+        self.assertEqual(self.bot.recipes_for("stick"), ())
+
+        for other in ((2, 1, 3), (1, 1, 4)):
+            await self.delivered(self.inventory((1, 1, 3), other))
+            self.assertIsNone(self.bot.plan_recipe_delta(8))
+            self.assertEqual(self.bot.recipes_for("stick"), ())
+        await self.delivered(self.inventory((1, 1, 3), (1, 1, 3)))
+        self.assertEqual(self.bot.recipes_for("stick"), (self.bot.get_recipe(7), self.bot.get_recipe(8)))
 
         await self.delivered(self.inventory((1, 2, 3), (7, 2, 3)))
         self.assertIn(self.bot.plan_recipe_delta(7).materials, (
@@ -388,6 +406,8 @@ class RecipeDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(two.materials, ((RecipeItemAmount(1, 3, 2, oak), RecipeItemAmount(7, 3, 2, oak)),))
         self.assertEqual([(item.item_id, item.count) for item in two.delta], [(1, -2), (7, -2), (3, 2)])
         self.assertIsNone(self.bot.plan_recipe_delta(7, times=3))
+        self.assertEqual(self.bot.recipes_for("stick", min_result_count=2), (two.recipe, self.bot.get_recipe(8)))
+        self.assertEqual(self.bot.recipes_for("stick", min_result_count=3), ())
 
     async def test_plan_counts_complete_batches_for_repeated_compatible_positions(self):
         catalog, registry, short, enough = self.plank_ring()
@@ -395,6 +415,7 @@ class RecipeDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         sent = self.bot.packets.transport.send
         before = sent.await_count
         self.assertIsNone(self.bot.plan_recipe_delta("test:plank_ring"))
+        self.assertNotIn(self.bot.get_recipe("test:plank_ring"), self.bot.recipes_for("wooden_pickaxe", grid_size=3))
         self.assertEqual(sent.await_count, before)
 
         await self.delivered(enough)
@@ -410,6 +431,7 @@ class RecipeDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({item.item_id: item.count for item in plan.delta}, {
             50: -4, **{item_id: -2 for item_id in range(51, 57)}, 3: -1, 4: 1,
         })
+        self.assertIn(plan.recipe, self.bot.recipes_for("wooden_pickaxe", grid_size=3))
         self.assertEqual(sent.await_count, before)
         self.assertIsNone(self.bot.open_window)
 
@@ -446,6 +468,75 @@ class RecipeDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             (RecipeItemAmount(1, 3, 2, "minecraft:oak_planks"),),
         ))
         self.assertIsNone(self.bot.plan_recipe_delta(4, times=2))
+
+    async def test_recipes_for_tracks_confirmed_slots_after_dropping_an_oak_log(self):
+        b = self.b
+
+        def log(net_id):
+            return b.SerializedNetworkItemStackDescriptor(id=17, stack_size=1, net_id_variant=net_id)
+
+        empty = b.SerializedNetworkItemStackDescriptor()
+        registry = b.ItemRegistryPacket(items=[
+            b.ItemData(id=17, name="minecraft:oak_log"),
+            b.ItemData(id=5, name="minecraft:oak_planks"),
+        ])
+        catalog = b.CraftingDataPacket(clear_recipes=True, shaped_recipes=[b.ShapedRecipePayload(
+            recipe_id="minecraft:oak_planks", net_id=3587, width=1, height=1, tag="crafting_table",
+            ingredients=[b.SerializedRecipeIngredient(descriptor={"name": "minecraft:oak_log"},
+                                                        stack_size=1, aux_value=32767)],
+            results=[b.SerializedNetworkItemInstanceDescriptor(id=5, stack_size=4, block_runtime_id=1921718966)],
+        )])
+        stocked = b.InventoryContentPacket(inventory_id=b.ContainerID.INVENTORY, slots=[log(31)])
+        await self.join(False, (registry, catalog, stocked))
+        send = self.bot.packets.transport.send
+        recipe = self.bot.get_recipe(3587)
+
+        def check(logs):
+            before = send.await_count
+            self.assertEqual(self.bot.recipes_all("oak_planks", grid_size=2), (recipe,))
+            for crafts in (1, 2):
+                plan = self.bot.plan_recipe_delta(3587, times=crafts)
+                self.assertEqual(plan is not None, crafts <= logs)
+                self.assertEqual(self.bot.recipes_for("oak_planks", min_result_count=4 * crafts, grid_size=2),
+                                 (recipe,) if crafts <= logs else ())
+            self.assertEqual(send.await_count, before)
+            self.assertIsNone(self.bot.open_window)
+
+        def slot(index, item):
+            return b.InventorySlotPacket(inventory_id=b.ContainerID.INVENTORY, slot=index, item=item)
+
+        check(1)
+        await self.bot.drop_selected_item(whole_stack=True)
+        raw, = read_batch(send.await_args.args[0])
+        self.assertEqual(raw.packet_id, b.InventoryTransactionPacket.ID)
+        transaction = self.bot.protocol.decode(raw).variant_transaction.transaction
+        carried = transaction.actions[1]
+        self.assertEqual((carried.slot, carried.from_item_descriptor.net_id_variant, carried.to_item_descriptor.id),
+                         (0, 31, 0))
+        self.assertEqual(self.bot.inventory_slots[0].stack_size, 1)
+        self.assertEqual(self.bot.held_item.predicted_count, 0)
+        check(0)
+
+        await self.delivered(slot(5, log(32)))
+        self.assertEqual(self.bot.held_item.predicted_count, 0)
+        check(1)
+        await self.delivered(slot(0, empty))
+        self.assertIsNone(self.bot.held_item.predicted_count)
+        check(1)
+        await self.delivered(slot(5, empty))
+        check(0)
+
+        await self.delivered(slot(0, log(33)))
+        check(1)
+        await self.bot.drop_selected_item(whole_stack=True)
+        self.assertEqual(self.bot.held_item.predicted_count, 0)
+        await self.delivered(self.inventory())
+        self.assertIsNone(self.bot.held_item.predicted_count)
+        self.assertEqual(self.bot.inventory_slots, {})
+        check(0)
+        await self.delivered(b.InventoryContentPacket(inventory_id=b.ContainerID.INVENTORY, slots=[log(34)]))
+        await self.delivered(slot(5, log(35)))
+        check(2)
 
     async def test_plan_reads_replaced_catalog_and_does_not_survive_disconnect(self):
         b = self.b

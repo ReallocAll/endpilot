@@ -104,6 +104,9 @@ verdict. Check the verdict and the observed destination stack.
 When several recipes produce the same item, use `bot.recipes_for` to find
 ones that match your inventory. For example, `bot.recipes_for("bed", 7)`
 finds recipes for a gray bed using the input colors you actually carry.
+The query uses confirmed main inventory stacks. After a drop-key prediction,
+the affected slot is skipped until the server describes it again. Other
+confirmed stacks remain available.
 
 For supported vanilla protocol 2225 recipe tags, automatic crafting
 can assign different matching materials to the same tag. For example,
@@ -134,7 +137,8 @@ if plan is not None:
 The immutable plan includes the recipe, requested craft count, and
 `materials` grouped in `plan.recipe.ingredients` order. A group can
 contain different compatible variants across multiple crafts. For each
-craft, an ingredient position uses its full quantity from one variant. The
+craft, an ingredient position uses its full quantity from one variant.
+`bot.recipes_for` uses the same confirmed materials and assignment rules. The
 `delta` rows combine consumption and all announced outputs by numeric
 item ID and aux value. Negative counts are consumed, positive counts are
 produced, and zero rows show that consumption and production cancel.

@@ -357,25 +357,15 @@ class Recipes:
         limited = None if self.environment is None else self.environment.limited_crafting
         if limited is None or self.inventory is None:
             return ()
-        materials = Counter()
-        for stack in self.inventory.slots.values():
-            name = self.item_names.get(int(stack.id)) if int(stack.id) != 0 else None
-            if name is not None and stack.stack_size > 0:
-                materials[name, int(stack.aux_value)] += int(stack.stack_size)
+        materials = self._observed_materials()
         return tuple(
             recipe for recipe, output in self._grid_recipes(item, aux_value, size)
             if (not limited or recipe.recipe_id in self._unlocked)
             and self._allocate_materials(recipe, materials, (requested + output - 1) // output) is not None
         )
 
-    def plan_delta(self, recipe_id: str | int, times: int) -> RecipeDeltaPlan | None:
-        recipe = self.get(recipe_id)
+    def _observed_materials(self) -> Counter[tuple[str, int, int]]:
         inventory = self.inventory
-        if (recipe is None or inventory is None or recipe.kind not in _CRAFTING_GRID_KINDS
-                or recipe.tag != "crafting_table" or not recipe.ingredients or not recipe.results
-                or any(result.item_id == 0 or result.count <= 0 for result in recipe.results)):
-            return None
-
         materials = Counter()
         uncertain = (
             inventory._count_observation_gaps | inventory._unconfirmed_transfer_slots | inventory._drop_key_counts.keys()
@@ -387,8 +377,16 @@ class Recipes:
             name = self.item_names.get(item_id) if item_id else None
             if name and stack.stack_size > 0:
                 materials[name, int(stack.aux_value), item_id] += int(stack.stack_size)
+        return materials
 
-        allocation = self._allocate_materials(recipe, materials, times, whole_positions=True)
+    def plan_delta(self, recipe_id: str | int, times: int) -> RecipeDeltaPlan | None:
+        recipe = self.get(recipe_id)
+        if (recipe is None or self.inventory is None or recipe.kind not in _CRAFTING_GRID_KINDS
+                or recipe.tag != "crafting_table" or not recipe.ingredients or not recipe.results
+                or any(result.item_id == 0 or result.count <= 0 for result in recipe.results)):
+            return None
+
+        allocation = self._allocate_materials(recipe, self._observed_materials(), times)
         if allocation is None:
             return None
         selected = tuple(
@@ -406,7 +404,7 @@ class Recipes:
             for (item_id, aux), count in delta.items()
         ))
 
-    def _allocate_materials(self, recipe: Recipe, materials: Counter, crafts: int, *, whole_positions: bool = False):
+    def _allocate_materials(self, recipe: Recipe, materials: Counter, crafts: int, *, whole_positions: bool = True):
         # Each inventory variant contributes a single shared capacity, even if
         # several ingredients can use it. Keys start with name and aux and can
         # also retain the actual item ID. A common unit avoids subdividing
@@ -425,8 +423,7 @@ class Recipes:
                 and ingredient.aux_value in (_ANY_AUX_VALUE, item[1])
             )
             if not variants or (not whole_positions and count > 1 and len(variants) > 1):
-                # Discovery and automatic crafting keep their existing handling
-                # of ambiguous multi-item requirements.
+                # Automatic crafting keeps its handling of ambiguous multi-item requirements.
                 return None
             # Positions needing the same count from the same concrete variants
             # are interchangeable during planning. Retain their output order.
@@ -558,7 +555,7 @@ class Recipes:
         # The request has a single description for each recipe position. Plan
         # one craft using the number of complete rounds each variant can cover.
         per_craft = Counter({variant: amount // times for variant, amount in materials.items() if amount >= times})
-        allocation = self._allocate_materials(recipe, per_craft, 1)
+        allocation = self._allocate_materials(recipe, per_craft, 1, whole_positions=False)
         if allocation is None:
             raise ValueError(f"not enough compatible ingredients for {times} crafts of {recipe.recipe_id}")
         return tuple((variant, slots_by_variant[variant]) for ((variant, _),) in allocation)
