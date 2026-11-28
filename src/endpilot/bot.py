@@ -50,7 +50,7 @@ from .entities import (
 from .expression import skin_packet
 from .fishing import Fishing, FishingResult
 from .forms import Forms
-from .game_hp_estimate import _estimate_sourceless_explosion_damage
+from .game_hp_estimate import TntDamageEstimate, _estimate_sourceless_explosion_damage, _estimate_tnt_base_damage
 from .harvest import HarvestTool, HarvestToolChest, HarvestTools
 from .inventory import CursorObservation, HeldItemSnapshot, Inventory, InventorySlotChange
 from .item_registry import ItemRegistrySnapshot
@@ -1522,6 +1522,16 @@ class Bot:
         return _estimate_sourceless_explosion_damage(
             self, center, radius, target_runtime_id=target_runtime_id, raw=raw,
         )
+
+    def estimate_tnt_base_damage(self, tnt_runtime_id: int) -> TntDamageEstimate | None:
+        """Estimate unmitigated damage to the local standing player if the TNT exploded now.
+
+        The synchronous query sends no packets. The estimate uses the last observed
+        position of the primed TNT, cached terrain, and vanilla strength 4. Unknown
+        required observations and actors outside the current session or dimension
+        return None.
+        """
+        return _estimate_tnt_base_damage(self, tnt_runtime_id)
 
     def raycast_player_view(self, runtime_id: int, *, max_distance: float = 5.0) -> BlockRaycastResult:
         """Trace a visible remote player's observed view through cached block outlines.

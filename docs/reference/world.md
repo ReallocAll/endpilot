@@ -138,6 +138,25 @@ unsupported poses, and ended or changing sessions return `None`.
 Pass a bool for `raw` and an int or `None` for `target_runtime_id`.
 Other types raise `TypeError`.
 
+## Estimate damage near observed primed TNT
+
+On vanilla Bedrock 2225, `bot.estimate_tnt_base_damage(tnt_runtime_id)`
+uses the last observation of a primed `minecraft:tnt` entity in the current
+dimension and session. Use its runtime ID from `bot.observed_entities`.
+The synchronous query sends no packets and returns an immutable
+`TntDamageEstimate`.
+
+- `center` is the entity's last observed position.
+- `base_damage` estimates unmitigated damage to the local player if the TNT
+  exploded at that position now. It uses vanilla strength 4, the local
+  player's observed standing geometry, and cached terrain.
+
+The estimate is independent of gear and remaining health. It uses the
+observed position without projecting entity motion or the future explosion
+center. Read `bot.health` for the actual health change. A missing or wrong
+actor, an unsupported pose, unknown required terrain, or an unavailable
+session returns `None`.
+
 ## Search observed blocks
 
 After position sync, `find_blocks()` searches the current dimension's

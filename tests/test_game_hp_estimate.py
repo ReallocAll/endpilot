@@ -1,11 +1,12 @@
 """Observe protocol 2225 packets through the public explosion estimate."""
 
 import asyncio
+from dataclasses import FrozenInstanceError
 import unittest
 from unittest.mock import patch
 from uuid import UUID
 
-from endpilot import Bot
+from endpilot import Bot, TntDamageEstimate
 from endpilot.protocol import RawPacket, read_batch, write_batch
 
 from test_harvest import enchantment_data
@@ -105,6 +106,17 @@ class GameHealthEstimateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.transport.sent), count)
         return result
 
+    def tnt(self, center=(7.375, 220, 9.25), *, actor_type="minecraft:tnt", unique_id=102):
+        b = self.b
+        return b.AddActorPacket(entity_id=unique_id, runtime_id=2, actor_type=actor_type,
+                                pos=b.Vec3(x=center[0], y=center[1], z=center[2]))
+
+    def estimate_tnt(self, runtime_id=2):
+        count = len(self.transport.sent)
+        result = self.bot.estimate_tnt_base_damage(runtime_id)
+        self.assertEqual(len(self.transport.sent), count)
+        return result
+
     def equipment(self):
         b = self.b
         empty = b.SerializedNetworkItemStackDescriptor()
@@ -169,6 +181,69 @@ class GameHealthEstimateTests(unittest.IsolatedAsyncioTestCase):
             self.bot.estimate_sourceless_explosion_damage(_CENTER, _RADIUS, target_runtime_id=True)
         with self.assertRaisesRegex(TypeError, "raw"):
             self.bot.estimate_sourceless_explosion_damage(_CENTER, _RADIUS, raw="false")
+
+    async def test_tnt_snapshots_follow_raw_actor_positions_and_removal(self):
+        self.assertIsNone(self.bot.estimate_tnt_base_damage(2))
+        b = self.b
+        await self.join(self.tnt(actor_type="minecraft:creeper"))
+        await self.apply(self.terrain())
+        self.assertIsNone(self.estimate_tnt())
+        await self.apply(self.tnt())
+        first = self.estimate_tnt()
+        self.assertEqual(first, TntDamageEstimate((7.375, 220, 9.25), 15.4375))
+        self.assertIsNone(self.estimate_tnt(True))
+        self.assertIsNone(self.estimate_tnt(2.0))
+        self.assertIsNone(self.estimate_tnt(1))
+        with self.assertRaises(FrozenInstanceError):
+            first.base_damage = 0
+
+        await self.apply(b.MoveActorDeltaPacket(move_data=b.MoveActorDeltaData(runtime_id=2, new_position_x=8.375)))
+        second = self.estimate_tnt()
+        self.assertEqual(second, TntDamageEstimate((8.375, 220, 9.25), 22.0))
+        self.assertEqual(first.center, (7.375, 220, 9.25))
+        await self.apply(b.MoveActorAbsolutePacket(move_data=b.MoveActorAbsoluteData(
+            runtime_id=2, pos=b.Vec3(x=4.375, y=220, z=9.25),
+        )))
+        self.assertEqual(self.estimate_tnt(), TntDamageEstimate((4.375, 220, 9.25), 1.0))
+        await self.apply(b.RemoveActorPacket(entity_id=102))
+        self.assertIsNone(self.estimate_tnt())
+
+    async def test_tnt_requires_current_standing_geometry_and_relevant_terrain(self):
+        b = self.b
+        await self.join()
+        await self.apply(self.tnt())
+        self.assertIsNone(self.estimate_tnt())
+        await self.apply(self.tnt((4, 220, 9.25)))
+        self.assertEqual(self.estimate_tnt(), TntDamageEstimate((4, 220, 9.25), 0.0))
+        flag = 1 << int(b.ActorFlags.SNEAKING)
+        await self.apply(self.terrain(), self.tnt(),
+                         b.SetActorDataPacket(id=1, packed_items=self.metadata(low=flag, size=False)))
+        self.assertIsNone(self.estimate_tnt())
+        await self.apply(b.SetActorDataPacket(id=1, packed_items=self.metadata(size=False)))
+        self.assertEqual(self.estimate_tnt().base_damage, 15.4375)
+
+    async def test_tnt_requires_a_fresh_actor_in_each_dimension_and_session(self):
+        b = self.b
+        await self.join()
+        await self.apply(self.terrain(), self.tnt())
+        first = self.estimate_tnt()
+        self.assertIsNotNone(first)
+        await self.apply(b.ChangeDimensionPacket(dimension_id=1))
+        self.assertIsNone(self.estimate_tnt())
+        await self.apply(b.PlayerActionPacket(runtime_id=1, action=b.PlayerActionType.CHANGE_DIMENSION_ACK),
+                         self.move(), b.SetActorDataPacket(id=1, packed_items=self.metadata()), self.terrain(1))
+        self.assertIsNone(self.estimate_tnt())
+        await self.apply(self.tnt((8.375, 220, 9.25), unique_id=202))
+        self.assertEqual(self.estimate_tnt().center, (8.375, 220, 9.25))
+        await self.apply(b.DisconnectPacket())
+        self.assertIsNone(self.estimate_tnt())
+        await self.bot.close()
+        await self.join()
+        await self.apply(self.terrain())
+        self.assertIsNone(self.estimate_tnt())
+        await self.apply(self.tnt((4.375, 220, 9.25), unique_id=302))
+        self.assertEqual(self.estimate_tnt().center, (4.375, 220, 9.25))
+        self.assertEqual(first.center, (7.375, 220, 9.25))
 
     async def test_archived_stone_row_uses_collision_exposure(self):
         await self.join(*self.equipment(), self.attributes(health=20, absorption=0), difficulty=2)

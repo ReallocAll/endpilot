@@ -34,6 +34,7 @@ from .entities import (
 )
 from .entity_registry import EntityRegistryEntry, EntityRegistrySnapshot
 from .fishing import FishingResult
+from .game_hp_estimate import TntDamageEstimate
 from .inventory import CursorObservation, HeldItemSnapshot, HeldItemStack, InventorySlotChange
 from .item_registry import ItemRegistrySnapshot
 from .item_use import ItemCooldownEvent
@@ -218,6 +219,7 @@ __all__ = [
     "TerrainStore",
     "TitleEvent",
     "TitleKind",
+    "TntDamageEstimate",
     "TradeManyRequest",
     "TradeManyResult",
     "VanillaBiome",

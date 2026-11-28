@@ -1,5 +1,6 @@
 """Read-only estimate for an observed Bedrock player and terrain."""
 
+from dataclasses import dataclass
 from math import isfinite
 from typing import TYPE_CHECKING
 
@@ -14,6 +15,15 @@ if TYPE_CHECKING:
 
 # The standing position on the wire includes the player Y reference and its epsilon.
 _STANDING_Y_OFFSET = 1.62001
+_TNT_STRENGTH = 4.0
+
+
+@dataclass(frozen=True, slots=True)
+class TntDamageEstimate:
+    """Observed primed TNT position and approximate damage before mitigation."""
+
+    center: tuple[float, float, float]
+    base_damage: float
 
 
 def _standing_feet(position):
@@ -80,25 +90,15 @@ def _armor_totals(inventory, registry):
     return armor_points, toughness
 
 
-def _estimate_sourceless_explosion_damage(
-    bot: "Bot", center: tuple[float, float, float], radius: float, *,
-    target_runtime_id: int | None, raw: bool,
-) -> float | None:
-    if target_runtime_id is not None and type(target_runtime_id) is not int:
-        raise TypeError("target_runtime_id must be an int or None")
-    if type(raw) is not bool:
-        raise TypeError("raw must be a bool")
+def _explosion_session(bot):
     session = bot._session
     if (bot.protocol.number != 2225 or session is None or not session.spawned
             or bot.session_end is not None or bot.is_changing_dimension):
         return None
-    state, blocks = bot._player_state, bot._blocks
-    binding = bot.protocol.binding
-    local = target_runtime_id is None or target_runtime_id == session.player_id
-    if local:
-        target = _local_target(bot._movement, state, binding)
-    else:
-        target = _remote_target(bot._entities, target_runtime_id, binding)
+    return session
+
+
+def _base_damage(target, blocks, center, radius):
     if target is None:
         return None
     feet, (width, height) = target
@@ -109,7 +109,37 @@ def _estimate_sourceless_explosion_damage(
         boxes = blocks._explosion_collision_at(position)
         return ((), _COLLISION_LIMITS) if boxes is None else (boxes, None)
 
-    damage = _estimate_game_base_damage(feet, aabb_center, half, center, radius, collision_at)
+    return _estimate_game_base_damage(feet, aabb_center, half, center, radius, collision_at)
+
+
+def _estimate_tnt_base_damage(bot: "Bot", tnt_runtime_id: int) -> TntDamageEstimate | None:
+    if type(tnt_runtime_id) is not int or _explosion_session(bot) is None:
+        return None
+    tnt = bot._entities.get(tnt_runtime_id)
+    if tnt is None or tnt.actor_type != "minecraft:tnt":
+        return None
+    center = tnt.position
+    target = _local_target(bot._movement, bot._player_state, bot.protocol.binding)
+    damage = _base_damage(target, bot._blocks, center, _TNT_STRENGTH)
+    return None if damage is None else TntDamageEstimate(center, damage)
+
+
+def _estimate_sourceless_explosion_damage(
+    bot: "Bot", center: tuple[float, float, float], radius: float, *,
+    target_runtime_id: int | None, raw: bool,
+) -> float | None:
+    if target_runtime_id is not None and type(target_runtime_id) is not int:
+        raise TypeError("target_runtime_id must be an int or None")
+    if type(raw) is not bool:
+        raise TypeError("raw must be a bool")
+    session = _explosion_session(bot)
+    if session is None:
+        return None
+    state, binding = bot._player_state, bot.protocol.binding
+    local = target_runtime_id is None or target_runtime_id == session.player_id
+    target = (_local_target(bot._movement, state, binding) if local
+              else _remote_target(bot._entities, target_runtime_id, binding))
+    damage = _base_damage(target, bot._blocks, center, radius)
     if raw or damage is None or damage == 0:
         return damage
     if (not local or bot.game_mode != binding.GameType.SURVIVAL or bot.world_difficulty not in (2, 3)
