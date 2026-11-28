@@ -1413,6 +1413,19 @@ class Blocks:
             body = None if state is None else state.name in (
                 "minecraft:dandelion", "minecraft:fern", "minecraft:short_grass", "minecraft:wildflowers",
             )
+            # Stock walking crossed these ground covers without stepping up.
+            if state is not None and state.name in (
+                "minecraft:allium", "minecraft:azure_bluet", "minecraft:blue_orchid",
+                "minecraft:brown_mushroom", "minecraft:bush", "minecraft:cornflower",
+                "minecraft:crimson_fungus", "minecraft:crimson_roots", "minecraft:deadbush",
+                "minecraft:firefly_bush", "minecraft:leaf_litter", "minecraft:lily_of_the_valley",
+                "minecraft:nether_sprouts", "minecraft:oxeye_daisy", "minecraft:pink_petals",
+                "minecraft:poppy", "minecraft:red_mushroom", "minecraft:red_tulip",
+                "minecraft:short_dry_grass", "minecraft:torchflower", "minecraft:warped_fungus",
+                "minecraft:warped_roots",
+            ):
+                x, y, z = position
+                body = self._stance_air(self.observed_block((x, y - 1, z), layer=1))
         else:
             body = self._stance_air(block)
         extra = self._stance_air(self.observed_block(position, layer=1))

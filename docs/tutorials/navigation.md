@@ -320,6 +320,11 @@ in the primary feet layer.
 The extra feet layer and both head layers must contain observed air, and the
 floor must provide safe support. The same vegetation is allowed at the
 launch stance of a one-block descent, but not at its landing or runout.
+Ordinary walking also admits the supported dry ground-cover blocks, including
+leaf litter, pink petals, small flowers, mushrooms, and Nether roots, only in
+the primary feet layer and with observed air in the support's extra layer.
+Passable ground cover does not imply that slowing, damaging, or interactive
+blocks are treated as air.
 A one-block ascent can enter beneath a known full-cell vanilla leaf canopy
 when the launch and both landing body layers still have clear space.
 Elevation changes require server landing evidence before continuing. A ladder
