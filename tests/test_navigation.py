@@ -540,33 +540,42 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((result.status, result.frames, result.matches), ("unreachable", 0, ()))
         self.assertEqual(self.stream.sent, [])
 
-    async def test_foot_goal_rebases_grass_path_walk_from_real_ground_correction(self):
+    async def test_foot_goal_matches_the_support_height_across_a_dry_grass_path_edge(self):
         self.prepare_vegetation_corridor(hashed=True)
         self.blocks._player_game_type = "SURVIVAL"
         self.movement._gap_jump_allowed = lambda: True
         self.set_block((1, 99, 0), 0x73C709FB)
-        self.set_position(0.5, 0.5, on_ground=True)
-        requested = FootGoal((1, 100, 0))
-        corrected = None
+        rules = NavigationRules(search_radius=1, vertical_radius=0)
+        full_y = 101.62
+        path_y = full_y - 1 / 16
 
-        def report_landing():
-            nonlocal corrected
-            frame = self.stream.sent[-1]
-            if corrected is None and frame.pos.x >= 1.15:
-                corrected = len(self.stream.sent)
-                self.correct_position(frame.pos.x, 101.62 - 1 / 16, 0.5, on_ground=True,
-                                      tick=frame.client_tick)
+        for source, y, destination in ((0, full_y, 1), (1, path_y, 0)):
+            with self.subTest(source=source):
+                self.set_position(source + 0.5, 0.5, y=y, on_ground=True)
+                self.stream.sent.clear()
+                corrected = False
 
-        self.stream.on_send = report_landing
-        result = await self.bot.navigate(requested, rules=NavigationRules(search_radius=1, vertical_radius=0))
-        self.assertEqual((result.status, result.stand_position), ("reached", requested.position))
-        self.assertIsNotNone(corrected)
-        self.assertGreater(len(self.stream.sent), corrected)
-        for frame in self.stream.sent[:corrected]:
-            self.assertAlmostEqual(frame.pos.y, 101.62, places=4)
-        for frame in self.stream.sent[corrected:]:
-            self.assertAlmostEqual(frame.pos.y, 101.62 - 1 / 16, places=4)
-        self.assertFalse(self.jump_input())
+                def report_path_height():
+                    nonlocal corrected
+                    frame = self.stream.sent[-1]
+                    if not corrected and frame.pos.x >= 1.3:
+                        corrected = True
+                        self.correct_position(frame.pos.x, path_y, 0.5, on_ground=True,
+                                              tick=frame.client_tick)
+
+                self.stream.on_send = report_path_height if destination == 1 else None
+                goal = FootGoal((destination, 100, 0))
+                result = await self.bot.navigate(goal, rules=rules)
+                self.assertEqual((result.status, result.stand_position), ("reached", goal.position))
+                self.assertEqual(corrected, destination == 1)
+                # The footprint clears the full block at center X=1.3,
+                # not when the feet center crosses the block boundary at X=1.
+                self.assertTrue(any(1 < frame.pos.x < 1.3 for frame in self.moving_input()))
+                for frame in self.stream.sent:
+                    self.assertAlmostEqual(frame.pos.y, full_y if frame.pos.x < 1.3 else path_y, places=4)
+                self.assertFalse(self.jump_input())
+                self.assert_released()
+        self.stream.on_send = None
 
     async def test_dry_straight_walk_passes_through_fern_but_stops_before_a_new_obstacle(self):
         self.blocks._player_game_type = "SURVIVAL"

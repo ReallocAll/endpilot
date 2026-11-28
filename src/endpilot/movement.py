@@ -2664,16 +2664,29 @@ class Movement:
             return (graph.carpet_walking and source[1] == destination[1]
                     and (blocks._walking_carpet(source) or blocks._walking_carpet(destination)))
 
+        def walking_footprint(y, x, z):
+            return {(a, y, b)
+                    for a in range(math.floor(x - _PLAYER_HALF_WIDTH), math.floor(x + _PLAYER_HALF_WIDTH) + 1)
+                    for b in range(math.floor(z - _PLAYER_HALF_WIDTH), math.floor(z + _PLAYER_HALF_WIDTH) + 1)}
+
         def carpet_height(cells, x, z):
             # The feet stay raised while any of the body footprint overlaps carpet.
-            footprint = {(a, cells[0][1], b)
-                         for a in range(math.floor(x - _PLAYER_HALF_WIDTH), math.floor(x + _PLAYER_HALF_WIDTH) + 1)
-                         for b in range(math.floor(z - _PLAYER_HALF_WIDTH), math.floor(z + _PLAYER_HALF_WIDTH) + 1)}
+            footprint = walking_footprint(cells[0][1], x, z)
             if (not self._standard_ground_motion(blocks) or self._observed_ground is not True
                     or self._jump_floor_y is not None or not footprint.issubset(cells)
                     or any(blocks._carpet_walk_stance(cell) is not True for cell in cells)):
                 raise _StraightWalkUnsafe
             return cells[0][1] + 1.62 + (1 / 16 if any(map(blocks._walking_carpet, footprint)) else 0)
+
+        def path_height(path, full, x, z):
+            footprint = walking_footprint(path[1], x, z)
+            if (not grass_path_walking() or self._observed_ground is not True
+                    or self._jump_floor_y is not None or not footprint.issubset((path, full))
+                    or blocks._dry_grass_path_stance(path) is not True
+                    or blocks._flat_stance(full, allow_vegetation=True) is not True):
+                raise _StraightWalkUnsafe
+            # Ordinary support wins until the whole footprint is on the lower path.
+            return path[1] + 1.62 - (0 if full in footprint else 1 / 16)
 
         def check_cruise_step(origin, proposal, corridor):
             # Bound one proposed frame plus all subsequent neutral coasting,
@@ -4210,6 +4223,14 @@ class Movement:
                         walk_height = None
                         if carpet_leg(anchor, route[0]):
                             walk_height = partial(carpet_height, (anchor, route[0]))
+                        elif grass_path_walking is not None and anchor[1] == route[0][1]:
+                            first, second = anchor, route[0]
+                            if (blocks._dry_grass_path_stance(first) is True
+                                    and blocks._flat_stance(second, allow_vegetation=True) is True):
+                                walk_height = partial(path_height, first, second)
+                            elif (blocks._dry_grass_path_stance(second) is True
+                                    and blocks._flat_stance(first, allow_vegetation=True) is True):
+                                walk_height = partial(path_height, second, first)
                         walk_args = {} if walk_height is None else {"walk_height": walk_height}
                         if use_ground_velocity:
                             # Keep the observed ground velocity through steering and braking.
