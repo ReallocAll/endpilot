@@ -1884,6 +1884,10 @@ class Bot:
         """Take from the current catalog into a player inventory slot and await BDS's verdict."""
         return await self._require_creative_inventory().take(entry, slot, amount, timeout=timeout)
 
+    async def equip_creative_armor(self, entry: CreativeEntry, armor_slot: int, *, timeout: float = 15):
+        """Equip one catalog item directly into a confirmed empty armor slot and await BDS's verdict."""
+        return await self._require_creative_inventory().equip_armor(entry, armor_slot, timeout=timeout)
+
     async def destroy_creative_item(self, slot: int, amount: int, *, timeout: float = 15):
         """Destroy a quantity in a player inventory slot and await BDS's verdict."""
         return await self._require_creative_inventory().destroy(slot, amount, timeout=timeout)

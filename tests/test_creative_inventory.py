@@ -649,6 +649,119 @@ class CreativeInventoryTests(unittest.IsolatedAsyncioTestCase):
                 await action
         self.assertTrue(self.transport.sent.empty())
 
+    async def catalog_armor_ready(self):
+        await self.join(self.mode.CREATIVE, self.catalog(), self.registry(7, "minecraft:iron_helmet"))
+        await self.deliver(self.open(), self.item_slot("ARMOR", 0, None), self.item_slot("ARMOR", 1, 45),
+                           self.item_slot("INVENTORY", 0, 43), self.item_slot("OFFHAND", 0, 44),
+                           self.item_slot("PLAYER_ONLY_UI", 0, 46))
+        return self.bot.creative_catalog.entries[0]
+
+    async def test_equip_creative_armor_targets_only_the_observed_armor_slot(self):
+        entry = await self.catalog_armor_ready()
+        main, offhand, cursor = self.bot.inventory_slots, self.bot.offhand_item, self.bot.last_cursor_observation
+        other = self.bot.armor_slots[1]
+        pending = asyncio.create_task(self.bot.equip_creative_armor(entry, 0, timeout=1))
+        request = await self.request()
+        craft, place = request.actions
+        self.assertIsInstance(craft, self.b.ItemStackRequestCereal.CraftCreativeActionData)
+        self.assertIsInstance(place, self.b.ItemStackRequestCereal.PlaceActionData)
+        self.assertEqual((craft.creative_item_net_id, craft.num_crafts, place.amount), (entry.net_id, 1, 1))
+        self.assertEqual((place.source.full_container_name.name.name, place.source.slot, place.source.net_id_variant),
+                         ("CREATED_OUTPUT_CONTAINER", 50, request.client_request_id.raw_id))
+        self.assertEqual((place.destination.full_container_name.name.name, place.destination.slot,
+                          place.destination.net_id_variant), ("ARMOR_CONTAINER", 0, 0))
+        self.assertFalse(self.bot.armor_slots[0].id)
+        with self.assertRaisesRegex(RuntimeError, "request in flight"):
+            await self.bot.equip_creative_armor(entry, armor_slot=0, timeout=1)
+        await self.deliver(self.transfer_reply(request, slot=0, domain="ARMOR_CONTAINER", source_empty=False))
+        self.assertEqual((await pending).result.name, "SUCCESS")
+        helmet = self.bot.armor_slots[0]
+        self.assertEqual((helmet.id, helmet.stack_size, helmet.net_id_variant, helmet.aux_value,
+                          helmet.block_runtime_id, helmet.user_data_buffer), (7, 1, 51, 7, 0x80000001, _NBT))
+        self.assertEqual(self.bot.inventory_slots, main)
+        self.assertIs(self.bot.armor_slots[1], other)
+        self.assertIs(self.bot.offhand_item, offhand)
+        self.assertIs(self.bot.last_cursor_observation, cursor)
+        self.assertTrue(self.transport.sent.empty())
+
+    async def test_equip_creative_armor_rejects_wrong_item_unknown_occupied_stale_or_disabled(self):
+        b = self.b
+        entry = await self.catalog_armor_ready()
+        for selection in ("feet", 2, True, 4, "headwear"):
+            with self.subTest(slot=selection), self.assertRaises(ValueError):
+                await self.bot.equip_creative_armor(entry, armor_slot=selection)
+        with self.assertRaisesRegex(ValueError, "current creative catalog"):
+            await self.bot.equip_creative_armor(replace(entry), armor_slot=0)
+        await self.deliver(b.InventoryContentPacket(inventory_id=b.ContainerID.ARMOR, slots=[]))
+        with self.assertRaisesRegex(ValueError, "observed empty"):
+            await self.bot.equip_creative_armor(entry, armor_slot=0)
+        await self.deliver(self.item_slot("ARMOR", 0, 66))
+        with self.assertRaisesRegex(ValueError, "observed empty"):
+            await self.bot.equip_creative_armor(entry, armor_slot=0)
+        await self.deliver(self.item_slot("ARMOR", 0, None), self.close())
+        with self.assertRaisesRegex(RuntimeError, "open the player inventory screen"):
+            await self.bot.equip_creative_armor(entry, armor_slot=0)
+        await self.deliver(self.open(), b.SetPlayerGameTypePacket(player_game_type=self.mode.UNDEFINED))
+        with self.assertRaises(PermissionError):
+            await self.bot.equip_creative_armor(entry, armor_slot=0)
+        await self.deliver(b.SetPlayerGameTypePacket(player_game_type=self.mode.CREATIVE),
+                           self.registry(7, "minecraft:diamond_helmet"))
+        with self.assertRaisesRegex(ValueError, "not supported"):
+            await self.bot.equip_creative_armor(self.bot.creative_catalog.entries[0], armor_slot=0)
+        self.assertTrue(self.transport.sent.empty())
+
+    async def test_equip_creative_armor_rechecks_mode_catalog_window_and_empty_slot_at_write(self):
+        b = self.b
+        for packets, error in (
+            ((b.SetPlayerGameTypePacket(player_game_type=self.mode.SURVIVAL),), PermissionError),
+            ((self.catalog(),), ValueError), ((self.close(), self.open()), RuntimeError),
+            ((self.item_slot("ARMOR", 0, 66),), RuntimeError),
+        ):
+            entry = await self.catalog_armor_ready()
+            send = self.bot.packets.send
+            reached, release = asyncio.Event(), asyncio.Event()
+
+            async def delay(packet, **kwargs):
+                reached.set()
+                await release.wait()
+                await send(packet, **kwargs)
+
+            with patch.object(self.bot.packets, "send", delay):
+                pending = asyncio.create_task(self.bot.equip_creative_armor(entry, armor_slot=0, timeout=1))
+                await asyncio.wait_for(reached.wait(), 1)
+                await self.deliver(*packets)
+                release.set()
+                with self.assertRaises(error):
+                    await pending
+            self.assertTrue(self.transport.sent.empty())
+            await self.bot.close()
+
+    async def test_catalog_armor_receipt_does_not_overwrite_newer_inventory_state(self):
+        for packets, expected in (
+            ((self.item_slot("ARMOR", 0, 66),), 66),
+            ((self.item_slot("ARMOR", 0, 66), self.item_slot("ARMOR", 0, None)), 0),
+            ((self.close(), self.open()), 0),
+        ):
+            entry = await self.catalog_armor_ready()
+            pending = asyncio.create_task(self.bot.equip_creative_armor(entry, armor_slot=0, timeout=1))
+            request = await self.request()
+            await self.deliver(*packets, self.transfer_reply(request, slot=0, domain="ARMOR_CONTAINER",
+                                                             source_empty=False))
+            self.assertEqual((await pending).result.name, "SUCCESS")
+            self.assertEqual(int(self.bot.armor_slots[0].net_id_variant or 0), expected)
+            await self.bot.close()
+
+    async def test_catalog_armor_requires_an_explicit_successful_armor_correction(self):
+        entry = await self.catalog_armor_ready()
+        for status in ("ERROR", "SUCCESS"):
+            pending = asyncio.create_task(self.bot.equip_creative_armor(entry, 0, timeout=1))
+            request = await self.request()
+            # A success that describes only a non-target slot confirms no armor stack.
+            await self.deliver(self.reply(request, 1, slot=0, result=status))
+            self.assertEqual((await pending).result.name, status)
+            self.assertEqual(self.bot.armor_slots[0].id, 0)
+            self.assertEqual(int(self.bot.inventory_slots[0].net_id_variant), 43)
+
     async def test_queue_rechecks_mode_before_sending(self):
         b = self.b
         await self.join(self.mode.CREATIVE, self.catalog())

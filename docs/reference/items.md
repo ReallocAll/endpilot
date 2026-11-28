@@ -342,8 +342,8 @@ entry has a creative `net_id`, a group index, and an item instance with its
 numeric ID, registry name, count, aux value, block runtime ID, and original
 user-data bytes. `entry.item.nbt` returns a fresh decoded dictionary.
 
-After the server grants creative mode, open the player inventory screen. The
-operations use Bedrock main inventory slots 0–35, including hotbar slots 0–8.
+After the server grants creative mode, open the player inventory screen. Main
+inventory operations use slots 0–35, including hotbar slots 0–8.
 Choose entries from the current catalog for each operation.
 
 ```python
@@ -366,6 +366,14 @@ is unknown. Single-slot creative operations require an observed slot.
 returns the ordered verdicts. A replacement can clear the existing stack
 before requesting a different one. Check all returned verdicts and the final
 observed slot. The server determines item stack limits and acceptance.
+
+`await bot.equip_creative_armor(helmet, 0)` takes one iron armor item from
+the current catalog directly into its observed empty armor slot, including
+when all 36 main inventory slots are full. Use 0 for head, 1 for chest, 2 for
+legs, or 3 for feet. The method checks the current inventory window, creative
+mode, catalog entry and target slot again before sending. It returns the
+matching server verdict. Check `bot.armor_slots` for the resulting slot
+observation.
 
 `await bot.clear_creative_inventory([0, 8, 17])` clears selected slots in
 order. Omit the list to check all 36 main inventory slots. Each result includes

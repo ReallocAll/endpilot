@@ -14,6 +14,8 @@ from .item_user_data import read_item_user_data
 
 _INVENTORY = "COMBINED_HOTBAR_AND_INVENTORY_CONTAINER"
 _PLAYER_CONTAINERS = (_INVENTORY, "HOTBAR_CONTAINER", "INVENTORY_CONTAINER")
+_ARMOR = "ARMOR_CONTAINER"
+_IRON_ARMOR_ITEMS = ("minecraft:iron_helmet", "minecraft:iron_chestplate", "minecraft:iron_leggings", "minecraft:iron_boots")
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,6 +356,70 @@ class CreativeInventory:
         )
         return await self._request(request_id, window, slot, observed, observed, [action], None,
                                    timeout=timeout, queued=queued, progress=progress)
+
+    async def equip_armor(self, entry, slot, *, timeout):
+        window = self._window()
+        if type(slot) is not int or not 0 <= slot < len(_ARMOR_SLOT_NAMES):
+            raise ValueError("armor slot must be between 0 and 3")
+        item = self._entry(entry)
+        if item.name != _IRON_ARMOR_ITEMS[slot]:
+            raise ValueError("creative catalog item is not supported in the selected armor slot")
+        if not self._armor_empty(slot):
+            raise ValueError("the armor slot must be observed empty")
+
+        b = self._binding
+        cereal = b.ItemStackRequestCereal
+        request_id = self._inventory._allocate_request_id()
+        request = b.ItemStackRequestPacketData.RequestData(
+            client_request_id=b.ItemStackRequestId(raw_id=request_id),
+            actions=[cereal.CraftCreativeActionData(creative_item_net_id=entry.net_id, num_crafts=1),
+                     cereal.PlaceActionData(amount=1, source=self._slot_info("CREATED_OUTPUT_CONTAINER", 50, request_id),
+                                            destination=self._slot_info(_ARMOR, slot, 0))],
+            strings_to_filter=[], strings_to_filter_origin=b.TextProcessingEventOrigin.UNKNOWN,
+        )
+        changed = False
+
+        def at_write():
+            self._require_window(window)
+            self._entry(entry)
+            if not self._armor_empty(slot):
+                raise RuntimeError("the creative armor slot changed before submission")
+            pending = self._inventory._pending_requests[request_id]
+            if any(other is not pending and other.submitted
+                   for other in self._inventory._requests_for_endpoints(pending.endpoints)):
+                raise RuntimeError("the creative armor slot has an item-stack request in flight")
+
+        def uncertain():
+            nonlocal changed
+            changed = True
+
+        def observe(_, observed):
+            if observed is None or observed.id or observed.stack_size or observed.net_id_variant:
+                uncertain()
+
+        def apply(response):
+            if (response.result.name != "SUCCESS" or changed or self._containers.window is not window
+                    or not self._armor_empty(slot)):
+                return
+            corrections = [correction for container in response.containers or ()
+                           if container.full_container_name.name.name == _ARMOR
+                           and container.full_container_name.dynamic_id is None
+                           for correction in container.slots if int(correction.slot) == slot]
+            if len(corrections) != 1 or int(corrections[0].amount) != 1:
+                return
+            net_id = corrections[0].item_stack_net_id
+            if net_id is None or int(net_id.raw_id) <= 0:
+                return
+            equipped = b.SerializedNetworkItemStackDescriptor(
+                id=item.item_id, stack_size=1, aux_value=item.aux_value, net_id_variant=int(net_id.raw_id),
+                block_runtime_id=item.block_runtime_id & 0xFFFFFFFF, user_data_buffer=item.user_data_buffer,
+            )
+            self._inventory._set_armor_slot(slot, equipped)
+
+        return await self._inventory._request_item_stack(
+            request, apply, timeout=timeout, _at_write=at_write, _on_slot_observed=observe,
+            _on_unconfirmed=uncertain,
+        )
 
     async def clear(self, slot, *, timeout):
         self._window()
