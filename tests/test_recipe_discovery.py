@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from endpilot import Bot
+from endpilot import Bot, RecipeDeltaPlan, RecipeItemAmount
 from endpilot.protocol import read_batch, write_batch
 
 
@@ -54,6 +54,38 @@ class RecipeDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             b.ShapelessRecipePayload(recipe_id="test:pair", net_id=4,
                                      ingredients=[oak_pair], results=[special_stick], tag="crafting_table"),
         ])
+
+    def shapeless(self, recipe_id, net_id, ingredients, results, *, clear=False):
+        b = self.b
+        return b.CraftingDataPacket(clear_recipes=clear, shapeless_recipes=[
+            b.ShapelessRecipePayload(
+                recipe_id=recipe_id, net_id=net_id, tag="crafting_table",
+                ingredients=[b.SerializedRecipeIngredient(descriptor=descriptor, stack_size=count, aux_value=aux)
+                             for descriptor, count, aux in ingredients],
+                results=[b.SerializedNetworkItemInstanceDescriptor(id=item_id, stack_size=count, aux_value=aux)
+                         for item_id, count, aux in results],
+            ),
+        ])
+
+    def plank_ring(self):
+        b = self.b
+        planks = b.SerializedRecipeIngredient(descriptor={"item_tag": "minecraft:planks"},
+                                              stack_size=2, aux_value=32767)
+        center = b.SerializedRecipeIngredient(descriptor={"name": "minecraft:stick"}, stack_size=1, aux_value=0)
+        catalog = b.CraftingDataPacket(clear_recipes=False, shaped_recipes=[b.ShapedRecipePayload(
+            recipe_id="test:plank_ring", net_id=17, width=3, height=3, tag="crafting_table",
+            ingredients=[planks] * 4 + [center] + [planks] * 4,
+            results=[b.SerializedNetworkItemInstanceDescriptor(id=4, stack_size=1)],
+        )])
+        woods = ("oak", "birch", "spruce", "jungle", "acacia", "dark_oak", "mangrove")
+        registry = b.ItemRegistryPacket(items=[
+            b.ItemData(id=3, name="minecraft:stick"),
+            b.ItemData(id=4, name="minecraft:wooden_pickaxe"),
+            *(b.ItemData(id=item_id, name=f"minecraft:{wood}_planks") for item_id, wood in enumerate(woods, 50)),
+        ])
+        counts = [(item_id, 3, 0) for item_id in range(50, 57)] + [(3, 1, 0)]
+        more = [(50, 4, 0), *counts[1:]]
+        return catalog, registry, self.inventory(*counts), self.inventory(*more)
 
     def deliver(self, *packets):
         self.incoming.put_nowait(write_batch(self.bot.protocol.encode(packet) for packet in packets))
@@ -210,6 +242,241 @@ class RecipeDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.recipes_for("stick", 2), (self.bot.get_recipe(4),))
         await self.delivered(self.inventory((1, 1, 2), (2, 1, 0)))
         self.assertEqual(self.bot.recipes_for("stick"), ())
+
+    async def test_plan_uses_shared_capacity_in_recipe_order_without_sending(self):
+        await self.join(True)
+        send = self.bot.packets.transport.send
+        before = send.await_count
+        self.assertIsNone(self.bot.open_window)
+        self.assertEqual(self.bot.recipes_for("stick", 0), ())
+        plan = self.bot.plan_recipe_delta("test:mix")
+        self.assertIsInstance(plan, RecipeDeltaPlan)
+        self.assertIs(plan.recipe, self.bot.get_recipe(1))
+        self.assertEqual(plan.times, 1)
+        self.assertEqual(plan.materials, (
+            (RecipeItemAmount(2, 0, 1, "minecraft:birch_planks"),),
+            (RecipeItemAmount(1, 3, 1, "minecraft:oak_planks"),),
+        ))
+        self.assertEqual(plan.delta, (
+            RecipeItemAmount(2, 0, -1, "minecraft:birch_planks"),
+            RecipeItemAmount(1, 3, -1, "minecraft:oak_planks"),
+            RecipeItemAmount(3, 0, 4, "minecraft:stick"),
+        ))
+        self.assertEqual(self.bot.plan_recipe_delta(2).recipe.recipe_id, "test:wide")
+        self.assertEqual(send.await_count, before)
+        self.assertIsNone(self.bot.open_window)
+
+        await self.delivered(self.inventory((1, 1, 3), (999, 16, 0)))
+        self.assertIsNone(self.bot.plan_recipe_delta("test:mix"))
+        await self.delivered(self.inventory((1, 2, 3), (999, 16, 0)))
+        satisfied = self.bot.plan_recipe_delta("test:mix")
+        self.assertEqual(satisfied.materials, (
+            (RecipeItemAmount(1, 3, 1, "minecraft:oak_planks"),),
+            (RecipeItemAmount(1, 3, 1, "minecraft:oak_planks"),),
+        ))
+        self.assertEqual(satisfied.delta[0], RecipeItemAmount(1, 3, -2, "minecraft:oak_planks"))
+        self.assertEqual(plan.delta[0].item_id, 2)
+
+    async def test_plan_keeps_actual_item_id_and_aux_and_retains_zero(self):
+        b = self.b
+        await self.join(before_spawn=(
+            b.ItemRegistryPacket(items=[
+                b.ItemData(id=1, name="minecraft:oak_planks"),
+                b.ItemData(id=7, name="minecraft:oak_planks"),
+            ]),
+            self.shapeless("test:variants", 7, [({"name": "minecraft:oak_planks:3"}, 1, 3)],
+                           [(7, 1, 3), (1, 1, 3), (7, 2, 4), (7, 3, 4), (77, 1, 0)]),
+            self.inventory((7, 1, 3), (1, 1, 5)),
+        ))
+        self.assertEqual(self.bot.item_registry.id_for_name("minecraft:oak_planks"), 1)
+        plan = self.bot.plan_recipe_delta(7)
+        self.assertEqual(plan.materials, ((RecipeItemAmount(7, 3, 1, "minecraft:oak_planks"),),))
+        self.assertEqual(plan.delta, (
+            RecipeItemAmount(7, 3, 0, "minecraft:oak_planks"),
+            RecipeItemAmount(1, 3, 1, "minecraft:oak_planks"),
+            RecipeItemAmount(7, 4, 5, "minecraft:oak_planks"),
+            RecipeItemAmount(77, 0, 1, None),
+        ))
+        with self.assertRaises(AttributeError):
+            plan.times = 7
+        with self.assertRaises(AttributeError):
+            plan.materials[0][0].count = 100
+        with self.assertRaises(AttributeError):
+            plan.recipe.recipe_id = "test:replaced"
+
+    async def test_plan_can_choose_different_egg_variants_across_crafts(self):
+        b = self.b
+        recipe = self.shapeless("test:egg", 11, [({"item_tag": "minecraft:egg"}, 1, 32767)], [(3, 2, 0)])
+        registry = b.ItemRegistryPacket(items=[
+            b.ItemData(id=3, name="minecraft:stick"),
+            b.ItemData(id=5, name="minecraft:egg"),
+            b.ItemData(id=6, name="minecraft:blue_egg"),
+        ])
+        await self.join(before_spawn=(recipe, registry, self.inventory((5, 1, 0), (6, 1, 0))))
+        one = self.bot.plan_recipe_delta(11)
+        self.assertIn(one.materials, (
+            ((RecipeItemAmount(5, 0, 1, "minecraft:egg"),),),
+            ((RecipeItemAmount(6, 0, 1, "minecraft:blue_egg"),),),
+        ))
+        two = self.bot.plan_recipe_delta(11, times=2)
+        self.assertEqual(two.times, 2)
+        self.assertEqual(two.materials, ((
+            RecipeItemAmount(5, 0, 1, "minecraft:egg"), RecipeItemAmount(6, 0, 1, "minecraft:blue_egg"),
+        ),))
+        self.assertEqual([(item.item_id, item.count) for item in two.delta], [(5, -1), (6, -1), (3, 4)])
+        self.assertIsNone(self.bot.plan_recipe_delta(11, times=3))
+
+        await self.bot.close()
+        self.incoming = asyncio.Queue()
+        await self.join(before_spawn=(recipe, registry, self.inventory((5, 1, 0), (6, 1, 0))), addon=True)
+        self.assertIsNone(self.bot.plan_recipe_delta(11))
+
+    async def test_plan_preserves_whole_positions_when_requirements_overlap(self):
+        oak = {"name": "minecraft:oak_planks"}
+        plank = {"item_tag": "minecraft:planks"}
+        pairs = self.shapeless("test:pairs", 7, [(plank, 2, 32767), (oak, 2, 3)], [(3, 1, 0)])
+        mixed = self.shapeless("test:mixed_count", 8, [(plank, 2, 32767), (oak, 1, 3)], [(3, 1, 0)])
+        overlapping = self.shapeless("test:overlapping_pairs", 12, [
+            (plank, 2, 32767), (oak, 2, 3), (plank, 2, 32767), ({"name": "minecraft:stick"}, 1, 0),
+        ], [(4, 1, 0)])
+        await self.join(False, (pairs, mixed, overlapping, self.inventory((1, 2, 3), (2, 2, 0))))
+        sent = self.bot.packets.transport.send.await_count
+        self.assertEqual(self.bot.plan_recipe_delta(7).materials, (
+            (RecipeItemAmount(2, 0, 2, "minecraft:birch_planks"),),
+            (RecipeItemAmount(1, 3, 2, "minecraft:oak_planks"),),
+        ))
+        self.assertEqual(self.bot.plan_recipe_delta(8).materials, (
+            (RecipeItemAmount(2, 0, 2, "minecraft:birch_planks"),),
+            (RecipeItemAmount(1, 3, 1, "minecraft:oak_planks"),),
+        ))
+        self.assertEqual(self.bot.packets.transport.send.await_count, sent)
+        self.assertIsNone(self.bot.open_window)
+        self.assertNotIn(self.bot.get_recipe(7), self.bot.recipes_for("stick"))
+        self.assertNotIn(self.bot.get_recipe(8), self.bot.recipes_for("stick"))
+
+        await self.delivered(self.inventory((1, 3, 3), (2, 3, 0)))
+        self.assertIsNone(self.bot.plan_recipe_delta(8, times=2))
+        await self.delivered(self.inventory((1, 4, 3), (2, 2, 0)))
+        self.assertEqual(self.bot.plan_recipe_delta(8, times=2).materials, ((
+            RecipeItemAmount(1, 3, 2, "minecraft:oak_planks"), RecipeItemAmount(2, 0, 2, "minecraft:birch_planks"),
+        ), (RecipeItemAmount(1, 3, 2, "minecraft:oak_planks"),)))
+
+        # The two whole-batch groups pass their individual bounds, but cannot
+        # both consume the same oak. Unrelated inventory does not help.
+        await self.delivered(self.inventory((1, 2, 3), (2, 2, 0), (3, 1, 0), (4, 10, 0)))
+        self.assertIsNone(self.bot.plan_recipe_delta(12))
+        await self.delivered(self.inventory((1, 4, 3), (2, 2, 0), (3, 1, 0)))
+        plan = self.bot.plan_recipe_delta(12)
+        self.assertEqual({plan.materials[i][0].item_id for i in (0, 2)}, {1, 2})
+        self.assertEqual(plan.materials[1], (RecipeItemAmount(1, 3, 2, "minecraft:oak_planks"),))
+        self.assertEqual(plan.materials[3], (RecipeItemAmount(3, 0, 1, "minecraft:stick"),))
+
+    async def test_plan_never_mixes_concrete_ids_with_same_name_and_aux_in_a_batch(self):
+        b = self.b
+        oak = "minecraft:oak_planks"
+        recipe = self.shapeless("test:concrete_ids", 7, [({"name": oak}, 2, 3)], [(3, 1, 0)])
+        registry = b.ItemRegistryPacket(items=[b.ItemData(id=item_id, name=oak) for item_id in (1, 7)])
+        await self.join(before_spawn=(recipe, registry, self.inventory((1, 1, 3), (7, 1, 3))))
+        self.assertIsNone(self.bot.plan_recipe_delta(7))
+
+        await self.delivered(self.inventory((1, 2, 3), (7, 2, 3)))
+        self.assertIn(self.bot.plan_recipe_delta(7).materials, (
+            ((RecipeItemAmount(1, 3, 2, oak),),),
+            ((RecipeItemAmount(7, 3, 2, oak),),),
+        ))
+        two = self.bot.plan_recipe_delta(7, times=2)
+        self.assertEqual(two.materials, ((RecipeItemAmount(1, 3, 2, oak), RecipeItemAmount(7, 3, 2, oak)),))
+        self.assertEqual([(item.item_id, item.count) for item in two.delta], [(1, -2), (7, -2), (3, 2)])
+        self.assertIsNone(self.bot.plan_recipe_delta(7, times=3))
+
+    async def test_plan_counts_complete_batches_for_repeated_compatible_positions(self):
+        catalog, registry, short, enough = self.plank_ring()
+        await self.join(False, (catalog, registry, short))
+        sent = self.bot.packets.transport.send
+        before = sent.await_count
+        self.assertIsNone(self.bot.plan_recipe_delta("test:plank_ring"))
+        self.assertEqual(sent.await_count, before)
+
+        await self.delivered(enough)
+        before = sent.await_count
+        plan = self.bot.plan_recipe_delta("test:plank_ring")
+        self.assertEqual(len(plan.materials), 9)
+        self.assertEqual(plan.materials[4], (RecipeItemAmount(3, 0, 1, "minecraft:stick"),))
+        outside = plan.materials[:4] + plan.materials[5:]
+        for group in outside:
+            item, = group
+            self.assertEqual((item.aux_value, item.count), (0, 2))
+            self.assertIn(item.item_id, range(50, 57))
+        self.assertEqual({item.item_id: item.count for item in plan.delta}, {
+            50: -4, **{item_id: -2 for item_id in range(51, 57)}, 3: -1, 4: 1,
+        })
+        self.assertEqual(sent.await_count, before)
+        self.assertIsNone(self.bot.open_window)
+
+    async def test_plan_returns_none_for_unresolved_requirements_or_results(self):
+        b = self.b
+        oak = [({"name": "minecraft:oak_planks"}, 1, 3)]
+        await self.join(before_spawn=(
+            self.shapeless("test:no_output", 7, oak, []),
+            self.shapeless("test:zero_output", 8, oak, [(3, 0, 0)]),
+            self.shapeless("test:anonymous_output", 9, oak, [(0, 1, 0)]),
+            self.shapeless("test:unknown_input", 10, [({"name": "test:missing"}, 1, 32767)], [(3, 1, 0)]),
+            self.shapeless("test:unsupported_input", 11, [({"molang": "1"}, 1, 32767)], [(3, 1, 0)]),
+            b.InventorySlotPacket(inventory_id=b.ContainerID.INVENTORY, slot=36,
+                                  item=b.SerializedNetworkItemStackDescriptor(id=1, stack_size=7, aux_value=3)),
+        ))
+        for key in ("test:unknown", "test:no_output", "test:zero_output", "test:anonymous_output",
+                    "test:unknown_input", "test:unsupported_input", "test:absent", "test:pair"):
+            with self.subTest(recipe=key):
+                self.assertIsNone(self.bot.plan_recipe_delta(key))
+
+    async def test_plan_uses_known_slots_while_a_drop_still_has_no_correction(self):
+        b = self.b
+        await self.join(before_spawn=(self.inventory((1, 2, 3)),))
+        self.assertIsNotNone(self.bot.plan_recipe_delta(4))
+        await self.bot.drop_selected_item(whole_stack=True)
+        self.assertEqual(self.bot.inventory_slots[0].stack_size, 2)
+        self.assertIsNone(self.bot.plan_recipe_delta(4))
+
+        await self.delivered(b.InventorySlotPacket(
+            inventory_id=b.ContainerID.INVENTORY, slot=5,
+            item=b.SerializedNetworkItemStackDescriptor(id=1, stack_size=2, aux_value=3),
+        ))
+        self.assertEqual(self.bot.plan_recipe_delta(4).materials, (
+            (RecipeItemAmount(1, 3, 2, "minecraft:oak_planks"),),
+        ))
+        self.assertIsNone(self.bot.plan_recipe_delta(4, times=2))
+
+    async def test_plan_reads_replaced_catalog_and_does_not_survive_disconnect(self):
+        b = self.b
+        self.assertIsNone(self.bot.plan_recipe_delta(1))
+        for invalid in (0, -1, True, False, 1.0, "1", None):
+            with self.subTest(times=invalid):
+                with self.assertRaisesRegex(ValueError, "times must be a positive integer"):
+                    self.bot.plan_recipe_delta(1, times=invalid)
+
+        await self.join()
+        old = self.bot.plan_recipe_delta(1)
+        recipe = self.shapeless("test:new", 1, [({"name": "minecraft:oak_planks"}, 1, 3)], [(4, 1, 0)], clear=True)
+        await self.delivered(recipe)
+        self.assertIsNone(self.bot.plan_recipe_delta("test:mix"))
+        self.assertIsNone(self.bot.plan_recipe_delta(2))
+        current = self.bot.plan_recipe_delta(1)
+        self.assertEqual(current.recipe.recipe_id, "test:new")
+        self.assertEqual(current.delta[-1], RecipeItemAmount(4, 0, 1, "minecraft:wooden_pickaxe"))
+        self.assertEqual(old.recipe.recipe_id, "test:mix")
+        self.assertEqual(old.delta[-1], RecipeItemAmount(3, 0, 4, "minecraft:stick"))
+
+        self.deliver(b.DisconnectPacket(reason=b.DisconnectFailReason.KICKED))
+        self.assertEqual((await self.bot.wait_for_session_end(timeout=1)).kind, "server_disconnect")
+        self.assertIsNone(self.bot.plan_recipe_delta(1))
+        await self.bot.close()
+        self.assertIsNone(self.bot.plan_recipe_delta(1))
+        self.incoming = asyncio.Queue()
+        await self.join(before_spawn=(self.inventory((1, 1, 3)),))
+        self.assertIsNone(self.bot.plan_recipe_delta("test:new"))
+        self.assertIsNone(self.bot.plan_recipe_delta(1))
+        self.assertEqual(current.recipe.recipe_id, "test:new")
 
     async def test_explicit_grid_queries_without_opening_or_sending(self):
         await self.join(False)

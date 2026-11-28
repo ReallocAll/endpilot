@@ -117,6 +117,35 @@ the inventory screen. With one honey bottle, the announced
 it produces three sugar and one glass bottle. The same recipe needs two
 honey bottles to satisfy a request for two glass bottles.
 
+Use `bot.plan_recipe_delta(recipe_id, times=1)` to estimate the change
+to your main inventory from the current announcement and observed
+carried stacks. Pass the recipe's string ID or network ID. The call is
+synchronous, sends no packets, and works with the inventory screen closed.
+
+```python
+plan = bot.plan_recipe_delta("minecraft:honey_bottle_to_sugar")
+if plan is not None:
+    for item in plan.delta:
+        print(item.name or item.item_id, item.aux_value, item.count)
+```
+
+The immutable plan includes the recipe, requested craft count, and
+`materials` grouped in `plan.recipe.ingredients` order. A group can
+contain different compatible variants across multiple crafts. For each
+craft, an ingredient position uses its full quantity from one variant. The
+`delta` rows combine consumption and all announced outputs by numeric
+item ID and aux value. Negative counts are consumed, positive counts are
+produced, and zero rows show that consumption and production cancel.
+An output name can be absent before the item registry identifies it.
+
+`times` must be a positive integer. The call returns `None` if the
+current catalog and observed inventory cannot establish a concrete plan.
+An announced, locked recipe can still have a plan. Use the discovery and
+crafting calls separately to check access, grid size, and the server's
+verdict. The plan describes one compatible material assignment. Manual
+staging can use another assignment, and available output space depends on
+the actual crafting action.
+
 To craft multiple results from a manually staged personal or workbench grid,
 call `bot.craft_recipe_grid` once with one distinct confirmed empty main
 inventory slot per announced result, in recipe order. After staging the

@@ -69,7 +69,7 @@ from .player_state import (
 )
 from .qa import PacketTimeline
 from .qa_terrain import _TerrainObserver
-from .recipes import Recipe, Recipes
+from .recipes import Recipe, RecipeDeltaPlan, Recipes
 from .recoverable_error import RecoverableError
 from .resource_packs import PackDecisionHandler, ResourcePackIndex
 from .scoreboard import Scoreboard, ScoreboardObserver, ScoreboardSnapshot
@@ -757,6 +757,22 @@ class Bot:
         if self._recipes is None:
             raise RuntimeError("player has not joined")
         return self._recipes.get(recipe_id)
+
+    def plan_recipe_delta(self, recipe_id: str | int, *, times: int = 1) -> RecipeDeltaPlan | None:
+        """Estimate the main inventory change for one material assignment, without sending packets.
+
+        Materials are grouped by Recipe.ingredients. Delta counts are signed
+        and include every output and any variants that cancel to zero.
+        Return None if the active catalog and observed inventory do not
+        establish a plan. This can be called with no window or with a locked
+        recipe. Check discovery and execution separately for crafting access.
+        """
+        if not isinstance(times, int) or isinstance(times, bool) or times <= 0:
+            raise ValueError("times must be a positive integer")
+        state = self._get_session_end_state()
+        if self._recipes is None or state is None or state.result is not None:
+            return None
+        return self._recipes.plan_delta(recipe_id, times)
 
     @property
     def limited_crafting(self) -> bool | None:

@@ -50,6 +50,7 @@ from .range_transfer import (
     RangeTransferResult, RangeTransferStep, transfer_container_range, transfer_inventory_range, transfer_item,
     transfer_range,
 )
+from .recipes import RecipeDeltaPlan, RecipeItemAmount
 from .recoverable_error import RecoverableError
 from .resource_packs import (
     LoadedResourcePack, ResourcePackCancelled, ResourcePackDecision, ResourcePackDetails,
@@ -185,6 +186,8 @@ __all__ = [
     "PlayerVitals",
     "RangeTransferResult",
     "RangeTransferStep",
+    "RecipeDeltaPlan",
+    "RecipeItemAmount",
     "RecoverableError",
     "ResourcePackCancelled",
     "ResourcePackDecision",

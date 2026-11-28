@@ -6,10 +6,14 @@ from dataclasses import dataclass, replace
 from functools import cache
 from importlib.resources import files
 import json
+from math import gcd
 from operator import index
 from typing import Literal
 
-from .inventory import _PLAYER_CONTAINERS, _CraftingGridEndpoint, _correct_observed_item, _response_item, _stack_snapshot
+from .inventory import (
+    _MAIN_INVENTORY_SIZE, _PLAYER_CONTAINERS, _CraftingGridEndpoint, _correct_observed_item, _response_item,
+    _stack_snapshot,
+)
 
 
 _RECIPE_KINDS = (
@@ -17,6 +21,7 @@ _RECIPE_KINDS = (
     "shapeless_chemistry_recipes", "shaped_chemistry_recipes",
     "smithing_transform_recipes", "smithing_trim_recipes",
 )
+_CRAFTING_GRID_KINDS = ("shaped_recipes", "shapeless_recipes", "user_data_shapeless_recipes")
 _ANY_AUX_VALUE = 32767
 
 
@@ -63,6 +68,26 @@ class Recipe:
     width: int | None = None
     height: int | None = None
     shape: tuple[RecipeIngredient | None, ...] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RecipeItemAmount:
+    """A concrete network item variant and its quantity in a recipe plan."""
+
+    item_id: int
+    aux_value: int
+    count: int
+    name: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RecipeDeltaPlan:
+    """An independent estimate based on the announced recipe and observed materials."""
+
+    recipe: Recipe
+    times: int
+    materials: tuple[tuple[RecipeItemAmount, ...], ...]
+    delta: tuple[RecipeItemAmount, ...]
 
 
 class Recipes:
@@ -305,14 +330,12 @@ class Recipes:
     def _grid_recipes(self, item: str, aux_value: int | None, size: int):
         name = item if ":" in item else f"minecraft:{item}"
         for recipe in self._by_id.values():
-            if recipe.tag != "crafting_table" or not recipe.ingredients:
+            if recipe.tag != "crafting_table" or not recipe.ingredients or recipe.kind not in _CRAFTING_GRID_KINDS:
                 continue
             if recipe.kind == "shaped_recipes":
                 if (recipe.shape is None or not (1 <= recipe.width <= size and 1 <= recipe.height <= size)
                         or len(recipe.shape) != recipe.width * recipe.height):
                     continue
-            elif recipe.kind not in ("shapeless_recipes", "user_data_shapeless_recipes"):
-                continue
             if len(recipe.ingredients) > size * size:
                 continue
             output = sum(result.count for result in recipe.results if result.name == name
@@ -345,32 +368,150 @@ class Recipes:
             and self._allocate_materials(recipe, materials, (requested + output - 1) // output) is not None
         )
 
-    def _allocate_materials(self, recipe: Recipe, materials: Counter, crafts: int):
+    def plan_delta(self, recipe_id: str | int, times: int) -> RecipeDeltaPlan | None:
+        recipe = self.get(recipe_id)
+        inventory = self.inventory
+        if (recipe is None or inventory is None or recipe.kind not in _CRAFTING_GRID_KINDS
+                or recipe.tag != "crafting_table" or not recipe.ingredients or not recipe.results
+                or any(result.item_id == 0 or result.count <= 0 for result in recipe.results)):
+            return None
+
+        materials = Counter()
+        uncertain = (
+            inventory._count_observation_gaps | inventory._unconfirmed_transfer_slots | inventory._drop_key_counts.keys()
+        )
+        for slot, stack in inventory.slots.items():
+            if not 0 <= slot < _MAIN_INVENTORY_SIZE or slot in uncertain:
+                continue
+            item_id = int(stack.id)
+            name = self.item_names.get(item_id) if item_id else None
+            if name and stack.stack_size > 0:
+                materials[name, int(stack.aux_value), item_id] += int(stack.stack_size)
+
+        allocation = self._allocate_materials(recipe, materials, times, whole_positions=True)
+        if allocation is None:
+            return None
+        selected = tuple(
+            tuple(RecipeItemAmount(item_id, aux, count, name) for (name, aux, item_id), count in group)
+            for group in allocation
+        )
+        delta = Counter()
+        for group in selected:
+            for item in group:
+                delta[item.item_id, item.aux_value] -= item.count
+        for result in recipe.results:
+            delta[result.item_id, result.aux_value] += result.count * times
+        return RecipeDeltaPlan(recipe, times, selected, tuple(
+            RecipeItemAmount(item_id, aux, count, self.item_names.get(item_id))
+            for (item_id, aux), count in delta.items()
+        ))
+
+    def _allocate_materials(self, recipe: Recipe, materials: Counter, crafts: int, *, whole_positions: bool = False):
         # Each inventory variant contributes a single shared capacity, even if
-        # several ingredients can use it. Residual edges allow reassignment.
-        source, sink = object(), object()
-        edges = defaultdict(dict)
-        edges[source].update(materials)
-        needed = 0
+        # several ingredients can use it. Keys start with name and aux and can
+        # also retain the actual item ID. A common unit avoids subdividing
+        # equally sized requirements when planning multiple crafts.
+        unit = gcd(*(ingredient.count for ingredient in recipe.ingredients)) if whole_positions else 1
+        if unit > 1:
+            materials = Counter({variant: count // unit for variant, count in materials.items()})
+        positions = {}
         for slot, ingredient in enumerate(recipe.ingredients):
+            count = ingredient.count // unit
             names = (self._tag_members.get(ingredient.tag, ()) if ingredient.tag is not None
                      else (ingredient._item_name,))
-            variants = [
+            variants = tuple(
                 item for item, amount in materials.items()
-                if amount >= ingredient.count and item[0] in names
+                if amount >= count and item[0] in names
                 and ingredient.aux_value in (_ANY_AUX_VALUE, item[1])
-            ]
-            if not variants or (ingredient.count > 1 and len(variants) > 1):
-                # A multi-item slot needs a single concrete variant per craft.
-                # Vanilla grids only use one item per occupied slot.
+            )
+            if not variants or (not whole_positions and count > 1 and len(variants) > 1):
+                # Discovery and automatic crafting keep their existing handling
+                # of ambiguous multi-item requirements.
                 return None
-            demand = ingredient.count * crafts
-            for item in variants:
-                edges[item][slot] = min(demand, materials[item])
-            edges[slot][sink] = demand
-            needed += demand
-        if needed > materials.total():
+            # Positions needing the same count from the same concrete variants
+            # are interchangeable during planning. Retain their output order.
+            key = count, variants, None if whole_positions else slot
+            positions.setdefault(key, []).append(slot)
+
+        demands = []
+        batches = []
+        limits = {}
+        for group, ((count, variants, _), slots) in enumerate(positions.items()):
+            batch = count if whole_positions else 1
+            demand = count * crafts * len(slots)
+            demands.append(demand)
+            batches.append(batch)
+            capacity = 0
+            for variant in variants:
+                upper = min(demand, materials[variant]) // batch * batch
+                limits[group, variant] = (0, upper)
+                capacity += upper
+            if capacity < demand:
+                return None
+        if sum(demands) > materials.total():
             return None
+
+        candidates = [limits]
+        while candidates:
+            limits = candidates.pop()
+            allocation = self._material_flow(materials, demands, limits)
+            if allocation is None:
+                continue
+            split = next((
+                (slot, variant, used) for slot, group in enumerate(allocation) if batches[slot] > 1
+                for variant, used in group if used % batches[slot]
+            ), None)
+            if split is None:
+                break
+
+            # Every legal use lies in one of these two intervals. Re-solve
+            # against the same shared supplies to reroute competing positions.
+            slot, variant, used = split
+            edge = slot, variant
+            lower, upper = limits[edge]
+            batch = batches[slot]
+            below = used // batch * batch
+            candidates.append(limits | {edge: (lower, below)})
+            candidates.append(limits | {edge: (below + batch, upper)})
+        else:
+            return None
+
+        # Both the group allocations and each original position are whole
+        # batches, so distributing these amounts needs no per-craft expansion.
+        selected = [()] * len(recipe.ingredients)
+        for ((count, _, _), slots), group in zip(positions.items(), allocation, strict=True):
+            supplies = deque(group)
+            for slot in slots:
+                needed = count * crafts
+                used = []
+                while needed:
+                    variant, available = supplies.popleft()
+                    amount = min(needed, available)
+                    used.append((variant, amount * unit))
+                    needed -= amount
+                    if amount < available:
+                        supplies.appendleft((variant, available - amount))
+                selected[slot] = tuple(used)
+        return tuple(selected)
+
+    @staticmethod
+    def _material_flow(materials, demands, limits):
+        source, sink = object(), object()
+        edges = defaultdict(dict)
+        available = dict(materials)
+        remaining = list(demands)
+        for (slot, variant), (lower, _) in limits.items():
+            available[variant] -= lower
+            remaining[slot] -= lower
+        if min(available.values(), default=0) < 0 or min(remaining, default=0) < 0:
+            return None
+        edges[source].update(available)
+        for (slot, variant), (lower, upper) in limits.items():
+            edges[variant][slot] = upper - lower
+        for slot, demand in enumerate(remaining):
+            edges[slot][sink] = demand
+        needed = sum(remaining)
+
         while needed:
             parent = {source: None}
             queue = deque([source])
@@ -395,10 +536,12 @@ class Recipes:
                 edges[node][previous] = edges[node].get(previous, 0) + flow
                 node = previous
             needed -= flow
-        return tuple(
-            tuple((variant, edges[slot][variant]) for variant in materials if edges[slot].get(variant, 0))
-            for slot in range(len(recipe.ingredients))
-        )
+        allocation = [[] for _ in demands]
+        for (slot, variant), (lower, _) in limits.items():
+            used = lower + edges[slot].get(variant, 0)
+            if used:
+                allocation[slot].append((variant, used))
+        return allocation
 
     def _tagged_auto_materials(self, recipe, items, times):
         materials = Counter()
