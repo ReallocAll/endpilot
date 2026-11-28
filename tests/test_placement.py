@@ -933,10 +933,29 @@ class EntityPlacementTests(_EntityPlacementHarness):
         await self.deliver(self.spawn(-61, position=position, actor_type=actor_type))
         self.assert_entity_placement_completed(await pending, EntitySpawn(-61, 61, actor_type, position))
 
-    async def test_minecart_rejects_slopes_curves_other_rails_and_unknown_states(self):
+    async def test_each_minecart_on_ascending_rails_completes_from_the_initial_center_spawn(self):
+        x, y, z = SUPPORT
+        center = (x + 0.5, y + 0.5, z + 0.5)
+        entity_id = -100
+        for direction, runtime_id in ((2, 2683460236), (3, 2621985413), (4, 2806409882), (5, 2744935059)):
+            for actor_type in ("minecraft:minecart", "minecraft:chest_minecart", "minecraft:hopper_minecart"):
+                with self.subTest(direction=direction, actor_type=actor_type):
+                    self.completions.clear()
+                    self.wire.sent.clear()
+                    await self.deliver(self.registry_packet(actor_type), self.boat_slot(1), self.block(SUPPORT, runtime_id))
+                    self.assertEqual(self.bot.observed_block_state(SUPPORT).properties["rail_direction"], direction)
+                    pending = await self.arm_entity(surface=runtime_id, click_height=0.125)
+                    await self.deliver(self.spawn(entity_id, position=center, actor_type=actor_type))
+                    self.assertFalse(pending.done())
+                    await self.deliver(self.boat_slot(0))
+                    expected = EntitySpawn(entity_id, -entity_id, actor_type, center)
+                    self.assert_entity_placement_completed(await pending, expected)
+                    entity_id -= 1
+
+    async def test_minecart_rejects_curves_other_rails_and_unknown_states(self):
         await self.deliver(self.registry_packet("minecraft:minecart"), self.boat_slot(1))
         for runtime_id, name, direction in (
-            (2683460236, "rail", 2), (2929359528, "rail", 6), (791742332, "golden_rail", 0),
+            (2929359528, "rail", 6), (791742332, "golden_rail", 0),
             (2297846613, "detector_rail", 0), (2602891109, "activator_rail", 0), (123456789, None, None),
         ):
             with self.subTest(runtime_id=runtime_id):

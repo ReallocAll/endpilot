@@ -534,7 +534,7 @@ async def observe_entity_placement[Result: EntityPlacementResult](
             click_pos = spawn_offset = (0.5, 0.875, 0.5)
         case "minecraft:minecart" | "minecraft:chest_minecart" | "minecraft:hopper_minecart":
             direction = clicked.properties.get("rail_direction")
-            if clicked.name != "minecraft:rail" or type(direction) is not int or direction not in (0, 1):
+            if clicked.name != "minecraft:rail" or type(direction) is not int or not 0 <= direction <= 5:
                 return result("precondition_failed")
             actor_type = item_name
             click_pos = (0.5, 0.125, 0.5)
