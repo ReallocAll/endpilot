@@ -1679,7 +1679,7 @@ class Blocks:
                     self._stance_air(self.observed_block(cell, layer=1)),
                     self._stance_clearance((x, y + 1, z)))
         if not self._walking_carpet(cell):
-            required += (self._stance_air(self.observed_block(cell)),)
+            required += (self._stance_clearance(cell, allow_vegetation=True),)
         if False in required:
             return False
         return True if all(required) else None

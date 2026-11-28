@@ -401,8 +401,16 @@ class BlockApproachTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((result.status, result.stand_position), ("reached", goal))
             self.assertAlmostEqual(self.stream.sent[-1].pos.y, height, places=4)
 
+        self.set_block((0, 100, 0), ids["fern"])
+        self.set_block((2, 100, 0), ids["leaf_litter"])
+        self.set_position(0.5, 0.5, on_ground=True)
+        result = await self.bot.navigate(FootGoal((2, 100, 0)))
+        self.assertEqual((result.status, result.stand_position), ("reached", (2, 100, 0)))
+        self.assertAlmostEqual(self.stream.sent[-1].pos.y, 101.62, places=4)
+
         self.set_position(0.5, 0.5, on_ground=True)
         for cell, layer, replacement, restore, status in (
+            ((0, 100, 0), 1, "unknown", "air", "unknown"),
             (carpet, 1, "unknown", "air", "unknown"),
             ((1, 99, 0), 1, "water", "air", "unreachable"),
             ((1, 101, 0), 0, "stone", "air", "unreachable"),
